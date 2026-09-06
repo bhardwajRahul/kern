@@ -181,6 +181,66 @@ jobs:
         # The HW/privilege-gated tests skip gracefully here exactly as on x86 (the runner's
         # userns/AppArmor posture, not the arch), so aarch64 CI stays green.
 
+  pi-extension:
+    name: pi extension (node ${{ matrix.node }})
+    # Until this job existed, `integrations/pi` appeared in NO workflow. Its three suites and 187
+    # assertions ran only when somebody remembered to, which is how `grep` shipped broken in 0.1.1:
+    # it was built against the guest workspace while pi's bundled ripgrep runs on the host, so it
+    # failed on every call and every host, and nothing was watching. An external audit of the
+    # published package did not find it either, because it read the README's table for where each
+    # tool runs instead of calling one.
+    #
+    # 22 is the floor `package.json` declares and 24 is what a user on current Node has. The pure
+    # half is exercised WITHOUT the pi peer installed, which is the only part of this an auditor can
+    # reproduce from the npm tarball alone.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: what this runner allows
+        # Same knob the webstack job turns: a GitHub runner ships AppArmor's unprivileged-userns
+        # restriction on, and kern refuses to pretend it can build a sandbox without one.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -qq && sudo apt-get install -y -qq uidmap
+      - name: build kern
+        run: cargo build --release -p getkern
+      - name: install
+        working-directory: integrations/pi
+        run: npm install
+      - name: typecheck
+        working-directory: integrations/pi
+        run: npm run check
+      - name: the pure half, with the pi peer REMOVED
+        # The point of the ./pure subpath: a stranger holding only the tarball can run the path gate.
+        # Removing the peer here is what proves the split is real rather than declared.
+        working-directory: integrations/pi
+        run: |
+          rm -rf node_modules/@earendil-works
+          node --experimental-strip-types test-pure.ts
+      - name: reinstall the peer
+        working-directory: integrations/pi
+        run: npm install
+      - name: registration against the real pi package
+        working-directory: integrations/pi
+        run: node --experimental-strip-types test-register.ts
+      - name: the three suites, against a real box
+        working-directory: integrations/pi
+        env:
+          KERN_BIN: ${{ github.workspace }}/target/release/kern
+        run: |
+          node --experimental-strip-types test.ts
+          node --experimental-strip-types test-edge.ts
+          node --experimental-strip-types test-hostile.ts
+
   webstack:
     name: a real stack, started
     # Until this job existed CI had never STARTED a box. Every box-backed test skipped itself here,

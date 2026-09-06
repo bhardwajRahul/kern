@@ -7,7 +7,18 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["index.ts", "harness.ts", "test.ts", "test-edge.ts", "test-hostile.ts"]
+  "include": [
+    "index.ts",
+    "pure.ts",
+    "harness.ts",
+    "test.ts",
+    "test-edge.ts",
+    "test-hostile.ts",
+    "test-pure.ts",
+    "test-register.ts"
+  ]
 }

@@ -2,10 +2,14 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "allowImportingTsExtensions": false,
+    "allowImportingTsExtensions": true,
     "declaration": true,
     "outDir": "dist",
-    "rootDir": "."
+    "rootDir": ".",
+    "rewriteRelativeImportExtensions": true
   },
-  "include": ["index.ts"]
+  "include": [
+    "index.ts",
+    "pure.ts"
+  ]
 }
