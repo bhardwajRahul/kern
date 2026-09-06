@@ -1,0 +1,86 @@
+/**
+ * The seven tools AS REGISTERED, driven through their own execute().
+ *
+ * The suite whose absence let two grep defects ship three days apart. The other files here test the
+ * pieces: the gate as a function, the box through the SDK, the registration shape, and pi's dispatch.
+ * None of them called `execute` with a hostile argument, so grep was first built against a path that
+ * does not exist on the host (broken on every call) and then against one that does (unconfined: an
+ * external audit read /etc/passwd through an absolute `path`, and host content through a workspace
+ * symlink). Both passed every test in this directory.
+ *
+ *   node --experimental-strip-types test-tools.ts
+ */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import activate from "./index.ts";
+
+const ws = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pi-tools-"));
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pi-outside-"));
+fs.writeFileSync(path.join(outside, "secret.txt"), "MARKER_OUTSIDE\n");
+fs.writeFileSync(path.join(ws, "proj.txt"), "MARKER_PROJ\nsecond line\n");
+fs.mkdirSync(path.join(ws, "sub"));
+fs.writeFileSync(path.join(ws, "sub", "deep.txt"), "MARKER_DEEP\n");
+fs.symlinkSync(path.join(outside, "secret.txt"), path.join(ws, "link-out.txt"));
+fs.symlinkSync("/etc", path.join(ws, "link-etc"));
+process.chdir(ws);
+
+// ACTIVATE AFTER THE CHDIR. The extension captures `process.cwd()` as the workspace when it is
+// activated, so activating first and moving later gave it the wrong root, and the three positive
+// controls failed while every refusal still passed. A test whose negative half passes for the wrong
+// reason is the shape to watch for.
+const tools: Record<string, any> = {};
+activate({ registerTool: (t: any) => (tools[t.name] = t), registerCommand: () => {}, on: () => {} } as never);
+
+let bad = 0;
+let n = 0;
+function ok(cond: boolean, what: string, saw?: unknown): void {
+	n++;
+	console.log(`  ${cond ? "PASS" : "FAIL"}  ${what}${cond ? "" : `  <- ${JSON.stringify(saw)?.slice(0, 200)}`}`);
+	if (!cond) bad++;
+}
+async function call(tool: string, params: Record<string, unknown>): Promise<string> {
+	try {
+		const r = await tools[tool].execute("t", params, new AbortController().signal, () => {}, undefined);
+		return JSON.stringify(r);
+	} catch (e) {
+		return `THREW ${String(e).split("\n")[0]}`;
+	}
+}
+const refused = (s: string) => s.startsWith("THREW") || /refus|escape|outside|denied/i.test(s);
+
+console.log("\n== grep finds what is inside the project");
+ok((await call("grep", { pattern: "MARKER_PROJ" })).includes("proj.txt"), "a match in the workspace root");
+ok((await call("grep", { pattern: "MARKER_DEEP" })).includes("sub/deep.txt"), "a match in a subdirectory");
+ok((await call("grep", { pattern: "MARKER_PROJ", path: "." })).includes("proj.txt"), "an explicit '.' path");
+ok((await call("grep", { pattern: "nothing-matches-this" })).includes("No matches"), "and says so when nothing matches");
+
+console.log("\n== and cannot reach anything outside it");
+// Every one of these returned host content on 0.1.3. They are the audit's five, verbatim.
+ok(refused(await call("grep", { pattern: "^root:", path: "/etc/passwd" })), "an absolute path to /etc/passwd");
+ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: outside })), "an absolute path to another directory");
+ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: "link-out.txt" })), "a symlink to a file outside");
+ok(refused(await call("grep", { pattern: "^root:", path: "link-etc/passwd" })), "a symlink to /etc");
+ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: "../" })), "a .. above the workspace");
+
+console.log("\n== the other verbs, with the same arguments");
+for (const [tool, params] of [
+	["read", { path: "/etc/passwd" }],
+	["read", { path: "link-out.txt" }],
+	["ls", { path: "/etc" }],
+	["find", { pattern: "*", path: "/etc" }],
+	["write", { path: path.join(outside, "pwned.txt"), content: "x" }],
+] as Array<[string, Record<string, unknown>]>) {
+	ok(refused(await call(tool, params)), `${tool} refuses ${JSON.stringify(params.path ?? params)}`);
+}
+ok(!fs.existsSync(path.join(outside, "pwned.txt")), "and write left nothing outside the workspace");
+
+console.log("\n== the positive control: the same verbs work inside");
+ok((await call("read", { path: "proj.txt" })).includes("MARKER_PROJ"), "read inside");
+ok((await call("ls", { path: "." })).includes("proj.txt"), "ls inside");
+ok((await call("find", { pattern: "**/deep.txt" })).includes("deep.txt"), "find inside");
+
+fs.rmSync(ws, { recursive: true, force: true });
+fs.rmSync(outside, { recursive: true, force: true });
+console.log(`\n  ${n - bad}/${n} PASS, ${bad} FAIL`);
+process.exit(bad === 0 ? 0 : 1);

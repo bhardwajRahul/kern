@@ -232,6 +232,13 @@ jobs:
       - name: registration against the real pi package
         working-directory: integrations/pi
         run: node --experimental-strip-types test-register.ts
+      - name: the seven tools as registered, including the hostile arguments
+        # The suite whose absence let two grep defects ship three days apart: everything else here
+        # tests the pieces, and nothing called execute() with a path pointing out of the workspace.
+        working-directory: integrations/pi
+        env:
+          KERN_BIN: ${{ github.workspace }}/target/release/kern
+        run: node --experimental-strip-types test-tools.ts
       - name: the three suites, against a real box
         working-directory: integrations/pi
         env:

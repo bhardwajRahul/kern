@@ -667,19 +667,77 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		...localGrep,
-		async execute(id, params, signal, onUpdate, ctx) {
+		async execute(id, params, _signal, _onUpdate, ctx) {
+			// GREP DOES ITS OWN SEARCHING, and it has to. pi's `GrepOperations` takes `isDirectory`
+			// and `readFile` and nothing else: its own comment says the default is "local filesystem
+			// plus ripgrep", so the SEARCH is not overridable. Built against GUEST_WORKSPACE, pi's
+			// ripgrep ran `rg /workspace` on the HOST and grep failed on every call. Built against
+			// hostWorkspace it worked and was UNCONFINED: an external audit drove it and read
+			// /etc/passwd through an absolute `path`, and host content through a workspace symlink.
+			// Both were shipped, three days apart. Neither is the boundary this extension claims.
+			//
+			// So the enumeration is the box's (`listFiles` sees only the box's /workspace), the read
+			// is the confined host read the other verbs use (`O_NOFOLLOW` plus a post-open
+			// `readlink("/proc/self/fd")`, so a symlink planted in the workspace cannot redirect it),
+			// and the matching happens here rather than in a subprocess that takes a path.
 			const b = await ensureBox(ctx);
-			// THE HOST PATH, and it is the only one that works. pi's `GrepOperations` takes
-			// `isDirectory` and `readFile` and nothing else: its own comment says the default is
-			// "local filesystem plus ripgrep", so the SEARCH is not overridable and ripgrep always
-			// runs locally against the cwd this tool was built with. Built against GUEST_WORKSPACE
-			// it ran `rg /workspace` on the host, where that path does not exist, and grep failed
-			// with `IO error ... No such file or directory` on every call and every host. The
-			// workspace is the same bytes on both sides of the bind mount, so searching it from the
-			// host gives the same answer, and pi's own cwd-rooted check still confines it. That is
-			// what this extension's README already describes: grep is host I/O over the workspace.
-			const tool = createGrepTool(hostWorkspace);
-			return tool.execute(id, params, signal, onUpdate);
+			const p = params as {
+				pattern: string;
+				path?: string;
+				glob?: string;
+				ignoreCase?: boolean;
+				literal?: boolean;
+				context?: number;
+				limit?: number;
+			};
+			const asked = p.path ?? "";
+			// A relative path is workspace-relative; an absolute one must be inside the workspace, and
+			// `refuseOutsideWorkspace` is what says so. `/etc/passwd` dies here.
+			const base = refuseOutsideWorkspace(
+				asked === "" || asked === "."
+					? GUEST_WORKSPACE
+					: path.posix.isAbsolute(asked)
+						? asked
+						: path.posix.join(GUEST_WORKSPACE, asked),
+			);
+			const src = p.literal
+				? p.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+				: p.pattern;
+			let re: RegExp;
+			try {
+				re = new RegExp(src, p.ignoreCase ? "i" : "");
+			} catch (e) {
+				throw refuse("gate", `not a usable pattern: ${String(e)}`);
+			}
+			const limit = Math.max(1, Math.min(p.limit ?? 100, 1000));
+			const ctxLines = Math.max(0, Math.min(p.context ?? 0, 20));
+			let files = (await b.listFiles(base)).map((f) => (base ? `${base}/${f.path}` : f.path));
+			if (p.glob) files = files.filter((rel) => globMatches(p.glob as string, rel));
+			const hits: string[] = [];
+			for (const rel of files) {
+				if (hits.length >= limit) break;
+				let text: string;
+				try {
+					text = readWorkspaceFile(hostWorkspace, rel, `${GUEST_WORKSPACE}/${rel}`).toString("utf8");
+				} catch {
+					continue; // unreadable, a directory, a symlink O_NOFOLLOW refused: not a match
+				}
+				const lines = text.split("\n");
+				for (let i = 0; i < lines.length && hits.length < limit; i++) {
+					if (!re.test(lines[i] as string)) continue;
+					const from = Math.max(0, i - ctxLines);
+					const to = Math.min(lines.length - 1, i + ctxLines);
+					for (let k = from; k <= to; k++) hits.push(`${rel}:${k + 1}: ${lines[k]}`);
+				}
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text: hits.length > 0 ? hits.join("\n") : "No matches found",
+					},
+				],
+			} as never;
 		},
 	});
 
