@@ -136,11 +136,12 @@ kern --version                                   # the binary; `0.0.0` means you
 python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
 ```
 
-Two cases are worth calling out because they are measured rather than theoretical. `--egress-allow`
-on a kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs
-**v0.9.1**, or the box starts with a proxy nothing can reach. And a `compose` stack with a **single
-service** needs **v0.9.2**: before it, only a stack of two or more got a pod, and the pod is what
-attaches `pasta`, so a lone service came up with no egress and an error that reads like DNS.
+Two cases are worth calling out because they are measured rather than theoretical, and both are fixed
+in the published release. On a kernel WITHOUT policy routing (`ip rule list` fails, which is common on
+ARM boards), `--egress-allow` used to start the box against a proxy nothing could reach. And a
+`compose` stack with a **single service** used to get no pod, and the pod is what attaches `pasta`, so
+a lone service came up with no egress at all behind an error that reads like DNS. If you are pinned to
+an older binary, those need **v0.9.1** and **v0.9.2** respectively.
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
@@ -356,7 +357,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
 inside a patch release. One exit code changed in 0.9, which is why it is a minor bump:
 `kern box --plan` exits 1 when a profile it named cannot attach, where it exited 0. The rest of the
-release is in the [v0.9.1 notes](CHANGELOG.md#v091---2026-09-05).
+release is in the [v0.9.2 notes](CHANGELOG.md#v092---2026-09-06).
 
 ## What kern is not
 
