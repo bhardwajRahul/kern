@@ -886,11 +886,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // sentence. On a REUSED pod there is no `create` line above this one, so this was the only
         // thing the operator saw. `DOCKER-COMPAT.md` promised "the bring-up line says which of the
         // two you got" and for compose it did not.
-        let net = if crate::pod::has_outbound(&pod) {
-            "services reach each other by name + outbound to the internet (pasta)"
-        } else {
-            "loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)"
-        };
+        // The SENTENCE comes from `pod`, not a flag decided here. This read `has_outbound()` and
+        // printed "install `passt`/`pasta`" on every false, so a pod whose pasta was installed and
+        // refused to start told its owner to install it (#6), two lines under kern's own correct
+        // "pasta IS installed but did not start". Five states, one bool, wrong branch.
+        let net = crate::pod::network_summary(&pod);
         println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
     Ok(())

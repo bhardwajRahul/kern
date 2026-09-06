@@ -69,6 +69,15 @@ pod_member_count() { printf '%s' "$1" | awk '$2 ~ /^[0-9]+$/ { print $2; exit }'
 # that says neither is the one this checks against, because it is what shipped.
 states_outbound() { printf '%s' "$1" | grep -qiE 'outbound|loopback-only'; }
 
+# THE TWO LINES MUST NOT CONTRADICT EACH OTHER. `pod create` reports why pasta refused; the compose
+# summary reports the pod's state. In v0.9.2 the second was a bool, and every false printed "install
+# passt", so a user whose pasta WAS installed and refused to start read an instruction to install it
+# two lines under kern's own correct sentence (#6). True when the output says both.
+contradicts_install() {
+    printf '%s' "$1" | grep -q 'pasta IS installed' \
+        && printf '%s' "$1" | grep -q 'install `passt`'
+}
+
 self_check() {
     echo "  self-check: the assertions, against fixed strings"
     proxy_answered "wget: server returned error: HTTP/1.1 403 Forbidden" \
@@ -112,6 +121,16 @@ self_check() {
     states_outbound "pod x: services reach each other by name. tear down with kern compose f down." \
         && fail "the pre-fix silent line was read as stating the network" \
         || pass "the pre-fix silent line is not read as stating the network"
+    # The v0.9.2 output that shipped, verbatim in shape: correct create line, wrong summary.
+    contradicts_install "$(printf 'network: loopback-only; pasta IS installed but did not start: x\npod p: loopback-only; NO outbound (install `passt`/`pasta` for egress).\n')" \
+        && pass "the contradiction between the two lines is recognised" \
+        || fail "the contradiction was not recognised"
+    contradicts_install "$(printf 'network: loopback-only; pasta IS installed but did not start: x\npod p: loopback-only; pasta is installed but is not running for this pod.\n')" \
+        && fail "the fixed pair was read as contradicting" \
+        || pass "the fixed pair is not read as contradicting"
+    contradicts_install "$(printf 'network: loopback-only; NO outbound (install `passt`/`pasta` for egress)\npod p: loopback-only; NO outbound (install `passt`/`pasta` for egress).\n')" \
+        && fail "a genuinely-absent pasta was read as contradicting" \
+        || pass "a genuinely-absent pasta is not read as contradicting"
     [ "$FAIL" -eq 0 ] && echo "  self-check passed" || echo "  self-check FAILED"
     exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
 }
@@ -275,6 +294,34 @@ sleep 1
 [ "$(live_kern_pids)" -eq 0 ] \
     && pass "one service: down leaves no kern process" \
     || fail "one service: down left $(live_kern_pids) kern process(es) alive"
+
+# --- A REFUSING PASTA MUST BE REPORTED ONCE, NOT CONTRADICTED -------------------------------------
+# v0.9.2 gave the compose summary its own opinion of the pod's network, derived from a BOOL. Every
+# false printed "install `passt`/`pasta`", so a Fedora user whose pasta was installed and refused to
+# start (SELinux, most likely) read that instruction two lines under kern's own correct "pasta IS
+# installed but did not start: netns dir open: Permission denied". Reported as #6 within hours.
+#
+# The stub is a `pasta` that EXISTS and exits non-zero, which is the reporter's shape exactly: on
+# PATH, so "not installed" is false, and refusing, so no NAT. It does not need a host where pasta
+# genuinely fails, which is the only way this case could run anywhere.
+echo
+echo "  a refusing pasta: the summary must not tell you to install what is installed"
+mkdir -p "$D/stub"
+printf '#!/bin/sh\necho "netns dir open: Permission denied, exiting" >&2\nexit 1\n' > "$D/stub/pasta"
+chmod +x "$D/stub/pasta"
+out6=$(PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/one.toml" up -d 2>&1)
+if [ "$(running)" -ne 1 ]; then
+    echo "    SKIP: the stack did not come up under a refusing pasta: $(printf '%s' "$out6" | head -1)"
+else
+    contradicts_install "$out6" \
+        && fail "the summary said to install a pasta that IS installed (#6)" \
+        || pass "a refusing pasta is reported once, consistently (#6)"
+    states_outbound "$out6" \
+        && pass "a refusing pasta still states the network the stack got" \
+        || fail "a refusing pasta left the network unstated"
+fi
+PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/one.toml" down >/dev/null 2>&1
+sleep 1
 
 # --- the v0.9.1 fix, exercised against the artifact rather than deduced from the changelog ---------
 echo

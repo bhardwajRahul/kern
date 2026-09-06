@@ -41,29 +41,12 @@ pub fn resolv_path(name: &str) -> PathBuf {
     pod_dir(name).join("resolv.conf")
 }
 
-/// Whether this pod has outbound WITH working DNS, for a caller that has to report the state of a
-/// pod it did not just create (a `compose up` that REUSED one prints its summary with no `create`
-/// line above it, so without this it can only report name resolution and stays silent about egress -
-/// which is the half that was missing when a one-service stack silently had none).
+/// Is this pod's `pasta` still the live process we recorded?
 ///
-/// READ, not re-derived: the pod `resolv.conf` is the exact artifact [`setup_outbound`] writes only
-/// on `Outbound::Up`, and [`crate::commands::start`] binds it into a member on the same `exists()`
-/// test. Re-deciding "does this pod have egress" from pasta's pid, or from whether `pasta` is on
-/// PATH, would be a second definition of one property, and a second definition is how a stack came
-/// up with no network while `kern doctor` reported pasta present.
-pub fn has_outbound(name: &str) -> bool {
-    if !resolv_path(name).is_file() {
-        return false;
-    }
-    // AND `pasta` MUST STILL BE ALIVE. The file alone was not enough, and the gap is measured rather
-    // than imagined: kill pasta while the holder lives and `resolv.conf` stays on disk, so this
-    // reported "outbound to the internet (pasta)" for a pod whose box could not reach `1.1.1.1`.
-    // That is the same defect this function exists to close, one state further in. Found by an
-    // external reviewer reading the diff, not by the tests.
-    //
-    // Verified by `comm` rather than by liveness alone: passt re-execs into an ISA variant
-    // (`pasta.avx2`, never the bare name) and a recorded pid can be reused once it dies. Same guard
-    // `teardown` applies below, for the same reason.
+/// Verified by `comm` rather than by liveness alone: passt re-execs into an ISA variant
+/// (`pasta.avx2`, never the bare name) and a recorded pid can be reused once it dies. Same guard
+/// `teardown` applies below, for the same reason.
+fn pasta_alive(name: &str) -> bool {
     let Ok(raw) = std::fs::read_to_string(pod_dir(name).join("pasta.pid")) else {
         return false;
     };
@@ -78,6 +61,41 @@ pub fn has_outbound(name: &str) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|c| is_pasta_comm(c.trim()))
         .unwrap_or(false)
+}
+
+/// The network sentence for an EXISTING pod, for a caller reporting on one it did not just create
+/// (a `compose up` that REUSED a pod has no `create` line above its summary).
+///
+/// A BOOL WAS THE WRONG SHAPE AND IT SHIPPED. The first version of this returned "does it have
+/// outbound", and the caller printed "NO outbound (install `passt`/`pasta`)" for every false. So a
+/// user on Fedora whose pasta was INSTALLED and refused to start read, two lines under kern's own
+/// correct "pasta IS installed but did not start", an instruction to install it. Reported as #6
+/// within hours of the release that introduced it. The comment above the caller even said `pod
+/// create` distinguishes five states; the code beneath it collapsed them to two.
+///
+/// So this returns the sentence, not a flag: the wording lives in one place, and a caller cannot
+/// map a state onto the wrong message because it never sees the states. "pasta is on PATH" and
+/// "pasta is running for THIS pod" are asked separately, because the difference between them is
+/// exactly what the bad message got wrong.
+pub fn network_summary(name: &str) -> String {
+    match (pasta_alive(name), resolv_path(name).is_file()) {
+        (true, true) => {
+            "services reach each other by name + outbound to the internet (pasta)".into()
+        }
+        (true, false) => {
+            "outbound is up but DNS is not - the pod can reach an IP and cannot resolve \
+                          a name"
+                .into()
+        }
+        (false, _) if which_pasta().is_some() => {
+            "loopback-only - services reach each other; pasta is installed but is not running for \
+             this pod (the `pod create` line says why it refused)"
+                .into()
+        }
+        (false, _) => "loopback-only - services reach each other; NO outbound (install \
+                       `passt`/`pasta` for egress)"
+            .into(),
+    }
 }
 
 /// The inode of `/proc/<pid>/ns/<kind>` - a namespace's stable identity. Used to detect PID reuse:
