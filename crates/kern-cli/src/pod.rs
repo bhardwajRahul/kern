@@ -663,15 +663,20 @@ const PASTA_SPAWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10
 ///
 /// The wait happens on a thread so the pipes are drained concurrently, which is what `output()`
 /// does and what keeps a chatty child from deadlocking against a full pipe buffer.
+///
+/// PRECONDITION: A TIMEOUT LEAKS A THREAD, a `Child` and two pipe fds, for the life of the
+/// process. The thread stays blocked in `wait_with_output` until the `SIGKILL` lands, and if the
+/// signal never lands it stays blocked forever. That is bounded here only because `pod create` is
+/// short-lived, which is a property of the CALL SITE and not of this function. Do not call it from
+/// anything long-running without fixing that first.
 fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    // THE GROUP IS ESTABLISHED HERE, not by the caller. This function is what signals a NEGATED pid
-    // on timeout, so the invariant that makes that safe has to belong to it: a caller could
-    // otherwise hand over a `Command` without the call and aim `-pid` at kern's own process group.
-    // A comment cannot hold that together, and an external reviewer was right that it should not
-    // have to.
+    // Its own process group, which is no longer about the kill: that was the reason when this
+    // signalled `-pid`, and it does not any more. It stays because it detaches the child from
+    // kern's group, so a Ctrl-C on kern's terminal does not also interrupt a pasta that is coming
+    // up. `create` gives the holder its own group for the same reason.
     let child = cmd.process_group(0).spawn()?;
     let pid = child.id() as i32;
     // A pidfd PINS the process: while it is open the kernel will not recycle the number. That
@@ -688,18 +693,35 @@ fn output_within(
     let result = match outcome {
         Ok(result) => result,
         Err(_) => {
+            // THE PROCESS, AND ONLY THE PROCESS. An earlier version also sent `kill(-pid,
+            // SIGKILL)` to sweep up anything the child had started, and that was wrong twice
+            // over.
+            //
+            // It was unsafe: a pidfd pins a `struct pid`, so the NUMBER cannot be reused while
+            // this fd is open, but a process GROUP is a different object with its own lifetime.
+            // The child leads the group; once the group empties, its number is free and a new
+            // leader can claim it while the pidfd still pins the old process. The signal would
+            // then land on a stranger's group.
+            //
+            // And it was pointless here: pasta calls `setsid`, measured on a live pod, where the
+            // recorded daemon has `pgrp == session == its own pid`. It has left the child's group
+            // before there is anything to sweep. What the group kill actually caught was a
+            // grandchild of a stub that is a shell script, which is an artefact of the test and
+            // not a shape pasta has.
+            //
+            // So a leaked descendant of a wedged child is accepted, and signalling a group that
+            // may have been reassigned is not: one leaked process is recoverable, SIGKILL to an
+            // unrelated group is not.
             unsafe {
                 if pidfd >= 0 {
                     // Exact, and immune to reuse: the fd names the process, not the number.
                     libc::syscall(libc::SYS_pidfd_send_signal, pidfd, libc::SIGKILL, 0, 0);
                 } else {
+                    // No pidfd (kernel < 5.3): the number is unpinned and could in principle
+                    // have been reused. That is the ordinary risk of signalling by pid, which is
+                    // far smaller than the group signal this replaced.
                     libc::kill(pid, libc::SIGKILL);
                 }
-                // And the group, for anything the child started that is still in it. Safe while
-                // the pidfd is open because the number cannot have been reused. Signalling only
-                // the child left a grandchild running: measured with a stub that is a shell
-                // script, where killing the shell orphaned the process it was waiting on.
-                libc::kill(-pid, libc::SIGKILL);
             }
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

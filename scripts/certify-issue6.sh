@@ -42,9 +42,9 @@ says_outbound() { printf '%s' "$1" | grep -q 'outbound to the internet'; }
 # the certification needs them to be distinguishable from success, not from each other.
 says_loopback_only() { printf '%s' "$1" | grep -q 'loopback-only'; }
 
-# The retry happened AND the first reason survived it. Reporting only the second reason would hide
-# the one that names the operation a policy refused.
-# The retry happened AND the first reason survived it AND the second one is not empty.
+# The retry happened AND the first reason survived it AND the second one is not empty. The first
+# reason matters because it names the operation a policy refused; reporting only the second would
+# hide it.
 #
 # The last clause is the one an external reviewer asked for, and he was right: both substrings come
 # from kern's own TEMPLATE, not from pasta, so if `pasta_reason` ever returned "" the message would
@@ -231,7 +231,10 @@ calls() { wc -l < "$D/calls" 2>/dev/null | tr -d ' '; }
 holders_now() {
     _h=0
     for _p in /proc/[0-9]*; do
-        _c=$(tr '\0' '\n' < "$_p/cmdline" 2>/dev/null) || continue
+        # The redirect is done by the SUBSHELL, so `2>/dev/null` on `tr` does not cover a
+        # process that exits between the readdir and the open: the shell prints its own "cannot
+        # open" first. Grouping puts the redirect inside the silenced scope.
+        _c=$( { tr '\0' '\n' < "$_p/cmdline"; } 2>/dev/null ) || continue
         [ "$(printf '%s' "$_c" | sed -n 2p)" = "__pod-holder" ] && _h=$((_h + 1))
     done
     echo "$_h"
@@ -511,18 +514,31 @@ else
     says_outbound "$outh" \
         && fail "a pod whose pasta never returned claimed outbound" \
         || pass "no outbound is claimed when pasta had to be killed"
-    # The whole process GROUP, not just the child: this stub is a shell script, and signalling the
-    # single pid left `sleep 600` running. Real pasta is a binary and would not have shown it.
+    # THE CHILD IS KILLED; ITS DESCENDANTS ARE NOT, and that is deliberate. This case used to
+    # assert "nothing survived, group and all", which passed because kern also sent
+    # `kill(-pid, SIGKILL)`. That group signal was removed: a pidfd pins a process, not a process
+    # group, so the group's number can be reassigned while the pidfd still holds the child, and
+    # the signal would land on a stranger. Real pasta calls `setsid` and is out of the group
+    # before there is anything to sweep, so the only thing the group kill ever caught here was a
+    # grandchild of this stub, which is a shell script. The artefact was the justification.
+    #
+    # So what is asserted is what kern promises and can fail to keep: THE PROCESS IT SPAWNED is
+    # gone. That is the shell running the stub, found by its argv, which no other process on the
+    # host carries. The stub's own `sleep` is expected to outlive it and is reaped by this script,
+    # because kern no longer claims to.
     sleep 1
-    survivors=0
+    spawned_alive=0
+    stub_children=0
     for pp in /proc/[0-9]*; do
-        case "$(tr '\0' ' ' < "$pp/cmdline" 2>/dev/null)" in
-            *"sleep 600"*) survivors=$((survivors + 1)) ;;
+        _cl=$( { tr '\0' ' ' < "$pp/cmdline"; } 2>/dev/null ) || continue
+        case "$_cl" in
+            *"$D/stub/pasta"*) spawned_alive=$((spawned_alive + 1)) ;;
+            *"sleep 600"*) stub_children=$((stub_children + 1)); kill -9 "${pp#/proc/}" 2>/dev/null ;;
         esac
     done
-    [ "$survivors" -eq 0 ] \
-        && pass "the wedged pasta left nothing behind, group and all" \
-        || fail "$survivors process(es) survived the killed pasta"
+    [ "$spawned_alive" -eq 0 ] \
+        && pass "the wedged pasta kern spawned is gone ($stub_children stub descendant(s) left, which are not kern's to reap)" \
+        || fail "the pasta kern spawned is still alive after the timeout"
 fi
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6hang >/dev/null 2>&1
 
