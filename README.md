@@ -140,8 +140,8 @@ Two cases are worth calling out because they are measured rather than theoretica
 in the published release. On a kernel WITHOUT policy routing (`ip rule list` fails, which is common on
 ARM boards), `--egress-allow` used to start the box against a proxy nothing could reach. And a
 `compose` stack with a **single service** used to get no pod, and the pod is what attaches `pasta`, so
-a lone service came up with no egress at all behind an error that reads like DNS. If you are pinned to
-an older binary, those need **v0.9.1** and **v0.9.2** respectively.
+a lone service came up with no egress at all behind an error that reads like DNS. Both are closed in
+**v0.9.2**, which is the published release.
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the

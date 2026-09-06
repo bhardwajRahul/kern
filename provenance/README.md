@@ -36,8 +36,8 @@ python3 -m venv ~/.venv-ots && ~/.venv-ots/bin/pip install opentimestamps-client
 **Reading the proof, no node required.** This is the check most people want:
 
 ```sh
-ots info provenance/v0.9.1.provenance.txt.ots   # BitcoinBlockHeaderAttestation(<height>) + merkle root
-sha256sum provenance/v0.9.1.provenance.txt      # the hash the block attests to
+ots info provenance/v0.9.2.provenance.txt.ots   # BitcoinBlockHeaderAttestation(<height>) + merkle root
+sha256sum provenance/v0.9.2.provenance.txt      # the hash the block attests to
 ```
 
 Cross-check each reported block height and merkle root on any block explorer. A release is normally
@@ -48,7 +48,7 @@ landing in the same block is normal and is not a missing anchor. A freshly stamp
 **Full verification** needs a local Bitcoin node:
 
 ```sh
-ots verify provenance/v0.9.1.provenance.txt.ots
+ots verify provenance/v0.9.2.provenance.txt.ots
 ```
 
 Without one it stops with `Could not connect to Bitcoin node`. That is not a failed proof, it is a
@@ -58,8 +58,8 @@ to trust anybody's block explorer. If you do not run a node, use the `ots info` 
 ## Cross-check the tag
 
 ```sh
-git verify-tag v0.9.1          # GPG signature on the tag
-git rev-parse v0.9.1^{}        # must equal the commit hash in the .txt
+git verify-tag v0.9.2          # GPG signature on the tag
+git rev-parse v0.9.2^{}        # must equal the commit hash in the .txt
 ```
 
 The signing key ships next to this file, and [SECURITY.md](../SECURITY.md) carries the fingerprint
