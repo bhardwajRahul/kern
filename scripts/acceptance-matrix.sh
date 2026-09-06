@@ -44,7 +44,19 @@ fail() { printf '    FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 claims_a_pod() { printf '%s' "$1" | grep -q "pod '"; }
 
 # "N box(es) stopped" must agree with how many were actually running before.
-stopped_count() { printf '%s' "$1" | sed -n 's/.*compose stop: \([0-9]*\) box(es) stopped.*/\1/p'; }
+#
+# `[0-9][0-9]*`, not `[0-9]*`, because the starred form matches the EMPTY string, so a formatting
+# regression that dropped the number ("compose stop:  box(es) stopped") matched the line and
+# extracted "".
+#
+# TIGHTER, NOT A FIX, and measured rather than assumed: both forms yield "" for that input (the
+# starred one because it substitutes to nothing, this one because it does not match), so every
+# assertion in this file behaves identically before and after. The count check fails either way,
+# which is the correct outcome for a malformed line. The change is worth keeping because the two
+# forms mean different things to the next reader, and a future caller that distinguishes "no match"
+# from "matched, empty capture" would inherit the wrong one. Stated so nobody credits it with a
+# behaviour change it does not have.
+stopped_count() { printf '%s' "$1" | sed -n 's/.*compose stop: \([0-9][0-9]*\) box(es) stopped.*/\1/p'; }
 
 # THE v0.9.1 DISCRIMINANT. A release cut for a fix must exercise that fix, or a competent green
 # report says nothing: the same battery passed on the defective artifact of v0.8.5.
@@ -95,6 +107,19 @@ self_check() {
     claims_a_pod "compose stop: 1 box(es) stopped (this stack runs without a pod)" \
         && fail "the no-pod line was read as naming a pod" \
         || pass "the no-pod line is not read as naming a pod"
+    # THIS CORPUS CONTAINED NO FAILING-SYSTEM OUTPUT AT ALL, which an external reviewer read out of
+    # the file: every string above is a success line or a crafted near-miss, so the predicates were
+    # only ever exercised against a program that works. `claims_a_pod` asks whether the text NAMES a
+    # pod, and an error naming the pod answers yes. Pinned here as the predicate's DOCUMENTED limit,
+    # so nobody rebuilds a positive assertion on it: `compose` is captured with `2>&1`, so
+    # "failed to create pod 'x'" used to satisfy "a pod is created". The one-service case reads
+    # `pod ls` for that now, and these two cases are why.
+    claims_a_pod "error: failed to create pod 'stack': permission denied" \
+        && pass "an error naming a pod matches: this is a NAMING test, never a success test" \
+        || fail "the predicate stopped matching an error that names a pod"
+    claims_a_pod "compose up: pod 'stack' already exists" \
+        && pass "the already-exists error matches too, and must not be read as creation" \
+        || fail "the predicate stopped matching the already-exists error"
     [ "$(stopped_count 'compose stop: 2 box(es) stopped, pod ...')" = "2" ] \
         && pass "the stopped count is read out of the line" \
         || fail "the stopped count was not read"
@@ -273,9 +298,24 @@ up1=$(K1 up -d)
 if [ "$(running)" -ne 1 ]; then
     echo "    SKIP: the one-service stack did not come up here: $(printf '%s' "$up1" | head -1)"
 else
-    claims_a_pod "$up1" \
+    # THE POD MUST EXIST, and this used to ask the OUTPUT whether it did. `K1` folds stderr in
+    # (`2>&1`), so `error: failed to create pod 'solo': ...` NAMES a pod, satisfied `claims_a_pod`,
+    # and passed as "a pod is created". Not hypothetical for this case: #5's shape is a stack that
+    # comes up with its box running and NO pod, so the `running` guard above does not exclude it,
+    # and the line reporting that failure is exactly the line that names the pod.
+    #
+    # `claims_a_pod` is still right for the NEGATIVE usage above ("a stack with no pod must never
+    # name one"), where any mention is the defect. It is the positive direction that cannot be
+    # answered by the sentence.
+    #
+    # A keyword blacklist on the output would be the same mistake one level down: on an SELinux host
+    # the SUCCESSFUL line contains "Permission denied" (pasta refused, the pod itself is fine), so
+    # "does it look like an error" cannot decide this either. The pod is in `pod ls` or it is not.
+    pods=$(XDG_RUNTIME_DIR=$XDG "$KERN" pod ls 2>/dev/null)
+    n=$(pod_member_count "$pods")
+    [ -n "$n" ] \
         && pass "one service: a pod is created (issue #5)" \
-        || fail "one service: NO pod, so no egress: $(printf '%s' "$up1" | tail -1)"
+        || fail "one service: NO pod in pod ls, so no egress: $(printf '%s' "$up1" | tail -1)"
     states_outbound "$up1" \
         && pass "one service: the bring-up line states the network it got" \
         || fail "one service: the bring-up line says nothing about outbound: $(printf '%s' "$up1" | tail -1)"
@@ -284,7 +324,6 @@ else
     # `<pod>-<service>` and the bare alias) while a `kern box --pod` member writes one. Measured on
     # v0.9.1: 1, 2 and 3 services read 2, 4 and 6. Checked against the SERVICE COUNT, not against
     # `kern ps`, so a future change that breaks both readers the same way still fails here.
-    n=$(pod_member_count "$(XDG_RUNTIME_DIR=$XDG "$KERN" pod ls 2>/dev/null)")
     [ "${n:-0}" = "1" ] \
         && pass "pod ls: 1 member for 1 running service" \
         || fail "pod ls: says '${n:-?}' for 1 running service"

@@ -77,24 +77,51 @@ fn pasta_alive(name: &str) -> bool {
 /// map a state onto the wrong message because it never sees the states. "pasta is on PATH" and
 /// "pasta is running for THIS pod" are asked separately, because the difference between them is
 /// exactly what the bad message got wrong.
+///
+/// The three facts are read here and decided in [`network_sentence`], which is pure and therefore
+/// testable: the previous version reached the filesystem inside every arm, so no test could reach
+/// the arms at all, and the wrong-arm defect below shipped unexercised.
+///
+/// `which_pasta` walks PATH, and is only consulted for the case where nothing else has answered, so
+/// it is evaluated lazily rather than on every summary line.
 pub fn network_summary(name: &str) -> String {
-    match (pasta_alive(name), resolv_path(name).is_file()) {
-        (true, true) => {
-            "services reach each other by name + outbound to the internet (pasta)".into()
-        }
+    let alive = pasta_alive(name);
+    let resolv = resolv_path(name).is_file();
+    let installed = !alive && !resolv && which_pasta().is_some();
+    network_sentence(alive, resolv, installed).into()
+}
+
+/// `installed` is consulted ONLY when `!alive && !resolv`; every other arm is decided before it is
+/// read, which is why the caller may pass `false` for it without looking.
+fn network_sentence(alive: bool, resolv: bool, installed: bool) -> &'static str {
+    match (alive, resolv) {
+        (true, true) => "services reach each other by name + outbound to the internet (pasta)",
         (true, false) => {
-            "outbound is up but DNS is not - the pod can reach an IP and cannot resolve \
-                          a name"
-                .into()
+            "outbound is up but DNS is not - the pod can reach an IP and cannot resolve a name"
         }
-        (false, _) if which_pasta().is_some() => {
+        // pasta WROTE this resolv.conf, so it started for this pod and has since exited: crashed,
+        // OOM-killed, or caught a teardown that raced. The arm below must not absorb this case. It
+        // says "the `pod create` line says why it refused", and nothing refused: create succeeded
+        // and printed no reason, so that sentence sends the reader to look for an explanation that
+        // was never printed. Same defect class as #6's visible symptom, one arm over, in the
+        // function written to fix it.
+        //
+        // No new marker is needed to tell the two apart, because `setup_outbound` only reaches the
+        // `resolv.conf` write after every failure path has already returned: the file existing IS
+        // the record that pasta once came up, and `teardown` removes the whole dir, so it cannot be
+        // left over from an earlier pod of the same name.
+        (false, true) => {
+            "outbound is DOWN - pasta started for this pod and has since exited (create reported \
+             no problem, so look for a crash, an OOM kill, or a racing teardown)"
+        }
+        (false, false) if installed => {
             "loopback-only - services reach each other; pasta is installed but is not running for \
              this pod (the `pod create` line says why it refused)"
-                .into()
         }
-        (false, _) => "loopback-only - services reach each other; NO outbound (install \
-                       `passt`/`pasta` for egress)"
-            .into(),
+        (false, false) => {
+            "loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for \
+             egress)"
+        }
     }
 }
 
@@ -895,6 +922,55 @@ mod tests {
             &"x".repeat(65),
         ] {
             assert!(validate_name(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn network_sentence_does_not_blame_a_refusal_that_never_happened() {
+        // THE ARM THAT WAS MISSING, found by an external reviewer reading the four arms rather
+        // than running anything. `resolv.conf` is written only after pasta has already started, so
+        // "pasta is not alive AND its resolv.conf exists" means it came up and later died: crashed,
+        // OOM-killed, or caught by a racing teardown. It used to fall into the "installed but not
+        // running" arm, which tells the reader `pod create` explains why it refused. Nothing
+        // refused, create succeeded, and no such line was ever printed, so the message sent the
+        // reader after an explanation that does not exist. Same shape as #6's symptom, one arm
+        // over, in the function written to fix #6.
+        let died = network_sentence(false, true, true);
+        assert!(
+            !died.contains("refused"),
+            "a pasta that started and died was never refused: {died}"
+        );
+        assert!(
+            !died.contains("install"),
+            "it is installed, and #6 was exactly this wrong remedy: {died}"
+        );
+        assert!(died.contains("has since exited"), "{died}");
+        // `installed` must not change that verdict: the resolv.conf already settled it.
+        assert_eq!(died, network_sentence(false, true, false));
+
+        // The refusal arm keeps its sentence, and only for the state that produced it.
+        let refused = network_sentence(false, false, true);
+        assert!(refused.contains("says why it refused"), "{refused}");
+        assert!(!refused.contains("install `passt`"), "{refused}");
+
+        // Genuinely absent pasta is the only arm that may say "install".
+        let absent = network_sentence(false, false, false);
+        assert!(absent.contains("install `passt`"), "{absent}");
+
+        // The two healthy arms are distinct, and only the fully-healthy one claims the internet.
+        let up = network_sentence(true, true, false);
+        let nodns = network_sentence(true, false, false);
+        assert!(up.contains("outbound to the internet"), "{up}");
+        assert!(nodns.contains("cannot resolve"), "{nodns}");
+        assert_ne!(up, nodns);
+
+        // All five reachable states say five different things: the collapse into two is what
+        // shipped as #6, so distinctness is the property under test, not the wording.
+        let all = [died, refused, absent, up, nodns];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two states share a sentence");
+            }
         }
     }
 
