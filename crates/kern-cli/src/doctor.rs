@@ -590,6 +590,54 @@ fn check_apparmor_userns() -> R {
     }
 }
 
+/// SELinux is the RHEL-family counterpart of the AppArmor gate above, and until this existed `kern
+/// doctor` probed one and not the other: on Fedora, RHEL, CentOS, Rocky and Alma it printed a full
+/// page of green without once looking at the mechanism that governs those hosts.
+///
+/// ENFORCING IS NOT A FAULT, so this does not warn about it. It is the correct posture on every
+/// distro that ships it, and a permanent warning on a correctly configured host teaches the reader
+/// to skim past `doctor`, which costs more than it buys. The mode is REPORTED, as a fact, because a
+/// pasted `doctor` output is how a maintainer reads someone else's host: one line saying `enforcing`
+/// turns an otherwise inexplicable report into a first hypothesis. The actionable hint belongs at
+/// the moment of the failure, not standing on every Fedora host forever, and it is in the pod's
+/// pasta-refused message instead.
+///
+/// WHAT IT READS AND WHY. `/sys/fs/selinux/enforce` is the kernel's own interface and reports the
+/// RUNTIME mode; `/etc/selinux/config` is the mode after the next boot and can differ from now, so
+/// it is deliberately not consulted. Nothing here is exercised: this is an inspection, it says so,
+/// and it claims nothing about whether a box will start.
+///
+/// THE THREE-STATE READ. `read_int` returns `None` both when the file is absent and when it cannot
+/// be parsed, and those are different facts: absent means SELinux is not active, unreadable means
+/// the mode is unknown. Existence is therefore tested separately rather than inferred from a failed
+/// parse, which is the same substitution that produced the defect this check was written after.
+fn check_selinux() -> R {
+    const ENFORCE: &str = "/sys/fs/selinux/enforce";
+    // The filesystem, not the file: a kernel without SELinux has neither, and conflating "no
+    // selinuxfs" with "cannot read enforce" is what the split below exists to prevent.
+    if !std::path::Path::new("/sys/fs/selinux").is_dir() {
+        return R::Ok("SELinux: not active on this host".into());
+    }
+    match read_int(ENFORCE) {
+        Some(1) => R::Ok(
+            "SELinux: ENFORCING (kern's isolation is unaffected; a policy can still refuse what the \
+             kernel would allow, e.g. pod egress)"
+                .into(),
+        ),
+        Some(0) => R::Ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
+        Some(other) => R::Warn(
+            format!("SELinux: {ENFORCE} reads {other}, which is neither 0 nor 1"),
+            "treat the mode as unknown and read it with `getenforce`".into(),
+        ),
+        None => R::Warn(
+            format!("SELinux is present but its mode could not be read from {ENFORCE}"),
+            "read it with `getenforce`; if it is Enforcing and a pod has no egress, look for a \
+             denial with `sudo ausearch -m avc -ts recent`"
+                .into(),
+        ),
+    }
+}
+
 fn check_max_userns() -> R {
     match read_int("/proc/sys/user/max_user_namespaces") {
         Some(n) if n > 0 => R::Ok(format!("max_user_namespaces: {n}")),

@@ -35,6 +35,21 @@ const IMAGE = process.env.KERN_PI_IMAGE ?? "python:3.12-slim";
 
 
 
+/** The workload's own lines, without kern's.
+ *
+ * `onData` receives one sink carrying stdout AND stderr, so anything kern says about the HOST lands
+ * in it too. On a runner with no cgroup delegation kern warns that `--memory` is accepted but not
+ * enforced, and an assertion comparing the buffer for equality failed on that warning while the
+ * command had done exactly what it was asked. kern's own lines carry the `kern: ` prefix by
+ * convention and by gate, which is what makes them separable here.
+ */
+function workloadOnly(sink: string): string {
+	return sink
+		.split("\n")
+		.filter((l) => !l.trimStart().startsWith("kern: "))
+		.join("\n");
+}
+
 async function main() {
 	// ---- the containment check, with no box: it is pure and it is the security boundary ----
 	console.log("\ncontainment");
@@ -246,7 +261,17 @@ async function main() {
 
 		out = "";
 		await b.exec("pwd", "/workspace/sub", { onData });
-		ok("cwd is honoured", out.trim() === "/workspace/sub", JSON.stringify(out));
+		ok("cwd is honoured", workloadOnly(out).trim() === "/workspace/sub", JSON.stringify(out));
+		// The positive control for that filter, with the exact line a GitHub runner produced: no cgroup
+		// delegation there, so kern warns and the old equality compared the warning against the path.
+		const withWarning =
+			"kern: --memory accepted but NOT enforced here - the `memory` controller is not delegated\n" +
+			"/workspace/sub\n";
+		ok(
+			"kern's own warning does not count as the command's output",
+			workloadOnly(withWarning).trim() === "/workspace/sub" && withWarning.trim() !== "/workspace/sub",
+			JSON.stringify(workloadOnly(withWarning)),
+		);
 
 		out = "";
 		await b.exec("echo $PI_MARKER", "/workspace", { onData, env: { PI_MARKER: "seen" } });
