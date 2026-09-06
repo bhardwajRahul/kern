@@ -272,20 +272,42 @@ if ! command -v strings >/dev/null 2>&1; then
     skip "no strings(1) here, so the predicate cannot be checked against the binary"
 else
     found=0
+    tolerant=0
     for b in "$REAL_PASTA" "$(command -v passt 2>/dev/null)"; do
         [ -n "$b" ] && [ -e "$b" ] || continue
         strings "$b" 2>/dev/null | grep -q 'netns dir open' && found=$((found + 1))
+        # THE OLDER BEHAVIOUR, and it is not drift. Before the message existed, a refused watch was
+        # a WARNING and pasta carried on without it: `inotify_init(): won't quit once netns is
+        # gone`. Such a build cannot produce #6 at all, so kern having no phrase to match in it is
+        # correct rather than a gap. MEASURED on Debian 12 / aarch64, passt 0.0~git20230309, where
+        # the string is absent and these two are present.
+        strings "$b" 2>/dev/null | grep -q "won't quit once netns is gone" && tolerant=$((tolerant + 1))
     done
-    [ "$found" -gt 0 ] \
-        && pass "the installed passt still contains 'netns dir open', which is what kern matches" \
-        || fail "'netns dir open' is not in the installed passt: the retry predicate has drifted"
+    if [ "$found" -gt 0 ]; then
+        pass "the installed passt contains 'netns dir open', which is what kern matches"
+    elif [ "$tolerant" -gt 0 ]; then
+        skip "this passt treats a refused watch as a warning and keeps going, so #6 cannot occur on it"
+    else
+        fail "the installed passt has neither 'netns dir open' nor the older tolerant wording: the retry predicate has drifted"
+    fi
 fi
 
 # --- POSITIVE CONTROL ----------------------------------------------------------------------------
 # Can a box on THIS host reach the internet through an unmodified pasta at all? Everything below
 # measures the absence or presence of exactly that, so if it cannot happen here for reasons that
-# have nothing to do with #6 (no route, a proxy, a firewall), the payload cases must SKIP rather
+# have nothing to do with #6 (no route, a proxy, a firewall), the dependent cases must SKIP rather
 # than go red and be read as the fix failing.
+#
+# IT GATES EVERY OUTCOME ASSERTION, NOT ONLY THE PAYLOAD ONES, and the first version gated only the
+# payloads. MEASURED on a VPS running Ubuntu 24.04 AS ROOT, where pasta drops to `nobody` and then
+# cannot open the holder's user namespace, so no pod on that host gets egress by any route: the
+# control correctly SKIPPED, and three cases below still ran and reported that kern had failed to
+# bring up outbound. Kern had done nothing wrong; the host cannot do it at all. That is a broken
+# probe wearing the same colour as a broken subject, which is the whole reason the control exists.
+#
+# The counting assertions are NOT gated, on purpose: how many times pasta was invoked and which
+# flags it got measure kern's DECISION, which is observable wherever pasta can be executed at all,
+# even on a host where it can never succeed.
 echo
 echo "  positive control: the harness can observe egress at all"
 CAN_EGRESS=no
@@ -323,20 +345,27 @@ grep -q -- '--no-netns-quit' "$D/argv" \
     && pass "the first attempt watches the netns, so a real policy still refuses it" \
     || fail "the first attempt already carried --no-netns-quit"
 
-says_outbound "$out" \
-    && pass "kern reports outbound after the retry" \
-    || fail "kern did not report outbound after the retry: $(printf '%s' "$out" | tail -1)"
-[ -f "$XDG/kern/pods/c6fix/resolv.conf" ] \
-    && pass "the pod's resolv.conf was written, so DNS is configured too" \
-    || fail "no resolv.conf: the NAT came up but DNS did not"
-
-# The pasta that is actually running must be the retried one. Read from the process, not from our
-# own log, because the log says what was ASKED and this says what SURVIVED.
-pp=$(cat "$XDG/kern/pods/c6fix/pasta.pid" 2>/dev/null || echo 0)
-if [ "${pp:-0}" -gt 0 ] && tr '\0' '\n' < "/proc/$pp/cmdline" 2>/dev/null | grep -q -- '--no-netns-quit'; then
-    pass "the live pasta is the retried one, running without the netns watch"
+pp=0
+if [ "$CAN_EGRESS" != yes ]; then
+    # Everything from here needs pasta to be able to ATTACH on this host, which the control just
+    # showed it cannot. Reporting these red would blame kern for the host.
+    skip "the outcome cases (this host gets no pod egress even with an unmodified pasta)"
 else
-    fail "the running pasta is not the retried one (pid '${pp:-none}')"
+    says_outbound "$out" \
+        && pass "kern reports outbound after the retry" \
+        || fail "kern did not report outbound after the retry: $(printf '%s' "$out" | tail -1)"
+    [ -f "$XDG/kern/pods/c6fix/resolv.conf" ] \
+        && pass "the pod's resolv.conf was written, so DNS is configured too" \
+        || fail "no resolv.conf: the NAT came up but DNS did not"
+
+    # The pasta that is actually running must be the retried one. Read from the process, not from
+    # our own log, because the log says what was ASKED and this says what SURVIVED.
+    pp=$(cat "$XDG/kern/pods/c6fix/pasta.pid" 2>/dev/null || echo 0)
+    if [ "${pp:-0}" -gt 0 ] && tr '\0' '\n' < "/proc/$pp/cmdline" 2>/dev/null | grep -q -- '--no-netns-quit'; then
+        pass "the live pasta is the retried one, running without the netns watch"
+    else
+        fail "the running pasta is not the retried one (pid '${pp:-none}')"
+    fi
 fi
 
 if [ "$CAN_EGRESS" = yes ]; then
@@ -380,6 +409,10 @@ if [ "${pp:-0}" -gt 0 ]; then
 else
     skip "no pasta pid was recorded, so there is nothing to reap"
 fi
+# UNCONDITIONALLY, and it used to live inside the branch above. On a host where pasta records no
+# pid the case skipped and the pod was never removed, so the footprint assertion at the end reported
+# a leaked holder that the script itself had abandoned. Measured on the VPS run.
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6fix >/dev/null 2>&1
 
 # --- 3. A REFUSAL THAT THE RETRY CANNOT FIX ------------------------------------------------------
 echo
@@ -435,9 +468,21 @@ echo "  edge: the refusal is not the first line pasta prints"
 write_stub buried
 outb=$(PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6bur 2>&1)
 note_pod c6bur
-says_outbound "$outb" \
+# THE PROPERTY IS THAT THE RETRY FIRED, not that egress came up, and asserting the second was a
+# host-dependent way of asking the first. On the VPS, where no pod gets egress at all because pasta
+# runs as root and cannot open the holder's user namespace, the outbound form reported that kern had
+# missed the buried refusal when kern had found it and retried correctly. The attempt count is the
+# direct observation and it holds on any host that can execute pasta.
+[ "$(calls)" = "2" ] \
     && pass "a refusal on the fourth line is still found, and still retried" \
-    || fail "the retry missed a refusal that was not on the first line: $(printf '%s' "$outb" | tail -1)"
+    || fail "a refusal below the first line was not retried: $(calls) attempt(s)"
+if [ "$CAN_EGRESS" = yes ]; then
+    says_outbound "$outb" \
+        && pass "and the pod ends up with outbound, as with a first-line refusal" \
+        || fail "the buried refusal was retried but the pod has no outbound: $(printf '%s' "$outb" | tail -1)"
+else
+    skip "whether the buried retry yields egress (this host gets none by any route)"
+fi
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6bur >/dev/null 2>&1
 
 echo

@@ -112,7 +112,23 @@ does, so the shape reproduces without a policy. Where SELinux **is** Enforcing t
 a block that uses the real pasta and nothing simulated, and it tells the two apart by reading
 `--no-netns-quit` off the surviving process: an Enforcing host that does not refuse the open
 skips rather than passing, because a green there would mean "this host is fine", not "the fix
-works". 30 cases on Fedora 43, 28 where there is no SELinux.
+works". 31 cases on Fedora 43, 29 where there is no SELinux, and it has been run on four hosts:
+Fedora 43 Enforcing, this workstation, an Ubuntu 24.04 VPS, and a **Raspberry Pi 5 on aarch64**,
+which is the reporter's architecture.
+
+**The message is not the same in every passt, and where it differs there is nothing to fix.**
+Measured by reading the installed binaries:
+
+| passt | ships in | on a refused watch |
+|---|---|---|
+| `0.0~git20230309` | Debian 12 | `inotify_init(): won't quit once netns is gone` and it CARRIES ON |
+| `0.0~git20240220` | Ubuntu 24.04 | `netns dir open: %s, exiting` |
+| `0^20250919` | Fedora 43 | `netns dir open: %s, exiting` |
+
+The older build treats the refusal as a warning and keeps the NAT, so #6 cannot happen on it and
+kern having no phrase to match is correct rather than a gap. The battery tells the two apart and
+skips rather than passing or failing blindly. Somewhere between March 2023 and February 2024 the
+same condition became fatal, and that is the window in which the retry is needed.
 
 Beyond the fix itself it covers the shapes around it: a refusal that is not on the first line
 (measured on WSL2, where pasta's first line is informational), a pasta that never returns, one

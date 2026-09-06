@@ -1620,9 +1620,13 @@ mod tests {
                 _pad: [0; 22],
             };
             req.name[..2].copy_from_slice(b"lo");
-            let ok = libc::ioctl(s, libc::SIOCGIFFLAGS, &mut req) == 0 && {
+            // `as _` on the request, because `ioctl`'s second parameter is a `c_ulong` on
+            // glibc and a `c_int` on musl, and `SIOCGIFFLAGS` is typed to match the platform
+            // rather than the call. Naming either type builds on one target and not the other,
+            // which is what kept this suite from compiling for aarch64-musl at all.
+            let ok = libc::ioctl(s, libc::SIOCGIFFLAGS as _, &mut req) == 0 && {
                 req.flags |= libc::IFF_UP as libc::c_short;
-                libc::ioctl(s, libc::SIOCSIFFLAGS, &req) == 0
+                libc::ioctl(s, libc::SIOCSIFFLAGS as _, &req) == 0
             };
             libc::close(s);
             ok

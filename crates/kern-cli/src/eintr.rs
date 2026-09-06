@@ -183,9 +183,16 @@ mod tests {
         // pthread_kill, not kill(getpid()): a process-directed signal may be taken by ANY thread
         // that has it unblocked, including the sender, and would then never interrupt our poll.
         let target = unsafe { libc::pthread_self() };
+        // ACROSS THE THREAD BOUNDARY AS AN INTEGER, because `pthread_t` is not the same type
+        // everywhere: a `c_ulong` on glibc, which is `Send`, and a `*mut c_void` on musl, which is
+        // not. Moving the handle directly compiles on x86_64-gnu and fails on aarch64-musl, which
+        // is why this suite had never been built for an ARM target. Nothing dereferences it, it is
+        // an opaque token that `pthread_kill` takes back unchanged.
+        let target_bits = target as usize;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let s2 = stop.clone();
         let t = std::thread::spawn(move || {
+            let target = target_bits as libc::pthread_t;
             while !s2.load(std::sync::atomic::Ordering::Relaxed) {
                 unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
                 std::thread::sleep(std::time::Duration::from_millis(10));
