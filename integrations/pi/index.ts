@@ -667,19 +667,22 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		...localGrep,
-		async execute(id, params, _signal, _onUpdate, ctx) {
-			// GREP DOES ITS OWN SEARCHING, and it has to. pi's `GrepOperations` takes `isDirectory`
-			// and `readFile` and nothing else: its own comment says the default is "local filesystem
-			// plus ripgrep", so the SEARCH is not overridable. Built against GUEST_WORKSPACE, pi's
-			// ripgrep ran `rg /workspace` on the HOST and grep failed on every call. Built against
-			// hostWorkspace it worked and was UNCONFINED: an external audit drove it and read
-			// /etc/passwd through an absolute `path`, and host content through a workspace symlink.
-			// Both were shipped, three days apart. Neither is the boundary this extension claims.
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// THE SEARCH RUNS IN THE BOX, and it took three shipped versions to get here.
 			//
-			// So the enumeration is the box's (`listFiles` sees only the box's /workspace), the read
-			// is the confined host read the other verbs use (`O_NOFOLLOW` plus a post-open
-			// `readlink("/proc/self/fd")`, so a symlink planted in the workspace cannot redirect it),
-			// and the matching happens here rather than in a subprocess that takes a path.
+			// Built against GUEST_WORKSPACE with pi's own tool, its bundled ripgrep ran `rg /workspace`
+			// on the HOST and grep failed on every call. Built against hostWorkspace it worked and was
+			// UNCONFINED: an external audit read /etc/passwd through an absolute `path` and host
+			// content through a workspace symlink. Matching in this process instead fixed the boundary
+			// and introduced a worse failure: the pattern comes from a model, and `(a+)+b` against a
+			// 4000-character line blocks the ONLY JavaScript thread. No timeout can rescue that,
+			// because the timer cannot fire while the regex is running. Measured: the process had to
+			// be killed.
+			//
+			// `grep` in the box has none of the three problems. Containment is the box's mount
+			// namespace, the same boundary `bash` gets. The pattern is compiled by grep, which is
+			// DFA-based and has no catastrophic backtracking. And any cost at all is inside a box with
+			// a timeout and a CPU cap, so a pathological pattern burns the box rather than the agent.
 			const b = await ensureBox(ctx);
 			const p = params as {
 				pattern: string;
@@ -691,52 +694,49 @@ export default function (pi: ExtensionAPI) {
 				limit?: number;
 			};
 			const asked = p.path ?? "";
-			// A relative path is workspace-relative; an absolute one must be inside the workspace, and
-			// `refuseOutsideWorkspace` is what says so. `/etc/passwd` dies here.
-			const base = refuseOutsideWorkspace(
+			// A relative path is workspace-relative; an absolute one must be inside the workspace.
+			// `/etc/passwd` dies here, before anything is spawned.
+			const rel = refuseOutsideWorkspace(
 				asked === "" || asked === "."
 					? GUEST_WORKSPACE
 					: path.posix.isAbsolute(asked)
 						? asked
 						: path.posix.join(GUEST_WORKSPACE, asked),
 			);
-			const src = p.literal
-				? p.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-				: p.pattern;
-			let re: RegExp;
-			try {
-				re = new RegExp(src, p.ignoreCase ? "i" : "");
-			} catch (e) {
-				throw refuse("gate", `not a usable pattern: ${String(e)}`);
-			}
+			const target = rel ? `${GUEST_WORKSPACE}/${rel}` : GUEST_WORKSPACE;
 			const limit = Math.max(1, Math.min(p.limit ?? 100, 1000));
 			const ctxLines = Math.max(0, Math.min(p.context ?? 0, 20));
-			let files = (await b.listFiles(base)).map((f) => (base ? `${base}/${f.path}` : f.path));
-			if (p.glob) files = files.filter((rel) => globMatches(p.glob as string, rel));
-			const hits: string[] = [];
-			for (const rel of files) {
-				if (hits.length >= limit) break;
-				let text: string;
-				try {
-					text = readWorkspaceFile(hostWorkspace, rel, `${GUEST_WORKSPACE}/${rel}`).toString("utf8");
-				} catch {
-					continue; // unreadable, a directory, a symlink O_NOFOLLOW refused: not a match
-				}
-				const lines = text.split("\n");
-				for (let i = 0; i < lines.length && hits.length < limit; i++) {
-					if (!re.test(lines[i] as string)) continue;
-					const from = Math.max(0, i - ctxLines);
-					const to = Math.min(lines.length - 1, i + ctxLines);
-					for (let k = from; k <= to; k++) hits.push(`${rel}:${k + 1}: ${lines[k]}`);
-				}
+			const flags = ["-rn", p.literal ? "-F" : "-E"];
+			if (p.ignoreCase) flags.push("-i");
+			if (ctxLines > 0) flags.push(`-C${ctxLines}`);
+			// `-r` does not follow symlinks it meets while walking, and a symlink it did follow would
+			// land in the BOX's filesystem, not the host's. stderr is dropped so an unreadable file is
+			// not a result; `head` bounds the output before it is ever in memory here.
+			// The pattern and the path travel as POSITIONAL ARGUMENTS, the way `probeInBox` already
+			// passes a path: they are never part of the script text, so nothing an agent writes is
+			// parsed as shell syntax. `-e` is what lets a pattern begin with a dash.
+			const script = `grep ${flags.join(" ")} -e "$1" -- "$2" 2>/dev/null | head -n ${limit}`;
+			const r = await b.run(["sh", "-c", script, "_", p.pattern, target], {
+				timeoutS: Math.min(TIMEOUT_S, 60),
+			});
+			const prefix = `${GUEST_WORKSPACE}/`;
+			let lines = (r.stdout ?? "")
+				.split("\n")
+				.filter((l) => l.length > 0)
+				.map((l) => (l.startsWith(prefix) ? l.slice(prefix.length) : l));
+			// kern's own scaffolding lives in the box's workspace and is not the agent's business:
+			// `.kern-env.<boxid>` is written per call, so it changes name every time and would be
+			// noise in every result. Filtered HERE and not with `--exclude`, because BusyBox and GNU
+			// grep do not guarantee that flag alike and an unsupported one would exit non-zero into
+			// the `2>/dev/null` above: zero results, silently, on whichever image lacked it.
+			const mine = (rel: string) => rel.startsWith(".kern-env") || rel.startsWith(".deps/");
+			lines = lines.filter((l) => !mine(l.slice(0, l.indexOf(":"))));
+			if (p.glob) {
+				const g = p.glob;
+				lines = lines.filter((l) => globMatches(g, l.slice(0, l.indexOf(":"))));
 			}
 			return {
-				content: [
-					{
-						type: "text",
-						text: hits.length > 0 ? hits.join("\n") : "No matches found",
-					},
-				],
+				content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No matches found" }],
 			} as never;
 		},
 	});

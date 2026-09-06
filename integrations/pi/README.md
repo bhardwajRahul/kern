@@ -23,7 +23,7 @@ thing.
 | Tool | Runs where | Confined by |
 |---|---|---|
 | `bash` and `!` | **inside the box** | namespaces, seccomp allowlist, memory/pids/CPU cgroup caps |
-| `ls` `grep` `find`, and `mkdir`/`access`/`stat` | **inside the box** | the box's mount namespace: it has no view of the host outside `/workspace` |
+| `ls` `grep` `find`, and `mkdir`/`access`/`stat` | **inside the box** | the box's mount namespace: it has no view of the host outside `/workspace`. A symlink under the workspace therefore resolves inside the BOX, so `grep` through one returns the box's file and never the host's |
 | `read`, and the staging half of `write` | host filesystem | the SDK's `O_NOFOLLOW` plus a post-open `readlink("/proc/self/fd")`, measured independently sufficient |
 
 A command the agent runs cannot see your `$HOME`, cannot reach the network unless you name a host,
@@ -82,7 +82,7 @@ package manager imports `globSync` from `node:fs`, which landed in Node 22, so o
 at the time of writing) the extension dies at import with `SyntaxError: The requested module 'node:fs'
 does not provide an export named 'globSync'`, naming a file inside `pi-coding-agent` rather than
 anything of yours. Measured on a clean aarch64 board: Node 20.18.1 fails that way, Node 22.11.0 runs
-all 249 assertions. `package.json` now declares `engines: node >= 22`, so npm says it before the import
+all 250 assertions. `package.json` now declares `engines: node >= 22`, so npm says it before the import
 does.
 
 **The image must carry your project's toolchain.** The default has Python and no `node`, so on a

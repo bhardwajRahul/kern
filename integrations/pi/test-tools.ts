@@ -54,13 +54,24 @@ ok((await call("grep", { pattern: "MARKER_PROJ" })).includes("proj.txt"), "a mat
 ok((await call("grep", { pattern: "MARKER_DEEP" })).includes("sub/deep.txt"), "a match in a subdirectory");
 ok((await call("grep", { pattern: "MARKER_PROJ", path: "." })).includes("proj.txt"), "an explicit '.' path");
 ok((await call("grep", { pattern: "nothing-matches-this" })).includes("No matches"), "and says so when nothing matches");
+// kern writes `.kern-env.<boxid>` into the box's workspace. It is per call, so it would be noise in
+// every result and a different name each time.
+const everything = await call("grep", { pattern: "." });
+ok(!everything.includes(".kern-env"), "kern's own scaffolding is not in the results", everything.slice(0, 160));
 
 console.log("\n== and cannot reach anything outside it");
 // Every one of these returned host content on 0.1.3. They are the audit's five, verbatim.
 ok(refused(await call("grep", { pattern: "^root:", path: "/etc/passwd" })), "an absolute path to /etc/passwd");
 ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: outside })), "an absolute path to another directory");
-ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: "link-out.txt" })), "a symlink to a file outside");
-ok(refused(await call("grep", { pattern: "^root:", path: "link-etc/passwd" })), "a symlink to /etc");
+// A symlink is not refused: the search runs in the box, so the link resolves inside the box's own
+// filesystem. What must be true is that no HOST content comes back, and "refused" is the wrong
+// assertion for it. Both of these returned host bytes on 0.1.3.
+const viaLink = await call("grep", { pattern: "MARKER_OUTSIDE", path: "link-out.txt" });
+ok(!viaLink.includes("MARKER_OUTSIDE"), "a symlink to a host file yields nothing of it", viaLink);
+// The host's own username is in the host's /etc/passwd and not in the box image's, which is what
+// tells the two files apart: their root lines are byte-identical and discriminate nothing.
+const viaEtc = await call("grep", { pattern: os.userInfo().username, path: "link-etc/passwd" });
+ok(!viaEtc.includes(os.userInfo().username), "a symlink to /etc reaches the BOX's /etc, not this host's", viaEtc);
 ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: "../" })), "a .. above the workspace");
 
 console.log("\n== the other verbs, with the same arguments");
