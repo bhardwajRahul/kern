@@ -44,6 +44,63 @@ A `kern box` is one short-lived process tree: no daemon, no shared state.
 output is generated from the code, so it cannot drift the way a description here would.
 See **[SECURITY.md](SECURITY.md)** for where each boundary is real, cooperative, or opt-in.
 
+## Peer relays, when a stack gives each service its own namespace
+
+A stack is normally one pod. `kern compose --no-pod` gives each service its own network namespace
+instead, and reaches peers over relays. Each service gets a stack-wide loopback alias; its own name
+resolves to `127.0.0.1` where its listener is, and every peer resolves to that peer's alias.
+
+- **A relay is two processes and a socketpair**, passing the accepted socket as `SCM_RIGHTS`, because
+  descriptors are not namespaced and one process cannot do it: from inside box A,
+  `open("/proc/<B>/ns/user")` fails `EACCES`, one step before `setns` is reached.
+- **A shared container port costs only the wildcard side**, and which side that is comes from
+  measurement, not from a compose file that never names an address. The holder reads
+  `/proc/<pid1>/net/tcp` for the box that would host each relay, after the services have bound, which
+  reports that pid's network namespace with no `setns` and no privilege. A specific listener leaves
+  the alias free and is served; a wildcard listener owns every address on its port and that direction
+  is reported by name with both remedies. A service that has not bound yet is a third answer,
+  deferred and re-measured every pass, so a service that restarts bound differently changes the answer
+  with no command run.
+- **Both halves shed their privilege and refuse to serve if they cannot.** `setns` into a box's user
+  namespace takes a process from `CapEff: 0` to `000001ffffffffff`, and the halves also keep the host
+  mount namespace, so they are the only processes in a stack with a host filesystem view reachable
+  from inside a box. The connector drops everything on entry; the listener narrows to
+  `CAP_NET_BIND_SERVICE` before its bind and to zero after, because a service on port 80 puts that
+  bind under it. Verified on x86_64 and a Raspberry Pi 5: `CapEff`, `CapPrm`, `CapBnd` and `CapAmb`
+  all zero, `NoNewPrivs: 1`, `Seccomp: 2`, with port 80 still served.
+- **The relay filter is a denylist where a box gets an allowlist**, and the asymmetry is the point. A
+  box runs arbitrary tenant code, so only deny-by-default means anything there. A relay half runs this
+  crate in a straight line and parses no tenant bytes, while an allowlist would have to be right on
+  every architecture kern publishes, where musl picks spellings per target and one missing spelling is
+  a `SIGSYS` on a board rather than a test failure. What is denied is the set that makes a host
+  filesystem view worth anything: `execve`, the file-opening family, `mount`, `ptrace`,
+  `process_vm_*`, `setns`, `unshare`, `bpf` and the module calls. A unit test asserts that `openat`
+  kills with `SIGSYS` while a socketpair and a byte still pass.
+- **A dead half takes its own edge down, and the edge is rebuilt** against the namespaces that exist
+  now; a box whose PID 1 has moved has exactly the edges touching it rebuilt. Every rebuild is
+  recorded, because an edge that dies twice a minute would otherwise look healthy, and one that keeps
+  failing is named in a `degraded` file that `kern compose ps` prints as
+  `peer edge DOWN: <a> -> <b> on <port>`. Retrying costs a registry read, so an edge whose service is
+  merely restarting comes back on its own: measured, given up at attempt 12 and rebuilt at attempt 114
+  when the box returned. Fail-closed applies at spawn and only at spawn: a plan that cannot be
+  realised at all is a stack-level fact that `up` reports, while a half dying at hour three is
+  repaired at service level. Because the holder heals itself, `compose start` no longer replaces it
+  when the plan is unchanged.
+- **Every pump arms `PR_SET_PDEATHSIG` against the connector.** It is not inherited across `fork`, so
+  the per-connection pumps used to survive the holder while still bridging two boxes' namespaces,
+  `compose down` included. An integration test asserts that killing the holder leaves nothing behind,
+  with a live connection open as its positive control. A peer blocked in `read` through a relay sees a
+  clean FIN and end-of-file when the holder is killed, not a reset, so the correct client response is
+  to reconnect.
+- **Published ports are one registry string read two ways**, by `ports::fmt` and its documented
+  inverse `ports::parse_display`. Storing the structured value and formatting at display time is not
+  available: `fmt`'s output is the only wire format there is, a second structured field would
+  duplicate state, and re-encoding the existing one would make a running kern read nothing for boxes
+  a previous kern started. So the drift is closed by exhausting the space instead of by deleting a
+  reader: every bind-address shape `fmt` can emit, both ports at their boundaries, both protocols, in
+  the single and the comma-joined forms. One asymmetry is deliberate, `parse_display` refusing port
+  `0`, which means "any port" to `bind` and addresses nothing.
+
 ## Workspace
 
 ```
