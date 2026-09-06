@@ -770,9 +770,10 @@ export default function (pi: ExtensionAPI) {
 					const c = l[i];
 					if ((c === ":" || c === "-") && known.has(l.slice(0, i))) return l.slice(0, i);
 				}
-				// A file the listing did not have (created between the two calls, or a path the SDK
-				// refuses to walk) falls back to the shape, which is right whenever the name carries
-				// no separator followed by digits.
+				// Only reachable for a file the listing did not have: written between the two calls,
+				// or one the SDK refuses to walk. The shape is guessed, which is what the audit broke
+				// on a dashed name, so it is used ONLY to decide a `glob` and never to hide a line.
+				// A line whose path cannot be resolved is still REPORTED, exactly as grep printed it.
 				return l.match(/^(.*?)[:-]\d+[:-]/)?.[1] ?? "";
 			};
 			// kern's own scaffolding lives in the box's workspace and is not the agent's business:
@@ -780,8 +781,14 @@ export default function (pi: ExtensionAPI) {
 			// noise in every result. Filtered HERE and not with `--exclude`, because BusyBox and GNU
 			// grep do not guarantee that flag alike and an unsupported one would exit non-zero into
 			// the `2>/dev/null` above: zero results, silently, on whichever image lacked it.
-			const mine = (rel: string) => rel.startsWith(".kern-env") || rel.startsWith(".deps/");
-			lines = lines.filter((l) => !mine(pathOf(l)));
+			// EXCLUDED BY PREFIX ON THE RAW LINE, not by parsing a path out of it. `.deps` is the
+			// dependency tree `setup=` installs and `listFiles` already omits it, so `find` never
+			// reports it either; `.kern-env.<boxid>` is kern's own per-call file. Both used to
+			// disappear only because the path lookup failed on them and the fallback happened to
+			// produce a string starting with `.deps/`: the right answer by accident. An external
+			// audit measured the mismatch. This needs no parse and cannot be defeated by a name.
+			const excluded = (l: string) => l.startsWith(".deps/") || l.startsWith(".kern-env");
+			lines = lines.filter((l) => !excluded(l));
 			if (p.glob) {
 				const g = p.glob;
 				lines = lines.filter((l) => globMatches(g, pathOf(l)));

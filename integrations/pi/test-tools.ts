@@ -105,6 +105,20 @@ ok(!(await call("grep", { pattern: "MARKER_AMBIG", glob: "a" })).includes("a-1-b
 // filter must not eat it.
 fs.writeFileSync(path.join(ws, "dashline.txt"), "x\n--\n");
 ok((await call("grep", { pattern: "^--$" })).includes("dashline.txt:2:--"), "a matched line that is exactly --");
+// `.deps` is what `setup=` installs. `listFiles` omits it and so does `find`, but grep -r walks it,
+// so the two disagree. An external audit measured those hits vanishing through the path-lookup
+// fallback: the right answer for the wrong reason. The exclusion is a prefix test on the raw line
+// now, which needs no parse and cannot be defeated by a filename.
+fs.mkdirSync(path.join(ws, ".deps", "pkg"), { recursive: true });
+fs.writeFileSync(path.join(ws, ".deps", "pkg", "a-1-b.txt"), "MARKER_DEPS\n");
+ok((await call("grep", { pattern: "MARKER_DEPS" })).includes("No matches"), "a hit under .deps is excluded, by prefix");
+// Names where the box's listing and grep's output could spell things differently.
+fs.writeFileSync(path.join(ws, "citt\u00e0-1-x.txt"), "MARKER_UTF\n");
+fs.writeFileSync(path.join(ws, "con spazio-1.txt"), "MARKER_SPACE\n");
+fs.writeFileSync(path.join(ws, "--"), "MARKER_DASHNAME\n");
+ok((await call("grep", { pattern: "MARKER_UTF" })).includes("citt\u00e0-1-x.txt:1:"), "a non-ASCII name is attributed in full");
+ok((await call("grep", { pattern: "MARKER_SPACE" })).includes("con spazio-1.txt:1:"), "a name with a space too");
+ok((await call("grep", { pattern: "MARKER_DASHNAME" })).includes("--:1:"), "and a file literally named --");
 // Four outcomes used to look identical because stderr was discarded: no matches, no grep in the
 // image, an unsupported flag, a permission denial.
 const badPattern = await call("grep", { pattern: "(" });
