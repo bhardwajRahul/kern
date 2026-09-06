@@ -49,8 +49,24 @@ pub fn resolv_path(name: &str) -> PathBuf {
 /// one of these files must never leave this function. It used to be re-checked at four call sites
 /// and explained in four comments, which is four chances to add a fifth reader and forget.
 fn read_pid_file(path: &std::path::Path) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
-    (pid > 0).then_some(pid)
+    let raw = std::fs::read_to_string(path).ok()?;
+    // `pid` or `pid:starttime`; the identity half is read by [`recorded_holder`].
+    let pid: i32 = raw.trim().split(':').next()?.parse().ok()?;
+    if pid <= 0 {
+        return None; // 0 is the caller's own process group, -1 is everything it may signal
+    }
+    if pid == 1 {
+        // Nonsense in a pod's pidfile. Rootless it would only earn an EPERM, but a value that
+        // cannot be right should not leave the reader on the strength of a permission check.
+        return None;
+    }
+    if pid == std::process::id() as i32 {
+        // A clobbered pidfile naming kern ITSELF, which would make teardown SIGKILL the process
+        // doing the teardown. Reachable by exactly the same corruption the battery already tests
+        // with a stranger's pid, and it was the one value that case did not cover.
+        return None;
+    }
+    Some(pid)
 }
 
 /// Is this pod's `pasta` still the live process we recorded?
@@ -243,23 +259,37 @@ fn claimed_by_another_pod(pid: i32, except: &str) -> bool {
 /// imagined: one integration run left SEVEN behind, and two of them survived `kern pod rm` because
 /// their directory was already gone and nothing could name them again.
 ///
-/// So this identifies the PROCESS rather than trusting the inode alone, and requires two independent
-/// facts before signalling: its argv carries kern's holder marker, and no other pod dir claims the
-/// same pid. The netns inode stays the fast path; this is only consulted when it could not answer.
+/// So this identifies the PROCESS rather than trusting the inode alone. The netns inode stays the
+/// fast path; the recorded start-time answers when it could not.
+///
+/// THE START-TIME IS THE IDENTITY, and argv is not. argv is forgeable: any process of this user can
+/// make its own `/proc/self/cmdline` read `kern\0__pod-holder\0`, and the only other guard was a
+/// scan of pod dirs, which by construction cannot see a pod whose dir has already been removed. The
+/// start-time comes from the kernel, cannot be rewritten by the process, and differs for whatever
+/// inherits the pid, so it answers the question the three previous name checks kept approximating.
+///
+/// A marker with no start-time is one an older kern wrote before this session's upgrade. There is
+/// nothing to verify it against, so it falls back to argv rather than leaking the holder outright.
 fn holder_to_reap(name: &str) -> Option<i32> {
     if let Some(pid) = holder_pid(name) {
         return Some(pid); // identity confirmed by the recorded netns inode
     }
-    let pid = read_pid_file(&pod_dir(name).join("holder"))?;
+    let dir = pod_dir(name);
+    let pid = read_pid_file(&dir.join("holder"))?;
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None;
     }
-    // A live pid whose inode check could not be made. Kill it only if it is provably one of ours and
-    // provably not somebody else's.
-    if is_holder_argv(pid) && !claimed_by_another_pod(pid, name) {
-        return Some(pid);
+    match recorded_holder_starttime(&dir) {
+        Some(want) => (crate::registry::proc_starttime(pid) == want).then_some(pid),
+        // Back-compat only: a bare-pid marker predating this format.
+        None => (is_holder_argv(pid) && !claimed_by_another_pod(pid, name)).then_some(pid),
     }
-    None
+}
+
+/// The start-time half of the `pid:starttime` holder marker, or `None` for a bare-pid marker.
+fn recorded_holder_starttime(dir: &std::path::Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(dir.join("holder")).ok()?;
+    raw.trim().split_once(':')?.1.parse().ok()
 }
 
 /// Is a concurrent `pod create` still mid-startup for this dir? True iff the `starting` marker names
@@ -404,7 +434,16 @@ pub fn create_with_range(
     if let Some(ino) = ns_inode(pid, "net") {
         let _ = std::fs::write(dir.join("netns"), ino.to_string());
     }
-    std::fs::write(dir.join("holder"), pid.to_string())
+    // `pid:starttime`, the same marker shape `starting` already uses. The start-time is what makes
+    // this an IDENTITY rather than a number: it is assigned by the kernel, cannot be rewritten by
+    // the process, and differs for whatever inherits the pid later. Three versions of a name-based
+    // check preceded it (`comm`, then argv presence, then argv position plus our own file name),
+    // and each fixed one hole and kept the class, which is the signal that the name was the wrong
+    // key. Measured against the last of them: after a package-style `mv` over the binary,
+    // `/proc/self/exe` reads `... (deleted)`, so `current_exe`'s file name stops matching during
+    // exactly the upgrade window in which teardown matters.
+    let holder_marker = format!("{pid}:{}", crate::registry::proc_starttime(pid));
+    std::fs::write(dir.join("holder"), holder_marker)
         .map_err(|e| Error::Sandbox(format!("pod holder pid: {e}")))?;
     let _ = std::fs::remove_file(dir.join("starting")); // claim complete: holder pid is now recorded
                                                         // The holder is detached (own process group, reparented to init on our exit) and runs until
@@ -604,43 +643,63 @@ const PASTA_SPAWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// `Command::output`, but it gives up.
 ///
-/// `output()` waits forever, and a pasta that never exits therefore hung `kern pod create` with
-/// nothing printed and no way out but Ctrl-C. Through `compose up` that is a whole stack. MEASURED
-/// with a stub pasta that sleeps: the SHIPPED v0.9.2 hangs the same way, so this is not something
-/// the SELinux retry introduced. What the retry does is double the number of chances to meet it.
+/// WHAT THIS IS AND IS NOT, because the first version of this comment claimed more than had been
+/// measured. `output()` waits for the pipes to reach EOF and then reaps, so it can be held open by
+/// a daemonising child that inherits the write end rather than by a child that fails to exit.
+/// Measured on a live pod: real pasta closes every descriptor and calls `setsid`, so the recorded
+/// pasta has an EMPTY `/proc/<pid>/fd` and its own session. The pipe therefore reaches EOF and the
+/// normal path returns in about 30 ms. A hang through the inherited pipe was NOT observed here.
 ///
-/// The wait happens on a thread so the pipes are still drained concurrently, which is what
-/// `output()` does and what keeps a chatty child from deadlocking against a full pipe buffer.
+/// What was observed is that the wait is unbounded, so anything that does wedge, before daemonising
+/// or during it, hangs `kern pod create` with nothing printed and no way out but Ctrl-C, and
+/// through `compose up` that is a whole stack. The SHIPPED v0.9.2 hangs the same way, so the SELinux
+/// retry did not introduce it; the retry doubles the number of chances to meet it. This bound is
+/// insurance against that class, not a fix for a failure seen in the field.
 ///
-/// THE WHOLE PROCESS GROUP IS KILLED, not just the child. The caller puts pasta in its own group,
-/// so the negated pid can only reach pasta and whatever it started. Signalling the single pid left
-/// a grandchild running: measured with a stub that is a shell script, where killing the shell
-/// orphaned the process it was waiting on. Real pasta is a binary and would not have shown this,
-/// which is exactly why it is worth closing rather than assuming.
+/// A CONSEQUENCE WORTH KNOWING: because pasta calls `setsid`, a timeout can no longer reach a pasta
+/// that has already daemonised, and it should not try to. If the direct child wedges AFTER the
+/// daemon is up, the NAT is working and this reports failure. Nothing kills the working daemon,
+/// which is the safe half of that trade, and `pasta_alive` still reads the truth from the pidfile.
 ///
-/// Killing by pid is safe here precisely because the timeout means `wait_with_output` has not
-/// returned, so the child has not been reaped and the number is still ours. The thread then reaps
-/// it, so a wedged pasta does not survive as an orphan holding the pod's namespace open.
+/// The wait happens on a thread so the pipes are drained concurrently, which is what `output()`
+/// does and what keeps a chatty child from deadlocking against a full pipe buffer.
 fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    let child = cmd.spawn()?;
-    let pid = child.id();
+    // THE GROUP IS ESTABLISHED HERE, not by the caller. This function is what signals a NEGATED pid
+    // on timeout, so the invariant that makes that safe has to belong to it: a caller could
+    // otherwise hand over a `Command` without the call and aim `-pid` at kern's own process group.
+    // A comment cannot hold that together, and an external reviewer was right that it should not
+    // have to.
+    let child = cmd.process_group(0).spawn()?;
+    let pid = child.id() as i32;
+    // A pidfd PINS the process: while it is open the kernel will not recycle the number. That
+    // closes the interleaving where the thread's `wait_with_output` completes, the pid is freed and
+    // handed to an unrelated process, and `recv_timeout` expires microseconds later and signals it.
+    // Nothing serialises those two, so the window is real rather than theoretical. `-1` on kernels
+    // older than 5.3, where the fallback below accepts that window rather than doing nothing.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    match rx.recv_timeout(limit) {
+    let outcome = rx.recv_timeout(limit);
+    let result = match outcome {
         Ok(result) => result,
         Err(_) => {
-            // The caller sets `process_group(0)`, so the child leads its own group and `-pid`
-            // cannot reach this process. Without that call `-pid` would be kern's own group, so
-            // the two belong together and neither is optional.
-            let pid = pid as i32;
             unsafe {
+                if pidfd >= 0 {
+                    // Exact, and immune to reuse: the fd names the process, not the number.
+                    libc::syscall(libc::SYS_pidfd_send_signal, pidfd, libc::SIGKILL, 0, 0);
+                } else {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                // And the group, for anything the child started that is still in it. Safe while
+                // the pidfd is open because the number cannot have been reused. Signalling only
+                // the child left a grandchild running: measured with a stub that is a shell
+                // script, where killing the shell orphaned the process it was waiting on.
                 libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
             }
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -650,7 +709,11 @@ fn output_within(
                 ),
             ))
         }
+    };
+    if pidfd >= 0 {
+        unsafe { libc::close(pidfd) };
     }
+    result
 }
 
 fn setup_outbound(name: &str, holder: i32) -> Outbound {
@@ -665,10 +728,7 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
                 .args(pasta_args(&dir, holder, watch_netns))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                // Its own process group, so a wedged pasta can be killed as a group without the
-                // signal reaching kern. Required by `output_within`, which negates the pid.
-                .process_group(0),
+                .stderr(std::process::Stdio::piped()),
             PASTA_SPAWN_LIMIT,
         )
     };
@@ -938,7 +998,20 @@ pub fn teardown(name: &str) -> (bool, usize) {
     if let Some(pid) = holder {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    // THE RESULT IS NOT DISCARDED, because another statement depends on it. `network_sentence`
+    // reads "no live pasta AND a resolv.conf" as "pasta started and has since exited", and the
+    // argument that the file cannot be left over from an earlier pod of the same name is exactly
+    // this removal succeeding. If it fails (EBUSY on something still mounted, a permissions
+    // problem, a file another process holds), the directory survives with its `resolv.conf`, and a
+    // pod re-created under the same name reports a crash that never happened.
+    //
+    // The individual files are removed as a fallback so the state that drives the message is gone
+    // even when the directory itself cannot be. Whatever remains is left for `create` to find.
+    if std::fs::remove_dir_all(&dir).is_err() {
+        for stale in ["resolv.conf", "pasta.pid", "holder", "netns", "hosts"] {
+            let _ = std::fs::remove_file(dir.join(stale));
+        }
+    }
     (true, members)
 }
 
@@ -1009,6 +1082,80 @@ mod tests {
         ] {
             assert!(validate_name(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn read_pid_file_refuses_every_value_that_must_not_reach_kill() {
+        let dir = std::env::temp_dir().join(format!("kern-pidfile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("p");
+        let read = |v: &str| {
+            std::fs::write(&f, v).expect("write the pid file");
+            read_pid_file(&f)
+        };
+
+        // `kill(0, ..)` signals the caller's own process group, `kill(-1, ..)` everything it may
+        // signal. Neither may ever leave this function.
+        for bad in [
+            "0",
+            "-1",
+            "-999",
+            "not-a-pid",
+            "",
+            "  ",
+            "9999999999999999999999",
+        ] {
+            assert_eq!(read(bad), None, "{bad:?} must not be read as a pid");
+        }
+        // pid 1 is nonsense in a pod's pidfile, and must not be excused by the EPERM it would earn.
+        assert_eq!(read("1"), None, "pid 1 must not be read as a pid");
+        // KERN ITSELF. A clobbered pidfile naming the process doing the teardown would make it
+        // SIGKILL itself, and this was the one value the pid-file battery did not cover.
+        let me = std::process::id();
+        assert_eq!(read(&me.to_string()), None, "our own pid must be refused");
+        assert_eq!(
+            read(&format!("{me}:12345")),
+            None,
+            "our own pid is refused in the pid:starttime form too"
+        );
+
+        // The forms that ARE pids, including the marker with its start-time half.
+        assert_eq!(read("4242"), Some(4242));
+        assert_eq!(read("4242:99887766"), Some(4242));
+        assert_eq!(read(" 4242:99887766 \n"), Some(4242));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_holder_marker_carries_a_start_time_that_a_reused_pid_cannot_match() {
+        let dir = std::env::temp_dir().join(format!("kern-holder-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // No start-time: an older kern's marker, and there is nothing to verify against.
+        std::fs::write(dir.join("holder"), "4242").expect("write");
+        assert_eq!(recorded_holder_starttime(&dir), None);
+
+        // With one, it is read back exactly. This is the value `holder_to_reap` compares against
+        // `proc_starttime`, and it is the whole identity: the kernel assigns it, the process
+        // cannot rewrite it, and whatever inherits the pid later has a different one. argv could
+        // do none of those three, which is why three versions of a name check kept leaking.
+        std::fs::write(dir.join("holder"), "4242:99887766").expect("write");
+        assert_eq!(recorded_holder_starttime(&dir), Some(99887766));
+
+        // Our own live pid with a WRONG start-time is a reused pid, not our holder.
+        let me = std::process::id() as i32;
+        let real = crate::registry::proc_starttime(me);
+        assert_ne!(real, 0, "this test needs a readable /proc/self/stat");
+        std::fs::write(dir.join("holder"), format!("{me}:{}", real.wrapping_add(1)))
+            .expect("write");
+        assert_ne!(
+            recorded_holder_starttime(&dir),
+            Some(crate::registry::proc_starttime(me)),
+            "a mismatched start-time must not read as the same process"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

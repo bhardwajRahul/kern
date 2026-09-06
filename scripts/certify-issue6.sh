@@ -44,9 +44,16 @@ says_loopback_only() { printf '%s' "$1" | grep -q 'loopback-only'; }
 
 # The retry happened AND the first reason survived it. Reporting only the second reason would hide
 # the one that names the operation a policy refused.
+# The retry happened AND the first reason survived it AND the second one is not empty.
+#
+# The last clause is the one an external reviewer asked for, and he was right: both substrings come
+# from kern's own TEMPLATE, not from pasta, so if `pasta_reason` ever returned "" the message would
+# read "...; retried without the netns watch and it also failed: " with nothing after the colon and
+# both greps would still pass. The predicate would then be confirming that the template fired, which
+# is not what it is for.
 reports_both_reasons() {
     printf '%s' "$1" | grep -q 'netns dir open' \
-        && printf '%s' "$1" | grep -q 'retried without the netns watch'
+        && printf '%s' "$1" | grep -qE 'retried without the netns watch and it also failed: *[^[:space:]]'
 }
 
 # HTTP/1.x 200, from a real server, fetched inside a box. A connect that succeeds proves nothing
@@ -79,6 +86,12 @@ self_check() {
     reports_both_reasons "network: loopback-only; pasta IS installed but did not start: nope" \
         && fail "a single-reason line was read as reporting both" \
         || pass "a single-reason line is not read as reporting both"
+    # AN EMPTY SECOND REASON. Both substrings come from kern's own template, so without the trailing
+    # check this passes while telling the reader nothing about why the retry failed. The predicate
+    # would be confirming that the template fired, which is not what it is for.
+    reports_both_reasons "network: pasta IS installed but did not start: netns dir open: Permission denied; retried without the netns watch and it also failed: " \
+        && fail "a line whose second reason is empty was read as reporting both" \
+        || pass "an empty second reason is not read as reporting both"
     fetched_a_page "HTTP/1.1 200 OK
 Content-Type: text/html
 PAYLOAD_200" \
@@ -204,25 +217,69 @@ EOS
 }
 calls() { wc -l < "$D/calls" 2>/dev/null | tr -d ' '; }
 
-# Live pod holders on this machine, by ARGV POSITION: argv[0] must name a kern and argv[1] must be
-# the marker. Never by `pgrep -f`, which matches this script's own command line and has twice in
-# this project been mistaken for a real process.
+# Live pod holders on this machine, by ARGV POSITION: argv[1] is the marker. Never by `pgrep -f`,
+# which matches this script's own command line and has twice in this project been mistaken for a
+# real process.
+#
+# argv[0] IS DELIBERATELY NOT CHECKED, and the first version of this did check it against the
+# literal "kern". Running the battery against a binary named anything else, which is exactly what
+# comparing two builds means, then undercounted to zero: eight orphans from a `kern-092` run were
+# reported as "no holder leaked". That is the same defect as the one this battery certifies fixed in
+# `cmdline_is_holder`, reproduced in the code that checks for it. Counting is not killing, so the
+# looser key is the right one here: over-counting a stranger would fail loudly, and missing our own
+# leak fails silently.
 holders_now() {
     _h=0
     for _p in /proc/[0-9]*; do
         _c=$(tr '\0' '\n' < "$_p/cmdline" 2>/dev/null) || continue
-        [ "$(basename "$(printf '%s' "$_c" | sed -n 1p)" 2>/dev/null)" = "kern" ] \
-            && [ "$(printf '%s' "$_c" | sed -n 2p)" = "__pod-holder" ] \
-            && _h=$((_h + 1))
+        [ "$(printf '%s' "$_c" | sed -n 2p)" = "__pod-holder" ] && _h=$((_h + 1))
     done
     echo "$_h"
 }
+# Live pasta daemons, by `comm`, which is `pasta.avx2` on this host: passt re-execs into an ISA
+# variant. Counted for the same reason as the holders: the pid-file cases below clobber `pasta.pid`,
+# so kern cannot reach the real pasta afterwards and the battery has to reap what it orphans. The
+# first version of these cases leaked seven of each per run.
+pastas_now() {
+    _n=0
+    for _p in /proc/[0-9]*; do
+        case "$(awk '{print $2}' "$_p/stat" 2>/dev/null)" in
+            *pasta*|*passt*) _n=$((_n + 1)) ;;
+        esac
+    done
+    echo "$_n"
+}
 HOLDERS_AT_START=$(holders_now)
+PASTAS_AT_START=$(pastas_now)
 
 echo "certify #6: the SELinux netns-dir refusal, and the retry that answers it"
+echo
 echo "  kern:  $KERN"
 echo "  pasta: $REAL_PASTA"
 echo "  target: $TARGET_HOST ($TARGET_IP)"
+
+# --- THE PREDICATE AGAINST THE REAL BINARY, NOT AGAINST THIS SCRIPT --------------------------------
+# THE CIRCULARITY THIS CLOSES, pointed out by an external reviewer: the stub below writes the very
+# string `is_netns_dir_denial` matches, so every case using it certifies kern against text this
+# script authored, not against passt's. If passt reworded the message, the whole battery would stay
+# green while the retry silently stopped firing on real hosts.
+#
+# The installed binary is the authority. `netns dir open: %s, exiting` is the format string pasta
+# actually holds, and the substring kern matches is its literal prefix. If this case goes red, the
+# predicate has drifted from passt and the retry is dead on real hosts, whatever the rest says.
+echo "  the matched string belongs to passt, not to this script"
+if ! command -v strings >/dev/null 2>&1; then
+    skip "no strings(1) here, so the predicate cannot be checked against the binary"
+else
+    found=0
+    for b in "$REAL_PASTA" "$(command -v passt 2>/dev/null)"; do
+        [ -n "$b" ] && [ -e "$b" ] || continue
+        strings "$b" 2>/dev/null | grep -q 'netns dir open' && found=$((found + 1))
+    done
+    [ "$found" -gt 0 ] \
+        && pass "the installed passt still contains 'netns dir open', which is what kern matches" \
+        || fail "'netns dir open' is not in the installed passt: the retry predicate has drifted"
+fi
 
 # --- POSITIVE CONTROL ----------------------------------------------------------------------------
 # Can a box on THIS host reach the internet through an unmodified pasta at all? Everything below
@@ -443,6 +500,7 @@ echo "  edge: the pid files name a live process that is NOT ours"
 sleep 300 &
 victim=$!
 XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6pid --no-outbound >/dev/null 2>&1
+# `--no-outbound`, so there is no real pasta to orphan when this file is clobbered.
 echo "$victim" > "$XDG/kern/pods/c6pid/pasta.pid"
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6pid >/dev/null 2>&1
 sleep 0.3
@@ -459,7 +517,10 @@ rm -f "$XDG/kern/pods/c6pid2/netns"
 # holder once the pid is gone from it. What matters here is that the battery not become the thing
 # that litters the machine, because `pod ls` and the acceptance matrix both count live kern
 # processes, and a leaking test turns their counts into noise.
-real_holder2=$(cat "$XDG/kern/pods/c6pid2/holder" 2>/dev/null)
+# The marker is `pid:starttime`, so take the pid half. Reading the whole thing and then refusing
+# anything non-numeric silently stopped reaping when that format arrived, and the footprint
+# assertion below is what caught it.
+real_holder2=$(cut -d: -f1 < "$XDG/kern/pods/c6pid2/holder" 2>/dev/null)
 echo "$victim" > "$XDG/kern/pods/c6pid2/holder"
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6pid2 >/dev/null 2>&1
 sleep 0.3
@@ -476,11 +537,15 @@ echo "  edge: the pid files hold values that are not pids"
 # teardown still succeeds AND that this script's own shell is alive afterwards, which is the thing
 # `kill(0, ...)` would have taken out.
 degenerate_ok=yes
-for bad in 0 -1 99999999999999999999 "" "not-a-pid" "12 34"; do
+# `$$` is this script's own pid, standing in for the case where a clobbered file names the process
+# doing the teardown. kern reads its OWN pid there and would SIGKILL itself; the battery already
+# covered a stranger's pid and this was the one value it did not. `1` is nonsense that rootless
+# would only meet with EPERM, which is a permission accident rather than a guard.
+for bad in 0 -1 1 "$$" 99999999999999999999 "" "not-a-pid" "12 34"; do
     XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6bad --no-outbound >/dev/null 2>&1
     # Read the real pid BEFORE clobbering the file, for the same reason as the case above: the
     # write is what makes the holder unreachable, so this script owns reaping it.
-    real_bad=$(cat "$XDG/kern/pods/c6bad/holder" 2>/dev/null)
+    real_bad=$(cut -d: -f1 < "$XDG/kern/pods/c6bad/holder" 2>/dev/null)
     printf '%s' "$bad" > "$XDG/kern/pods/c6bad/pasta.pid"
     printf '%s' "$bad" > "$XDG/kern/pods/c6bad/holder"
     XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6bad >/dev/null 2>&1 || degenerate_ok=no
@@ -545,6 +610,13 @@ holders_end=$(holders_now)
 [ "$holders_end" -le "$HOLDERS_AT_START" ] \
     && pass "no pod holder leaked (${HOLDERS_AT_START} before, ${holders_end} after)" \
     || fail "leaked $((holders_end - HOLDERS_AT_START)) pod holder(s): ${HOLDERS_AT_START} before, ${holders_end} after"
+# PASTA TOO. The holder count alone was a partial answer: the same cases that orphan a holder by
+# clobbering its pidfile orphan a pasta the same way, and only the holders were being counted. Seven
+# pasta daemons were sitting on this machine when that was noticed.
+pastas_end=$(pastas_now)
+[ "$pastas_end" -le "$PASTAS_AT_START" ] \
+    && pass "no pasta leaked (${PASTAS_AT_START} before, ${pastas_end} after)" \
+    || fail "leaked $((pastas_end - PASTAS_AT_START)) pasta(s): ${PASTAS_AT_START} before, ${pastas_end} after"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
