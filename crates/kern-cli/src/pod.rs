@@ -182,6 +182,17 @@ const HOLDER_ARGV: &str = "__pod-holder";
 /// `grep __pod-holder /proc/1/cmdline`, and argv[0] alone accepts every other kern subcommand.
 /// argv[0]'s file name rather than its full path, so a holder started by a kern that has since been
 /// reinstalled elsewhere is still recognised as one.
+///
+/// "NAMES A KERN" IS NOT THE SAME AS "IS LITERALLY CALLED kern", and comparing only against the
+/// literal was a guess about how this binary is installed. `create` spawns the holder with
+/// `std::env::current_exe()`, so argv[0] is whatever the installed file is actually called, and a
+/// distribution or a user is free to call it something else. MEASURED: with the binary copied to
+/// `getkern`, a holder whose netns inode could not be read was never identified and survived
+/// `pod rm` for the life of the session, which is the same leak this function was added to close.
+///
+/// So both names are accepted: the literal, which also covers a holder started by a kern that has
+/// since been reinstalled under a different name, and our own file name, which covers every name
+/// the binary is actually shipped under.
 fn cmdline_is_holder(cmdline: &[u8]) -> bool {
     let mut argv = cmdline.split(|c| *c == 0);
     let Some(arg0) = argv.next() else {
@@ -191,7 +202,17 @@ fn cmdline_is_holder(cmdline: &[u8]) -> bool {
         Some(i) => &arg0[i + 1..],
         None => arg0,
     };
-    base == b"kern" && argv.next() == Some(HOLDER_ARGV.as_bytes())
+    let names_a_kern = base == b"kern" || Some(base) == self_exe_file_name().as_deref();
+    names_a_kern && argv.next() == Some(HOLDER_ARGV.as_bytes())
+}
+
+/// This binary's own file name, for [`cmdline_is_holder`]. `None` if `current_exe` cannot be read,
+/// in which case only the literal name is accepted: fewer processes recognised is the safe
+/// direction, because the answer decides a `SIGKILL`.
+fn self_exe_file_name() -> Option<Vec<u8>> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_name()?;
+    Some(std::os::unix::ffi::OsStrExt::as_bytes(name).to_vec())
 }
 
 /// Does this pid's argv carry kern's holder marker? IO wrapper over [`cmdline_is_holder`]; an
@@ -794,6 +815,38 @@ fn is_pasta_comm(comm: &str) -> bool {
         .any(|base| comm == *base || comm.strip_prefix(base).is_some_and(|r| r.starts_with('.')))
 }
 
+/// Is this pid, right now, a pasta? Identity by `comm`, read at the moment it is asked rather than
+/// cached, because a pid outlives the process that held it.
+fn pid_is_pasta(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|c| is_pasta_comm(c.trim()))
+        .unwrap_or(false)
+}
+
+/// Stop the pod's pasta.
+///
+/// `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process
+/// it may signal, so a degenerate pid from the file must never reach `kill`, not even to probe.
+///
+/// SIGTERM ONLY, and there is an argument for escalating that is deliberately not taken here. A
+/// pasta started with `--no-netns-quit` (the SELinux retry in `setup_outbound`) does not watch the
+/// namespace and will not exit on its own, so this signal is the only thing that stops it, and
+/// `teardown` deletes the pid file immediately afterwards: if the signal were ever ignored, the
+/// process would be unnameable for the rest of the session. That is the same shape as the holder
+/// leak fixed above.
+///
+/// It is not escalated because the cost was measured and the failure was not. Waiting for the exit
+/// and following with SIGKILL takes `pod rm` from 1.8 ms to 33 ms on this host (five runs each,
+/// same binary), because pasta genuinely takes about 30 ms to leave after SIGTERM. Paying 18x on
+/// every teardown to insure against a pasta ignoring SIGTERM, which has never been observed here,
+/// is the wrong trade to make silently. Revisit if one is ever seen.
+fn stop_pasta(pid: i32) {
+    if pid <= 0 || !pid_is_pasta(pid) {
+        return;
+    }
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+}
+
 /// Tear a pod down: kill its pasta NAT daemon (verified by PID + `comm` family prefix), then its holder, then wipe
 /// its state dir. Returns `(existed, member_count)`. Silent - callers do the messaging so `pod rm`
 /// and `compose down` can each say the right thing. Member boxes keep their own (already-joined)
@@ -837,16 +890,7 @@ pub fn teardown(name: &str) -> (bool, usize) {
     let holder = holder_to_reap(name);
     if let Ok(pp) = std::fs::read_to_string(dir.join("pasta.pid")) {
         if let Ok(pp) = pp.trim().parse::<i32>() {
-            // `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals
-            // every process it may signal; a degenerate value in that file must never reach `kill`.
-            if pp > 0 {
-                let is_pasta = std::fs::read_to_string(format!("/proc/{pp}/comm"))
-                    .map(|c| is_pasta_comm(c.trim()))
-                    .unwrap_or(false);
-                if is_pasta {
-                    unsafe { libc::kill(pp, libc::SIGTERM) };
-                }
-            }
+            stop_pasta(pp);
         }
     }
     if let Some(pid) = holder {
@@ -1121,6 +1165,23 @@ mod tests {
         assert!(!cmdline_is_holder(b"\0\0\0"));
         assert!(!cmdline_is_holder(b"__pod-holder"));
         assert!(!cmdline_is_holder(b"kern"));
+
+        // OUR OWN FILE NAME COUNTS, whatever it happens to be, and under `cargo test` that is the
+        // test binary rather than `kern` - which is exactly the point. `create` spawns the holder
+        // with `current_exe()`, so argv[0] is the installed file's name, and comparing only against
+        // the literal was a guess about how kern is installed. Measured with the binary copied to
+        // `getkern`: the holder survived `pod rm` whenever its netns inode could not be read.
+        if let Some(me) = self_exe_file_name() {
+            let mut argv = me.clone();
+            argv.push(0);
+            argv.extend_from_slice(HOLDER_ARGV.as_bytes());
+            assert!(
+                cmdline_is_holder(&argv),
+                "a holder started by THIS binary must be recognised as one"
+            );
+            // The marker is still required: the name alone must not be enough.
+            assert!(!cmdline_is_holder(&me));
+        }
     }
 
     /// `--no-netns-quit` appears on the RETRY and never on the first attempt, and the retry is

@@ -639,7 +639,17 @@ const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
 /// those are different facts about the host.
 fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
     if !selinuxfs_present {
-        return R::Ok("SELinux: not active on this host".into());
+        // "NOT VISIBLE FROM HERE", not "not active on this host", and the difference is not
+        // pedantry: selinuxfs is a mount, and a container that does not mount it sees exactly this
+        // while the host underneath is Enforcing and refusing things. kern is frequently run inside
+        // one. The old wording asserted a fact about the host that this probe cannot establish, and
+        // a reader chasing a denial would have crossed SELinux off the list on the strength of it.
+        return R::Ok(
+            "SELinux: no selinuxfs visible from here (not in force for this process; a \
+                      host policy can still apply if kern is running inside a container that does \
+                      not mount it)"
+                .into(),
+        );
     }
     // THE AUDIT LOG IS THE WRONG PLACE TO LOOK, and this hint said to look there until a Fedora 43
     // VM with SELinux Enforcing was built to check. The denial that stops pod egress produces NO
@@ -1478,7 +1488,15 @@ mod tests {
         // No selinuxfs: the mode is not merely unknown, SELinux is not in force at all.
         let none = selinux_verdict(false, None);
         assert!(matches!(none, R::Ok(_)), "absent SELinux must not warn");
-        assert!(msg(&none).contains("not active"));
+        // It must report what it OBSERVED (no selinuxfs here), not a claim about the host it
+        // cannot see: a container that does not mount selinuxfs looks identical to a host with no
+        // SELinux at all, and "not active on this host" told the reader the second one either way.
+        assert!(msg(&none).contains("visible from here"), "{}", msg(&none));
+        assert!(
+            !msg(&none).contains("not active on this host"),
+            "the probe cannot establish that: {}",
+            msg(&none)
+        );
 
         // Present and enforcing. Trailing newline, as the kernel writes it.
         let enf = selinux_verdict(true, Some("1\n".into()));
