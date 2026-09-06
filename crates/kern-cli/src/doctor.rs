@@ -617,28 +617,49 @@ fn check_apparmor_userns() -> R {
 /// the mode is unknown. Existence is therefore tested separately rather than inferred from a failed
 /// parse, which is the same substitution that produced the defect this check was written after.
 fn check_selinux() -> R {
-    const ENFORCE: &str = "/sys/fs/selinux/enforce";
     // The filesystem, not the file: a kernel without SELinux has neither, and conflating "no
-    // selinuxfs" with "cannot read enforce" is what the split below exists to prevent.
-    if !std::path::Path::new("/sys/fs/selinux").is_dir() {
+    // selinuxfs" with "cannot read enforce" is what the split exists to prevent.
+    selinux_verdict(
+        std::path::Path::new(SELINUXFS).is_dir(),
+        std::fs::read_to_string(SELINUX_ENFORCE).ok(),
+    )
+}
+
+const SELINUXFS: &str = "/sys/fs/selinux";
+const SELINUX_ENFORCE: &str = "/sys/fs/selinux/enforce";
+
+/// The verdict as a PURE function of the two facts, so all five states are unit-testable without a
+/// host that has SELinux. They were reachable only by building a container per state and
+/// bind-mounting a fake `selinuxfs` over it, which no CI run will ever do, and one of the five was
+/// wrong when that was the only way to look: a readable `enforce` holding a non-number reported
+/// "could not be read", which it had been.
+///
+/// `mode` is the file's RAW contents rather than a parsed integer for exactly that reason. Parsing
+/// first collapses "absent or unopenable" and "read fine, is not a number" into one `None`, and
+/// those are different facts about the host.
+fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
+    if !selinuxfs_present {
         return R::Ok("SELinux: not active on this host".into());
     }
-    match read_int(ENFORCE) {
-        Some(1) => R::Ok(
+    let hint = "read it with `getenforce`; if it is Enforcing and a pod has no egress, look for a \
+                denial with `sudo ausearch -m avc -ts recent`";
+    match mode.as_deref().map(str::trim) {
+        Some("1") => R::Ok(
             "SELinux: ENFORCING (kern's isolation is unaffected; a policy can still refuse what the \
              kernel would allow, e.g. pod egress)"
                 .into(),
         ),
-        Some(0) => R::Ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
+        Some("0") => R::Ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
         Some(other) => R::Warn(
-            format!("SELinux: {ENFORCE} reads {other}, which is neither 0 nor 1"),
-            "treat the mode as unknown and read it with `getenforce`".into(),
+            format!(
+                "SELinux is present and {SELINUX_ENFORCE} holds {:?}, which is neither 0 nor 1",
+                crate::ui::scrub(other).chars().take(40).collect::<String>()
+            ),
+            hint.into(),
         ),
         None => R::Warn(
-            format!("SELinux is present but its mode could not be read from {ENFORCE}"),
-            "read it with `getenforce`; if it is Enforcing and a pod has no egress, look for a \
-             denial with `sudo ausearch -m avc -ts recent`"
-                .into(),
+            format!("SELinux is present but {SELINUX_ENFORCE} could not be opened"),
+            hint.into(),
         ),
     }
 }
@@ -1422,5 +1443,64 @@ mod tests {
             vec!["me".to_string(), "7".to_string()]
         );
         assert_eq!(subid_identities(99, passwd), vec!["99".to_string()]);
+    }
+
+    /// All five SELinux states, including the two that need a host this project does not have.
+    ///
+    /// They were first exercised by building a Fedora box per state and bind-mounting a synthetic
+    /// `selinuxfs` over `/sys/fs/selinux`, which found a real defect (a readable `enforce` holding a
+    /// non-number was reported as unreadable) and which no CI run will ever repeat. A pure verdict
+    /// makes the same five checkable in a millisecond.
+    ///
+    /// ENFORCING MUST NOT WARN. It is the correct posture on every distro that ships SELinux, and a
+    /// standing warning on a correct host teaches the reader to skim past `doctor`, which costs more
+    /// than the line buys. The state is reported, and the actionable hint lives at the failure.
+    #[test]
+    fn selinux_verdict_separates_all_five_states() {
+        let msg = |r: &R| match r {
+            R::Ok(m) => m.clone(),
+            R::Warn(m, _) | R::Fail(m, _) => m.clone(),
+        };
+
+        // No selinuxfs: the mode is not merely unknown, SELinux is not in force at all.
+        let none = selinux_verdict(false, None);
+        assert!(matches!(none, R::Ok(_)), "absent SELinux must not warn");
+        assert!(msg(&none).contains("not active"));
+
+        // Present and enforcing. Trailing newline, as the kernel writes it.
+        let enf = selinux_verdict(true, Some("1\n".into()));
+        assert!(
+            matches!(enf, R::Ok(_)),
+            "enforcing is the correct posture and must not warn"
+        );
+        assert!(msg(&enf).contains("ENFORCING"));
+
+        // Present and permissive.
+        let perm = selinux_verdict(true, Some("0\n".into()));
+        assert!(matches!(perm, R::Ok(_)));
+        assert!(msg(&perm).contains("permissive"));
+
+        // Readable and NOT a number: the state that was reported as unreadable before this split.
+        let odd = selinux_verdict(true, Some("banana\n".into()));
+        assert!(matches!(odd, R::Warn(..)), "an unparseable mode is unknown");
+        assert!(
+            msg(&odd).contains("holds") && msg(&odd).contains("banana"),
+            "it must say what it found, not that it could not read it: {}",
+            msg(&odd)
+        );
+        assert!(
+            !msg(&odd).contains("could not be opened"),
+            "a file that was read must not be reported as unopenable"
+        );
+
+        // A number that is neither 0 nor 1 lands in the same arm, and still shows the value.
+        let two = selinux_verdict(true, Some("2".into()));
+        assert!(matches!(two, R::Warn(..)));
+        assert!(msg(&two).contains('2'));
+
+        // Present but unopenable: genuinely unknown, and worded as the different fact it is.
+        let unopenable = selinux_verdict(true, None);
+        assert!(matches!(unopenable, R::Warn(..)));
+        assert!(msg(&unopenable).contains("could not be opened"));
     }
 }
