@@ -138,6 +138,103 @@ pub fn holder_pid(name: &str) -> Option<i32> {
     }
 }
 
+/// The argv token that makes a process kern's own pod holder. One definition: `create` spawns the
+/// holder with it and [`holder_to_reap`] recognises it, so the two cannot drift.
+const HOLDER_ARGV: &str = "__pod-holder";
+
+/// Does this raw `/proc/<pid>/cmdline` belong to a kern pod holder?
+///
+/// POSITION, NOT PRESENCE, and the first version of this got it wrong. A cmdline is NUL-separated
+/// argv, so matching "any argument equals the marker" already rejects `--flag=__pod-holder` and
+/// `__pod-holder-ish`. It does NOT reject `kern box x -- echo __pod-holder`, where the marker is a
+/// whole argument belonging to the WORKLOAD, and the test written to assert that case is what caught
+/// it. Since the answer decides a `SIGKILL`, presence anywhere is too weak.
+///
+/// `create` spawns the holder as `<kern> __pod-holder`, so the marker is argv[1] and nowhere else,
+/// and argv[0] must name a `kern`. Both are required: argv[1] alone would accept
+/// `grep __pod-holder /proc/1/cmdline`, and argv[0] alone accepts every other kern subcommand.
+/// argv[0]'s file name rather than its full path, so a holder started by a kern that has since been
+/// reinstalled elsewhere is still recognised as one.
+fn cmdline_is_holder(cmdline: &[u8]) -> bool {
+    let mut argv = cmdline.split(|c| *c == 0);
+    let Some(arg0) = argv.next() else {
+        return false;
+    };
+    let base = match arg0.iter().rposition(|c| *c == b'/') {
+        Some(i) => &arg0[i + 1..],
+        None => arg0,
+    };
+    base == b"kern" && argv.next() == Some(HOLDER_ARGV.as_bytes())
+}
+
+/// Does this pid's argv carry kern's holder marker? IO wrapper over [`cmdline_is_holder`]; an
+/// unreadable `/proc/<pid>/cmdline` (the process died, or it is another user's) answers no, because
+/// "cannot read it" is not "it is ours".
+fn is_holder_argv(pid: i32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| cmdline_is_holder(&b))
+        .unwrap_or(false)
+}
+
+/// Is `pid` recorded as the holder of some OTHER live pod? Used to refuse killing a sibling pod's
+/// holder that happens to have recycled the number.
+fn claimed_by_another_pod(pid: i32, except: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(pods_root()) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let n = e.file_name();
+        let other = n.to_string_lossy();
+        other != except
+            && std::fs::read_to_string(e.path().join("holder"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                == Some(pid)
+    })
+}
+
+/// The holder to KILL, which is a different question from the one [`holder_pid`] answers.
+///
+/// `holder_pid` asks "may a box `setns` into this?", where any doubt must be a no, and that is right
+/// for its callers. Its `None` therefore covers five situations and only two of them mean there is
+/// nothing to kill:
+///
+///   the `holder` file is unreadable   -> a live holder may exist, and is about to become unnameable
+///   the pid is <= 0                   -> nothing to kill
+///   `kill(pid, 0)` fails              -> the process is already gone
+///   the `netns` file is unreadable    -> cannot tell whose it is
+///   the recorded netns inode differs  -> provably a stranger, and must NOT be killed
+///
+/// `teardown` used that `None` and then removed the directory anyway, so "cannot tell" became a
+/// holder running for the life of the session with the only record of it deleted. MEASURED, not
+/// imagined: one integration run left SEVEN behind, and two of them survived `kern pod rm` because
+/// their directory was already gone and nothing could name them again.
+///
+/// So this identifies the PROCESS rather than trusting the inode alone, and requires two independent
+/// facts before signalling: its argv carries kern's holder marker, and no other pod dir claims the
+/// same pid. The netns inode stays the fast path; this is only consulted when it could not answer.
+fn holder_to_reap(name: &str) -> Option<i32> {
+    if let Some(pid) = holder_pid(name) {
+        return Some(pid); // identity confirmed by the recorded netns inode
+    }
+    let pid: i32 = std::fs::read_to_string(pod_dir(name).join("holder"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process
+    // it may signal, so a degenerate value must never reach `kill` even to probe liveness.
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        return None;
+    }
+    // A live pid whose inode check could not be made. Kill it only if it is provably one of ours and
+    // provably not somebody else's.
+    if is_holder_argv(pid) && !claimed_by_another_pod(pid, name) {
+        return Some(pid);
+    }
+    None
+}
+
 /// Is a concurrent `pod create` still mid-startup for this dir? True iff the `starting` marker names
 /// a live PID **whose kernel start-time still matches** - so a stale marker whose pid was reused by an
 /// unrelated process reads as dead, not as a live starter. Used only to make two racing
@@ -707,7 +804,10 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // does not exit on its own, so gating on a live holder would leak it for the life of the
     // session. The `comm` check below is what makes killing safe when the holder is already gone: it
     // is the guard against the recycled PID that the old gate was standing in for.
-    let holder = holder_pid(name);
+    // `holder_to_reap`, not `holder_pid`: the second says whether a box may join this namespace, and
+    // its `None` also covers "could not tell", which is exactly the case that used to leak a live
+    // holder one line before the directory naming it was deleted.
+    let holder = holder_to_reap(name);
     if let Ok(pp) = std::fs::read_to_string(dir.join("pasta.pid")) {
         if let Ok(pp) = pp.trim().parse::<i32>() {
             // `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals
@@ -886,6 +986,65 @@ mod tests {
                 .and_then(|i| flat.get(i + 1));
             assert_eq!(us.map(String::as_str), Some("/proc/4242/ns/user"));
         }
+    }
+
+    /// The holder is identified by argv POSITION, because the answer decides a `SIGKILL`.
+    ///
+    /// `teardown` reaps a live holder whose netns inode could not be checked, which is the case that
+    /// leaked one process per pod; this is what says the process is kern's own. The first version
+    /// asked only whether ANY argument equalled the marker, and this test is what showed that
+    /// `kern box x -- echo __pod-holder` satisfies it: a whole argument, belonging to the workload.
+    #[test]
+    fn holder_is_identified_by_argv_position_not_by_presence() {
+        let cmd = |args: &[&str]| {
+            let mut v = Vec::new();
+            for a in args {
+                v.extend_from_slice(a.as_bytes());
+                v.push(0);
+            }
+            v
+        };
+        // The real thing, however kern was installed.
+        assert!(cmdline_is_holder(&cmd(&[
+            "/usr/local/bin/kern",
+            "__pod-holder"
+        ])));
+        assert!(cmdline_is_holder(&cmd(&["kern", "__pod-holder"])));
+        assert!(cmdline_is_holder(&cmd(&[
+            "./target/debug/kern",
+            "__pod-holder"
+        ])));
+        // A holder carries nothing after the marker today; a future flag must not unmake it one.
+        assert!(cmdline_is_holder(&cmd(&["kern", "__pod-holder", "--x"])));
+
+        for argv in [
+            // THE ONE THAT BROKE THE FIRST VERSION: the marker is the WORKLOAD's own argument.
+            vec!["kern", "box", "x", "--", "echo", "__pod-holder"],
+            // argv[1] is right and the program is not kern.
+            vec!["grep", "__pod-holder", "/proc/1/cmdline"],
+            vec!["/usr/bin/pkill", "__pod-holder"],
+            // kern, and any other subcommand.
+            vec!["kern", "box", "app"],
+            vec!["kern", "ps"],
+            vec!["kern"],
+            // Substrings, which the token split already rejected and must keep rejecting.
+            vec!["kern", "--flag=__pod-holder"],
+            vec!["kern", "__pod-holder-ish"],
+            vec!["kern", "x__pod-holder"],
+            // A binary whose name merely ends with or extends kern.
+            vec!["/usr/bin/mykern", "__pod-holder"],
+            vec!["kernel", "__pod-holder"],
+        ] {
+            assert!(
+                !cmdline_is_holder(&cmd(&argv)),
+                "{argv:?} must not read as the pod holder"
+            );
+        }
+        // Degenerate inputs: empty, only separators, and a buffer with no separator at all.
+        assert!(!cmdline_is_holder(b""));
+        assert!(!cmdline_is_holder(b"\0\0\0"));
+        assert!(!cmdline_is_holder(b"__pod-holder"));
+        assert!(!cmdline_is_holder(b"kern"));
     }
 
     /// `--no-netns-quit` appears on the RETRY and never on the first attempt, and the retry is
