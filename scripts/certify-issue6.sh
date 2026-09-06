@@ -162,6 +162,11 @@ fetch_in_pod() {
 #                THE SELINUX SHAPE.
 #   both       : refuse every attempt. The pod must end up with no egress.
 #   other      : refuse with a DIFFERENT permission error, which must NOT be retried.
+#   buried     : the refusal is the FOURTH line, under three informational ones. Measured on WSL2,
+#                where pasta's first line is "Started as root, will change to nobody." A reader
+#                given only the first line is told something true and useless.
+#   hang       : never return. `Command::output` waits forever, so this used to hang `pod create`.
+#   flood      : refuse, after ten thousand lines of noise, to check the reason is capped.
 write_stub() {
     cat > "$D/stub/pasta" <<EOS
 #!/bin/sh
@@ -178,6 +183,19 @@ case "\$MODE" in
       echo "netns dir open: Permission denied, exiting" >&2; exit 1 ;;
   other)
       echo "Couldn't open network namespace /proc/1/ns/net: Permission denied" >&2; exit 1 ;;
+  buried)
+      if [ "\$has_no_quit" = yes ]; then exec $REAL_PASTA "\$@"; fi
+      echo "Started as root, will change to nobody." >&2
+      echo "No interfaces with usable IPv6 routes" >&2
+      echo "Couldn't pick external interface: disabling IPv6" >&2
+      echo "netns dir open: Permission denied, exiting" >&2
+      exit 1 ;;
+  hang)
+      sleep 600 ;;
+  flood)
+      i=0
+      while [ \$i -lt 10000 ]; do echo "noise \$i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >&2; i=\$((i+1)); done
+      echo "netns dir open: Permission denied, exiting" >&2; exit 1 ;;
 esac
 EOS
     chmod +x "$D/stub/pasta"
@@ -185,6 +203,21 @@ EOS
     : > "$D/argv"
 }
 calls() { wc -l < "$D/calls" 2>/dev/null | tr -d ' '; }
+
+# Live pod holders on this machine, by ARGV POSITION: argv[0] must name a kern and argv[1] must be
+# the marker. Never by `pgrep -f`, which matches this script's own command line and has twice in
+# this project been mistaken for a real process.
+holders_now() {
+    _h=0
+    for _p in /proc/[0-9]*; do
+        _c=$(tr '\0' '\n' < "$_p/cmdline" 2>/dev/null) || continue
+        [ "$(basename "$(printf '%s' "$_c" | sed -n 1p)" 2>/dev/null)" = "kern" ] \
+            && [ "$(printf '%s' "$_c" | sed -n 2p)" = "__pod-holder" ] \
+            && _h=$((_h + 1))
+    done
+    echo "$_h"
+}
+HOLDERS_AT_START=$(holders_now)
 
 echo "certify #6: the SELinux netns-dir refusal, and the retry that answers it"
 echo "  kern:  $KERN"
@@ -334,7 +367,132 @@ printf '%s' "$out3" | grep -q 'retried without the netns watch' \
     || pass "no retry is mentioned for an unrelated refusal"
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6other >/dev/null 2>&1
 
-# --- 5. THE REAL THING, where a policy and not a stub does the refusing -----------------------------
+# --- 5. EDGE CASES ---------------------------------------------------------------------------------
+# Everything above is the fix working or refusing cleanly. These are the shapes around it, and two
+# of them were defects when this section was written.
+echo
+echo "  edge: the refusal is not the first line pasta prints"
+# Measured on WSL2: pasta prints five lines and the FIRST is informational. If the match ran against
+# one line rather than the whole stderr, a host in this shape would never retry, and the reason
+# reported would be "Started as root, will change to nobody.", which is true and useless.
+write_stub buried
+outb=$(PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6bur 2>&1)
+note_pod c6bur
+says_outbound "$outb" \
+    && pass "a refusal on the fourth line is still found, and still retried" \
+    || fail "the retry missed a refusal that was not on the first line: $(printf '%s' "$outb" | tail -1)"
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6bur >/dev/null 2>&1
+
+echo
+echo "  edge: a pasta that never returns"
+# `Command::output` waits forever. A pasta that hangs therefore hung `kern pod create`, and through
+# `compose up` a whole stack, with nothing printed and no way out but Ctrl-C. MEASURED against the
+# SHIPPED v0.9.2 too, so the retry did not introduce it; the retry doubles the chances of meeting
+# it. Bounded now, at the same ten seconds `create` already allowed the holder handshake.
+write_stub hang
+# THE CALL IS BOUNDED BY THE TEST TOO, and it has to be: a kern that hangs would otherwise hang
+# this script rather than fail it, and a gate that never returns reports nothing at all. `timeout`
+# is coreutils and present everywhere this runs; without it the case is skipped rather than made
+# into a trap for whoever runs the battery next.
+note_pod c6hang
+if ! command -v timeout >/dev/null 2>&1; then
+    skip "no timeout(1) here, and this case must not be allowed to hang the script"
+else
+    t0=$(date +%s)
+    outh=$(timeout 45 env PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6hang 2>&1)
+    hang_rc=$?
+    t1=$(date +%s)
+    took=$((t1 - t0))
+    [ "$hang_rc" -ne 124 ] && [ "$took" -lt 40 ] \
+        && pass "pod create returned in ${took}s instead of hanging" \
+        || fail "pod create did not return (${took}s, rc=$hang_rc): the pasta spawn is unbounded"
+    says_outbound "$outh" \
+        && fail "a pod whose pasta never returned claimed outbound" \
+        || pass "no outbound is claimed when pasta had to be killed"
+    # The whole process GROUP, not just the child: this stub is a shell script, and signalling the
+    # single pid left `sleep 600` running. Real pasta is a binary and would not have shown it.
+    sleep 1
+    survivors=0
+    for pp in /proc/[0-9]*; do
+        case "$(tr '\0' ' ' < "$pp/cmdline" 2>/dev/null)" in
+            *"sleep 600"*) survivors=$((survivors + 1)) ;;
+        esac
+    done
+    [ "$survivors" -eq 0 ] \
+        && pass "the wedged pasta left nothing behind, group and all" \
+        || fail "$survivors process(es) survived the killed pasta"
+fi
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6hang >/dev/null 2>&1
+
+echo
+echo "  edge: pasta floods stderr before refusing"
+write_stub flood
+outf=$(PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6flood 2>&1)
+note_pod c6flood
+longest=$(printf '%s' "$outf" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+[ "$longest" -lt 2000 ] \
+    && pass "the reported reason is capped (longest line ${longest} chars)" \
+    || fail "a chatty pasta flooded the output: longest line ${longest} chars"
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6flood >/dev/null 2>&1
+
+echo
+echo "  edge: the pid files name a live process that is NOT ours"
+# The pid in `pasta.pid` or `holder` can be recycled by anything on the host. teardown signals both,
+# and one of those signals is a SIGKILL, so being wrong here is not recoverable. A `sleep` stands in
+# for the innocent bystander.
+sleep 300 &
+victim=$!
+XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6pid --no-outbound >/dev/null 2>&1
+echo "$victim" > "$XDG/kern/pods/c6pid/pasta.pid"
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6pid >/dev/null 2>&1
+sleep 0.3
+kill -0 "$victim" 2>/dev/null \
+    && pass "a stranger named by pasta.pid is not killed" \
+    || fail "teardown killed an unrelated process through pasta.pid"
+
+XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6pid2 --no-outbound >/dev/null 2>&1
+# Remove the netns file so the inode fast path cannot answer and the argv fallback decides.
+rm -f "$XDG/kern/pods/c6pid2/netns"
+# THE TEST REAPS WHAT THE TEST BREAKS. Overwriting the holder file destroys the only record that
+# names this pod's real holder, so kern cannot reach it afterwards and it would run until logout.
+# That is a limitation worth stating rather than a defect to report: nothing links a pod dir to its
+# holder once the pid is gone from it. What matters here is that the battery not become the thing
+# that litters the machine, because `pod ls` and the acceptance matrix both count live kern
+# processes, and a leaking test turns their counts into noise.
+real_holder2=$(cat "$XDG/kern/pods/c6pid2/holder" 2>/dev/null)
+echo "$victim" > "$XDG/kern/pods/c6pid2/holder"
+XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6pid2 >/dev/null 2>&1
+sleep 0.3
+kill -0 "$victim" 2>/dev/null \
+    && pass "a stranger named by the holder file is not killed either" \
+    || fail "teardown killed an unrelated process through the holder file"
+kill "$victim" 2>/dev/null
+[ -n "${real_holder2:-}" ] && kill -9 "$real_holder2" 2>/dev/null
+
+echo
+echo "  edge: the pid files hold values that are not pids"
+# `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process it
+# may signal. A `0` or a `-1` in one of these files must never reach `kill`, so this asserts that
+# teardown still succeeds AND that this script's own shell is alive afterwards, which is the thing
+# `kill(0, ...)` would have taken out.
+degenerate_ok=yes
+for bad in 0 -1 99999999999999999999 "" "not-a-pid" "12 34"; do
+    XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6bad --no-outbound >/dev/null 2>&1
+    # Read the real pid BEFORE clobbering the file, for the same reason as the case above: the
+    # write is what makes the holder unreachable, so this script owns reaping it.
+    real_bad=$(cat "$XDG/kern/pods/c6bad/holder" 2>/dev/null)
+    printf '%s' "$bad" > "$XDG/kern/pods/c6bad/pasta.pid"
+    printf '%s' "$bad" > "$XDG/kern/pods/c6bad/holder"
+    XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6bad >/dev/null 2>&1 || degenerate_ok=no
+    kill -0 $$ 2>/dev/null || degenerate_ok=no
+    [ -d "$XDG/kern/pods/c6bad" ] && degenerate_ok=no
+    case "${real_bad:-}" in ''|*[!0-9]*) ;; *) kill -9 "$real_bad" 2>/dev/null ;; esac
+done
+[ "$degenerate_ok" = yes ] \
+    && pass "six degenerate pid-file values: torn down, nothing signalled, this shell alive" \
+    || fail "a degenerate pid-file value broke teardown or signalled something"
+
+# --- 6. THE REAL THING, where a policy and not a stub does the refusing -----------------------------
 # Everything above reproduces #6's SHAPE with a stub, which is what makes it runnable anywhere. This
 # block runs only where the actual policy is in force, uses the REAL pasta, and is the only case in
 # the file where nothing is simulated.
@@ -374,6 +532,19 @@ else
     fi
     XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6real >/dev/null 2>&1
 fi
+
+# --- 7. THE BATTERY ITSELF LEAVES NOTHING BEHIND ---------------------------------------------------
+# Counted, because it was not. An earlier version of the cases above leaked SEVEN pod holders per
+# run by clobbering the file that names them, and seven orphaned holders is exactly what turned up
+# as an unexplained failure in the acceptance matrix, which counts live kern processes. A test suite
+# that litters makes every other suite's counts unreadable, so this asserts on its own footprint.
+echo
+echo "  the battery's own footprint"
+sleep 1
+holders_end=$(holders_now)
+[ "$holders_end" -le "$HOLDERS_AT_START" ] \
+    && pass "no pod holder leaked (${HOLDERS_AT_START} before, ${holders_end} after)" \
+    || fail "leaked $((holders_end - HOLDERS_AT_START)) pod holder(s): ${HOLDERS_AT_START} before, ${holders_end} after"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -595,6 +595,64 @@ enum Outbound {
     NoDns,
 }
 
+/// How long pasta gets to return before it is treated as wedged.
+///
+/// pasta daemonises and normally returns in about 30 ms, so ten seconds is not a deadline it can
+/// miss by being slow. It matches the bound `create` already puts on the holder handshake, so both
+/// spawns in this file now fail the same way rather than one of them not failing at all.
+const PASTA_SPAWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `Command::output`, but it gives up.
+///
+/// `output()` waits forever, and a pasta that never exits therefore hung `kern pod create` with
+/// nothing printed and no way out but Ctrl-C. Through `compose up` that is a whole stack. MEASURED
+/// with a stub pasta that sleeps: the SHIPPED v0.9.2 hangs the same way, so this is not something
+/// the SELinux retry introduced. What the retry does is double the number of chances to meet it.
+///
+/// The wait happens on a thread so the pipes are still drained concurrently, which is what
+/// `output()` does and what keeps a chatty child from deadlocking against a full pipe buffer.
+///
+/// THE WHOLE PROCESS GROUP IS KILLED, not just the child. The caller puts pasta in its own group,
+/// so the negated pid can only reach pasta and whatever it started. Signalling the single pid left
+/// a grandchild running: measured with a stub that is a shell script, where killing the shell
+/// orphaned the process it was waiting on. Real pasta is a binary and would not have shown this,
+/// which is exactly why it is worth closing rather than assuming.
+///
+/// Killing by pid is safe here precisely because the timeout means `wait_with_output` has not
+/// returned, so the child has not been reaped and the number is still ours. The thread then reaps
+/// it, so a wedged pasta does not survive as an orphan holding the pod's namespace open.
+fn output_within(
+    cmd: &mut std::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(_) => {
+            // The caller sets `process_group(0)`, so the child leads its own group and `-pid`
+            // cannot reach this process. Without that call `-pid` would be kern's own group, so
+            // the two belong together and neither is optional.
+            let pid = pid as i32;
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "pasta did not return within {}s and was killed",
+                    limit.as_secs()
+                ),
+            ))
+        }
+    }
+}
+
 fn setup_outbound(name: &str, holder: i32) -> Outbound {
     let Some(pasta) = which_pasta() else {
         return Outbound::NotInstalled;
@@ -602,12 +660,17 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
     let dir = pod_dir(name);
     // stderr is CAPTURED, not discarded: when pasta refuses, its message is the whole diagnosis.
     let spawn = |watch_netns: bool| {
-        std::process::Command::new(&pasta)
-            .args(pasta_args(&dir, holder, watch_netns))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
+        output_within(
+            std::process::Command::new(&pasta)
+                .args(pasta_args(&dir, holder, watch_netns))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                // Its own process group, so a wedged pasta can be killed as a group without the
+                // signal reaching kern. Required by `output_within`, which negates the pid.
+                .process_group(0),
+            PASTA_SPAWN_LIMIT,
+        )
     };
     match spawn(true) {
         Ok(o) if o.status.success() => {}
@@ -946,6 +1009,41 @@ mod tests {
         ] {
             assert!(validate_name(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn output_within_returns_a_fast_command_and_gives_up_on_a_wedged_one() {
+        // The fast path must be untouched: the output still comes back, stderr included.
+        let mut ok = std::process::Command::new("/bin/sh");
+        ok.arg("-c")
+            .arg("echo out; echo err >&2")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let got = output_within(&mut ok, std::time::Duration::from_secs(10))
+            .expect("a command that exits immediately must return its output");
+        assert!(got.status.success());
+        assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&got.stderr).trim(), "err");
+
+        // The wedged path: `Command::output` would wait forever here, which is what hung
+        // `kern pod create`. Measured, not asserted from the clock alone: it must come back as a
+        // timeout AND it must come back quickly.
+        let start = std::time::Instant::now();
+        let mut wedged = std::process::Command::new("/bin/sh");
+        wedged
+            .arg("-c")
+            .arg("sleep 60")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let err = output_within(&mut wedged, std::time::Duration::from_millis(300))
+            .expect_err("a command that never returns must not be waited on forever");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "it gave up, but only after {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

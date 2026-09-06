@@ -112,14 +112,22 @@ does, so the shape reproduces without a policy. Where SELinux **is** Enforcing t
 a block that uses the real pasta and nothing simulated, and it tells the two apart by reading
 `--no-netns-quit` off the surviving process: an Enforcing host that does not refuse the open
 skips rather than passing, because a green there would mean "this host is fine", not "the fix
-works". Nineteen cases on Fedora 43, sixteen where there is no SELinux.
+works". 29 cases on Fedora 43, 26 where there is no SELinux.
 
-It goes red against the shipped v0.9.2, on this host and in the VM, and against three
-mutations: removing the retry, putting `--no-netns-quit` on the first attempt as well (which
-still works, and would quietly make the retry unreachable on every real policy host), and
-dropping the teardown signal. That last one is the leak the fix itself creates: a pasta started
-without the netns watch does not notice the namespace disappear, so nothing but the signal
-stops it.
+Beyond the fix itself it covers the shapes around it: a refusal that is not on the first line
+(measured on WSL2, where pasta's first line is informational), a pasta that never returns, one
+that floods stderr before refusing, pid files naming a live process that is not ours, and pid
+files holding `0`, `-1` and other values that must never reach `kill`. The last assertion is
+the script's own footprint, because an earlier version of these cases leaked seven pod holders
+per run and seven orphaned holders is what had already shown up as an unexplained failure in
+the acceptance matrix.
+
+It goes red against the shipped v0.9.2 at 11 cases, on this host and in the VM, and against
+three mutations: removing the retry, putting `--no-netns-quit` on the first attempt as well
+(which still works, and would quietly make the retry unreachable on every real policy host),
+and dropping the teardown signal. That last one is the leak the fix itself creates: a pasta
+started without the netns watch does not notice the namespace disappear, so nothing but the
+signal stops it.
 
 **openSUSE is the other way round and needs nothing.** Its `passt-apparmor` profile
 (`/etc/apparmor.d/abstractions/pasta`, upstream passt's own) GRANTS the access SELinux
