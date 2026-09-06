@@ -85,6 +85,23 @@ both EMPTY while this happens, because the policy `dontaudit`s the denial, so th
 diagnostic says SELinux is not involved when it is. Toggling enforcement is the check that
 works.
 
+It is not a Fedora quirk. `passt-selinux` is `noarch`, so it is the same policy on x86_64
+and aarch64, and **`passt` requires it**, so installing pasta installs the confinement with
+it. Queried from each distro's own repositories:
+
+| | `passt-selinux` | |
+|---|---|---|
+| Fedora 43 | yes | **reproduced here** |
+| AlmaLinux 9 and 10 | yes (`appstream`) | pulled in by `passt` |
+| Rocky Linux 9 | yes (`appstream`) | pulled in by `passt` |
+| CentOS Stream 9 | yes (`baseos`) | pulled in by `passt` |
+| Amazon Linux 2023 | yes (`amazonlinux`) | pulled in by `passt` |
+| openSUSE Tumbleweed | yes, **and `passt-apparmor`** | not tested |
+
+Only Fedora 43 was run; the rest is what their package metadata says, and whether each ships
+Enforcing by default was not checked here. openSUSE carries an AppArmor profile for pasta as
+well, so the same shape may exist there under a different LSM; kern has not measured it.
+
 kern recovers from this by itself now: pasta opens the netns's DIRECTORY only to watch it
 and quit when it disappears, so on that one refusal kern retries once with
 `--no-netns-quit`, which drops that open. Verified end to end under Enforcing: a box in the
