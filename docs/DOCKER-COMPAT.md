@@ -114,7 +114,9 @@ a block that uses the real pasta and nothing simulated, and it tells the two apa
 skips rather than passing, because a green there would mean "this host is fine", not "the fix
 works". 31 cases on Fedora 43, 29 where there is no SELinux, and it has been run on four hosts:
 Fedora 43 Enforcing, this workstation, an Ubuntu 24.04 VPS, and a **Raspberry Pi 5 on aarch64**,
-which is the reporter's architecture.
+which is the reporter's architecture. The Rust suite also runs on a second aarch64 board, a
+Jetson on kernel 5.15, where `doctor` prints the **permissive** SELinux verdict against a real
+host rather than a test fixture.
 
 **The message is not the same in every passt, and where it differs there is nothing to fix.**
 Measured by reading the installed binaries:
