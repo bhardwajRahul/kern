@@ -52,7 +52,32 @@ pub fn resolv_path(name: &str) -> PathBuf {
 /// PATH, would be a second definition of one property, and a second definition is how a stack came
 /// up with no network while `kern doctor` reported pasta present.
 pub fn has_outbound(name: &str) -> bool {
-    resolv_path(name).is_file()
+    if !resolv_path(name).is_file() {
+        return false;
+    }
+    // AND `pasta` MUST STILL BE ALIVE. The file alone was not enough, and the gap is measured rather
+    // than imagined: kill pasta while the holder lives and `resolv.conf` stays on disk, so this
+    // reported "outbound to the internet (pasta)" for a pod whose box could not reach `1.1.1.1`.
+    // That is the same defect this function exists to close, one state further in. Found by an
+    // external reviewer reading the diff, not by the tests.
+    //
+    // Verified by `comm` rather than by liveness alone: passt re-execs into an ISA variant
+    // (`pasta.avx2`, never the bare name) and a recorded pid can be reused once it dies. Same guard
+    // `teardown` applies below, for the same reason.
+    let Ok(raw) = std::fs::read_to_string(pod_dir(name).join("pasta.pid")) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    // `/proc/0` does not exist so this would fall out anyway, but a degenerate pid is rejected on
+    // purpose here as it is in `holder_pid` and `starter_alive`, rather than by accident.
+    if pid <= 0 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|c| is_pasta_comm(c.trim()))
+        .unwrap_or(false)
 }
 
 /// The inode of `/proc/<pid>/ns/<kind>` - a namespace's stable identity. Used to detect PID reuse:
