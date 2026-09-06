@@ -46,6 +46,15 @@ they work is in [ARCHITECTURE.md](ARCHITECTURE.md#peer-relays-when-a-stack-gives
 the two-process design, what a shared port costs, the privilege both halves shed, edge rebuilding, and
 the published-port round trip.
 
+### The progress gate cannot tell a diagnostic from progress
+
+`scripts/progress-is-tty-gated.py` makes kern's narration terminal-only and refuses a diagnostic
+written inside `progress!`. It classifies by module, so it passed three lines in the image-cache path
+that were narration by shape and diagnostics by meaning: two of them said a cached entry was damaged
+and being re-fetched, and gating them made that repair silent under an SDK. A suite caught it, not
+the gate. Settling it needs a rule that reads what a line says rather than where it lives, and the
+cheap approximation, refusing anything naming a repair or an anomaly, would fire on true progress.
+
 ### The egress fix cannot be validated on most hosts
 
 `--egress-allow` raises the box's loopback itself, so readiness means reachable rather than bound.
