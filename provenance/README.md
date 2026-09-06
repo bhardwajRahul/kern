@@ -1,11 +1,12 @@
 # Provenance
 
-Independent, third-party proof of *when* the kern release was created, anchored to the Bitcoin
-blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one record:
+Independent, third-party proof of *when* each kern release was created, anchored to the Bitcoin
+blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pair of files, from
+`v0.7.0` to the current tag:
 
-- `v0.7.0.provenance.txt`, naming the GPG-signed git **tag object** hash and the release **commit**
+- `<tag>.provenance.txt`, naming the GPG-signed git **tag object** hash and the release **commit**
   hash.
-- `v0.7.0.provenance.txt.ots`, an OpenTimestamps proof that the `.txt` above existed at a point in
+- `<tag>.provenance.txt.ots`, an OpenTimestamps proof that the `.txt` above existed at a point in
   time recorded in a Bitcoin block. Several independent calendar servers attest to the same fact.
 
 Together they let anyone prove the release existed at a given time, with no trust in this repo, in
@@ -37,8 +38,8 @@ python3 -m venv ~/.venv-ots && ~/.venv-ots/bin/pip install opentimestamps-client
 **Reading the proof, no node required.** This is the check most people want:
 
 ```sh
-ots info provenance/v0.7.0.provenance.txt.ots   # BitcoinBlockHeaderAttestation(<height>) + merkle root
-sha256sum provenance/v0.7.0.provenance.txt      # the hash the block attests to
+ots info provenance/v0.9.1.provenance.txt.ots   # BitcoinBlockHeaderAttestation(<height>) + merkle root
+sha256sum provenance/v0.9.1.provenance.txt      # the hash the block attests to
 ```
 
 Cross-check each reported block height and merkle root on any block explorer. A release is normally
@@ -49,7 +50,7 @@ landing in the same block is normal and is not a missing anchor. A freshly stamp
 **Full verification** needs a local Bitcoin node:
 
 ```sh
-ots verify provenance/v0.7.0.provenance.txt.ots
+ots verify provenance/v0.9.1.provenance.txt.ots
 ```
 
 Without one it stops with `Could not connect to Bitcoin node`. That is not a failed proof, it is a
@@ -59,8 +60,8 @@ to trust anybody's block explorer. If you do not run a node, use the `ots info` 
 ## Cross-check the tag
 
 ```sh
-git verify-tag v0.7.0          # GPG signature on the tag
-git rev-parse v0.7.0^{}        # must equal the commit hash in the .txt
+git verify-tag v0.9.1          # GPG signature on the tag
+git rev-parse v0.9.1^{}        # must equal the commit hash in the .txt
 ```
 
 The signing key ships next to this file, and [SECURITY.md](../SECURITY.md) carries the fingerprint
@@ -72,14 +73,14 @@ gpg --import provenance/getkerndev-signing-key.asc
 
 ## Producing the record
 
-For whoever cuts the release, after `git tag -s v0.7.0 && git push origin v0.7.0`:
+For whoever cuts the release, after `git tag -s vX.Y.Z && git push origin vX.Y.Z`:
 
 ```sh
-sh provenance/make-provenance.sh v0.7.0        # writes the .txt and stamps it (PendingAttestation)
-git add provenance/v0.7.0.provenance.txt provenance/v0.7.0.provenance.txt.ots
-git commit -m 'chore(provenance): anchor v0.7.0' && git push origin main
+sh provenance/make-provenance.sh vX.Y.Z        # writes the .txt and stamps it (PendingAttestation)
+git add provenance/vX.Y.Z.provenance.txt provenance/vX.Y.Z.provenance.txt.ots
+git commit -m 'chore(provenance): anchor vX.Y.Z' && git push origin main
 # hours later, once a Bitcoin block carries it:
-sh provenance/upgrade-when-ready.sh v0.7.0     # safe to re-run; commits only if the anchor arrived
+sh provenance/upgrade-when-ready.sh vX.Y.Z     # safe to re-run; commits only if the anchor arrived
 ```
 
 `make-provenance.sh` refuses a tag that does not exist or is not GPG-signed, so the record cannot

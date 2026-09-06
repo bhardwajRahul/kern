@@ -50,7 +50,7 @@ discovered.
 |---|---|---|
 | Isolation | micro-VM: a separate kernel | namespaces + seccomp: the same kernel |
 | File tools cross the boundary | yes | no, see above |
-| Needs | QEMU, Node >= 23.6 | the `kern` binary |
+| Needs | QEMU, Node >= 23.6 | the `kern` binary, Node >= 22 |
 | Per-command cost | a VM boot, amortised | a fresh box per command |
 | Runs on macOS | yes | only inside a Linux VM |
 
