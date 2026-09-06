@@ -136,9 +136,11 @@ kern --version                                   # the binary; `0.0.0` means you
 python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
 ```
 
-One case is worth calling out because it is measured rather than theoretical: `--egress-allow` on a
-kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs **v0.9.1**,
-or the box starts with a proxy nothing can reach.
+Two cases are worth calling out because they are measured rather than theoretical. `--egress-allow`
+on a kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs
+**v0.9.1**, or the box starts with a proxy nothing can reach. And a `compose` stack with a **single
+service** needs **v0.9.2**: before it, only a stack of two or more got a pod, and the pod is what
+attaches `pasta`, so a lone service came up with no egress and an error that reads like DNS.
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the

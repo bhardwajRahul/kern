@@ -64,7 +64,7 @@ started here. The fourth and the third look identical from inside a box until yo
 an IP literal rather than a name. `curl http://1.1.1.1` failing in **0 ms** is no route
 at all; `curl` by name failing while the IP answers is the DNS half alone.
 
-**A one-service stack gets a pod too.** Until v0.9.1 it did not: the pod was created
+**A one-service stack gets a pod too.** Before v0.9.2 it did not: the pod was created
 only from two services up, on the reasoning that a pod's other job is letting services
 find each other. The pod is also the only thing that attaches `pasta`, so a lone
 service came up with no egress and no `/etc/resolv.conf`, and the failure read as DNS.

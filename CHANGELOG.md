@@ -5,10 +5,49 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.9.2 - 2026-09-06
+
+**Cut for a defect the first person to try compose would hit.** A `docker-compose.yml` with ONE
+service came up with no network at all, for the whole 0.9 line. The auto-pod was gated on two
+services or more, on the reasoning that a pod's other job is letting services find each other and one
+service has nobody to find; but the pod is also the only thing that attaches `pasta`, so a lone
+service got no pod, no NAT and no `/etc/resolv.conf`.
+
+It does not present as a missing network, which is why it survived: the image ships its own
+`resolv.conf` and it looks healthy, so the failure surfaces as `Could not resolve host` and every
+diagnosis goes after DNS. `curl http://1.1.1.1` from inside the box failed in **0 ms**. There was no
+route. Reported from a Mac running Lima with a Fedora guest, but the platform was never the variable:
+reproduced on x86_64 Linux with pasta installed, changing only the service count.
+
+**Every compose test in this repo ran three services, which is how it shipped.** The single
+`services:` in the Rust suite points at an unreachable registry and never starts a box, so the
+one-service path had no coverage anywhere. `scripts/acceptance-matrix.sh` now has a case for it, with
+its two new assertions exercised in `--self-check` including a negative control on the pre-fix
+summary line. The case goes RED on the v0.9.1 binary and green here, confirmed by an external
+reviewer on their own host rather than only here.
 
 ### Fixed
 
+- **A one-service compose stack had no egress.** The auto-pod condition tested a service COUNT while
+  the property it stood in for was "does this stack need a managed network". It now creates a pod
+  whenever any service is not on the host net, which is what the comment above it always said it did.
+- **`kern pod ls` and `pod ls --json` reported double the members.** They counted lines in the pod's
+  shared `hosts` file, and a compose member writes two of them (the qualified `<pod>-<service>` and
+  the bare alias) while a `kern box --pod` member writes one. Measured on the shipped v0.9.1: 1, 2 and
+  3 services read 2, 4 and 6, while `kern ps` read 1, 2 and 3. Both now read the registry `kern ps`
+  reads, scanned once rather than per pod. The two views had been unified so they could not disagree;
+  they could not, and both were wrong, while a third reader had the right answer.
+- **`compose up` never said whether the stack had egress**, only that services could reach each other,
+  so a stack with internet and one without printed the same sentence. On a reused pod that line is the
+  only one printed. It now names the state, and `docs/DOCKER-COMPAT.md` lists all five instead of two.
+- **`restart:` in a pod does not survive a reboot, and now says so.** A pod member is supervised
+  in-process because a systemd unit that outlives the pod holder cannot re-join its namespace. The gap
+  predates this release and reached only multi-service stacks; the auto-pod now reaches one-service
+  stacks, so `up` prints a note instead of trading reboot-survival in silence.
+- **`has_outbound` answered from `resolv.conf` alone.** Kill `pasta` while the holder lives and the
+  file stays on disk, so the predicate reported egress for a pod with no route. It now also requires a
+  live pasta, verified by `comm` because passt re-execs into an ISA variant and a pid can be reused.
+  Found by an external reviewer reading the diff, not by a test here.
 - **`kern killall --help`, `kern down --help` and `kern logout --help` printed the whole 184-line
   reference.** The per-verb match read only the first token of each line, and those three are
   documented as the second half of a pair. The test that missed them named fifteen verbs by hand; it
