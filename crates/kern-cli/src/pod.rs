@@ -348,18 +348,85 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 /// invariants above are unit-testable without spawning anything. `--config-net` copies the host's
 /// addresses/routes into the ns tap and NATs outbound; pasta then daemonizes (the spawned process
 /// exits once setup is done). `-q` quiets it, `-P` records its PID for teardown.
-fn pasta_args(dir: &std::path::Path, holder: i32) -> Vec<std::ffi::OsString> {
-    let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(15);
+///
+/// `watch_netns == false` adds `--no-netns-quit`, which is the SECOND attempt and never the first.
+/// STRACED, not assumed: with the watch on, pasta opens the netns file, the userns file, AND the
+/// DIRECTORY that holds them, in that order, immediately before it touches `/dev/net/tun`:
+///
+///   openat("/proc/<holder>/ns/user", O_RDONLY) = 6
+///   openat("/proc/<holder>/ns/net",  O_RDONLY) = 6
+///   openat("/proc/<holder>/ns",      O_RDONLY) = 16   <- only for the quit watch
+///   openat("/dev/net/tun",           O_RDWR)   = 18
+///
+/// With `--no-netns-quit` the third line is gone and the fourth takes its place at the same point in
+/// the sequence, so the flag removes that open and nothing else. That open is what a Fedora 43 host
+/// under Lima refused with `netns dir open: Permission denied, exiting`, leaving the pod
+/// loopback-only (#6).
+///
+/// WHAT THE FLAG COSTS. pasta no longer exits by itself when the netns disappears, so `teardown`
+/// becomes the only thing that reaps it. That is why the pasta kill there is no longer conditional
+/// on the holder still being alive: with the watch off, a holder that dies outside teardown would
+/// otherwise leave pasta running forever.
+fn pasta_args(dir: &std::path::Path, holder: i32, watch_netns: bool) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(16);
     a.push("--config-net".into());
     a.push("-q".into());
     a.push("-P".into());
     a.push(dir.join("pasta.pid").into());
     a.extend(PASTA_NO_PORT_MAP.iter().map(Into::into));
+    if !watch_netns {
+        a.push("--no-netns-quit".into());
+    }
     a.push("--userns".into());
     a.push(format!("/proc/{holder}/ns/user").into());
     a.push("--netns".into());
     a.push(format!("/proc/{holder}/ns/net").into());
     a
+}
+
+/// Does this pasta stderr name the netns-directory open, the one thing `--no-netns-quit` removes?
+///
+/// NARROW ON PURPOSE. Retrying on any failure would hide the real ones behind a second attempt that
+/// changes an unrelated variable; this matches pasta's own string for the single operation the flag
+/// elides, so a pod that fails for any other reason still fails once, loudly, with its own message.
+fn is_netns_dir_denial(stderr: &str) -> bool {
+    stderr.contains("netns dir open")
+}
+
+/// pasta's stderr as ONE reportable sentence.
+///
+/// Scrubbed like every other borrowed string kern prints: pasta is a local binary and not the threat
+/// model that `crate::ui::scrub` was written for, but the filter is free and the alternative is one
+/// unscrubbed path that the next reader has to reason about.
+///
+/// EVERY line, not the first. pasta's message is the whole diagnosis and taking one line of it is
+/// wrong whenever the first line is not the error. Measured on WSL2, where pasta prints five lines
+/// and the first is informational:
+///
+///   Started as root, will change to nobody.        <- what kern used to report
+///   No interfaces with usable IPv6 routes
+///   Couldn't pick external interface: disabling IPv6
+///   Could not open /proc/self/uid_map: Permission denied   <- the actual cause
+///   Couldn't configure user mappings
+///
+/// A reader given only the first line is told something true and useless, and would go looking at
+/// privilege dropping instead of uid maps. Joined with "; " and capped, so a pasta that decides to
+/// be verbose cannot flood the line either.
+fn pasta_reason(stderr: &[u8]) -> String {
+    let joined = String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    crate::ui::scrub(if joined.is_empty() {
+        "no output"
+    } else {
+        &joined
+    })
+    .chars()
+    .take(300)
+    .collect::<String>()
 }
 
 /// Why a pod did or did not get outbound. One `bool` used to cover all of these, and `create`
@@ -386,48 +453,42 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
     };
     let dir = pod_dir(name);
     // stderr is CAPTURED, not discarded: when pasta refuses, its message is the whole diagnosis.
-    let out = std::process::Command::new(pasta)
-        .args(pasta_args(&dir, holder))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    match out {
+    let spawn = |watch_netns: bool| {
+        std::process::Command::new(&pasta)
+            .args(pasta_args(&dir, holder, watch_netns))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    };
+    match spawn(true) {
         Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            // Scrubbed like every other borrowed string kern prints: pasta is a local binary and
-            // not the threat model that `crate::ui::scrub` was written for, but the filter is free
-            // and the alternative is one unscrubbed path that the next reader has to reason about.
-            // EVERY line, not the first. The comment above says pasta's message is the whole
-            // diagnosis and the code then took one line of it, which is wrong whenever the first
-            // line is not the error. Measured on WSL2, where pasta prints five lines and the first
-            // is informational:
+        Ok(o) if is_netns_dir_denial(&String::from_utf8_lossy(&o.stderr)) => {
+            // ONE narrower retry, and only for this refusal. pasta opens the netns's DIRECTORY
+            // solely to watch it and quit when it disappears; `--no-netns-quit` drops that open and
+            // nothing else (straced, see `pasta_args`). A host whose policy refuses that open still
+            // permits the netns and userns FILES, so the NAT itself is reachable without the watch.
             //
-            //   Started as root, will change to nobody.        <- what kern used to report
-            //   No interfaces with usable IPv6 routes
-            //   Couldn't pick external interface: disabling IPv6
-            //   Could not open /proc/self/uid_map: Permission denied   <- the actual cause
-            //   Couldn't configure user mappings
-            //
-            // A reader given only the first line is told something true and useless, and would go
-            // looking at privilege dropping instead of uid maps. Joined with "; " and capped, so a
-            // pasta that decides to be verbose cannot flood the line either.
-            let joined = String::from_utf8_lossy(&o.stderr)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join("; ");
-            let why = crate::ui::scrub(if joined.is_empty() {
-                "no output"
-            } else {
-                &joined
-            })
-            .chars()
-            .take(300)
-            .collect::<String>();
-            return Outbound::Failed(why);
+            // Attempted rather than assumed to be the whole story: if the second attempt also fails,
+            // BOTH reasons are reported. Reporting only the second would hide the first, and the
+            // first is the one that names the operation a policy refused.
+            let first = pasta_reason(&o.stderr);
+            match spawn(false) {
+                Ok(o2) if o2.status.success() => {}
+                Ok(o2) => {
+                    return Outbound::Failed(format!(
+                        "{first}; retried without the netns watch and it also failed: {}",
+                        pasta_reason(&o2.stderr)
+                    ));
+                }
+                Err(e) => {
+                    return Outbound::Failed(format!(
+                        "{first}; the retry without the netns watch could not be spawned: {e}"
+                    ));
+                }
+            }
         }
+        Ok(o) => return Outbound::Failed(pasta_reason(&o.stderr)),
         Err(e) => return Outbound::Failed(e.to_string()),
     }
     // Seed the pod resolv.conf with the host's real (non-loopback) nameservers - reachable through
@@ -605,10 +666,20 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // Kill pasta FIRST, while the holder still owns the net ns - so its recorded PID is unambiguously
     // pasta (killing the holder frees the ns → pasta auto-exits → PID-reuse window). Verify via comm
     // (pasta runs in the HOST net ns, so the holder's ns-inode guard can't cover it).
+    //
+    // UNCONDITIONAL, and it was not. This used to run only `if holder.is_some()`, on the assumption
+    // that a dead holder means pasta already noticed the netns vanish and left. That assumption is
+    // no longer safe: a pod whose pasta was started with `--no-netns-quit` (the retry in
+    // `setup_outbound`, for hosts that refuse the netns-dir open) does NOT watch the namespace and
+    // does not exit on its own, so gating on a live holder would leak it for the life of the
+    // session. The `comm` check below is what makes killing safe when the holder is already gone: it
+    // is the guard against the recycled PID that the old gate was standing in for.
     let holder = holder_pid(name);
-    if holder.is_some() {
-        if let Ok(pp) = std::fs::read_to_string(dir.join("pasta.pid")) {
-            if let Ok(pp) = pp.trim().parse::<i32>() {
+    if let Ok(pp) = std::fs::read_to_string(dir.join("pasta.pid")) {
+        if let Ok(pp) = pp.trim().parse::<i32>() {
+            // `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals
+            // every process it may signal; a degenerate value in that file must never reach `kill`.
+            if pp > 0 {
                 let is_pasta = std::fs::read_to_string(format!("/proc/{pp}/comm"))
                     .map(|c| is_pasta_comm(c.trim()))
                     .unwrap_or(false);
@@ -719,43 +790,94 @@ mod tests {
         // own forwarder binds the host side of every `-p`, pasta would steal the published port from
         // the service ~1-2 s after start (measured: bind at >=2 s always got EADDRINUSE) while
         // `compose up` still reported success. All four MUST stay explicitly `none`.
-        let argv = pasta_args(std::path::Path::new("/run/user/1000/kern/pods/demo"), 4242);
-        let flat: Vec<String> = argv
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        for dir_flag in ["-t", "-u", "-T", "-U"] {
-            let at = flat.iter().position(|a| a == dir_flag);
-            let Some(at) = at else {
-                panic!("pasta argv must pin {dir_flag} explicitly, got {flat:?}");
-            };
+        // BOTH modes, because the retry path in `setup_outbound` builds this argv too and a guard
+        // that covers only the first attempt stops covering the run that a Fedora host actually gets.
+        for watch_netns in [true, false] {
+            let argv = pasta_args(
+                std::path::Path::new("/run/user/1000/kern/pods/demo"),
+                4242,
+                watch_netns,
+            );
+            let flat: Vec<String> = argv
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            for dir_flag in ["-t", "-u", "-T", "-U"] {
+                let at = flat.iter().position(|a| a == dir_flag);
+                let Some(at) = at else {
+                    panic!("pasta argv must pin {dir_flag} explicitly, got {flat:?}");
+                };
+                assert_eq!(
+                    flat.get(at + 1).map(String::as_str),
+                    Some("none"),
+                    "{dir_flag} must be 'none' (pasta's default is 'auto', which steals published \
+                     ports); watch_netns={watch_netns}"
+                );
+            }
+            // The rest of the contract the teardown and egress depend on.
+            assert!(flat.contains(&"--config-net".to_string()), "NAT'd egress");
+            let pidfile = flat
+                .iter()
+                .position(|a| a == "-P")
+                .and_then(|i| flat.get(i + 1));
             assert_eq!(
-                flat.get(at + 1).map(String::as_str),
-                Some("none"),
-                "{dir_flag} must be 'none' (pasta's default is 'auto', which steals published ports)"
+                pidfile.map(String::as_str),
+                Some("/run/user/1000/kern/pods/demo/pasta.pid"),
+                "teardown reads this exact path to kill pasta"
+            );
+            let ns = flat
+                .iter()
+                .position(|a| a == "--netns")
+                .and_then(|i| flat.get(i + 1));
+            assert_eq!(ns.map(String::as_str), Some("/proc/4242/ns/net"));
+            let us = flat
+                .iter()
+                .position(|a| a == "--userns")
+                .and_then(|i| flat.get(i + 1));
+            assert_eq!(us.map(String::as_str), Some("/proc/4242/ns/user"));
+        }
+    }
+
+    /// `--no-netns-quit` appears on the RETRY and never on the first attempt, and the retry is
+    /// entered only for the one refusal it removes.
+    ///
+    /// The flag has a cost (pasta stops reaping itself when the namespace goes), so a build that
+    /// passed it unconditionally would leak a pasta on every host, not only the ones that need it.
+    /// The two directions are asserted separately because "present when needed" and "absent
+    /// otherwise" are two claims, and the defect that motivated all of this was one condition
+    /// standing in for two.
+    #[test]
+    fn no_netns_quit_is_the_retry_only_and_matches_only_its_own_refusal() {
+        let dir = std::path::Path::new("/run/user/1000/kern/pods/demo");
+        let has = |watch: bool| {
+            pasta_args(dir, 4242, watch)
+                .iter()
+                .any(|a| a == "--no-netns-quit")
+        };
+        assert!(
+            !has(true),
+            "the first attempt must keep pasta's netns watch"
+        );
+        assert!(has(false), "the retry must drop it, or the refusal recurs");
+
+        // pasta's own string for the open that the flag elides, as reported in #6.
+        assert!(is_netns_dir_denial(
+            "netns dir open: Permission denied, exiting"
+        ));
+        // Every other failure must fail once, with its own message, and never be retried behind a
+        // second attempt that changed an unrelated variable. These are real pasta stderr lines.
+        for other in [
+            "Couldn't open user namespace /proc/1/ns/user: Permission denied",
+            "Could not open /proc/self/uid_map: Permission denied",
+            "TUNSETIFF failed: Device or resource busy",
+            "No routable interface for IPv6: IPv6 is disabled",
+            "",
+        ] {
+            assert!(
+                !is_netns_dir_denial(other),
+                "{other:?} must not trigger the netns-watch retry"
             );
         }
-        // The rest of the contract the teardown and egress depend on.
-        assert!(flat.contains(&"--config-net".to_string()), "NAT'd egress");
-        let pidfile = flat
-            .iter()
-            .position(|a| a == "-P")
-            .and_then(|i| flat.get(i + 1));
-        assert_eq!(
-            pidfile.map(String::as_str),
-            Some("/run/user/1000/kern/pods/demo/pasta.pid"),
-            "teardown reads this exact path to kill pasta"
-        );
-        let ns = flat
-            .iter()
-            .position(|a| a == "--netns")
-            .and_then(|i| flat.get(i + 1));
-        assert_eq!(ns.map(String::as_str), Some("/proc/4242/ns/net"));
-        let us = flat
-            .iter()
-            .position(|a| a == "--userns")
-            .and_then(|i| flat.get(i + 1));
-        assert_eq!(us.map(String::as_str), Some("/proc/4242/ns/user"));
     }
 
     #[test]

@@ -310,6 +310,17 @@ mkdir -p "$D/stub"
 printf '#!/bin/sh\necho "netns dir open: Permission denied, exiting" >&2\nexit 1\n' > "$D/stub/pasta"
 chmod +x "$D/stub/pasta"
 out6=$(PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/one.toml" up -d 2>&1)
+# THE RETRY HAPPENED AND SAID SO. A pasta refused on the netns-directory open is retried once with
+# `--no-netns-quit`, which straces show is the only open that flag removes. This stub refuses BOTH
+# times, which is the case that must still report honestly: both reasons, not the second one alone,
+# because the first names the operation a policy refused and the second would hide it.
+if printf '%s' "$out6" | grep -q 'netns dir open'; then
+    printf '%s' "$out6" | grep -q 'retried without the netns watch' \
+        && pass "a netns-dir refusal is retried without the watch, and both reasons are reported" \
+        || fail "the netns-dir refusal was not retried, or the retry swallowed the first reason"
+else
+    echo "    SKIP: the stub's refusal did not reach the reported reason"
+fi
 if [ "$(running)" -ne 1 ]; then
     echo "    SKIP: the stack did not come up under a refusing pasta: $(printf '%s' "$out6" | head -1)"
 else
