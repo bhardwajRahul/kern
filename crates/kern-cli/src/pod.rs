@@ -41,26 +41,25 @@ pub fn resolv_path(name: &str) -> PathBuf {
     pod_dir(name).join("resolv.conf")
 }
 
+/// A pid out of one of a pod dir's small state files (`holder`, `pasta.pid`).
+///
+/// `None` unless the file holds a POSITIVE integer, and that guard belongs here rather than at each
+/// call site because every caller eventually reaches `kill`: `kill(0, ...)` signals the caller's own
+/// process group and `kill(-1, ...)` signals every process it may signal, so a degenerate value in
+/// one of these files must never leave this function. It used to be re-checked at four call sites
+/// and explained in four comments, which is four chances to add a fifth reader and forget.
+fn read_pid_file(path: &std::path::Path) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
 /// Is this pod's `pasta` still the live process we recorded?
 ///
 /// Verified by `comm` rather than by liveness alone: passt re-execs into an ISA variant
 /// (`pasta.avx2`, never the bare name) and a recorded pid can be reused once it dies. Same guard
 /// `teardown` applies below, for the same reason.
 fn pasta_alive(name: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(pod_dir(name).join("pasta.pid")) else {
-        return false;
-    };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
-        return false;
-    };
-    // `/proc/0` does not exist so this would fall out anyway, but a degenerate pid is rejected on
-    // purpose here as it is in `holder_pid` and `starter_alive`, rather than by accident.
-    if pid <= 0 {
-        return false;
-    }
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|c| is_pasta_comm(c.trim()))
-        .unwrap_or(false)
+    read_pid_file(&pod_dir(name).join("pasta.pid")).is_some_and(pid_is_pasta)
 }
 
 /// The network sentence for an EXISTING pod, for a caller reporting on one it did not just create
@@ -138,17 +137,7 @@ fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
 /// holder died - otherwise a box could `setns` into a stranger's namespace). Else `None`.
 pub fn holder_pid(name: &str) -> Option<i32> {
     let dir = pod_dir(name);
-    let pid: i32 = std::fs::read_to_string(dir.join("holder"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    // Same reason as `marker_alive` above: `kill(0, 0)` and `kill(-1, 0)` succeed, so a degenerate
-    // value in the holder file would pass the liveness probe. The netns identity check below happens
-    // to reject it too, but that is an accident of `/proc/0` not existing, not a guard.
-    if pid <= 0 {
-        return None;
-    }
+    let pid = read_pid_file(&dir.join("holder"))?;
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None; // holder gone
     }
@@ -233,11 +222,7 @@ fn claimed_by_another_pod(pid: i32, except: &str) -> bool {
     rd.flatten().any(|e| {
         let n = e.file_name();
         let other = n.to_string_lossy();
-        other != except
-            && std::fs::read_to_string(e.path().join("holder"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok())
-                == Some(pid)
+        other != except && read_pid_file(&e.path().join("holder")) == Some(pid)
     })
 }
 
@@ -265,14 +250,8 @@ fn holder_to_reap(name: &str) -> Option<i32> {
     if let Some(pid) = holder_pid(name) {
         return Some(pid); // identity confirmed by the recorded netns inode
     }
-    let pid: i32 = std::fs::read_to_string(pod_dir(name).join("holder"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    // `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process
-    // it may signal, so a degenerate value must never reach `kill` even to probe liveness.
-    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+    let pid = read_pid_file(&pod_dir(name).join("holder"))?;
+    if unsafe { libc::kill(pid, 0) } != 0 {
         return None;
     }
     // A live pid whose inode check could not be made. Kill it only if it is provably one of ours and
@@ -825,8 +804,10 @@ fn pid_is_pasta(pid: i32) -> bool {
 
 /// Stop the pod's pasta.
 ///
+/// The `pid > 0` check is belt and braces: [`read_pid_file`] is what actually guarantees it, and
+/// this repeats it because the argument is an `i32` and the next caller may not come from a file.
 /// `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process
-/// it may signal, so a degenerate pid from the file must never reach `kill`, not even to probe.
+/// it may signal, so a degenerate value must never reach `kill`, not even to probe.
 ///
 /// SIGTERM ONLY, and there is an argument for escalating that is deliberately not taken here. A
 /// pasta started with `--no-netns-quit` (the SELinux retry in `setup_outbound`) does not watch the
@@ -888,10 +869,8 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // its `None` also covers "could not tell", which is exactly the case that used to leak a live
     // holder one line before the directory naming it was deleted.
     let holder = holder_to_reap(name);
-    if let Ok(pp) = std::fs::read_to_string(dir.join("pasta.pid")) {
-        if let Ok(pp) = pp.trim().parse::<i32>() {
-            stop_pasta(pp);
-        }
+    if let Some(pp) = read_pid_file(&dir.join("pasta.pid")) {
+        stop_pasta(pp);
     }
     if let Some(pid) = holder {
         unsafe { libc::kill(pid, libc::SIGKILL) };

@@ -119,7 +119,10 @@ cp "$BB" "$RF/bin/busybox"
 for l in $(ldd "$BB" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
     [ -e "$l" ] && { mkdir -p "$RF$(dirname "$l")"; cp "$l" "$RF$l" 2>/dev/null; }
 done
-for a in sh wget nc cat; do ln -sf busybox "$RF/bin/$a"; done
+# Only the applets this script actually runs. `nc` and `cat` were here and unused, and an applet
+# that is present but never invoked is indistinguishable from one that is missing until the day
+# something calls it: this project has twice diagnosed `sh: nc: not found` as an unreachable peer.
+for a in sh wget; do ln -sf busybox "$RF/bin/$a"; done
 
 # The egress target is resolved HERE, on the host, and used by ADDRESS inside the box. Two reasons:
 # the NAT and the DNS are separate halves of `setup_outbound` and a failure of either would
@@ -128,8 +131,10 @@ for a in sh wget nc cat; do ln -sf busybox "$RF/bin/$a"; done
 TARGET_HOST=example.com
 TARGET_IP=$(getent ahostsv4 "$TARGET_HOST" 2>/dev/null | awk 'NR==1{print $1}')
 
-pods_used=""
-note_pod() { pods_used="$pods_used $1"; echo "$pods_used" > "$D/pods"; }
+# Every pod this script creates is recorded so the EXIT trap can tear it down even if the script is
+# interrupted between creating one and removing it. Appended to the file directly: keeping the same
+# list in a shell variable as well meant two copies of one fact, and the trap can only read the file.
+note_pod() { echo "$1" >> "$D/pods"; }
 
 # Fetch through the pod, from inside a box, by IP with an explicit Host header.
 #
@@ -301,6 +306,12 @@ reports_both_reasons "$out2" \
 says_outbound "$out2" \
     && fail "a pod with no NAT claimed outbound to the internet" \
     || pass "no outbound is claimed when both attempts refused"
+# POSITIVELY, not merely by the absence of the other sentence. "does not say outbound" is also
+# satisfied by empty output and by a crash, so on its own it cannot tell a pod that correctly
+# reports having no egress from one that reported nothing at all.
+says_loopback_only "$out2" \
+    && pass "and it says loopback-only, so the pod reported its state rather than going quiet" \
+    || fail "the pod neither claimed outbound nor said loopback-only: $(printf '%s' "$out2" | tail -1)"
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6both >/dev/null 2>&1
 
 # --- 4. AN UNRELATED REFUSAL MUST NOT BE RETRIED --------------------------------------------------
