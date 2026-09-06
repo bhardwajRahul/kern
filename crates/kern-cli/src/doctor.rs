@@ -202,6 +202,11 @@ pub fn doctor() -> Result<(), Error> {
         // Core: can we create an unprivileged user namespace at all?
         check_userns(),
         check_apparmor_userns(),
+        // The other mandatory-access-control system, and the one this doctor had no line for. It was
+        // written and never wired in, which `-D warnings` caught as dead code on main. AppArmor is
+        // named in 157 places here and SELinux was named in four, while the report that prompted it
+        // came from Fedora, where AppArmor is not the LSM in force.
+        check_selinux(),
         check_max_userns(),
         // Resource enforcement (cgroup v2 + delegation).
         check_cgroup(),
