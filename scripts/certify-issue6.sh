@@ -539,6 +539,13 @@ else
     says_outbound "$outh" \
         && fail "a pod whose pasta never returned claimed outbound" \
         || pass "no outbound is claimed when pasta had to be killed"
+    # A TIMED-OUT ATTEMPT IS NEVER RETRIED, which is what bounds the leak `output_within`
+    # documents to one thread per invocation. A timeout returns Err, and the retry fires only on
+    # an Ok carrying the netns-dir refusal, so the second spawn cannot happen. Asserted rather
+    # than deduced, because the doc comment states it as a ceiling.
+    [ "$(calls)" = "1" ] \
+        && pass "a wedged pasta is attempted once, so a timeout cannot leak two waiters" \
+        || fail "a timed-out attempt was retried: $(calls) invocations"
 
     # THE CHILD IS KILLED; ITS DESCENDANTS ARE NOT, and that is deliberate: see `output_within`.
     # What is asserted is what kern promises and can fail to keep, that the process it spawned is

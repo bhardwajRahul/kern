@@ -665,10 +665,22 @@ const PASTA_SPAWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10
 /// does and what keeps a chatty child from deadlocking against a full pipe buffer.
 ///
 /// PRECONDITION: A TIMEOUT LEAKS A THREAD, a `Child` and two pipe fds, for the life of the
-/// process. The thread stays blocked in `wait_with_output` until the `SIGKILL` lands, and if the
-/// signal never lands it stays blocked forever. That is bounded here only because `pod create` is
-/// short-lived, which is a property of the CALL SITE and not of this function. Do not call it from
-/// anything long-running without fixing that first.
+/// PROCESS. The thread stays blocked in `wait_with_output` until the `SIGKILL` lands, and if the
+/// signal never lands it stays blocked forever.
+///
+/// "Bounded because `pod create` is short-lived" was the first version of this line and it was
+/// wrong, which an external reviewer caught by reading the callers rather than this function.
+/// `compose up` reaches here through `create_with_range` at `commands/compose.rs` and then keeps
+/// going: it starts every box and waits on the health gates. So the bound is THIS KERN
+/// INVOCATION, and the longest one is a compose bring-up, not a `pod create` that returns as soon
+/// as pasta is attached.
+///
+/// What does bound it, and is worth stating because it was not: AT MOST ONE PER INVOCATION. A
+/// timeout returns `Err`, and `setup_outbound`'s retry fires only on `Ok` carrying the netns-dir
+/// refusal, so a timed-out attempt is never followed by a second one. Each `pod create` creates
+/// one pod, so a single leaked thread is the ceiling however long the process then runs.
+///
+/// Do not call this from a daemon without fixing that first.
 fn output_within(
     cmd: &mut std::process::Command,
     limit: std::time::Duration,
