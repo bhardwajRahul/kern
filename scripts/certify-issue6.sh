@@ -217,6 +217,19 @@ EOS
 }
 calls() { wc -l < "$D/calls" 2>/dev/null | tr -d ' '; }
 
+# Live processes running THIS session's stub pasta, found by the stub's path in their argv. No
+# `|| continue` on the read: `tr` exits 0 for a cmdline that vanished mid-loop, so an empty result
+# simply matches nothing.
+count_spawned() {
+    _n=0
+    for _sp in /proc/[0-9]*; do
+        case "$( { tr '\0' ' ' < "$_sp/cmdline"; } 2>/dev/null )" in
+            *"$D/stub/pasta"*) _n=$((_n + 1)) ;;
+        esac
+    done
+    echo "$_n"
+}
+
 # Live pod holders on this machine, by ARGV POSITION: argv[1] is the marker. Never by `pgrep -f`,
 # which matches this script's own command line and has twice in this project been mistaken for a
 # real process.
@@ -503,41 +516,65 @@ note_pod c6hang
 if ! command -v timeout >/dev/null 2>&1; then
     skip "no timeout(1) here, and this case must not be allowed to hang the script"
 else
+    # Backgrounded so the wedged pasta can be COUNTED WHILE IT IS STILL WEDGED. See below: the
+    # after-count on its own cannot fail for the right reason.
     t0=$(date +%s)
-    outh=$(timeout 45 env PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6hang 2>&1)
-    hang_rc=$?
+    (
+        timeout 45 env PATH="$D/stub:$PATH" XDG_RUNTIME_DIR=$XDG "$KERN" pod create c6hang \
+            > "$D/hang.out" 2>&1
+        echo $? > "$D/hang.rc"
+    ) &
+    hang_job=$!
+    sleep 3
+    spawned_mid=$(count_spawned)
+    wait "$hang_job" 2>/dev/null
     t1=$(date +%s)
+    outh=$(cat "$D/hang.out" 2>/dev/null)
+    hang_rc=$(cat "$D/hang.rc" 2>/dev/null || echo 1)
     took=$((t1 - t0))
+
     [ "$hang_rc" -ne 124 ] && [ "$took" -lt 40 ] \
         && pass "pod create returned in ${took}s instead of hanging" \
         || fail "pod create did not return (${took}s, rc=$hang_rc): the pasta spawn is unbounded"
     says_outbound "$outh" \
         && fail "a pod whose pasta never returned claimed outbound" \
         || pass "no outbound is claimed when pasta had to be killed"
-    # THE CHILD IS KILLED; ITS DESCENDANTS ARE NOT, and that is deliberate. This case used to
-    # assert "nothing survived, group and all", which passed because kern also sent
-    # `kill(-pid, SIGKILL)`. That group signal was removed: a pidfd pins a process, not a process
-    # group, so the group's number can be reassigned while the pidfd still holds the child, and
-    # the signal would land on a stranger. Real pasta calls `setsid` and is out of the group
-    # before there is anything to sweep, so the only thing the group kill ever caught here was a
-    # grandchild of this stub, which is a shell script. The artefact was the justification.
+
+    # THE CHILD IS KILLED; ITS DESCENDANTS ARE NOT, and that is deliberate: see `output_within`.
+    # What is asserted is what kern promises and can fail to keep, that the process it spawned is
+    # gone, identified by the stub's path in its argv.
     #
-    # So what is asserted is what kern promises and can fail to keep: THE PROCESS IT SPAWNED is
-    # gone. That is the shell running the stub, found by its argv, which no other process on the
-    # host carries. The stub's own `sleep` is expected to outlive it and is reaped by this script,
-    # because kern no longer claims to.
+    # ARGV IS THE RIGHT KEY HERE AND THE WRONG ONE IN THE PRODUCT, which is not a contradiction.
+    # In the product it asks "is this stranger mine?" against a value the stranger controls. Here
+    # it asks "is the process I started, from a path I created under my own mktemp dir, still
+    # alive?" - and a process whose cmdline carries this session's temp path already knows
+    # something it could only have learned from this script.
+    #
+    # A TRANSITION, NOT A STATE, and the previous version measured only the state after. Zero
+    # survivors also happens when the stub never ran at all: a path typo, a missing chmod, a temp
+    # dir cleaned early. That version passed green having measured nothing, which is the exact
+    # shape of the broken fetch helper this battery caught two rounds ago. Counting while the
+    # pasta is still wedged makes a stub that never started fail at the first count instead of
+    # passing at the second.
     sleep 1
-    spawned_alive=0
+    spawned_after=$(count_spawned)
     stub_children=0
     for pp in /proc/[0-9]*; do
-        _cl=$( { tr '\0' ' ' < "$pp/cmdline"; } 2>/dev/null ) || continue
+        # No `|| continue`: `tr` exits 0 on a cmdline that vanished mid-loop, so the guard never
+        # fired and read as if it were doing work. An empty read matches no case and is skipped,
+        # which is the right outcome and is now the stated one. A ZOMBIE also reads empty, so a
+        # killed-but-unreaped pasta counts as gone here; that is correct, because the thread in
+        # `output_within` reaps it, but it means this cannot tell reaped from pending.
+        _cl=$( { tr '\0' ' ' < "$pp/cmdline"; } 2>/dev/null )
         case "$_cl" in
-            *"$D/stub/pasta"*) spawned_alive=$((spawned_alive + 1)) ;;
             *"sleep 600"*) stub_children=$((stub_children + 1)); kill -9 "${pp#/proc/}" 2>/dev/null ;;
         esac
     done
-    [ "$spawned_alive" -eq 0 ] \
-        && pass "the wedged pasta kern spawned is gone ($stub_children stub descendant(s) left, which are not kern's to reap)" \
+    [ "$spawned_mid" -ge 1 ] \
+        && pass "the stub pasta really was running and wedged ($spawned_mid alive mid-flight)" \
+        || fail "no stub pasta was ever alive: this case measured nothing"
+    [ "$spawned_after" -eq 0 ] \
+        && pass "and kern killed it ($stub_children stub descendant(s) left, which are not kern's to reap)" \
         || fail "the pasta kern spawned is still alive after the timeout"
 fi
 XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6hang >/dev/null 2>&1

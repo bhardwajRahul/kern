@@ -694,24 +694,27 @@ fn output_within(
         Ok(result) => result,
         Err(_) => {
             // THE PROCESS, AND ONLY THE PROCESS. An earlier version also sent `kill(-pid,
-            // SIGKILL)` to sweep up anything the child had started, and that was wrong twice
-            // over.
+            // SIGKILL)` to sweep up anything the child had started.
             //
-            // It was unsafe: a pidfd pins a `struct pid`, so the NUMBER cannot be reused while
-            // this fd is open, but a process GROUP is a different object with its own lifetime.
-            // The child leads the group; once the group empties, its number is free and a new
-            // leader can claim it while the pidfd still pins the old process. The signal would
-            // then land on a stranger's group.
+            // THE MEASURED REASON IT IS GONE: pasta calls `setsid`, so it has left the child's
+            // process group before there is anything to sweep. Checked on a live pod against two
+            // passt generations, `0^20250919` on Fedora 43 and `0.0~git20230309` on Debian 12,
+            // both reporting `pgrp == session == pid` with `ppid` 1. The only thing the group
+            // kill ever caught was a grandchild of a test stub that is a shell script, which is a
+            // shape pasta does not have. The artefact was the justification.
             //
-            // And it was pointless here: pasta calls `setsid`, measured on a live pod, where the
-            // recorded daemon has `pgrp == session == its own pid`. It has left the child's group
-            // before there is anything to sweep. What the group kill actually caught was a
-            // grandchild of a stub that is a shell script, which is an artefact of the test and
-            // not a shape pasta has.
+            // THERE IS ALSO A SAFETY ARGUMENT, AND IT IS NOT SETTLED, so it is not the reason.
+            // It runs: a pidfd pins a `struct pid`, so the NUMBER cannot be reused, but a process
+            // GROUP is a different object, and once the group empties its number is free for a
+            // new leader while the pidfd still pins the old process. An external reviewer then
+            // pointed out that the second half may be false BECAUSE the first is true: if the
+            // pidfd holds the number out of the allocator, nothing can take it as a pid, and so
+            // nothing can become a leader with that pgid. Neither of us has read the allocator.
             //
-            // So a leaked descendant of a wedged child is accepted, and signalling a group that
-            // may have been reassigned is not: one leaked process is recoverable, SIGKILL to an
-            // unrelated group is not.
+            // The removal survives either answer, which is why it stands on the measurement
+            // instead. Note the consequence: with the group signal gone, the surviving kill goes
+            // through the pidfd and targets the fd rather than the number, so whether a pidfd
+            // pins the number is no longer load-bearing here either.
             unsafe {
                 if pidfd >= 0 {
                     // Exact, and immune to reuse: the fd names the process, not the number.
