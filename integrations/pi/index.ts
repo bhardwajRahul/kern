@@ -750,7 +750,31 @@ export default function (pi: ExtensionAPI) {
 			// path as "everything before the first colon" therefore mangled every context line, and a
 			// filename containing a dash made it worse. The path is what precedes the first
 			// separator that is followed by a line number.
-			const pathOf = (l: string): string => l.match(/^(.*?)[:-]\d+[:-]/)?.[1] ?? "";
+			// THE PATH IS LOOKED UP, NOT GUESSED. grep writes `path:line:text` and `path-line-text`
+			// and the separator also occurs in filenames, so a regex cannot tell them apart: an
+			// external audit measured `a-1-b.txt:1:MATCH` being read as `a`, because the non-greedy
+			// prefix stops at the `-1-` inside the NAME. There is nothing in the line that says where
+			// the path ends. So the box's own file list is the ground truth, and the answer is the
+			// LONGEST prefix that is a real file: longest, because `a` and `a-1-b.txt` can both
+			// exist and the shorter one would win a first-match scan.
+			// `listFiles` refuses a file, and `path` may name one: then the only path grep can print
+			// is that file, so the set is it.
+			let known: Set<string>;
+			try {
+				known = new Set((await b.listFiles(rel)).map((f) => (rel ? `${rel}/${f.path}` : f.path)));
+			} catch {
+				known = new Set([rel]);
+			}
+			const pathOf = (l: string): string => {
+				for (let i = l.length - 1; i > 0; i--) {
+					const c = l[i];
+					if ((c === ":" || c === "-") && known.has(l.slice(0, i))) return l.slice(0, i);
+				}
+				// A file the listing did not have (created between the two calls, or a path the SDK
+				// refuses to walk) falls back to the shape, which is right whenever the name carries
+				// no separator followed by digits.
+				return l.match(/^(.*?)[:-]\d+[:-]/)?.[1] ?? "";
+			};
 			// kern's own scaffolding lives in the box's workspace and is not the agent's business:
 			// `.kern-env.<boxid>` is written per call, so it changes name every time and would be
 			// noise in every result. Filtered HERE and not with `--exclude`, because BusyBox and GNU

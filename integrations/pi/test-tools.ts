@@ -89,6 +89,22 @@ ok(withCtx.includes("ctx.txt-1-L1") && withCtx.includes("ctx.txt:2:"), "context 
 ok(!withCtx.includes('"--"') && !/\\n--\\n/.test(withCtx), "and the bare -- separators are gone", withCtx);
 ok((await call("grep", { pattern: "MARKER_CTX", glob: "**/dash-name.txt" })).includes("dash-name.txt"),
    "a glob matches a filename containing a dash");
+// THE SEPARATOR ALSO OCCURS IN NAMES, so nothing in the line says where the path ends. An external
+// audit measured `a-1-b.txt:1:MATCH` being read as `a`, because a non-greedy prefix stops at the
+// `-1-` inside the NAME. Both files exist here on purpose: the answer has to be the LONGEST prefix
+// that is a real file, or the shorter one wins.
+fs.writeFileSync(path.join(ws, "a"), "MARKER_AMBIG\n");
+fs.writeFileSync(path.join(ws, "a-1-b.txt"), "MARKER_AMBIG\n");
+const ambig = await call("grep", { pattern: "MARKER_AMBIG" });
+ok(ambig.includes("a-1-b.txt:1:") && ambig.includes("a:1:"), "both a and a-1-b.txt are named in full", ambig);
+ok((await call("grep", { pattern: "MARKER_AMBIG", glob: "a-1-b.txt" })) .includes("a-1-b.txt"),
+   "and a glob on the dashed name selects it");
+ok(!(await call("grep", { pattern: "MARKER_AMBIG", glob: "a" })).includes("a-1-b.txt"),
+   "while a glob on the short name does not drag it in");
+// A matched line whose TEXT is exactly `--`: with -H it arrives as `path:N:--`, so the separator
+// filter must not eat it.
+fs.writeFileSync(path.join(ws, "dashline.txt"), "x\n--\n");
+ok((await call("grep", { pattern: "^--$" })).includes("dashline.txt:2:--"), "a matched line that is exactly --");
 // Four outcomes used to look identical because stderr was discarded: no matches, no grep in the
 // image, an unsupported flag, a permission denial.
 const badPattern = await call("grep", { pattern: "(" });
