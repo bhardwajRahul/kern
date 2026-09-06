@@ -359,9 +359,20 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 ///   openat("/dev/net/tun",           O_RDWR)   = 18
 ///
 /// With `--no-netns-quit` the third line is gone and the fourth takes its place at the same point in
-/// the sequence, so the flag removes that open and nothing else. That open is what a Fedora 43 host
-/// under Lima refused with `netns dir open: Permission denied, exiting`, leaving the pod
-/// loopback-only (#6).
+/// the sequence. That open is what a Fedora 43 host under Lima refused with `netns dir open:
+/// Permission denied, exiting`, leaving the pod loopback-only (#6).
+///
+/// "AND NOTHING ELSE" WAS WRONG, and it said so here until an external reviewer asked for the trace
+/// that was never taken: the first pass filtered on `openat`, so it could only ever have found an
+/// open. Diffing the FULL syscall set of both runs, the flag removes four things, not one:
+///
+///   openat("/proc/<holder>/ns", …)    the directory the watch would monitor
+///   fstatfs                            whether that filesystem can be watched at all
+///   timerfd_create + timerfd_settime   the polling fallback when it cannot
+///
+/// All four are the watch and nothing but the watch, so the claim the retry rests on still holds.
+/// The claim that was made is not the claim that was measured, which is the difference this note
+/// exists to record. (No `inotify_*` in either run on this host: passt took the timer fallback.)
 ///
 /// WHAT THE FLAG COSTS. pasta no longer exits by itself when the netns disappears, so `teardown`
 /// becomes the only thing that reaps it. That is why the pasta kill there is no longer conditional
@@ -389,6 +400,19 @@ fn pasta_args(dir: &std::path::Path, holder: i32, watch_netns: bool) -> Vec<std:
 /// NARROW ON PURPOSE. Retrying on any failure would hide the real ones behind a second attempt that
 /// changes an unrelated variable; this matches pasta's own string for the single operation the flag
 /// elides, so a pod that fails for any other reason still fails once, loudly, with its own message.
+///
+/// AN EXTERNAL REVIEWER READ THE OTHER PERMISSION STRINGS OUT OF THE BINARY and asked whether these
+/// should retry too:
+///
+///   Couldn't open network namespace %s: %s
+///   Couldn't open user namespace %s: %s
+///   setns() failed entering netns: %s
+///
+/// They should not, and the trace says why rather than the argument: `/proc/<holder>/ns/net` and
+/// `/proc/<holder>/ns/user` are opened in BOTH runs, with the watch and without it, and `setns` is
+/// not part of the watch at all. A host that refuses those refuses them identically on the retry, so
+/// widening the match would spend a second attempt that cannot succeed and would bury the real
+/// reason under a second copy of itself. The narrowness is the measurement, not caution.
 fn is_netns_dir_denial(stderr: &str) -> bool {
     stderr.contains("netns dir open")
 }
@@ -633,8 +657,17 @@ pub fn list() -> Result<(), Error> {
 /// ISA-optimized variant, so `comm` is `pasta.avx2` (or `passt.avx512`, …) - never the bare `pasta`.
 /// Matching by family prefix is what keeps the teardown's PID-reuse check from silently leaking the
 /// NAT daemon (the bug where `comm == "pasta"` never matched → pasta survived every `pod rm`).
+///
+/// THE FAMILY IS `<base>` OR `<base>.<variant>`, not "anything starting with pasta". A bare
+/// `starts_with` also accepts `pastafarian`, which an external reviewer pointed out, and the
+/// teardown now signals a recorded pid unconditionally rather than only while the holder lives, so
+/// the guard carries more weight than it did. The variant is always introduced by a `.`, so
+/// requiring that separator costs one comparison and removes the whole class of unrelated names
+/// that merely share a prefix.
 fn is_pasta_comm(comm: &str) -> bool {
-    comm.starts_with("pasta") || comm.starts_with("passt")
+    ["pasta", "passt"]
+        .iter()
+        .any(|base| comm == *base || comm.strip_prefix(base).is_some_and(|r| r.starts_with('.')))
 }
 
 /// Tear a pod down: kill its pasta NAT daemon (verified by PID + `comm` family prefix), then its holder, then wipe
@@ -778,7 +811,24 @@ mod tests {
         ] {
             assert!(is_pasta_comm(ok), "{ok} should match the pasta family");
         }
-        for no in ["bash", "sleep", "kern", "past", "asta", "", "pas"] {
+        // A shared PREFIX is not membership of the family, and the teardown now signals a recorded
+        // pid whether or not the holder is still alive, so a name that merely starts with `pasta`
+        // must not be enough. `pastafarian` was named by an external reviewer; the rest are the same
+        // shape. The variant separator is always `.`, so anything else after the base is a stranger.
+        for no in [
+            "bash",
+            "sleep",
+            "kern",
+            "past",
+            "asta",
+            "",
+            "pas",
+            "pastafarian",
+            "passthrough",
+            "pasta_helper",
+            "pasta-avx2",
+            "pastad",
+        ] {
             assert!(!is_pasta_comm(no), "{no} must NOT match");
         }
     }
