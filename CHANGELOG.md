@@ -314,7 +314,3 @@ message on hosts where it never printed, and one new `kern box` flag. The CLI ch
 
 - **`memory_mb` bounds the cgroup, not the workload's usable memory**, and the docs now say so: a
   tmpfs, `/dev/shm` and the page cache are charged to the same cap.
-
-## Earlier releases
-
-v0.9.0 back to v0.7.0 are in **[docs/CHANGELOG-HISTORY.md](docs/CHANGELOG-HISTORY.md)**.
