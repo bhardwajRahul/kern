@@ -352,11 +352,9 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
-inside a patch release. **The 0.9 minor bump changes one exit code**, which is why it is minor and not
-a patch: `kern box --plan` now exits 1 when a profile it named cannot attach, where it used to print
-the refusal and exit 0. A script that read the preview is unaffected; one that chained on `&&` now
-stops where it should have. That, and everything else in the release, is in the
-[v0.9.1 notes](CHANGELOG.md#v091---2026-09-05).
+inside a patch release. One exit code changed in 0.9, which is why it is a minor bump:
+`kern box --plan` exits 1 when a profile it named cannot attach, where it exited 0. The rest of the
+release is in the [v0.9.1 notes](CHANGELOG.md#v091---2026-09-05).
 
 ## What kern is not
 
