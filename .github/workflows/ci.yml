@@ -240,6 +240,15 @@ jobs:
           node --experimental-strip-types test.ts
           node --experimental-strip-types test-edge.ts
           node --experimental-strip-types test-hostile.ts
+      - name: end to end, with pi actually running
+        # The pi BINARY, the extension loaded the way a user loads it, and pi's own tool dispatch
+        # calling into it. The model is scripted by e2e-provider.ts because a model is what PRODUCES
+        # a tool call, and that half tests the model; everything after the call is pi's machinery
+        # and a real box. Until this existed, "works with pi" rested on a type-check.
+        working-directory: integrations/pi
+        env:
+          KERN_BIN: ${{ github.workspace }}/target/release/kern
+        run: node --experimental-strip-types test-e2e.ts
 
   webstack:
     name: a real stack, started
