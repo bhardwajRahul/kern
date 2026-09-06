@@ -59,6 +59,16 @@ stopped_count() { printf '%s' "$1" | sed -n 's/.*compose stop: \([0-9]*\) box(es
 # defect); only bytes coming back prove the whole chain, box to pump to unix socket to proxy.
 proxy_answered() { printf '%s' "$1" | grep -q '403'; }
 
+# The member count out of `kern pod ls`'s table: the first row whose second field is all digits, so
+# the `POD  BOXES  STATUS` header (second field `BOXES`) and the empty-table sentence both yield
+# nothing rather than a number.
+pod_member_count() { printf '%s' "$1" | awk '$2 ~ /^[0-9]+$/ { print $2; exit }'; }
+
+# A compose bring-up line must say WHICH network the stack got, not only that services can find each
+# other. Both halves count as stating it: having egress and not having it are both answers. The line
+# that says neither is the one this checks against, because it is what shipped.
+states_outbound() { printf '%s' "$1" | grep -qiE 'outbound|loopback-only'; }
+
 self_check() {
     echo "  self-check: the assertions, against fixed strings"
     proxy_answered "wget: server returned error: HTTP/1.1 403 Forbidden" \
@@ -82,6 +92,26 @@ self_check() {
     [ -z "$(stopped_count 'compose up: 2 box(es) started.')" ] \
         && pass "an unrelated line yields no count" \
         || fail "an unrelated line produced a count"
+    [ "$(pod_member_count "$(printf 'POD    BOXES  STATUS\nstack-1    3  up\n')")" = "3" ] \
+        && pass "the pod member count is read out of the table" \
+        || fail "the pod member count was not read"
+    [ -z "$(pod_member_count 'no pods - create one with kern pod create name')" ] \
+        && pass "an empty pod table yields no count" \
+        || fail "an empty pod table produced a count"
+    states_outbound "pod x: services reach each other by name + outbound to the internet (pasta)." \
+        && pass "an outbound line is recognised as stating the network" \
+        || fail "the outbound line was not recognised"
+    states_outbound "pod x: loopback-only - services reach each other; NO outbound (install passt for egress)." \
+        && pass "a loopback-only line is recognised as stating the network" \
+        || fail "the loopback-only line was not recognised"
+    # THE NEGATIVE CONTROL, and the whole reason this assertion exists: the line that SHIPPED named
+    # the pod and reported name resolution while saying nothing about egress, so a stack with no
+    # internet and a stack with internet printed the same sentence. If this string ever passes
+    # `states_outbound`, the assertion has stopped discriminating and every green tick below it is
+    # worth nothing.
+    states_outbound "pod x: services reach each other by name. tear down with kern compose f down." \
+        && fail "the pre-fix silent line was read as stating the network" \
+        || pass "the pre-fix silent line is not read as stating the network"
     [ "$FAIL" -eq 0 ] && echo "  self-check passed" || echo "  self-check FAILED"
     exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
 }
@@ -194,6 +224,57 @@ for MODE in --no-pod pod; do
     [ -z "$leftovers" ] && pass "down: nothing left under relays/" \
         || fail "down: relays/ still holds [$leftovers]"
 done
+
+# --- ONE SERVICE IS A STACK TOO -------------------------------------------------------------------
+# Every case above runs THREE services, and so did every other compose test in this repo: the single
+# `services:` in `sandbox_run.rs` points at an unreachable registry and never starts a box. So the
+# one-service path had no coverage anywhere, and it shipped for the whole 0.9 line with NO NETWORK AT
+# ALL. The auto-pod was gated on `boxes.len() >= 2`, because a pod's OTHER job is letting services
+# find each other and one service has nobody to find. But the pod is also the only thing that
+# attaches `pasta`, so a lone service got no pod, no NAT and no `/etc/resolv.conf`. It reads as a DNS
+# fault and is not one: measured with the reporter's file, `curl http://1.1.1.1` failed in 0 ms.
+# Filed as issue #5 by a user whose compose file had exactly one service, which is the first thing
+# anyone writes.
+#
+# EGRESS ITSELF IS NOT ASSERTED HERE, and the omission is deliberate rather than an oversight: it
+# needs `pasta` installed and a route off the host, and this script is built to run where neither is
+# guaranteed. What IS asserted is the structure egress hangs off - a pod exists, and the bring-up line
+# says which network the operator got - because those hold on any host that can start a box at all. A
+# case that silently skips on most hosts is the green tick this matrix exists to prevent.
+echo
+echo "  one service: a stack of one must still get a pod"
+cat > "$D/one.toml" <<TOML
+[box.solo]
+rootfs = "$RF"
+port = 7404
+command = ["/bin/busybox", "httpd", "-f", "-p", "127.0.0.1:7404", "-h", "/tmp"]
+TOML
+K1() { XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/one.toml" "$@" 2>&1; }
+up1=$(K1 up -d)
+if [ "$(running)" -ne 1 ]; then
+    echo "    SKIP: the one-service stack did not come up here: $(printf '%s' "$up1" | head -1)"
+else
+    claims_a_pod "$up1" \
+        && pass "one service: a pod is created (issue #5)" \
+        || fail "one service: NO pod, so no egress: $(printf '%s' "$up1" | tail -1)"
+    states_outbound "$up1" \
+        && pass "one service: the bring-up line states the network it got" \
+        || fail "one service: the bring-up line says nothing about outbound: $(printf '%s' "$up1" | tail -1)"
+    # `kern ps` and `kern pod ls` are two readers of one number and they disagreed: `pod ls` counted
+    # lines in the pod's shared `hosts` file, and a compose member writes TWO of them (the qualified
+    # `<pod>-<service>` and the bare alias) while a `kern box --pod` member writes one. Measured on
+    # v0.9.1: 1, 2 and 3 services read 2, 4 and 6. Checked against the SERVICE COUNT, not against
+    # `kern ps`, so a future change that breaks both readers the same way still fails here.
+    n=$(pod_member_count "$(XDG_RUNTIME_DIR=$XDG "$KERN" pod ls 2>/dev/null)")
+    [ "${n:-0}" = "1" ] \
+        && pass "pod ls: 1 member for 1 running service" \
+        || fail "pod ls: says '${n:-?}' for 1 running service"
+fi
+K1 down >/dev/null 2>&1
+sleep 1
+[ "$(live_kern_pids)" -eq 0 ] \
+    && pass "one service: down leaves no kern process" \
+    || fail "one service: down left $(live_kern_pids) kern process(es) alive"
 
 # --- the v0.9.1 fix, exercised against the artifact rather than deduced from the changelog ---------
 echo

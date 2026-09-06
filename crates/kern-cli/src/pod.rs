@@ -41,6 +41,20 @@ pub fn resolv_path(name: &str) -> PathBuf {
     pod_dir(name).join("resolv.conf")
 }
 
+/// Whether this pod has outbound WITH working DNS, for a caller that has to report the state of a
+/// pod it did not just create (a `compose up` that REUSED one prints its summary with no `create`
+/// line above it, so without this it can only report name resolution and stays silent about egress -
+/// which is the half that was missing when a one-service stack silently had none).
+///
+/// READ, not re-derived: the pod `resolv.conf` is the exact artifact [`setup_outbound`] writes only
+/// on `Outbound::Up`, and [`crate::commands::start`] binds it into a member on the same `exists()`
+/// test. Re-deciding "does this pod have egress" from pasta's pid, or from whether `pasta` is on
+/// PATH, would be a second definition of one property, and a second definition is how a stack came
+/// up with no network while `kern doctor` reported pasta present.
+pub fn has_outbound(name: &str) -> bool {
+    resolv_path(name).is_file()
+}
+
 /// The inode of `/proc/<pid>/ns/<kind>` - a namespace's stable identity. Used to detect PID reuse:
 /// a recorded holder PID is only trusted if its net ns inode still matches the one from create time.
 fn ns_inode(pid: i32, kind: &str) -> Option<u64> {
@@ -441,6 +455,21 @@ pub fn add_member(name: &str, member: &str) -> Result<(), Error> {
 /// blast radius, because only one of the two is what a script acts on.
 fn rows() -> Vec<(String, usize, bool)> {
     let root = pods_root();
+    // MEMBERS COME FROM THE REGISTRY, NOT FROM THE SHARED `hosts` FILE. Counting hosts lines beyond
+    // the two localhost seeds was right until aliases existed: `kern box --pod` adds ONE entry (the
+    // box name, `add_member` in `start.rs`) while a compose service adds TWO (the qualified
+    // `<pod>-<service>` and the bare alias, `add_member` in `compose.rs`), so this and `--json` both
+    // reported exactly DOUBLE for every compose stack. MEASURED on the shipped v0.9.1 binary: 1, 2
+    // and 3 services read 2, 4 and 6 here while `kern ps` read 1, 2 and 3.
+    //
+    // The comment on this function says the human table and `--json` were unified so they cannot
+    // disagree. They could not, and both were wrong: a THIRD view (`kern ps`, which filters
+    // `registry::list()` on `pod`) had the right answer and was never reconciled with them. Unifying
+    // two readers is not the same as reading the right thing, so this now reads what `ps` reads.
+    //
+    // Scanned ONCE, outside the loop: `list()` walks the registry dir, and doing it per-pod would
+    // make `pod ls` O(pods x boxes) for a number both views already have.
+    let live = crate::registry::list();
     let mut rows: Vec<(String, usize, bool)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.flatten() {
@@ -449,15 +478,7 @@ fn rows() -> Vec<(String, usize, bool)> {
             }
             let name = e.file_name().to_string_lossy().into_owned();
             let alive = holder_pid(&name).is_some();
-            // Members = shared-hosts lines beyond the two localhost seeds.
-            let members = std::fs::read_to_string(hosts_path(&name))
-                .map(|b| {
-                    b.lines()
-                        .filter(|l| l.contains('\t'))
-                        .count()
-                        .saturating_sub(2)
-                })
-                .unwrap_or(0);
+            let members = live.iter().filter(|i| i.pod == name).count();
             rows.push((name, members, alive));
         }
     }
@@ -528,6 +549,16 @@ pub fn teardown(name: &str) -> (bool, usize) {
     if !dir.is_dir() {
         return (false, 0);
     }
+    // Members from the REGISTRY, and BEFORE anything is killed. Same defect and same fix as `rows()`
+    // above: a compose member writes TWO `hosts` lines (qualified name + alias) and a `kern box
+    // --pod` member writes one, so the old shared-hosts count doubled for a compose stack and was
+    // right for a hand-made pod. Read first because `list()` prunes dead entries as it scans: taking
+    // it after the holder dies would race the members that exit with it and report a low number for
+    // the same teardown that a caller is about to print.
+    let members = crate::registry::list()
+        .iter()
+        .filter(|i| i.pod == name)
+        .count();
     // Kill pasta FIRST, while the holder still owns the net ns - so its recorded PID is unambiguously
     // pasta (killing the holder frees the ns → pasta auto-exits → PID-reuse window). Verify via comm
     // (pasta runs in the HOST net ns, so the holder's ns-inode guard can't cover it).
@@ -547,15 +578,6 @@ pub fn teardown(name: &str) -> (bool, usize) {
     if let Some(pid) = holder {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    // Members = shared-hosts entries beyond the two localhost seeds.
-    let members = std::fs::read_to_string(hosts_path(name))
-        .map(|b| {
-            b.lines()
-                .filter(|l| l.contains('\t'))
-                .count()
-                .saturating_sub(2)
-        })
-        .unwrap_or(0);
     let _ = std::fs::remove_dir_all(&dir);
     (true, members)
 }

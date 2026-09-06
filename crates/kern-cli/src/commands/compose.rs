@@ -440,10 +440,18 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .unwrap_or(0)
     );
 
-    // Auto-pod: a multi-service stack gets a shared network (name resolution + outbound) unless the
-    // user opts out or every box already shares the host net (`--net`). Reuse an existing pod so
-    // `up` is idempotent.
-    let mut use_pod = !no_pod && boxes.len() >= 2 && boxes.iter().any(|b| !b.net);
+    // Auto-pod: a stack gets a shared network (name resolution + outbound) unless the user opts out
+    // or every box already shares the host net (`--net`). Reuse an existing pod so `up` is
+    // idempotent.
+    //
+    // THE COUNT IS NOT THE CONDITION. This read `boxes.len() >= 2`, because a pod's OTHER job is
+    // letting services reach each other by name and one service has nobody to reach. But the pod is
+    // also the only thing that attaches `pasta`, so a ONE-service stack came up with no egress at
+    // all: not "no DNS", no route. MEASURED with the reporter's own file (one service, published
+    // port, two binds): `curl http://1.1.1.1` failed in 0 ms, and the box's `/etc/resolv.conf` came
+    // from the IMAGE and looked perfectly healthy, which is why it reads as a DNS fault. A single
+    // service is the first thing anyone tries.
+    let mut use_pod = !no_pod && boxes.iter().any(|b| !b.net);
     // `start` CARRIES THE MODE, from the same registry fact the refusal above uses.
     //
     // MEASURED, and it is the reason this exists rather than a precaution. Bring a stack up with
@@ -519,6 +527,29 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         for b in boxes.iter().filter(|b| b.net) {
             eprintln!(
                 "kern: note: service '{}' uses --net (host network) - it is NOT reachable by name inside pod '{pod}'",
+                b.name
+            );
+        }
+    }
+    // THE TRADE IS STATED, NOT MADE IN SILENCE. A pod member is supervised IN-PROCESS and never by a
+    // systemd unit: `start.rs` excludes it deliberately, because a unit that outlives the pod holder
+    // cannot re-join the network namespace it was started in. So `restart: always`/`unless-stopped`
+    // inside a pod restarts on ANY exit and does NOT survive a reboot, which is not what the same key
+    // does under Docker.
+    //
+    // It is printed now because the auto-pod stopped requiring two services. While it did, only
+    // multi-service stacks lost reboot-survival and nobody filed it; the same gap now reaches a
+    // ONE-service stack, which is the first thing anyone writes. The gap is older than the change
+    // that exposes it, and being consistent with an existing gap is not the same as it being
+    // acceptable, so the operator is told rather than left to discover it after a reboot.
+    if use_pod {
+        for b in boxes.iter().filter(|b| b.restart_always) {
+            eprintln!(
+                "kern: note: service '{}' sets `restart:` and is a pod member - kern supervises it \
+                 in-process (restarted on ANY exit) but it does NOT survive a reboot, because a \
+                 systemd unit cannot re-join the pod's network namespace. For reboot-survival run it \
+                 as a standalone box: `kern box <name> --restart unless-stopped` (no pod, so no pod \
+                 egress either)",
                 b.name
             );
         }
@@ -849,9 +880,18 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     println!("compose up: {total} box(es) started. track with `kern ps`.");
     if use_pod {
-        println!(
-            "  pod '{pod}': services reach each other by name. tear down with `kern compose {file} down`."
-        );
+        // SAY WHETHER THERE IS EGRESS, not only whether services can find each other. `pod create`
+        // distinguishes five outbound states and prints the one you got; this line reported name
+        // resolution alone, so a stack with no internet and a stack with internet printed the SAME
+        // sentence. On a REUSED pod there is no `create` line above this one, so this was the only
+        // thing the operator saw. `DOCKER-COMPAT.md` promised "the bring-up line says which of the
+        // two you got" and for compose it did not.
+        let net = if crate::pod::has_outbound(&pod) {
+            "services reach each other by name + outbound to the internet (pasta)"
+        } else {
+            "loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)"
+        };
+        println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
     Ok(())
 }

@@ -44,13 +44,38 @@ from a rootless network namespace needs a userspace network stack, so `kern comp
 attaches `pasta` (the `passt` package) to the pod for NAT'd egress and DNS. It is on by
 default whenever `pasta` is installed; a compose stack has no flag to turn egress off
 (`--no-outbound` is a `kern pod create` option, not a compose one). If `pasta` is not installed the pod comes up
-**loopback-only** and the bring-up line says which of the two you got, rather than
-leaving you to discover it when a `pip install` inside a service times out:
+**loopback-only**, and the bring-up line says which state you got rather than
+leaving you to discover it when a `pip install` inside a service times out.
+
+There are **five**, not two. This page listed two until a user hit one of the other
+three and had no line to match it against ([issue #5](https://github.com/getkern/kern/issues/5)):
 
 ```
 network: services reach each other by name + outbound to the internet (pasta)
 network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)
+network: loopback-only - services reach each other; pasta IS installed but did not start: <why>
+network: outbound is up but DNS is not - the pod can reach an IP and cannot resolve a name
+network: loopback-only (--no-outbound) - services reach each other; no egress
 ```
+
+The third is the one worth knowing about, because `kern doctor` reports `pasta: found`
+and the pod still has no egress: `doctor` asserts the binary EXISTS, never that it
+started here. The fourth and the third look identical from inside a box until you try
+an IP literal rather than a name. `curl http://1.1.1.1` failing in **0 ms** is no route
+at all; `curl` by name failing while the IP answers is the DNS half alone.
+
+**A one-service stack gets a pod too.** Until v0.9.1 it did not: the pod was created
+only from two services up, on the reasoning that a pod's other job is letting services
+find each other. The pod is also the only thing that attaches `pasta`, so a lone
+service came up with no egress and no `/etc/resolv.conf`, and the failure read as DNS.
+
+**`restart:` in a pod does not survive a reboot.** A pod member is supervised
+in-process, so it is restarted on any exit for the life of the stack, but it is not
+handed to a systemd unit: a unit that outlives the pod holder cannot re-join the
+network namespace it was started in. Docker's `restart: unless-stopped` does come back
+after a reboot, so `kern compose up` prints a note when a service asks for one. For
+reboot-survival, run that service as a standalone box (`kern box <name> --restart
+unless-stopped`), which has no pod and therefore no pod egress.
 
 `pasta` is the only thing in kern that is worth installing separately, and it buys
 exactly this one capability. What it costs, measured on an Intel i7-14700KF, Linux 7.0,
