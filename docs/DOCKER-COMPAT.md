@@ -85,22 +85,31 @@ both EMPTY while this happens, because the policy `dontaudit`s the denial, so th
 diagnostic says SELinux is not involved when it is. Toggling enforcement is the check that
 works.
 
-It is not a Fedora quirk. `passt-selinux` is `noarch`, so it is the same policy on x86_64
-and aarch64, and **`passt` requires it**, so installing pasta installs the confinement with
-it. Queried from each distro's own repositories:
+It is not a Fedora quirk, and it is not one kernel. `passt-selinux` is `noarch`, so it is
+the same policy on x86_64 and aarch64, and **`passt` requires it**, so installing pasta
+installs the confinement with it. Run in a VM per distro, each Enforcing out of the box:
 
-| | `passt-selinux` | |
-|---|---|---|
-| Fedora 43 | yes | **reproduced here** |
-| AlmaLinux 9 and 10 | yes (`appstream`) | pulled in by `passt` |
-| Rocky Linux 9 | yes (`appstream`) | pulled in by `passt` |
-| CentOS Stream 9 | yes (`baseos`) | pulled in by `passt` |
-| Amazon Linux 2023 | yes (`amazonlinux`) | pulled in by `passt` |
-| openSUSE Tumbleweed | yes, **and `passt-apparmor`** | not tested |
+| | kernel | shipped v0.9.2 | with the retry |
+|---|---|---|---|
+| Fedora 43 | 6.17 | `netns dir open: Permission denied` | page fetched from the box |
+| AlmaLinux 9.8 | 5.14 | `netns dir open: Permission denied` | page fetched from the box |
+| AlmaLinux 10.2 | 6.12 | `netns dir open: Permission denied` | page fetched from the box |
 
-Only Fedora 43 was run; the rest is what their package metadata says, and whether each ships
-Enforcing by default was not checked here. openSUSE carries an AppArmor profile for pasta as
-well, so the same shape may exist there under a different LSM; kern has not measured it.
+Three kernel generations, one result. **The audit log was empty on all three.** Rocky Linux
+and CentOS Stream ship the identical `passt-selinux` from the same RHEL sources and were not
+run; Amazon Linux 2023 ships it too and its image did not boot here, so its default
+enforcement mode is unverified.
+
+**openSUSE is the other way round and needs nothing.** Its `passt-apparmor` profile
+(`/etc/apparmor.d/abstractions/pasta`, upstream passt's own) GRANTS the access SELinux
+refuses, and names the function while doing it:
+
+```
+@{PROC}/[0-9]*/ns/    r,    # pasta_netns_quit_init(),
+```
+
+So the watch works there. The problem is the SELinux policy specifically, not confinement in
+general.
 
 kern recovers from this by itself now: pasta opens the netns's DIRECTORY only to watch it
 and quit when it disappears, so on that one refusal kern retries once with
