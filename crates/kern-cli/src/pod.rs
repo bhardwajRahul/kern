@@ -50,7 +50,7 @@ pub fn resolv_path(name: &str) -> PathBuf {
 /// and explained in four comments, which is four chances to add a fifth reader and forget.
 fn read_pid_file(path: &std::path::Path) -> Option<i32> {
     let raw = std::fs::read_to_string(path).ok()?;
-    // `pid` or `pid:starttime`; the identity half is read by [`recorded_holder`].
+    // `pid` or `pid:starttime`; the identity half is read by [`recorded_holder_starttime`].
     let pid: i32 = raw.trim().split(':').next()?.parse().ok()?;
     if pid <= 0 {
         return None; // 0 is the caller's own process group, -1 is everything it may signal
