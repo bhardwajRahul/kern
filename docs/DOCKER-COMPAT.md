@@ -64,6 +64,32 @@ started here. The fourth and the third look identical from inside a box until yo
 an IP literal rather than a name. `curl http://1.1.1.1` failing in **0 ms** is no route
 at all; `curl` by name failing while the IP answers is the DNS half alone.
 
+**On Fedora and the RHEL family, SELinux refuses pasta and the audit log says nothing.**
+Reported from Fedora 43 ([issue #6](https://github.com/getkern/kern/issues/6)) and then
+reproduced in a Fedora 43 VM, kernel 6.17.1, `passt-selinux` installed, `pasta` running
+confined as `pasta_exec_t`. With the shipped v0.9.2 the pod came up loopback-only:
+
+```
+network: loopback-only - ...; pasta IS installed but did not start: netns dir open: Permission denied, exiting
+```
+
+One variable, same binary and same host, is what identifies the cause:
+
+```
+setenforce 0  ->  services reach each other by name + outbound to the internet (pasta)
+setenforce 1  ->  loopback-only ... netns dir open: Permission denied, exiting
+```
+
+**Do not go to the audit log.** `ausearch -m avc -ts recent` and the kernel journal are
+both EMPTY while this happens, because the policy `dontaudit`s the denial, so the obvious
+diagnostic says SELinux is not involved when it is. Toggling enforcement is the check that
+works.
+
+kern recovers from this by itself now: pasta opens the netns's DIRECTORY only to watch it
+and quit when it disappears, so on that one refusal kern retries once with
+`--no-netns-quit`, which drops that open. Verified end to end under Enforcing: a box in the
+pod fetched `http://example.com` and got the page back. Nothing needs to be turned off.
+
 **A one-service stack gets a pod too.** Before v0.9.2 it did not: the pod was created
 only from two services up, on the reasoning that a pod's other job is letting services
 find each other. The pod is also the only thing that attaches `pasta`, so a lone

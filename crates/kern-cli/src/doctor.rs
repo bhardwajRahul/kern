@@ -641,8 +641,21 @@ fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
     if !selinuxfs_present {
         return R::Ok("SELinux: not active on this host".into());
     }
-    let hint = "read it with `getenforce`; if it is Enforcing and a pod has no egress, look for a \
-                denial with `sudo ausearch -m avc -ts recent`";
+    // THE AUDIT LOG IS THE WRONG PLACE TO LOOK, and this hint said to look there until a Fedora 43
+    // VM with SELinux Enforcing was built to check. The denial that stops pod egress produces NO
+    // AVC: `ausearch -m avc -ts recent` and the kernel journal are both empty while pasta is being
+    // refused, because the policy `dontaudit`s it. A reader sent to the audit log finds nothing and
+    // concludes SELinux is not involved, which is the opposite of true.
+    //
+    // Toggling enforcement is the discriminator that works, and it is one variable: same binary,
+    // same host, same file. Measured, with the shipped v0.9.2 on Fedora 43 (kernel 6.17.1,
+    // passt-selinux installed):
+    //
+    //   Permissive -> services reach each other by name + outbound to the internet (pasta)
+    //   Enforcing  -> loopback-only ... netns dir open: Permission denied, exiting
+    let hint = "read it with `getenforce`. If a pod has no egress, `sudo setenforce 0`, retry, then \
+                `sudo setenforce 1`: that is the discriminator, because the denial is `dontaudit`ed \
+                and the audit log stays empty while it happens";
     match mode.as_deref().map(str::trim) {
         Some("1") => R::Ok(
             "SELinux: ENFORCING (kern's isolation is unaffected; a policy can still refuse what the \
