@@ -309,6 +309,23 @@ jobs:
       - name: doctor says whether boxes will run here
         continue-on-error: true
         run: ./target/debug/kern doctor
+      - name: issue #6 stays fixed
+        # The SELinux netns-dir refusal. This runner has no SELinux, and the script's last block
+        # skips accordingly, but the first four cases reproduce the SHAPE with a stub pasta that
+        # refuses only the attempt watching the namespace, which is what the policy does. The fix
+        # was verified by hand in a Fedora VM and had no automated coverage anywhere: the matrix's
+        # refusing-pasta stub refuses BOTH attempts, so it exercised the error message and never the
+        # retry that succeeds.
+        #
+        # Assertions counted rather than inferred: the pasta stub logs every invocation, so "one
+        # attempt" and "two attempts" are read off a file. Verified to go RED against the shipped
+        # v0.9.2 binary and against three mutations of this tree.
+        #
+        # The gate stays BARE. Piping it anywhere would hand this step the pipe's exit status.
+        run: |
+          sudo apt-get install -y -qq busybox
+          sh scripts/certify-issue6.sh --self-check
+          sh scripts/certify-issue6.sh ./target/debug/kern
       - name: bring the stack up, and prove the health gate actually gated
         # The published page says "the cache was healthy first", and that string is printed by the web
         # service unconditionally: asserting on it proves a page was served, not that anything waited.

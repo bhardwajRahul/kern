@@ -100,6 +100,27 @@ and CentOS Stream ship the identical `passt-selinux` from the same RHEL sources 
 run; Amazon Linux 2023 ships it too and its image did not boot here, so its default
 enforcement mode is unverified.
 
+Running it yourself, on any host, with or without SELinux:
+
+```
+sh scripts/certify-issue6.sh --self-check      # the assertions, against fixed strings
+sh scripts/certify-issue6.sh ./target/release/kern
+```
+
+A stub `pasta` refuses only the attempt that watches the namespace, which is what the policy
+does, so the shape reproduces without a policy. Where SELinux **is** Enforcing the script adds
+a block that uses the real pasta and nothing simulated, and it tells the two apart by reading
+`--no-netns-quit` off the surviving process: an Enforcing host that does not refuse the open
+skips rather than passing, because a green there would mean "this host is fine", not "the fix
+works". Nineteen cases on Fedora 43, sixteen where there is no SELinux.
+
+It goes red against the shipped v0.9.2, on this host and in the VM, and against three
+mutations: removing the retry, putting `--no-netns-quit` on the first attempt as well (which
+still works, and would quietly make the retry unreachable on every real policy host), and
+dropping the teardown signal. That last one is the leak the fix itself creates: a pasta started
+without the netns watch does not notice the namespace disappear, so nothing but the signal
+stops it.
+
 **openSUSE is the other way round and needs nothing.** Its `passt-apparmor` profile
 (`/etc/apparmor.d/abstractions/pasta`, upstream passt's own) GRANTS the access SELinux
 refuses, and names the function while doing it:
