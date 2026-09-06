@@ -235,6 +235,19 @@ function fromHost(e: unknown, what: string): Error {
  * `/etc` and then refused. Testing the raw string would pass it.
  */
 export function refuseOutsideWorkspace(absolutePath: string): string {
+	// A GATE MUST REFUSE, NOT CRASH. The argument arrives from a model, so `null`, a number or a
+	// missing field are reachable inputs, and `.trim()` on them threw a TypeError that reads like a
+	// bug in the extension rather than a rejected path. Raised in an external audit of 0.1.1.
+	if (typeof absolutePath !== "string") {
+		throw refuse("gate", `refusing a path that is not a string: ${typeof absolutePath}`);
+	}
+	// A NUL cannot appear in a real filename and truncates the path in every syscall that takes a
+	// C string, so a name is one thing to this gate and another to the kernel. Newlines are legal in
+	// POSIX filenames and are NOT refused: the shell path quotes with single quotes, and refusing
+	// them would refuse files that exist.
+	if (absolutePath.includes("\0")) {
+		throw refuse("gate", "refusing a path containing a NUL byte");
+	}
 	const raw = absolutePath.trim();
 	if (!path.posix.isAbsolute(raw)) {
 		throw refuse("gate", `refusing a relative path from the agent: ${absolutePath}`);
@@ -954,7 +967,16 @@ export default function (pi: ExtensionAPI) {
 		...localGrep,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const b = await ensureBox(ctx);
-			const tool = createGrepTool(GUEST_WORKSPACE, { operations: kernGrepOps(b, hostWorkspace) });
+			// THE HOST PATH, and it is the only one that works. pi's `GrepOperations` takes
+			// `isDirectory` and `readFile` and nothing else: its own comment says the default is
+			// "local filesystem plus ripgrep", so the SEARCH is not overridable and ripgrep always
+			// runs locally against the cwd this tool was built with. Built against GUEST_WORKSPACE
+			// it ran `rg /workspace` on the host, where that path does not exist, and grep failed
+			// with `IO error ... No such file or directory` on every call and every host. The
+			// workspace is the same bytes on both sides of the bind mount, so searching it from the
+			// host gives the same answer, and pi's own cwd-rooted check still confines it. That is
+			// what this extension's README already describes: grep is host I/O over the workspace.
+			const tool = createGrepTool(hostWorkspace);
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});
