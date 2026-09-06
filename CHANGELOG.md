@@ -5,6 +5,34 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**The Rust test suite had never been built for aarch64, though the binary always was.** So every
+"the tests pass" statement this project has made was an x86_64 statement, silently, for as long as
+ARM has been a supported target. Two lines caused it, both in test code and both invisible on
+x86_64-gnu: `pthread_t` is a `c_ulong` on glibc and a `*mut c_void` on musl, and the pointer form is
+not `Send`; and `ioctl`'s request parameter is a `c_ulong` on glibc and a `c_int` on musl. It now
+builds and runs on ARM: **577/577 on a Raspberry Pi 5 (kernel 6.6) and on a Jetson (5.15-tegra)**,
+on the hardware rather than under emulation. Under `qemu-user` one `flock` contention test fails
+reproducibly and passes six times out of six on the boards, so that red is an emulation artifact and
+not a name-collision bug on ARM.
+
+That is the largest instrument defect in this cycle: not a probe reading the wrong thing, but a
+whole suite that was never executed on a target kern ships for.
+
+**A refused netns watch is only fatal in newer passt, and where it is not there is nothing to fix.**
+Read out of three installed binaries rather than inferred:
+
+| passt | ships in | on a refused watch |
+|---|---|---|
+| `0.0~git20230309` | Debian 12 | `inotify_init(): won't quit once netns is gone`, and it keeps the NAT |
+| `0.0~git20240220` | Ubuntu 24.04 | `netns dir open: %s, exiting` |
+| `0^20250919` | Fedora 43 | `netns dir open: %s, exiting` |
+
+So a Raspberry Pi on Debian 12 needs no retry and never could have: issue #6 cannot occur against
+the tolerant build. The condition became fatal between March 2023 and February 2024, which is
+exactly the range the retry covers.
+
 ## v0.9.2 - 2026-09-06
 
 **Cut for a defect the first person to try compose would hit.** A `docker-compose.yml` with ONE
