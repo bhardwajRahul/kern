@@ -941,15 +941,22 @@ pub(crate) fn pull_to_cache(
             !rd.flatten()
                 .any(|e| e.file_name().to_string_lossy().starts_with(".kern-"))
         });
+        // A FIRST PULL IS PROGRESS; A REPAIR IS A DIAGNOSTIC, and the two do not share a channel.
+        // "not cached" happens for every image nobody has pulled yet, so it is gated on a terminal
+        // like the rest of the pull's narration. The other two say the cache entry is DAMAGED and
+        // that kern is re-fetching to repair it, which is not an expected state and is the thing
+        // `pentest/pentest-cache-edge.sh` asserts kern says: gating them on a terminal made a
+        // corrupted entry re-fetch in silence under an SDK, which is exactly where nobody is
+        // watching a terminal. Caught by that suite, not by review.
         if !sentinel.exists() {
             kern_common::progress!("→ image '{image}' not cached - pulling once (reused after)");
         } else if !rootfs_usable {
-            kern_common::progress!(
-                "→ image '{image}' is cached without a usable rootfs - re-fetching it once"
+            eprintln!(
+                "kern: note: image '{image}' is cached without a usable rootfs - re-fetching it once"
             );
         } else {
-            kern_common::progress!(
-                "→ image '{image}' is cached without its config - re-fetching it once"
+            eprintln!(
+                "kern: note: image '{image}' is cached without its config - re-fetching it once"
             );
         }
         // INVALIDATE THE ENTRY BEFORE TOUCHING THE ROOTFS. The sentinel is written LAST precisely so

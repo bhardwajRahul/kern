@@ -15,6 +15,11 @@ the build on any undocumented change. Full detail for any entry is in the git hi
   now reads the list out of the reference, all 51.
 - **Nine `kern --help` lines sat outside the description column**, `pod` by twenty because it did not
   fit; `pod` is two lines now. 76 verbs and 83 flags either side, checked by diffing both sets.
+- **A damaged image-cache entry was repaired in silence under an SDK.** v0.9.1 gated kern's progress
+  on a terminal and took the two repair lines with it, so in a pipe a cached image with no usable
+  rootfs, or with no config, was re-fetched with nothing said. They are `kern: note:` now and reach a
+  pipe; the ordinary "not cached, pulling once" stays gated. Found by
+  `pentest/pentest-cache-edge.sh`, which asserts kern names the missing part.
 
 ## v0.9.1 - 2026-09-05
 
