@@ -92,3 +92,4 @@ kern-sandbox-*.tgz
 integrations/pi/REVIEW-*.md
 integrations/pi/BREAK-*.md
 integrations/pi/REPORT.md
+integrations/pi/dist/

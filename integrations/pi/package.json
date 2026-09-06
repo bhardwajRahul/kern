@@ -1,17 +1,40 @@
 {
-  "name": "pi-extension-kern",
-  "private": true,
-  "version": "0.0.1",
+  "name": "kern-pi",
+  "version": "0.1.1",
+  "description": "Route pi's bash, read, write, edit, ls, grep and find into a rootless kern box.",
+  "license": "Apache-2.0",
+  "homepage": "https://getkern.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getkern/kern.git",
+    "directory": "integrations/pi"
+  },
+  "bugs": {
+    "url": "https://github.com/getkern/kern/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-extension",
+    "sandbox",
+    "kern",
+    "agent",
+    "container"
+  ],
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "index.ts",
+    "README.md"
+  ],
   "scripts": {
     "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build'",
-    "check": "tsc --noEmit"
-  },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "prepublishOnly": "rm -rf dist && tsc -p tsconfig.build.json"
   },
   "dependencies": {
     "kern-sandbox": "^0.1.41"
@@ -21,7 +44,21 @@
     "@types/node": "^26.4.1",
     "typescript": "^5.6.0"
   },
-  "engines": {
-    "node": ">=22"
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.4"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./index.ts": "./index.ts"
   }
 }
