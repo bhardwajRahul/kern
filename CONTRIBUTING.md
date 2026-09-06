@@ -276,7 +276,7 @@ entry answers that in its first line and stops. What went wrong, which review ca
 was verified do not belong there, because a reader scanning for "does this affect me" has to walk
 past them to find out.
 
-The measure that made this a rule: the v0.7.1 entries went from 268 lines to 57 without losing a fact
+The measure that made this a rule: the changelog went from 7227 words to 1034 without losing a fact
 a user needs. Everything cut was already in the commits. If an entry runs past about eight lines, it
 is usually telling the story rather than the change.
 

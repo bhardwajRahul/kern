@@ -1,8 +1,7 @@
 # Provenance
 
 Independent, third-party proof of *when* each kern release was created, anchored to the Bitcoin
-blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pair of files, from
-`v0.7.0` to the current tag:
+blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pair of files:
 
 - `<tag>.provenance.txt`, naming the GPG-signed git **tag object** hash and the release **commit**
   hash.
@@ -12,11 +11,10 @@ blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pa
 Together they let anyone prove the release existed at a given time, with no trust in this repo, in
 GitHub, or in the author.
 
-> **The record appears with the tag, not before it.** `v0.7.0` is the first public release; the
-> pre-launch history was reorganized before it, its tags are not in this repository, and the 29
-> proofs that named them were removed rather than kept: a proof that names a tag you cannot resolve
-> proves nothing you can check, and a directory of those is worse than an empty one. What is here is
-> what you can verify end to end.
+> **A record for the release you can install, and no others.** Proofs for superseded releases were
+> removed with the releases themselves: a proof of when a build nobody can download was created is
+> not something anyone checks. What is here is what you can verify end to end, against the binary
+> the install line gives you.
 
 ## Verify
 

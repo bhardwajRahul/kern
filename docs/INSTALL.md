@@ -171,7 +171,7 @@ that is still not enough, measured on the guest itself.** A session opened with 
 `/system.slice/ssh.service`, which root owns and the user cannot write, and colima creates no
 `user@<uid>.service`, so a rootless kern has no cgroup it may create a child in. No write to
 `cgroup.subtree_control` changes that: what is missing is a write permission, not a controller.
-v0.7.1 fixed the neighbouring case, kern running as ROOT with no user manager, which is a container
+kern handles the neighbouring case, running as ROOT with no user manager, which is a container
 or WSL2 rather than this. Either way kern says at every start whether the box is capped, and
 `--require-limits` turns that into a refusal to start. Two further warnings are
 worth clearing before real work: `sudo apt install uidmap` for official images that chown to a service
