@@ -105,7 +105,15 @@ measured). On a Mac that privilege is inside Docker's own Linux VM, which is alr
 against macOS. On a Linux host it is privilege on the real machine, so this recipe is a way to TRY
 kern rather than the way to run it there.
 
-**If it finds none, install one.** colima is the smallest thing that works:
+**If it finds none, install one, and the guest matters more than the VM does.** colima is the
+smallest thing that works and it is not the most capable: its default **Ubuntu** guest gives you a
+kern whose resource caps do not bite, with an AppArmor restriction to switch off before the first
+box. A **Fedora** guest has neither, on the evidence of a user's own `kern doctor` posted in
+[issue #5](https://github.com/getkern/kern/issues/5) (16 ok, caps enforced, `pasta` and Landlock
+present); [FAQ.md](FAQ.md#does-it-run-on-macos) has that output and says whose host it came from.
+Choose on that, not on install size.
+
+colima, the smallest route:
 
 ```sh
 brew install colima
