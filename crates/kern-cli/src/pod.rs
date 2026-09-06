@@ -123,8 +123,14 @@ fn network_sentence(alive: bool, resolv: bool, installed: bool) -> &'static str 
         //
         // No new marker is needed to tell the two apart, because `setup_outbound` only reaches the
         // `resolv.conf` write after every failure path has already returned: the file existing IS
-        // the record that pasta once came up, and `teardown` removes the whole dir, so it cannot be
-        // left over from an earlier pod of the same name.
+        // the record that pasta once came up.
+        //
+        // TWO THINGS STOP IT SURVIVING AN EARLIER POD OF THE SAME NAME, and this used to cite only
+        // the first. `teardown` removes the directory, and removes the state files one by one if
+        // that fails. And `create`, reclaiming a dead leftover dir, calls `remove_dir_all` and then
+        // `DirBuilder::create`, which returns `AlreadyExists` and fails the whole create if the
+        // removal did not take. So a stale directory cannot be silently reused even when teardown's
+        // cleanup failed: the second gate refuses rather than inheriting it.
         (false, true) => {
             "outbound is DOWN - pasta started for this pod and has since exited (create reported \
              no problem, so look for a crash, an OOM kill, or a racing teardown)"
@@ -268,8 +274,17 @@ fn claimed_by_another_pod(pid: i32, except: &str) -> bool {
 /// start-time comes from the kernel, cannot be rewritten by the process, and differs for whatever
 /// inherits the pid, so it answers the question the three previous name checks kept approximating.
 ///
-/// A marker with no start-time is one an older kern wrote before this session's upgrade. There is
-/// nothing to verify it against, so it falls back to argv rather than leaking the holder outright.
+/// A marker with no start-time has nothing to verify it against, so it falls back to argv rather
+/// than leaking the holder outright.
+///
+/// WHERE ONE CAN COME FROM, checked by opening every writer rather than assumed: `create` is the
+/// only production writer and it always writes `pid:starttime`, so this version cannot produce
+/// one. A bare marker therefore means an older kern within this session, a hand edit, or a WRITE
+/// THAT WAS TRUNCATED, which an external reviewer pointed out and which "an older kern" did not
+/// cover. The last of those is the uncomfortable one: a torn write reaches the forgeable argv path
+/// without anybody upgrading anything. It stays anyway, because the alternative is refusing to
+/// reap and leaking the holder for certain, and the forgery still requires the attacker to hold
+/// the pid that the truncated file names.
 fn holder_to_reap(name: &str) -> Option<i32> {
     if let Some(pid) = holder_pid(name) {
         return Some(pid); // identity confirmed by the recorded netns inode
