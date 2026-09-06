@@ -74,6 +74,26 @@ const viaEtc = await call("grep", { pattern: os.userInfo().username, path: "link
 ok(!viaEtc.includes(os.userInfo().username), "a symlink to /etc reaches the BOX's /etc, not this host's", viaEtc);
 ok(refused(await call("grep", { pattern: "MARKER_OUTSIDE", path: "../" })), "a .. above the workspace");
 
+console.log("\n== the shape of what grep returns");
+fs.writeFileSync(path.join(ws, "ctx.txt"), "L1\nL2 MARKER_CTX\nL3\n");
+fs.mkdirSync(path.join(ws, "dashdir"));
+fs.writeFileSync(path.join(ws, "dashdir", "dash-name.txt"), "also MARKER_CTX\n");
+// grep omits the filename when it is handed a single file, so `path: "ctx.txt"` came back as
+// `2:L2` and an agent could not tell which file a line was from. `-H` forces it.
+ok((await call("grep", { pattern: "MARKER_CTX", path: "ctx.txt" })).includes("ctx.txt:2:"),
+   "a single-file search still names the file");
+// Context lines use `-` where match lines use `:`, and grep emits a bare `--` between groups.
+// Reading the path as "everything before the first colon" mangled every context line.
+const withCtx = await call("grep", { pattern: "MARKER_CTX", path: "ctx.txt", context: 1 });
+ok(withCtx.includes("ctx.txt-1-L1") && withCtx.includes("ctx.txt:2:"), "context lines carry the path too", withCtx);
+ok(!withCtx.includes('"--"') && !/\\n--\\n/.test(withCtx), "and the bare -- separators are gone", withCtx);
+ok((await call("grep", { pattern: "MARKER_CTX", glob: "**/dash-name.txt" })).includes("dash-name.txt"),
+   "a glob matches a filename containing a dash");
+// Four outcomes used to look identical because stderr was discarded: no matches, no grep in the
+// image, an unsupported flag, a permission denial.
+const badPattern = await call("grep", { pattern: "(" });
+ok(badPattern.startsWith("THREW") && /grep/i.test(badPattern), "a pattern grep rejects says so instead of 'No matches'", badPattern);
+
 console.log("\n== the other verbs, with the same arguments");
 for (const [tool, params] of [
 	["read", { path: "/etc/passwd" }],

@@ -23,7 +23,11 @@
  *   - `bash` runs INSIDE the box: its own namespaces, a seccomp allowlist, and memory/pids/CPU caps.
  *     A command cannot see the host filesystem outside /workspace, and cannot reach the network
  *     unless KERN_PI_EGRESS names a host.
- *   - `read`, `write`, `edit`, `ls`, `grep`, `find` are HOST filesystem I/O confined to the workspace
+ *   - `grep` runs IN THE BOX, so what it can reach is the box's mount namespace, the same boundary
+ *     `bash` gets. A symlink under the workspace therefore re-roots into the box rather than being
+ *     refused, which is a real difference from the verbs below and is stated in the README. This
+ *     line said the opposite until an external audit read the code and the behaviour apart.
+ *   - `read`, `write`, `edit`, `ls`, `find` are HOST filesystem I/O confined to the workspace
  *     by [[refuseOutsideWorkspace]] and, for reads and writes, by the SDK's own O_NOFOLLOW and
  *     directory-descent guards. That is a path check plus a syscall flag, not a namespace.
  *
@@ -706,7 +710,10 @@ export default function (pi: ExtensionAPI) {
 			const target = rel ? `${GUEST_WORKSPACE}/${rel}` : GUEST_WORKSPACE;
 			const limit = Math.max(1, Math.min(p.limit ?? 100, 1000));
 			const ctxLines = Math.max(0, Math.min(p.context ?? 0, 20));
-			const flags = ["-rn", p.literal ? "-F" : "-E"];
+			// `-H` FORCES THE FILENAME. Without it grep omits the name when it is given a single
+			// file, so `path: "ctx.txt"` came back as `2:L2` and the agent could not tell which file
+			// a line was from. Raised by an external audit of 0.1.5, reproduced here.
+			const flags = ["-rnH", p.literal ? "-F" : "-E"];
 			if (p.ignoreCase) flags.push("-i");
 			if (ctxLines > 0) flags.push(`-C${ctxLines}`);
 			// `-r` does not follow symlinks it meets while walking, and a symlink it did follow would
@@ -715,25 +722,51 @@ export default function (pi: ExtensionAPI) {
 			// The pattern and the path travel as POSITIONAL ARGUMENTS, the way `probeInBox` already
 			// passes a path: they are never part of the script text, so nothing an agent writes is
 			// parsed as shell syntax. `-e` is what lets a pattern begin with a dash.
-			const script = `grep ${flags.join(" ")} -e "$1" -- "$2" 2>/dev/null | head -n ${limit}`;
+			// STDERR IS NOT DISCARDED. It was, and that made four different outcomes look identical:
+			// no matches, an image with no `grep`, an unsupported flag, and a permission denial all
+			// returned "No matches found". An external audit named it, and I then produced the exact
+			// failure myself while changing the flags: every result went empty and silent, and the
+			// reason was invisible. grep exits 1 for "no match" and 2 or more for an error, but the
+			// pipe makes `$?` `head`'s, so the discriminator is stderr rather than the exit code.
+			// grep's OWN exit status, not the pipeline's. `head` makes `$?` head's, and stderr alone is
+			// not a discriminator either: a dangling symlink in the workspace makes grep complain
+			// about ONE file while the search itself is fine, and treating that as failure turned a
+			// legitimate empty result into an error on Alpine. So grep's status is written to stderr
+			// as a marker: 0 is a match, 1 is no match, 141 is SIGPIPE from `head` closing early, and
+			// 2 or more is the search failing to run at all.
+			const script =
+				`{ grep ${flags.join(" ")} -e "$1" -- "$2"; echo "GREPRC=$?" >&2; }` +
+				` | head -n ${limit}`;
 			const r = await b.run(["sh", "-c", script, "_", p.pattern, target], {
 				timeoutS: Math.min(TIMEOUT_S, 60),
 			});
 			const prefix = `${GUEST_WORKSPACE}/`;
 			let lines = (r.stdout ?? "")
 				.split("\n")
-				.filter((l) => l.length > 0)
+				.filter((l) => l.length > 0 && l !== "--")
 				.map((l) => (l.startsWith(prefix) ? l.slice(prefix.length) : l));
+			// THE SEPARATOR IS NOT ALWAYS A COLON. grep writes `path:line:text` for a match and
+			// `path-line-text` for a context line, and emits a bare `--` between groups. Reading the
+			// path as "everything before the first colon" therefore mangled every context line, and a
+			// filename containing a dash made it worse. The path is what precedes the first
+			// separator that is followed by a line number.
+			const pathOf = (l: string): string => l.match(/^(.*?)[:-]\d+[:-]/)?.[1] ?? "";
 			// kern's own scaffolding lives in the box's workspace and is not the agent's business:
 			// `.kern-env.<boxid>` is written per call, so it changes name every time and would be
 			// noise in every result. Filtered HERE and not with `--exclude`, because BusyBox and GNU
 			// grep do not guarantee that flag alike and an unsupported one would exit non-zero into
 			// the `2>/dev/null` above: zero results, silently, on whichever image lacked it.
 			const mine = (rel: string) => rel.startsWith(".kern-env") || rel.startsWith(".deps/");
-			lines = lines.filter((l) => !mine(l.slice(0, l.indexOf(":"))));
+			lines = lines.filter((l) => !mine(pathOf(l)));
 			if (p.glob) {
 				const g = p.glob;
-				lines = lines.filter((l) => globMatches(g, l.slice(0, l.indexOf(":"))));
+				lines = lines.filter((l) => globMatches(g, pathOf(l)));
+			}
+			const err = (r.stderr ?? "").split("\n");
+			const rc = Number(err.find((l) => l.startsWith("GREPRC="))?.slice(7) ?? 0);
+			if (rc >= 2 && rc !== 141) {
+				const why = err.find((l) => l.length > 0 && !l.startsWith("GREPRC=")) ?? `exit ${rc}`;
+				throw refuse("box", `grep could not run in the box: ${why}`);
 			}
 			return {
 				content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No matches found" }],

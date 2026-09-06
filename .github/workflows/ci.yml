@@ -239,6 +239,15 @@ jobs:
         env:
           KERN_BIN: ${{ github.workspace }}/target/release/kern
         run: node --experimental-strip-types test-tools.ts
+      - name: the same tool suite on BusyBox grep
+        # The box's grep is whatever the image ships, and the two disagree: BusyBox writes a
+        # different message for a bad pattern and complains about a dangling symlink where GNU is
+        # quiet. That difference turned a legitimate empty result into an error here once.
+        working-directory: integrations/pi
+        env:
+          KERN_BIN: ${{ github.workspace }}/target/release/kern
+          KERN_PI_IMAGE: alpine
+        run: node --experimental-strip-types test-tools.ts
       - name: the three suites, against a real box
         working-directory: integrations/pi
         env:
