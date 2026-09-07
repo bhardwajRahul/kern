@@ -2,7 +2,7 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-**kern:** a fast, rootless sandbox and virtual resource runtime. Run any workload, trusted or not, in a real box and throw it away: an agent's tool-call, AI-generated code, a notebook cell, a CI step.
+**kern:** a fast, rootless sandbox and virtual resource runtime. Run an agent's tool-call, AI-generated code or any untrusted workload in a real container, then throw it away.
 
 **A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
