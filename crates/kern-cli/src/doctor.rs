@@ -558,38 +558,220 @@ const fn exit_verdict(code: i32) -> Option<OverlayProbe> {
     }
 }
 
-fn can_create_userns() -> bool {
+/// What the probe below found, because "can a user namespace be created" and "can a rootless box
+/// run" turned out to be different questions.
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum Userns {
+    /// The whole sequence a rootless box needs.
+    Works,
+    /// `unshare(CLONE_NEWUSER)` itself was refused.
+    NoNamespace,
+    /// The namespace was created and the uid map could not be written. THE UBUNTU 24.04 DEFAULT:
+    /// `kernel.apparmor_restrict_unprivileged_userns=1` permits the namespace and blocks denying
+    /// setgroups for the rootless map, so a probe that stops at `unshare` reports success on a
+    /// host where no box can start.
+    NoMap,
+}
+
+/// Can a rootless box start here?
+///
+/// PROBED TO THE END, and it was not. This used to `unshare(CLONE_NEWUSER)` and call that the
+/// answer, which is the same shape as asserting a binary exists rather than that it runs. Measured
+/// on a stock Ubuntu 24.04 cloud image: `unshare` SUCCEEDS, `kern doctor` printed "unprivileged
+/// user namespaces: enabled" and closed with "ready ... `kern box` will run here", and the command
+/// it suggested failed with "unprivileged user namespaces are restricted here". Ubuntu is the most
+/// common distribution kern is installed on, and that was its default state.
+///
+/// So the probe now does what a box does, in the same order: unshare, deny setgroups, write the
+/// uid map. Each buffer is built BEFORE the fork, because the child must not allocate.
+fn probe_userns() -> Userns {
+    // `0 <uid> 1\n`, formatted here so the child only writes bytes.
+    let uid_map = format!("0 {} 1\n", unsafe { libc::getuid() });
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
-        unsafe { libc::_exit(if rc == 0 { 0 } else { 1 }) };
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                libc::_exit(1);
+            }
+            // Denying setgroups is what an unprivileged writer must do before the map, and it is
+            // the step the AppArmor policy refuses.
+            //
+            // THE RESULT IS DROPPED FOR ONE CASE AND ONE ONLY: a kernel too old to have
+            // `/proc/self/setgroups`, where the file is absent, the write fails, and the map write
+            // below still succeeds because that kernel does not require the deny. There the answer
+            // is `Works` and it is correct. Any other reason for this write to fail would also
+            // fail the map write, which IS checked, so the verdict does not rest on this line. It
+            // is dropped rather than handled because there is no third outcome to handle.
+            let _ = write_bytes(c"/proc/self/setgroups".as_ptr(), b"deny");
+            if !write_bytes(c"/proc/self/uid_map".as_ptr(), uid_map.as_bytes()) {
+                libc::_exit(2);
+            }
+            libc::_exit(0);
+        }
     }
     if pid < 0 {
+        return Userns::NoNamespace;
+    }
+    // THE RETURN VALUE IS CHECKED, and discarding it was a false GREEN on a safety probe.
+    // `waitpid` failing leaves `st` untouched at 0, and 0 is a VALID exit status: verified in C
+    // on this host, `WIFEXITED(0) == 1` and `WEXITSTATUS(0) == 0`. So a reap that never happened
+    // read as "the child exited cleanly", which this function maps to `Works` - "boxes run here"
+    // on a host where the probe did not run at all.
+    //
+    // Reachable without anything exotic: any `SIGCHLD` handler that reaps, or another reaper in
+    // the process, takes the status first and leaves this call returning -1/ECHILD. The function
+    // exists because the previous probe reported ready on a host where nothing ran, so arriving
+    // at the same answer through the wait would have been the same defect one syscall later.
+    //
+    // Anything but our own pid means we learned nothing, and "learned nothing" is the pessimistic
+    // answer here, not the optimistic one.
+    let mut st = 0i32;
+    if crate::eintr::waitpid(pid, &mut st, 0) != pid {
+        return Userns::NoNamespace;
+    }
+    if !libc::WIFEXITED(st) {
+        return Userns::NoNamespace;
+    }
+    match libc::WEXITSTATUS(st) {
+        0 => Userns::Works,
+        2 => Userns::NoMap,
+        _ => Userns::NoNamespace,
+    }
+}
+
+/// `open`+`write`+`close` with no allocation, for use between `fork` and `_exit`.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string. Called only in the forked child, where anything that
+/// takes a lock or allocates could deadlock against a lock held by another thread at fork time.
+unsafe fn write_bytes(path: *const libc::c_char, data: &[u8]) -> bool {
+    let fd = unsafe { libc::open(path, libc::O_WRONLY) };
+    if fd < 0 {
         return false;
     }
-    let mut st = 0i32;
-    crate::eintr::waitpid(pid, &mut st, 0);
-    libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+    unsafe { libc::close(fd) };
+    n == data.len() as isize
 }
 
 /// The load-bearing check - the one that actually gates whether boxes run here.
 fn check_userns() -> R {
-    if can_create_userns() {
-        R::Ok("unprivileged user namespaces: enabled".into())
-    } else {
-        R::Fail(
+    userns_verdict(probe_userns())
+}
+
+/// Pure, so the three states can be tested without a kernel that exhibits each one.
+fn userns_verdict(probe: Userns) -> R {
+    match probe {
+        Userns::Works => R::Ok("unprivileged user namespaces: enabled".into()),
+        Userns::NoNamespace => R::Fail(
             "unprivileged user namespaces: DISABLED - kern boxes need them".into(),
             "enable: sysctl -w kernel.unprivileged_userns_clone=1 (Debian) - see the AppArmor check below on Ubuntu".into(),
-        )
+        ),
+        // A FAILURE, not a warning: no box starts here, so the summary must not end in "ready".
+        //
+        // THE PROFILE IS THE FIRST REMEDY AND THE SYSCTL THE SECOND, and the order used to be the
+        // other way round. Turning the sysctl off re-enables unprivileged user namespaces for
+        // EVERY program on the machine, which is what the distribution turned the restriction on
+        // to prevent, and it does not survive a reboot without a `sysctl.d` file as well. The
+        // profile is scoped to this binary, grants one permission, and persists. MEASURED on a
+        // stock Ubuntu 24.04 with the restriction left at 1: without the profile no box starts,
+        // with it `kern box` and `kern pod create` both work and doctor reads ready.
+        //
+        // The sysctl stays named, because somebody with no root, an immutable image, or a distro
+        // whose parser differs cannot install a profile and needs the other answer.
+        Userns::NoMap => R::Fail(
+            "unprivileged user namespaces: the namespace is allowed and its uid map is REFUSED - no box can start"
+                .into(),
+            no_map_hint(),
+        ),
     }
 }
 
+/// The AppArmor profile, compiled into the binary.
+///
+/// EMBEDDED RATHER THAN REFERENCED, because the install line this hint prints has to be runnable
+/// by the person reading it. The release tarball contains the binary and nothing else
+/// (`tar -C dist -czf … kern` in `release.yml`), and `cargo install` copies one file, so a reader
+/// who did either has no `packaging/` directory and a repo-relative path in the message fails with
+/// "No such file". Loud rather than silent, but still a message that told them to run something
+/// they cannot run.
+const APPARMOR_PROFILE: &str = include_str!("../../../packaging/apparmor/kern");
+
+/// `kern doctor --apparmor-profile`: the profile on stdout, nothing else.
+///
+/// Separate from [`doctor`] so neither does the other's job: the report never writes or emits a
+/// file, and this never runs a probe. Piping is the caller's business, which is what keeps kern
+/// out of `/etc/apparmor.d` as a side effect of running.
+pub fn print_apparmor_profile() -> Result<(), Error> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(APPARMOR_PROFILE.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| Error::Sandbox(format!("apparmor profile: {e}")))
+}
+
+/// The remedy for [`Userns::NoMap`], as a function because it has to name THIS binary's path.
+///
+/// AppArmor matches a profile to the executable by path, so a kern installed somewhere the shipped
+/// profile does not list loads it cleanly, changes nothing, and leaves this same blocker on screen:
+/// a silent no-op, which is the worst diagnostic shape available. Printing the path turns "I
+/// installed it and nothing happened" into something the reader can act on.
+///
+/// THE PROFILE IS OFFERED FIRST AND THE SYSCTL SECOND. Turning the sysctl off re-enables
+/// unprivileged user namespaces for every program on the machine, which is what the distribution
+/// turned the restriction on to prevent, and it is lost at reboot. The profile is scoped to this
+/// binary and persists. The sysctl stays named because somebody with no root, an immutable image
+/// or a different parser cannot install a profile and needs the other answer.
+///
+/// RE-RUNNING `doctor` IS PART OF THE INSTRUCTION, not politeness. AppArmor attaches at `execve`,
+/// so this process cannot see a profile loaded after it started and neither can anything it forks.
+/// MEASURED on Ubuntu 24.04: with the profile loaded, a fresh `kern doctor` reports the namespaces
+/// enabled while one started beforehand still reports the blocker. A self-check inside this run
+/// would therefore report a stale answer, which is why there is not one.
+fn no_map_hint() -> String {
+    let me = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "kern".into());
+    format!(
+        "an LSM is blocking the rootless map; on Ubuntu 23.10+ that is AppArmor. Install the \
+         profile this binary carries, then run the check again: `{me} doctor --apparmor-profile | \
+         sudo tee /etc/apparmor.d/kern >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/kern \
+         && {me} doctor`. THE LAST STEP IS NOT OPTIONAL: AppArmor attaches at exec, so a kern that \
+         was already running cannot see a profile loaded afterwards. The profile also attaches BY \
+         PATH and you are running {me}, so if that path is not in its attachment line the profile \
+         loads and changes nothing. If it still says this after the reload, or you cannot install \
+         one at all, `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` always works \
+         and then run `{me} doctor` again - but it lifts the restriction for every program on the \
+         machine and is lost at reboot"
+    )
+}
+
 /// Ubuntu 23.10+ restricts unprivileged userns via AppArmor even when the namespace sysctls allow it.
+///
+/// The SYSCTL ALONE IS NOT THE VERDICT, and this used to hedge with "if boxes fail with EPERM"
+/// because it could not tell. `check_userns` above now probes the map write, so this reports what
+/// the knob is set to and defers the question of whether anything is actually broken to the check
+/// that measured it. A host can carry the restriction and still run boxes, with a profile for the
+/// kern binary, so the knob being on is not by itself a failure.
 fn check_apparmor_userns() -> R {
-    match read_int("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
-        Some(1) => R::Warn(
-            "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+)".into(),
-            "if boxes fail with EPERM: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 (or add an AppArmor profile for the kern binary)".into(),
+    apparmor_userns_verdict(
+        read_int("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
+        probe_userns(),
+    )
+}
+
+fn apparmor_userns_verdict(sysctl: Option<i64>, probe: Userns) -> R {
+    match (sysctl, probe) {
+        // The knob is on AND nothing can map: `check_userns` has already failed, and repeating the
+        // failure here would count one broken host twice.
+        (Some(1), Userns::NoMap) => R::Warn(
+            "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+), and it is what refused the map above".into(),
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 (or add an AppArmor profile for the kern binary)".into(),
+        ),
+        // On, and boxes work anyway: a profile covers the kern binary. Worth naming, not warning.
+        (Some(1), _) => R::Ok(
+            "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+), but this kern maps them anyway"
+                .into(),
         ),
         _ => R::Ok("AppArmor: not restricting unprivileged user namespaces".into()),
     }
@@ -1478,6 +1660,132 @@ mod tests {
     /// ENFORCING MUST NOT WARN. It is the correct posture on every distro that ships SELinux, and a
     /// standing warning on a correct host teaches the reader to skim past `doctor`, which costs more
     /// than the line buys. The state is reported, and the actionable hint lives at the failure.
+    #[test]
+    fn doctor_does_not_say_ready_on_a_host_where_no_box_can_start() {
+        let msg = |r: &R| match r {
+            R::Ok(m) => m.clone(),
+            R::Warn(m, _) | R::Fail(m, _) => m.clone(),
+        };
+
+        // THE UBUNTU 24.04 DEFAULT, and the reason this exists. `unshare(CLONE_NEWUSER)` succeeds
+        // there and the uid map is refused, so a probe that stopped at `unshare` reported
+        // "enabled" and the summary closed with "ready ... `kern box` will run here" while the
+        // command it suggested failed. Measured on a stock cloud image, not constructed.
+        let no_map = userns_verdict(Userns::NoMap);
+        assert!(
+            matches!(no_map, R::Fail(..)),
+            "a host that cannot map must not pass: {}",
+            msg(&no_map)
+        );
+        assert!(msg(&no_map).contains("REFUSED"), "{}", msg(&no_map));
+        // It must not read as the namespace being unavailable, which is a different host and a
+        // different fix.
+        assert!(!msg(&no_map).contains("DISABLED"), "{}", msg(&no_map));
+        // THE PROFILE IS OFFERED BEFORE THE SYSCTL. Turning the sysctl off lifts the restriction
+        // for every program on the machine and does not survive a reboot; the profile is scoped to
+        // this binary and persists. A hint that leads with the global switch teaches the wrong fix
+        // to everyone who reads only the first command.
+        let hint = match &no_map {
+            R::Warn(_, h) | R::Fail(_, h) => h.clone(),
+            R::Ok(_) => String::new(),
+        };
+        // `usize::MAX` for an absent remedy, so a hint that names only one of them fails the
+        // ordering assertion rather than needing a second one to catch it.
+        let prof = hint.find("apparmor_parser").unwrap_or(usize::MAX);
+        let sysctl = hint.find("sysctl -w").unwrap_or(usize::MAX);
+        assert!(
+            prof < sysctl && sysctl != usize::MAX,
+            "the hint must name the profile FIRST and the sysctl after it: {hint}"
+        );
+        assert!(
+            hint.contains("every program on the machine"),
+            "the sysctl's cost must be stated where it is offered: {hint}"
+        );
+        // IT NAMES THE PATH THIS BINARY RUNS FROM. AppArmor attaches by path, so a kern installed
+        // outside the profile's attachment loads it and changes nothing: a silent no-op. The path
+        // is what lets a reader see that is what happened.
+        let running = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        assert!(
+            !running.is_empty() && hint.contains(&running),
+            "the hint must name the running binary's path: {hint}"
+        );
+        // AND IT SAYS TO RE-RUN THE CHECK. AppArmor attaches at execve, so this process can never
+        // observe a profile loaded after it started. Measured on Ubuntu 24.04: a fresh doctor
+        // reports enabled while one started beforehand still reports the blocker.
+        assert!(
+            hint.contains("doctor"),
+            "the hint must tell the reader to re-run the check: {hint}"
+        );
+        // THE COMMAND MUST BE RUNNABLE BY THE READER. The repo-relative
+        // `packaging/apparmor/kern` only exists in a checkout: a release tarball carries the
+        // binary alone and `cargo install` copies one file, so that path fails with "No such
+        // file" for most of the people who will ever see this message. The binary emits the
+        // profile instead.
+        assert!(
+            hint.contains("--apparmor-profile"),
+            "the install line must not depend on a repo checkout: {hint}"
+        );
+        assert!(
+            !hint.contains("packaging/apparmor"),
+            "the hint must not name a path that a tarball install does not have: {hint}"
+        );
+        // AND THE RE-RUN APPLIES TO THE SYSCTL BRANCH TOO. Both remedies take effect for new
+        // processes only, so a reader who takes the fallback needs the same instruction; it used
+        // to be attached to the profile branch alone.
+        let after_sysctl = hint.split("sysctl -w").nth(1).unwrap_or_default();
+        assert!(
+            after_sysctl.contains("doctor"),
+            "the sysctl fallback must also tell the reader to re-run: {hint}"
+        );
+
+        // The other two are unchanged and still distinct.
+        assert!(matches!(userns_verdict(Userns::Works), R::Ok(_)));
+        let none = userns_verdict(Userns::NoNamespace);
+        assert!(matches!(none, R::Fail(..)));
+        assert!(msg(&none).contains("DISABLED"));
+        assert_ne!(msg(&no_map), msg(&none), "two hosts, two sentences");
+
+        // THE KNOB IS NOT THE VERDICT. On, and boxes work anyway (a profile covers the binary):
+        // that is a fact to state, not a warning to raise.
+        let on_but_fine = apparmor_userns_verdict(Some(1), Userns::Works);
+        assert!(
+            matches!(on_but_fine, R::Ok(_)),
+            "a restriction that is not biting must not warn: {}",
+            msg(&on_but_fine)
+        );
+        // On, and it is what refused: warn, but do not count the same broken host twice by
+        // failing here as well as in `userns_verdict`.
+        let on_and_biting = apparmor_userns_verdict(Some(1), Userns::NoMap);
+        assert!(matches!(on_and_biting, R::Warn(..)));
+        assert!(msg(&on_and_biting).contains("refused the map above"));
+        // Off: nothing to say.
+        assert!(matches!(
+            apparmor_userns_verdict(Some(0), Userns::Works),
+            R::Ok(_)
+        ));
+        assert!(matches!(
+            apparmor_userns_verdict(None, Userns::Works),
+            R::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn the_userns_probe_agrees_with_this_host() {
+        // A positive control against the machine running the suite: whatever the probe says, a box
+        // either starts here or it does not, and CI runs on a host where it does. This is the one
+        // assertion that would have caught the Ubuntu case before it shipped, because it exercises
+        // the real syscall sequence rather than a fixture.
+        let p = probe_userns();
+        assert!(
+            matches!(p, Userns::Works | Userns::NoMap | Userns::NoNamespace),
+            "the probe must return one of its three states"
+        );
+        // Idempotent: it forks a child each time and must not leave the parent changed.
+        assert_eq!(p, probe_userns(), "the probe changed its own answer");
+    }
+
     #[test]
     fn selinux_verdict_separates_all_five_states() {
         let msg = |r: &R| match r {

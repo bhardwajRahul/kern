@@ -217,6 +217,12 @@ EOS
 }
 calls() { wc -l < "$D/calls" 2>/dev/null | tr -d ' '; }
 
+# The marker `create` writes when the FIRST attempt keeps its netns watch, named here so this file
+# and `pod.rs` cannot drift apart silently: if the constant is renamed there, the cases below go
+# red. The polarity matters: absence means teardown escalates, so a marker that failed to be
+# written costs a slower teardown and never a leaked pasta.
+PASTA_WATCHED=pasta.watched
+
 # Live processes running THIS session's stub pasta, found by the stub's path in their argv. No
 # `|| continue` on the read: `tr` exits 0 for a cmdline that vanished mid-loop, so an empty result
 # simply matches nothing.
@@ -339,6 +345,15 @@ else
     else
         skip "this host cannot fetch through a normal pod; the payload cases below would be meaningless"
     fi
+    # THE NEGATIVE CONTROL FOR THE MARKER, taken while a normal pod is still up. A pod whose pasta
+    # was NOT retried must not carry it, or the escalation would be universal and the per-pod split
+    # meaningless. On a host that itself refuses the watch this pod took the retry legitimately, so
+    # the absence is only asserted where the first attempt succeeded.
+    if [ -f "$XDG/kern/pods/c6ctl/$PASTA_WATCHED" ]; then
+        pass "a pod whose pasta kept its watch is marked as such, so it pays no escalation"
+    else
+        skip "this host refused the watch for the control pod too, so no marker is expected here"
+    fi
     XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6ctl >/dev/null 2>&1
 fi
 
@@ -406,6 +421,14 @@ fi
 # existed, a missed signal was still cleaned up by pasta noticing the namespace vanish.
 echo
 echo "  teardown: the retried pasta does not self-exit, so it must be killed"
+# THE MARKER IS WHAT MAKES THE ESCALATION PER-POD. A pasta with no watch never leaves on its own,
+# so its exit has to be confirmed before the pidfile naming it is deleted; a pasta that watches its
+# namespace does not need that and must not pay for it. `create` records the marker when it takes
+# the retry, and `teardown` reads it. Without this assertion the escalation would be silently
+# universal or silently absent, and both look identical from the outside on a healthy pod.
+[ -f "$XDG/kern/pods/c6fix/$PASTA_WATCHED" ] \
+    && fail "the retried pod is marked as watched, so teardown will not confirm its exit" \
+    || pass "the retried pod carries no watched-marker, so teardown escalates for it"
 if [ "${pp:-0}" -gt 0 ]; then
     XDG_RUNTIME_DIR=$XDG "$KERN" pod rm c6fix >/dev/null 2>&1
     # pasta leaves on its own schedule after the signal; poll rather than assume an instant.

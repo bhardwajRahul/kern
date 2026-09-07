@@ -108,6 +108,19 @@ pub fn network_summary(name: &str) -> String {
 
 /// `installed` is consulted ONLY when `!alive && !resolv`; every other arm is decided before it is
 /// read, which is why the caller may pass `false` for it without looking.
+///
+/// KNOWN RESIDUAL, ON RECORD RATHER THAN FIXED. The `(true, true)` arm says "outbound to the
+/// internet" from a live pasta plus a written `resolv.conf`, which is a proxy for reachability and
+/// not a measurement of it: a `resolv.conf` naming a nameserver that cannot be reached produces
+/// that sentence with DNS broken. It is the same proxy shape the other arms were fixed to avoid.
+///
+/// It stays for two reasons. The precise version would make a status line perform a DNS
+/// resolution, with its own timeout and its own failure modes, on a path whose whole job is to
+/// print what is already known. And the sentence is approximately true where it is wrong: outbound
+/// IS up, which is what the reader is asking. The failure needs a resolver that kern itself wrote
+/// into the pod to be unreachable, which is rarer than the cost of getting it exactly right: the
+/// string is keyed on by `says_outbound` in `scripts/certify-issue6.sh` and `states_outbound` in
+/// `scripts/acceptance-matrix.sh`, so narrowing the wording moves three copies to close it.
 fn network_sentence(alive: bool, resolv: bool, installed: bool) -> &'static str {
     match (alive, resolv) {
         (true, true) => "services reach each other by name + outbound to the internet (pasta)",
@@ -179,6 +192,25 @@ pub fn holder_pid(name: &str) -> Option<i32> {
 /// The argv token that makes a process kern's own pod holder. One definition: `create` spawns the
 /// holder with it and [`holder_to_reap`] recognises it, so the two cannot drift.
 const HOLDER_ARGV: &str = "__pod-holder";
+
+/// Marker file: this pod's pasta was started WITH the netns watch, i.e. the first attempt in
+/// [`setup_outbound`] succeeded and no retry was needed. Empty, because its existence is the fact.
+///
+/// WRITTEN FOR THE HEALTHY CASE, AND THE POLARITY IS THE POINT. It records the pasta that exits by
+/// itself when the namespace goes; every other pasta needs `teardown` to confirm its exit before
+/// the pidfile naming it is deleted. So ABSENCE means escalate, by construction.
+///
+/// The first version recorded the opposite, `pasta.nowatch` on the retry, and absence then meant
+/// "do not escalate". That write is best-effort, because it must not fail a pod whose NAT is up,
+/// so a failed write produced exactly the leak the marker exists to prevent: a pasta with no
+/// watch, no escalation, and a pidfile about to be deleted. The costs are not symmetric. An
+/// unnecessary escalation costs a poll loop that exits on its first check; a missing one costs a
+/// userspace NAT that nothing can name for the rest of the session.
+const PASTA_WATCHED: &str = "pasta.watched";
+
+/// How long [`stop_pasta`] waits for a no-watch pasta to leave before SIGKILL. pasta was measured
+/// leaving about 30 ms after SIGTERM, so this is eight times its observed exit.
+const PASTA_STOP_BUDGET_MS: u64 = 250;
 
 /// Does this raw `/proc/<pid>/cmdline` belong to a kern pod holder?
 ///
@@ -457,8 +489,20 @@ pub fn create_with_range(
     // key. Measured against the last of them: after a package-style `mv` over the binary,
     // `/proc/self/exe` reads `... (deleted)`, so `current_exe`'s file name stops matching during
     // exactly the upgrade window in which teardown matters.
+    // WRITTEN ATOMICALLY, and not for the reason it usually is. A torn write of twenty bytes on a
+    // tmpfs is not a likely failure; what matters is that a PARTIAL write produces a bare `pid`
+    // with no start-time, which is indistinguishable from the marker an older kern wrote, and
+    // `holder_to_reap` sends that form down the argv path it otherwise never takes. The comment
+    // there says "back-compat only", and until this rename that claim was false: the forgeable
+    // path was reachable with nobody upgrading anything. One `rename` makes the sentence true.
     let holder_marker = format!("{pid}:{}", crate::registry::proc_starttime(pid));
-    std::fs::write(dir.join("holder"), holder_marker)
+    let holder_tmp = dir.join("holder.new");
+    std::fs::write(&holder_tmp, holder_marker)
+        .map_err(|e| Error::Sandbox(format!("pod holder pid: {e}")))?;
+    // Same directory, so the rename is within one filesystem and is the atomic replace it looks
+    // like. A failure here leaves `holder.new` behind, which no reader looks for and `teardown`
+    // removes with the directory.
+    std::fs::rename(&holder_tmp, dir.join("holder"))
         .map_err(|e| Error::Sandbox(format!("pod holder pid: {e}")))?;
     let _ = std::fs::remove_file(dir.join("starting")); // claim complete: holder pid is now recorded
                                                         // The holder is detached (own process group, reparented to init on our exit) and runs until
@@ -785,7 +829,13 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
         )
     };
     match spawn(true) {
-        Ok(o) if o.status.success() => {}
+        // The first attempt kept its netns watch, so this pasta exits by itself when the namespace
+        // goes and `teardown` need not wait for it. Best-effort: if the write fails, teardown
+        // escalates, which is slower and never wrong. That asymmetry is why the marker records the
+        // HEALTHY case rather than the dangerous one.
+        Ok(o) if o.status.success() => {
+            let _ = std::fs::write(dir.join(PASTA_WATCHED), b"");
+        }
         Ok(o) if is_netns_dir_denial(&String::from_utf8_lossy(&o.stderr)) => {
             // ONE narrower retry, and only for this refusal. pasta opens the netns's DIRECTORY
             // solely to watch it and quit when it disappears; `--no-netns-quit` drops that open and
@@ -797,6 +847,10 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
             // first is the one that names the operation a policy refused.
             let first = pasta_reason(&o.stderr);
             match spawn(false) {
+                // Nothing is recorded here ON PURPOSE. A retried pasta has no watch, never exits
+                // on its own, and is exactly the case `teardown` must confirm; the absence of
+                // [`PASTA_WATCHED`] is what tells it so, and a marker that has to be written for
+                // the dangerous case can fail to be written. See the constant.
                 Ok(o2) if o2.status.success() => {}
                 Ok(o2) => {
                     return Outbound::Failed(format!(
@@ -984,23 +1038,51 @@ fn pid_is_pasta(pid: i32) -> bool {
 /// `kill(0, ...)` signals the caller's own process group and `kill(-1, ...)` signals every process
 /// it may signal, so a degenerate value must never reach `kill`, not even to probe.
 ///
-/// SIGTERM ONLY, and there is an argument for escalating that is deliberately not taken here. A
-/// pasta started with `--no-netns-quit` (the SELinux retry in `setup_outbound`) does not watch the
-/// namespace and will not exit on its own, so this signal is the only thing that stops it, and
-/// `teardown` deletes the pid file immediately afterwards: if the signal were ever ignored, the
-/// process would be unnameable for the rest of the session. That is the same shape as the holder
-/// leak fixed above.
+/// ESCALATION IS PER-POD, AND THE ARGUMENT FOR DECLINING IT EVERYWHERE HAS EXPIRED. It was
+/// declined on the grounds that a lost SIGTERM is harmless because pasta notices the namespace
+/// vanish and leaves on its own. That is true of a pasta with the netns watch, and FALSE of one
+/// started with `--no-netns-quit` by the SELinux retry in `setup_outbound`: it has no watch, it
+/// never self-exits, this signal is the only thing that will ever stop it, and `teardown` deletes
+/// the pidfile straight after, so a missed signal leaves a userspace NAT running for a namespace
+/// that is gone, unnameable for the rest of the session.
 ///
-/// It is not escalated because the cost was measured and the failure was not. Waiting for the exit
-/// and following with SIGKILL takes `pod rm` from 1.8 ms to 33 ms on this host (five runs each,
-/// same binary), because pasta genuinely takes about 30 ms to leave after SIGTERM. Paying 18x on
-/// every teardown to insure against a pasta ignoring SIGTERM, which has never been observed here,
-/// is the wrong trade to make silently. Revisit if one is ever seen.
-fn stop_pasta(pid: i32) {
+/// Certifying the retry on five Enforcing distributions made that the NORMAL path there, not an
+/// edge, so the two now have different leak semantics and teardown must not treat them alike.
+///
+/// The cost was measured and is why it is not unconditional: waiting for the exit and following
+/// with SIGKILL takes `pod rm` from 1.8 ms to 33 ms (five runs each, same binary), because pasta
+/// takes about 30 ms to leave after SIGTERM. So `create` records [`PASTA_WATCHED`] when the
+/// first attempt keeps its watch, and every pod without that record pays. A pod whose pasta watches its namespace is unchanged at
+/// 1.8 ms, and the 31 ms lands exactly where the leak it prevents is possible.
+///
+/// The `pid > 0` check is belt and braces: [`read_pid_file`] is what actually guarantees it, and
+/// this repeats it because the argument is an `i32` and the next caller may not come from a file.
+fn stop_pasta(pid: i32, escalate: bool) {
     if pid <= 0 || !pid_is_pasta(pid) {
         return;
     }
     unsafe { libc::kill(pid, libc::SIGTERM) };
+    if !escalate {
+        return;
+    }
+    // Backs off from 1 ms so a pasta that leaves promptly costs about that, rather than a full
+    // poll interval. 250 ms total: pasta was measured leaving in about 30 ms after SIGTERM, so
+    // this is eight times its observed exit and not a deadline it can miss by being slow.
+    let (mut waited, mut step) = (0u64, 1u64);
+    while waited < PASTA_STOP_BUDGET_MS {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return; // gone
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+        step = (step * 2).min(32);
+    }
+    // Still there after the budget. RE-VERIFY IDENTITY before escalating: a quarter of a second is
+    // long enough for the pid to have been recycled by something unrelated, and SIGKILL to a
+    // stranger is not recoverable.
+    if pid_is_pasta(pid) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 /// Tear a pod down: kill its pasta NAT daemon (verified by PID + `comm` family prefix), then its holder, then wipe
@@ -1045,7 +1127,12 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // holder one line before the directory naming it was deleted.
     let holder = holder_to_reap(name);
     if let Some(pp) = read_pid_file(&dir.join("pasta.pid")) {
-        stop_pasta(pp);
+        // A pasta with no watch will never leave on its own, so its exit is confirmed before the
+        // pidfile that names it is deleted. Every other pod pays nothing for this.
+        // ESCALATE UNLESS THE POD IS RECORDED AS WATCHED. Absence covers both "the retry was
+        // used" and "the marker write failed", and both need the confirmation, so the default
+        // falls on the safe side rather than the fast one.
+        stop_pasta(pp, !dir.join(PASTA_WATCHED).exists());
     }
     if let Some(pid) = holder {
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -1059,8 +1146,21 @@ pub fn teardown(name: &str) -> (bool, usize) {
     //
     // The individual files are removed as a fallback so the state that drives the message is gone
     // even when the directory itself cannot be. Whatever remains is left for `create` to find.
+    //
+    // `pasta.pid` IS REMOVED LAST, and the order is load-bearing rather than tidy. If the signal
+    // above did not take, that file is the only thing that can still name the process; deleting it
+    // first would make the pasta unreachable for good, while leaving it means the next `pod rm`
+    // can try again. Free, and it costs nothing when the removal succeeds, which is the normal
+    // case and does not reach this branch at all.
     if std::fs::remove_dir_all(&dir).is_err() {
-        for stale in ["resolv.conf", "pasta.pid", "holder", "netns", "hosts"] {
+        for stale in [
+            "resolv.conf",
+            "holder",
+            "netns",
+            "hosts",
+            PASTA_WATCHED,
+            "pasta.pid",
+        ] {
             let _ = std::fs::remove_file(dir.join(stale));
         }
     }

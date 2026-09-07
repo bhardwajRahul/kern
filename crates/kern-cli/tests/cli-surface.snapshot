@@ -65,7 +65,7 @@ COMMANDS:
     login [registry] [--username U] / logout [registry]            Registry credentials (private pulls)
 
   Diagnostics
-    doctor                                                         Preflight: will boxes run here?
+    doctor [--apparmor-profile]                                    Preflight: will boxes run here?
     probe                                                          Host resources you can put in kern.toml
     info                                                           Runtime + host snapshot
     bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency

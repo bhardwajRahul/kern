@@ -72,6 +72,11 @@ jobs:
           name="kern-${{ matrix.target }}"
           install -Dm755 "target/${{ matrix.target }}/release/kern" "dist/kern"
           strip "dist/kern" || true
+          # ONE FILE. A release tarball is the binary and nothing else, and `cargo install` copies
+          # one file too, so NOTHING in `packaging/` reaches a user this way. Anything added there
+          # needs its own delivery path: `packaging/apparmor/kern` is compiled in with
+          # `include_str!` and emitted by `kern doctor --apparmor-profile` for that reason. See
+          # packaging/README.md before assuming a new file ships.
           tar -C dist -czf "${name}.tar.gz" kern
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
       - name: Upload to release

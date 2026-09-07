@@ -395,6 +395,8 @@ pub enum Command {
     },
     /// `kern doctor`: preflight - will boxes run here, and which optional features are available?
     Doctor,
+    /// `doctor --apparmor-profile`: write the shipped AppArmor profile to stdout and exit.
+    DoctorApparmorProfile,
     /// `kern info`: compact runtime + host snapshot.
     Info,
     /// `kern bench [--rootfs R] [--bind-rootfs] [-n N]`: time N box start→exit cycles.
@@ -1033,8 +1035,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `doctor`: environment preflight. `info`: runtime snapshot.
         Some("doctor") => {
-            reject_unknown_flags("doctor", &rest, &[])?;
-            Command::Doctor
+            reject_unknown_flags("doctor", &rest, &["--apparmor-profile"])?;
+            // Emitting the profile is a DIFFERENT command from diagnosing, so it is a different
+            // variant: `doctor` must not write or print anything but its report, and the emitter
+            // must not run the checks. The flag exists because the install line `doctor` prints
+            // has to be runnable by someone who installed from a release tarball or
+            // `cargo install`, neither of which carries the repo's `packaging/` directory.
+            if rest.contains(&"--apparmor-profile") {
+                Command::DoctorApparmorProfile
+            } else {
+                Command::Doctor
+            }
         }
         Some("info") => {
             reject_unknown_flags("info", &rest, &[])?;
@@ -3128,6 +3139,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Prune => commands::prune(),
         Command::Gc { images } => commands::gc(images),
         Command::Doctor => crate::doctor::doctor(),
+        Command::DoctorApparmorProfile => crate::doctor::print_apparmor_profile(),
         Command::Info => crate::doctor::info(),
         Command::Bench {
             rootfs,

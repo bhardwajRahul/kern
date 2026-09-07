@@ -102,7 +102,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}login{z} [registry] [--username U] / {c}logout{z} [registry]            Registry credentials (private pulls)
 
   {d}Diagnostics{z}
-    {c}doctor{z}                                                         Preflight: will boxes run here?
+    {c}doctor{z} [--apparmor-profile]                                    Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
     {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency

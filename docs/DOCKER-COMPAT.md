@@ -89,13 +89,24 @@ It is not a Fedora quirk, and it is not one kernel. `passt-selinux` is `noarch`,
 the same policy on x86_64 and aarch64, and **`passt` requires it**, so installing pasta
 installs the confinement with it. Run in a VM per distro, each Enforcing out of the box:
 
-| | kernel | shipped v0.9.2 | with the retry |
+| | kernel | passt | with the retry |
 |---|---|---|---|
-| Fedora 43 | 6.17 | `netns dir open: Permission denied` | page fetched from the box |
-| AlmaLinux 9.8 | 5.14 | `netns dir open: Permission denied` | page fetched from the box |
-| AlmaLinux 10.2 | 6.12 | `netns dir open: Permission denied` | page fetched from the box |
+| Fedora 43 | 6.17 | `0^20250919` | page fetched from the box |
+| AlmaLinux 9.8 | 5.14 | | page fetched from the box |
+| AlmaLinux 10.2 | 6.12 | | page fetched from the box |
+| Rocky Linux 10.2 | 6.12 | `0^20251210` | page fetched from the box |
+| CentOS Stream 10 | 6.12 | `0^20260728` | page fetched from the box |
 
-Three kernel generations, one result. **The audit log was empty on all three.**
+Each reproduced `netns dir open: Permission denied` on the shipped v0.9.2 first. Rocky and
+CentOS Stream were listed here as unverified until they were run; on both, the surviving pasta
+carries `--no-netns-quit`, which is how you know the policy refused the first attempt rather
+than the host simply being permissive.
+
+Five distributions, three kernel generations and four passt builds, one result. **The audit log
+was empty on every one of them.** The wording kern matches has been stable across those builds:
+`netns dir open: %s, exiting` is present in the 2024-02, 2025-09, 2025-12 and 2026-07 packages.
+Only the 2023-03 build in Debian 12 words it differently, and there it is a warning that keeps
+the NAT, so nothing needs matching.
 
 **And the reporter confirmed the cause on aarch64**, which is the half of it these VMs cannot
 reach: everything in the table is x86_64. On his own Fedora 43 aarch64 guest, `setenforce 0`
@@ -103,10 +114,13 @@ makes the pod reach the internet ([#6](https://github.com/getkern/kern/issues/6)
 architecture-plus-policy combination is measured for the FAULT, by the person who has the
 machine. Whether the retry fixes it there is still his to say.
 
-Rocky Linux
-and CentOS Stream ship the identical `passt-selinux` from the same RHEL sources and were not
-run; Amazon Linux 2023 ships it too and its image did not boot here, so its default
-enforcement mode is unverified.
+Amazon Linux 2023 ships the same `passt-selinux` and its image did not boot here, so its default
+enforcement mode is still unverified.
+
+One thing worth knowing if you build your own images: **a RHEL 10 guest needs a CPU model that
+advertises x86-64-v3.** Rocky 10 and CentOS Stream 10 panic on `init` under QEMU's default model
+and boot fine with `-cpu host`. That is a property of RHEL 10's baseline, not of kern, and it
+cost a first run here that looked like a broken image.
 
 Running it yourself, on any host, with or without SELinux:
 
@@ -155,16 +169,21 @@ and dropping the teardown signal. That last one is the leak the fix itself creat
 started without the netns watch does not notice the namespace disappear, so nothing but the
 signal stops it.
 
-**openSUSE is the other way round and needs nothing.** Its `passt-apparmor` profile
-(`/etc/apparmor.d/abstractions/pasta`, upstream passt's own) GRANTS the access SELinux
-refuses, and names the function while doing it:
+**Where AppArmor confines pasta instead, the same access is granted.** upstream passt's own
+profile (`/etc/apparmor.d/abstractions/pasta`) allows it, and names the function while doing it:
 
 ```
 @{PROC}/[0-9]*/ns/    r,    # pasta_netns_quit_init(),
 ```
 
-So the watch works there. The problem is the SELinux policy specifically, not confinement in
-general.
+So the problem is that SELinux policy specifically, not confinement in general.
+
+This page used to say "openSUSE is the other way round and needs nothing", which was read out
+of upstream packaging rather than measured, and the measurement does not support it: **openSUSE
+Leap 15.6 has no `passt` in its repositories at all**, so there is no pasta to confine, no
+abstraction file on disk, and a pod there is loopback-only for the ordinary reason. kern's
+acceptance matrix passes 38/38 on Leap; issue #6 simply cannot arise on it. Whether Tumbleweed
+packages passt was not checked.
 
 kern recovers from this by itself now: pasta opens the netns's DIRECTORY only to watch it
 and quit when it disappears, so on that one refusal kern retries once with

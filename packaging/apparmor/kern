@@ -1,0 +1,86 @@
+# AppArmor profile for kern.
+#
+# WHAT IT IS FOR. Ubuntu 23.10 and later ship
+# `kernel.apparmor_restrict_unprivileged_userns=1`, which PERMITS an unprivileged user namespace
+# and REFUSES the uid map inside it. kern is rootless and maps a uid in every box, so on a stock
+# Ubuntu no box starts at all until either this profile is installed or that sysctl is turned off.
+#
+# WHAT IT DOES NOT DO, and read this before installing a file into /etc/apparmor.d on a program's
+# say-so. It grants ONE permission, `userns`, and confines nothing. `flags=(unconfined)` means kern
+# is not restricted by this file in any way: not its paths, not its capabilities, not its syscalls.
+# Removing the file returns the machine to exactly its previous state.
+#
+# It is deliberately not a confining profile, and not only because such a profile would have to
+# permit `pivot_root`, `mount`, `unshare`, capability transitions and reads of every image layer
+# and workspace a user might bind, which is an allow-list of "yes" with extra steps that breaks on
+# the next feature. The reason is what it would be protecting. Confining kern would constrain KERN
+# on the host's behalf; kern's job is to constrain the WORKLOAD on the host's behalf, and it does
+# that with user namespaces, seccomp, cgroups, pivot_root and Landlock. A second, weaker,
+# unmaintained mechanism aimed at the same target would mostly invite the belief that it is doing
+# something.
+#
+# WHY A PROFILE RATHER THAN THE SYSCTL. `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+# re-enables unprivileged user namespaces for EVERY program on the machine, which is the exact
+# thing Ubuntu turned the restriction on to prevent, and it is lost at reboot unless a `sysctl.d`
+# file is written too. This profile is scoped to the kern binary and persists.
+#
+# INSTALL. Not done for you, deliberately: a runtime that writes into /etc/apparmor.d as a side
+# effect of running is a worse program than one that tells you what to run.
+#
+#     sudo install -m644 packaging/apparmor/kern /etc/apparmor.d/kern
+#     sudo apparmor_parser -r /etc/apparmor.d/kern
+#     kern doctor
+#
+# THE THIRD LINE IS NOT OPTIONAL. AppArmor attaches a profile at `execve`, so a kern that was
+# already running when you loaded this does not pick it up, and neither does anything it forks.
+# MEASURED: with the profile loaded, a fresh `kern doctor` reports the namespaces enabled and one
+# started beforehand still reports the blocker. Re-run it; do not judge by a process that was
+# already up.
+#
+# It is also what catches a TRUNCATED install. This file holds two profiles, and a pipe that breaks
+# between them leaves a syntactically valid file with one: MEASURED, `apparmor_parser -r` returns 0
+# and loads `kern` alone, in silence. A user installed under /usr/local/bin then sees "enabled" and
+# is genuinely fine; a user under $HOME sees the blocker again, which is the loud answer, and gets
+# it because they run `kern doctor` from their own path. Without the re-run that failure would be
+# silent for exactly the population it affects.
+#
+# One more thing about reloading, learned by contaminating a test with it: `apparmor_parser -r`
+# REPLACES the profiles named in the file and does NOT unload ones loaded earlier that the file no
+# longer contains. To get back to a known state use `apparmor_parser -R` with the file that loaded
+# them, or your "reload" is measuring a mixture.
+#
+# THE ATTACHMENT IS BY PATH. AppArmor matches a profile to the executable's path and will not
+# attach otherwise, so a kern installed somewhere not listed below loads this file cleanly, changes
+# nothing, and leaves `doctor` reporting the same blocker: a silent no-op. `kern doctor` prints the
+# path it is running from for that reason. If it is not covered here, edit the attachment line.
+#
+# The two profiles exist because AppArmor takes one attachment per profile and kern has two normal
+# homes: `install.sh` uses /usr/local/bin as root and $HOME/.local/bin otherwise, and
+# `cargo install` uses $HOME/.cargo/bin.
+#
+# READ WHAT THE SECOND PROFILE ACTUALLY GRANTS BEFORE KEEPING IT. `@{HOME}` is a tunable, and on
+# Ubuntu `tunables/home` defines it as `/home/*/ /root/`: EVERY user's home directory, not the
+# invoking one. So `kern-home` grants `userns` to whatever binary sits at
+# `~/.local/bin/kern` or `~/.cargo/bin/kern` for ANY user on this machine, at a path that user can
+# write. That is still far narrower than the sysctl, which lifts the restriction for every program
+# system-wide, and the permission it grants is one the restriction hardens rather than a boundary
+# it enforces. It is stated here rather than left for someone to discover by expanding the tunable.
+#
+# DELETE THE SECOND PROFILE if every kern on this machine is installed system-wide. Nothing else
+# depends on it.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile kern /{usr/,usr/local/}bin/kern flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/kern>
+}
+
+profile kern-home @{HOME}/.{cargo,local}/bin/kern flags=(unconfined) {
+  userns,
+
+  include if exists <local/kern>
+}
