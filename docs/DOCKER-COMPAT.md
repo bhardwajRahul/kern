@@ -95,7 +95,15 @@ installs the confinement with it. Run in a VM per distro, each Enforcing out of 
 | AlmaLinux 9.8 | 5.14 | `netns dir open: Permission denied` | page fetched from the box |
 | AlmaLinux 10.2 | 6.12 | `netns dir open: Permission denied` | page fetched from the box |
 
-Three kernel generations, one result. **The audit log was empty on all three.** Rocky Linux
+Three kernel generations, one result. **The audit log was empty on all three.**
+
+**And the reporter confirmed the cause on aarch64**, which is the half of it these VMs cannot
+reach: everything in the table is x86_64. On his own Fedora 43 aarch64 guest, `setenforce 0`
+makes the pod reach the internet ([#6](https://github.com/getkern/kern/issues/6)). So the
+architecture-plus-policy combination is measured for the FAULT, by the person who has the
+machine. Whether the retry fixes it there is still his to say.
+
+Rocky Linux
 and CentOS Stream ship the identical `passt-selinux` from the same RHEL sources and were not
 run; Amazon Linux 2023 ships it too and its image did not boot here, so its default
 enforcement mode is unverified.

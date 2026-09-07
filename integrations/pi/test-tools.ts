@@ -112,6 +112,20 @@ ok((await call("grep", { pattern: "^--$" })).includes("dashline.txt:2:--"), "a m
 fs.mkdirSync(path.join(ws, ".deps", "pkg"), { recursive: true });
 fs.writeFileSync(path.join(ws, ".deps", "pkg", "a-1-b.txt"), "MARKER_DEPS\n");
 ok((await call("grep", { pattern: "MARKER_DEPS" })).includes("No matches"), "a hit under .deps is excluded, by prefix");
+// BOTH PREFIXES MUST END AT A SEPARATOR. `.deps/` did; `.kern-env` did not, and swallowed
+// `.kern-envelope.md`, an ordinary file that merely starts with those letters. Measured by an
+// external audit driving this same execute.
+fs.writeFileSync(path.join(ws, ".kern-envelope.md"), "MARKER_ENVELOPE\n");
+fs.writeFileSync(path.join(ws, ".depsomething.txt"), "MARKER_DEPSISH\n");
+fs.mkdirSync(path.join(ws, ".deps-old"), { recursive: true });
+fs.writeFileSync(path.join(ws, ".deps-old", "x.txt"), "MARKER_DEPSOLD\n");
+ok((await call("grep", { pattern: "MARKER_ENVELOPE" })).includes(".kern-envelope.md:1:"), "a user file starting with .kern-env is NOT hidden");
+ok((await call("grep", { pattern: "MARKER_DEPSISH" })).includes(".depsomething.txt:1:"), "nor one starting with .deps");
+ok((await call("grep", { pattern: "MARKER_DEPSOLD" })).includes(".deps-old/x.txt:1:"), "nor a directory named .deps-old");
+// `.kern-env.<something>` stays hidden, and that is consistent rather than arbitrary: the SDK's own
+// listFiles omits the same shape, so `find` does not report it either.
+fs.writeFileSync(path.join(ws, ".kern-env.fake"), "MARKER_KERNENV\n");
+ok((await call("grep", { pattern: "MARKER_KERNENV" })).includes("No matches"), "while .kern-env.<x> stays hidden, as the SDK's own listing has it");
 // Names where the box's listing and grep's output could spell things differently.
 fs.writeFileSync(path.join(ws, "citt\u00e0-1-x.txt"), "MARKER_UTF\n");
 fs.writeFileSync(path.join(ws, "con spazio-1.txt"), "MARKER_SPACE\n");

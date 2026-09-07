@@ -787,7 +787,17 @@ export default function (pi: ExtensionAPI) {
 			// disappear only because the path lookup failed on them and the fallback happened to
 			// produce a string starting with `.deps/`: the right answer by accident. An external
 			// audit measured the mismatch. This needs no parse and cannot be defeated by a name.
-			const excluded = (l: string) => l.startsWith(".deps/") || l.startsWith(".kern-env");
+			// BOTH PREFIXES END AT A SEPARATOR, and one of them did not. `.deps/` was anchored on the
+			// slash and behaved: `.depsomething.txt` and `.deps-old/x.txt` are the user's and are
+			// reported. `.kern-env` was not anchored, so it swallowed `.kern-envelope.md`, an
+			// ordinary file that merely starts with those letters. Measured by an external audit
+			// driving the shipped execute, and reproduced here.
+			//
+			// The trailing dot is the anchor: kern's own file is `.kern-env.<boxid>`. A user file
+			// named `.kern-env.<anything>` is still hidden, and that is consistent rather than
+			// arbitrary: the SDK's own `listFiles` omits the same shape, so `find` does not report it
+			// either.
+			const excluded = (l: string) => l.startsWith(".deps/") || l.startsWith(".kern-env.");
 			lines = lines.filter((l) => !excluded(l));
 			if (p.glob) {
 				const g = p.glob;

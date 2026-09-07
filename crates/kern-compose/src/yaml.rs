@@ -2228,7 +2228,31 @@ fn service_to_box(
                 "service '{name}': 'shm_size:' ignored on purpose - kern bounds /dev/shm by the memory \
                  cgroup (mem_limit / --memory), not a fixed size, so there is no 64 MB shm footgun"
             )),
-            "configs" | "logging" | "extends" | "stdin_open" | "tty" | "domainname" => {
+            // `tty:` IS SILENT, and `stdin_open:` speaks only when it is true. Both used to fall
+            // into the generic "ignored (unsupported)" bucket below, which was wrong twice: it
+            // fired on the KEY rather than the value, so `tty: false` warned about nothing at all,
+            // and it told a user a feature was missing when nothing is missing for the thing they
+            // are running.
+            //
+            // A compose service is always detached, and MEASURED on a detached box: stdin is
+            // non-tty and at EOF, stdout is non-tty. `tty: true` therefore changes nothing kern
+            // can act on, and a terminal is available on demand anyway: `kern exec -it <service>`
+            // gives a real PTY inside the running box, which is more than `docker attach` offers.
+            // It appears in thousands of compose files out of habit, on daemons that never read a
+            // terminal, and warning all of them is noise. The reporter's own service is one:
+            // measured, it serves HTTP 200 and stays up with both keys ignored.
+            //
+            // `stdin_open: true` is the one with a consequence worth naming, and only that one: a
+            // program that waits on stdin gets EOF instead of a held-open pipe, so one written to
+            // block there will exit at once. That is a real behaviour difference, so it is stated
+            // as a behaviour rather than as a missing feature.
+            "tty" => {}
+            "stdin_open" => {
+                if scalar_is_true(node) {
+                    warn(&stdin_open_note(name));
+                }
+            }
+            "configs" | "logging" | "extends" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
             // kern's own TOML config spells these `health_cmd:` / `depends_healthy:`; a
@@ -3310,6 +3334,27 @@ fn warn(msg: &str) {
     eprintln!("kern: warning: compose: {}", sanitize_for_terminal(msg));
 }
 
+/// The note for `stdin_open: true`, which is the only half of Docker's `-it` pair that changes
+/// anything here.
+///
+/// A function rather than a fixed sentence, for the same reason as
+/// [`container_only_port_note`]: it names the SERVICE, and the remedy it offers is a command the
+/// reader can paste. MEASURED on a detached box, which is what every compose service is: stdin is
+/// non-tty and at EOF, stdout is non-tty.
+///
+/// `tty:` gets no note at all. It changes nothing kern can act on for a detached service, a
+/// terminal is available on demand through `kern exec -it`, and it sits in thousands of compose
+/// files out of habit on daemons that never read one. Both keys used to produce
+/// "ignored (unsupported)" off the KEY rather than the value, so `tty: false` warned about nothing
+/// and a working daemon was told a feature was missing.
+fn stdin_open_note(service: &str) -> String {
+    format!(
+        "service '{service}': 'stdin_open: true' - a compose service runs detached, so its stdin is \
+         at EOF rather than held open. A program that blocks on stdin will exit immediately; for an \
+         interactive shell use `kern exec -it {service}`"
+    )
+}
+
 /// `warn`, but the same text is printed once per run.
 ///
 /// For facts that belong to the FILE rather than to a service: `networks:` is dropped for the whole
@@ -4138,6 +4183,41 @@ mod tests {
         );
         // A unicode value passes through (only CONTROL chars are escaped, not multibyte text).
         assert_eq!(sanitize_for_terminal("café→🦀"), "café→🦀");
+    }
+
+    /// TWO ALARMING WARNINGS FOR A STACK THAT HAD NOTHING WRONG WITH IT.
+    ///
+    /// `stdin_open:` and `tty:` both produced "ignored (unsupported)", matched on the KEY, so
+    /// `tty: false` warned about nothing and a working daemon was told a feature was missing.
+    /// Reported as getkern#7 against a service that, measured, serves HTTP 200 and stays up with
+    /// both keys ignored.
+    #[test]
+    fn tty_is_silent_and_stdin_open_speaks_only_when_it_is_true() {
+        // Both keys parse, in both boolean spellings, and neither breaks the service.
+        for v in ["true", "false", "yes", "no"] {
+            let y = format!("services:\n  s:\n    image: x\n    tty: {v}\n    stdin_open: {v}\n");
+            let boxes = parse(&y).unwrap_or_else(|e| panic!("tty/stdin_open {v} broke parse: {e}"));
+            assert_eq!(boxes.len(), 1, "the service must survive {v}");
+            assert_eq!(boxes[0].name, "s");
+        }
+
+        // The note names the service in both places, and offers a command rather than a verdict.
+        let n = stdin_open_note("paseo");
+        assert!(
+            n.contains("'paseo'") && n.contains("kern exec -it paseo"),
+            "{n}"
+        );
+        assert!(n.contains("EOF"), "it must say what actually differs: {n}");
+        // NOT "unsupported": nothing is missing, the behaviour is different and that is the point.
+        assert!(!n.contains("unsupported"), "{n}");
+        assert!(!n.contains("ignored"), "{n}");
+        // It is per-service, which a fixed sentence could not be.
+        assert_ne!(stdin_open_note("a"), stdin_open_note("b"));
+
+        // `tty` HAS NO NOTE TO GET WRONG: the arm is empty on purpose, so there is no `tty_note`
+        // to assert against here. Nor does the loop above prove silence, only that parsing
+        // survives: `warn` writes to stderr, which a unit test in this crate cannot capture. The
+        // silence is asserted where stderr is readable, in `scripts/acceptance-matrix.sh`.
     }
 
     #[test]

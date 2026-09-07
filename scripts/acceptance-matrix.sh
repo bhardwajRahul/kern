@@ -334,6 +334,49 @@ sleep 1
     && pass "one service: down leaves no kern process" \
     || fail "one service: down left $(live_kern_pids) kern process(es) alive"
 
+# --- A WARNING A READER CAN DO NOTHING WITH IS NOISE ----------------------------------------------
+# `stdin_open:` and `tty:` both printed "ignored (unsupported)", matched on the KEY rather than the
+# value, so `tty: false` warned about nothing and a working daemon was told a feature was missing
+# (getkern#7). A compose service is always detached, and a detached box has non-tty stdin at EOF, so
+# `tty:` changes nothing kern can act on and a terminal is available through `kern exec -it` anyway.
+#
+# Asserted HERE and not in a Rust test because `warn` writes to stderr, which the compose crate's
+# own tests cannot capture. The message text is unit-tested; its ABSENCE has to be read off a real
+# run.
+echo
+echo "  compose: a key kern cannot act on must not produce an alarm"
+cat > "$D/tty.toml" <<TOML
+[box.q]
+rootfs = "$RF"
+command = ["/bin/busybox", "true"]
+TOML
+cat > "$D/tty.yml" <<YML
+services:
+  q:
+    image: x
+    tty: true
+    stdin_open: false
+YML
+outq=$(XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/tty.yml" config 2>&1)
+printf '%s' "$outq" | grep -qE "'tty:'|'stdin_open:'" \
+    && fail "tty:/stdin_open: false still warn: $(printf '%s' "$outq" | grep -E "tty|stdin" | head -1)" \
+    || pass "tty: true and stdin_open: false say nothing, because nothing is wrong"
+# THE OTHER HALF, so this is not just an assertion that kern went quiet everywhere: the one key
+# with a real consequence must still speak, and must name the service and the remedy.
+cat > "$D/tty2.yml" <<YML
+services:
+  q:
+    image: x
+    stdin_open: true
+YML
+outq2=$(XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/tty2.yml" config 2>&1)
+printf '%s' "$outq2" | grep -q "kern exec -it q" \
+    && pass "stdin_open: true still states the difference and names the remedy" \
+    || fail "stdin_open: true went silent too, so the noise fix silenced the signal"
+printf '%s' "$outq2" | grep -q 'unsupported' \
+    && fail "the stdin_open note still calls it unsupported" \
+    || pass "and it is not phrased as a missing feature"
+
 # --- A REFUSING PASTA MUST BE REPORTED ONCE, NOT CONTRADICTED -------------------------------------
 # v0.9.2 gave the compose summary its own opinion of the pod's network, derived from a BOOL. Every
 # false printed "install `passt`/`pasta`", so a Fedora user whose pasta was installed and refused to
