@@ -86,74 +86,31 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 ## Install
 
 A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
-boards** (Raspberry Pi · Jetson · Arduino UNO Q) directly, and **Windows through WSL2**, for which
-kern ships a pre-baked rootfs and an installer that sets WSL2 up for you.
-
-**On a Mac** it runs inside a Linux VM (colima, Lima, OrbStack, UTM, or one you already have), where
-it is the ordinary Linux kern: same binary, same CLI, same behaviour as your CI box. Verified on
-Apple Silicon with an Ubuntu 24.04 guest. Start from [docs/INSTALL.md](docs/INSTALL.md), which names
-the two steps a Mac guest needs and what the resource caps do on a default one.
-
-The quickest route is the release binary: one static file, no toolchain, and the script verifies its
-SHA256 before installing it.
+boards** (Raspberry Pi · Jetson · Arduino UNO Q) directly, **Windows through WSL2** with a pre-baked
+rootfs and an installer that sets WSL2 up for you, and **a Mac inside a Linux VM** (colima, Lima,
+OrbStack, UTM), where it is the ordinary Linux kern: same binary, same CLI, same behaviour as your CI
+box.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-It picks `x86_64` or `aarch64` for you, installs to `~/.local/bin` (`/usr/local/bin` as root, or
-`KERN_INSTALL_DIR`), and refuses to install a download whose checksum does not match. Verifying by
-hand instead is two lines:
+One static file, no toolchain. The script picks `x86_64` or `aarch64`, installs to `~/.local/bin`,
+and refuses a download whose SHA256 does not match. From source instead, the whole dependency tree is
+one crate:
 
 ```sh
-curl -fsSLO https://github.com/getkern/kern/releases/latest/download/kern-x86_64-unknown-linux-musl.tar.gz{,.sha256}
-sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256 && tar xzf kern-x86_64-unknown-linux-musl.tar.gz
-```
-
-**From source** is the other route, and the whole dependency tree is one crate (`libc`), so it is
-short: clone, build and install took 36 s on a desktop (i7-14700KF), longer on a small ARM board.
-
-```sh
-# if you do not have Rust yet
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-That puts `kern` in `~/.cargo/bin`, which rustup adds to your `PATH` (open a new shell, or
-`source "$HOME/.cargo/env"`, if `kern` is not found).
+[docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
+the Windows and Mac guests step by step, and what the resource caps do on a default VM.
 
-The release also ships an `aarch64` binary, a Windows `.exe` shim and a pre-baked WSL rootfs, each
-with its own `.sha256`; the tag is GPG-signed and independently timestamped ([provenance/](provenance/)).
-
-### Two versions, and they move separately
-
-The `kern` binary is versioned by its git tag and `kern-sandbox` by its own release, so the two can
-be out of step and it matters which way. **The SDK drives the binary as a subprocess**, so a binding
-newer than the binary asks for behaviour the binary does not have yet.
-
-Today `install.sh` gives you the latest **release**, and `pip install kern-sandbox` gives you the
-latest **SDK**. If the release predates a fix the SDK relies on, that shows up as behaviour this
-README describes and your machine does not do. The [CHANGELOG](CHANGELOG.md) is where the two are
-reconciled: an entry names the release it landed in.
-
-To see what you actually have:
-
-```sh
-kern --version                                   # the binary; `0.0.0` means you built it from source
-python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
-```
-
-Two cases are worth calling out because they are measured rather than theoretical, and both are fixed
-in the published release. On a kernel WITHOUT policy routing (`ip rule list` fails, which is common on
-ARM boards), `--egress-allow` used to start the box against a proxy nothing could reach. And a
-`compose` stack with a **single service** used to get no pod, and the pod is what attaches `pasta`, so
-a lone service came up with no egress at all behind an error that reads like DNS. Both are closed in
-**v0.9.2**, which is the published release.
-
-`kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
-[docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
-threat model): [docs/FAQ.md](docs/FAQ.md).
+**The binary and the SDK move separately.** `kern` is versioned by its git tag, `kern-sandbox` by its
+own release, and the SDK drives the binary as a subprocess, so an SDK newer than the binary can ask
+for behaviour the binary does not have. `kern --version` and
+`python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"` tell you what you have, and the
+[changelog](CHANGELOG.md) names the release each fix landed in.
 
 ## Quickstart
 
