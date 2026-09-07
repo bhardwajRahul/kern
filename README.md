@@ -2,7 +2,7 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-**kern:** A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and AI-generated code.
+**kern:** a fast, rootless sandbox and virtual resource runtime. Run any workload, trusted or not, in a real box and throw it away: an agent's tool-call, AI-generated code, a notebook cell, a CI step.
 
 **A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
@@ -291,7 +291,7 @@ prewarming and the LangChain integration in
 into a box, with a README that states which half is the kernel's boundary and which is a path check,
 in [integrations/pi/](integrations/pi/).
 
-## kern vs Docker vs Podman
+## kern vs Docker vs Podman: what a container costs, and what kern does not have
 
 All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
 7.0.0, with the method in [BENCHMARKS.md](BENCHMARKS.md).
@@ -308,7 +308,7 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 | OCI images, pull / build / push | yes | yes | yes |
 | `docker-compose.yml` | yes, read as-is ([one caveat](#stacks)) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
-| GPU | on the roadmap | yes | yes |
+| GPU passed into the container | no | yes | yes |
 
 ## Performance
 
