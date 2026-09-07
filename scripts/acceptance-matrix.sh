@@ -497,6 +497,43 @@ else
     fail "egress: no answer from the proxy - ${why:-$(printf '%s' "$egr" | tail -1 | cut -c1-90)}"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# The "accepted but NOT enforced here" notice must follow the CGROUP, not the code path.
+#
+# The defect this replaces: the check read `/proc/self/cgroup`, which on the systemd-scope tier is
+# the SUPERVISOR, parked in a sibling leaf of the box. Walking up from there never reaches the box's
+# own leaf, so both notices fired over a box capped exactly as asked. Reported on WSL2 and reproduced
+# on a Raspberry Pi 5 and a Jetson.
+#
+# ASSERTED ON BEHAVIOUR, not on the cgroup's numbers. An earlier version of this check compared
+# `memory.max` against the requested byte count, and kern rounds a cap DOWN to a page (correctly), so
+# `--memory 1000000` lands at 999424 and an equality test fails a correct binary. A 400 MB load
+# against a 256 MB ceiling dying with 137 is the same claim without a number in it.
+#
+# MATCHED ON THE NOTICE CLASS, not per flag. Where no cgroup is delegated, kern emits ONE combined
+# message covering memory and pids together, and there is no `--pids-limit accepted but NOT enforced`
+# line at all; a per-flag matcher read that as silence and failed a correct binary. If you are here
+# because you changed the wording of either notice, this is the matcher that reads it.
+am_mem=$("$KERN" box am-cap --image alpine --memory 256m --pids-limit 8 -- \
+           sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count=400 2>/dev/null' 2>/dev/null)
+am_oom=$?
+am_notice=$("$KERN" box am-cap2 --image alpine --memory 256m --pids-limit 8 -- /bin/true 2>&1 |
+              grep -cE "NOT enforced|could not be enforced")
+"$KERN" rm am-cap am-cap2 >/dev/null 2>&1
+if [ "$am_oom" -eq 137 ]; then
+    if [ "$am_notice" -eq 0 ]; then
+        pass "caps: a 400M load over a 256m ceiling was KILLED and kern reported no unenforced cap"
+    else
+        fail "caps: the ceiling KILLED the load and kern still reported a cap as unenforced"
+    fi
+else
+    if [ "$am_notice" -gt 0 ]; then
+        pass "caps: no ceiling bit here (exit $am_oom) and kern says so - correct on an undelegated host"
+    else
+        fail "caps: a 400M load survived a 256m cap and kern said nothing"
+    fi
+fi
+
 rm -rf "$D"
 echo
 if [ "$FAIL" -eq 0 ]; then

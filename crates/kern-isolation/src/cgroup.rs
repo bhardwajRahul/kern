@@ -2170,12 +2170,52 @@ fn is_real_limit(raw: &str) -> bool {
 /// beats answering about a layout we did not inspect, so every caller treats `None` as "cannot tell"
 /// rather than as "not capped".
 fn own_cgroup_dir() -> Option<std::path::PathBuf> {
-    let raw = fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_dir_from_proc_line(&fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+/// The parse and the ambiguity check, split out so a test can exercise THIS code rather than a
+/// copy of it. The first version of the test below reproduced these four lines inline and passed
+/// against a build with the guard deleted, which is the defect it was written to prevent, one
+/// level up.
+fn cgroup_dir_from_proc_line(raw: &str) -> Option<std::path::PathBuf> {
     let rel = raw
         .lines()
         .find_map(|l| l.strip_prefix("0::"))
         .map(str::trim)
         .filter(|p| p.starts_with('/'))?;
+    // `0::/` IS AN ANSWER THIS FUNCTION CANNOT USE, and it used to be treated as one. It means
+    // either "I am at the true root of the hierarchy" or "I am inside a cgroup NAMESPACE and my
+    // root is whatever cgroup was namespaced" - one value standing for two conditions, which is
+    // the in-band-sentinel shape this codebase has removed elsewhere.
+    //
+    // Resolving it is not neutral, it is always wrong in the same direction: joining an empty
+    // relative path yields `/sys/fs/cgroup`, and the ROOT CGROUP HAS NO `memory.max` (verified:
+    // `ls /sys/fs/cgroup/memory.max` -> No such file). So every caller that cannot locate itself
+    // reads a directory where the cap file cannot exist, concludes "not capped", and prints
+    // "accepted but NOT enforced here" about a box whose cap may be perfectly in force.
+    //
+    // `None` matches this module's own stated policy for the case one line up: an unreadable
+    // `/proc/self/cgroup` means we cannot tell, and a warning we cannot justify is worse than
+    // none. Not knowing where you are is the same condition as not being able to read where you
+    // are, and it now gets the same answer.
+    //
+    // THE RETURN TYPE IS NARROW BECAUSE THE POLICY IS UNIFORM, not because there happen to be two
+    // callers. `None` now collapses four conditions - no `0::` line, a relative path, an unreadable
+    // file, and a root we cannot place - and every one of them means "stay quiet", so nothing can
+    // tell them apart and nothing needs to. If that policy ever stops being uniform, if some caller
+    // must warn on doubt or distinguish "cgroup v1 host" from "namespaced box", THE TYPE HAS TO
+    // GROW FIRST: widening it afterwards means auditing every branch that already treated the four
+    // as one. Stated this way round because "two callers do not need it" stops being true the day a
+    // third appears, and this reason does not. This cannot create a false GREEN beyond what that
+    // branch already accepts: a box is never left at the hierarchy root by `apply_caps`, and a
+    // cap that truly failed to apply is caught by its fail-closed read-back and by
+    // `--require-limits`, neither of which routes through here.
+    //
+    // Found by an external reviewer reading the function, with no host and no binary. It is a
+    // property of the code, not of a machine, which is why it did not need one.
+    if rel == "/" {
+        return None;
+    }
     Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
@@ -2203,38 +2243,90 @@ pub fn memory_cap_in_force_at_or_below(bytes: u64) -> bool {
 /// (`cpu.weight`) and no `cpu.max` anywhere in the chain, so `--cpus 0.5` became a share rather than
 /// a ceiling, in silence, while `kern doctor` reported caps as enforced. Measured there, not assumed.
 ///
-/// Runs INSIDE the scope, so `/proc/self/cgroup` is the box's own chain and the answer is the
-/// effective one. Read-only and best-effort: an unreadable `/proc/self/cgroup` means we cannot tell,
-/// and a warning we cannot justify is worse than none, so it stays quiet.
-pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) {
+/// `dir` is the BOX's cgroup, and passing it is not optional bookkeeping: the supervisor is parked in
+/// a SIBLING leaf (so a whole-box OOM cannot take it), and that leaf is uncapped by construction while
+/// the box's own leaf carries the exact caps. This function used to read `/proc/self/cgroup`, which on
+/// the scope tier answered for the supervisor's leaf and then walked to the ANCESTORS - never reaching
+/// the box's leaf, because it is a sibling, not a parent. MEASURED on a Raspberry Pi 5 and a Jetson
+/// (2026-09-07), `--memory 256m --pids-limit 64`: the box's leaf held `memory.max=268435456` and
+/// `pids.max=64`, exactly as asked, and kern printed BOTH "accepted but NOT enforced here" lines. The
+/// only ancestor with a memory ceiling is the scope, deliberately set to the request PLUS
+/// [`SCOPE_SUPERVISOR_HEADROOM`] (see `scope_memory_max`: equal ceilings OOM the supervisor first), so
+/// `<= request` was false BY DESIGN. Both notices were wrong on 100% of that tier, and silent on the
+/// direct tier, where `KERN_SCOPE` is unset and this is never called: the check had never once fired
+/// correctly. [`record_memory_cap_signal`] already took the directory for this exact reason, so the
+/// enforcement BYTE said "enforced" while the prose said the opposite.
+///
+/// `None` restores the self-read for the callers that ARE the workload (`kern run` execs in place).
+/// Read-only and best-effort: an unreadable `/proc/self/cgroup` means we cannot tell, and a warning we
+/// cannot justify is worse than none, so it stays quiet.
+pub fn warn_unenforced_caps(
+    dir: Option<&std::path::Path>,
+    memory: Option<u64>,
+    cpus: Option<f64>,
+    pids: Option<u64>,
+) {
     // KERN_QUIET drops this human-readable warning for embedders (e.g. the MCP server) whose channel
     // is a machine one: they read the enforcement verdict off the unforgeable started-fd signal, which
     // this does NOT touch, so `oom` vs `killed` classification still holds. Only the prose is silenced.
     if env_flag("KERN_QUIET") {
         return;
     }
-    let Some(dir) = own_cgroup_dir() else {
+    let dir_given = dir.is_some();
+    let Some(dir) = dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(own_cgroup_dir)
+    else {
         return;
     };
-    // Each knob carries its OWN enforcement check, so the loop dispatches on the check, not on the
-    // file name. The three differ on purpose:
-    //   * memory - VALUE-aware (`AtOrBelow`): an ancestor `memory.max` larger than the request does not
-    //     satisfy `--memory 32m`. A finite-but-larger outer cap once masked a box that asked for less
-    //     than it got, so this compares against the request, not mere existence.
-    //   * cpu - an ancestor ceiling counts (`TreeExists`): a `cpu.max` anywhere up the chain bounds this
-    //     box wherever it sits.
-    //   * pids - the box's OWN level only (`HereExists`). Measured on a Raspberry Pi 5,
-    //     `--pids-limit 999999999`: the walk found `user-1000.slice pids.max=20370` and stayed quiet,
-    //     but 20370 is systemd's session-wide `TasksMax`, shared with every other process the user runs
-    //     - not a per-box fork-bomb guard. `apply_caps`'s fail-closed block keys on the box's own
-    //     read-back for the same reason; the rule was applied in one place and not the other. Checking
-    //     only the box's own level costs no false warning: 64/256/1000000 all landed in the box's cgroup
-    //     exactly, only 999999999 did not.
+    // WHICH ceiling counts as satisfying `--memory`. Given the box's own leaf, the request EXACTLY:
+    // that leaf is written with `memory.max=<request>`. Falling back to the self-read under a scope we
+    // are reading the chain the supervisor stands in, whose only ceiling is the one kern itself asked
+    // systemd for - the request plus the supervisor's headroom - so comparing against the bare request
+    // there reports a correctly-capped box as unenforced by exactly that headroom, which is the same
+    // false red one vantage up.
+    let memory = match (dir_given, env_flag("KERN_SCOPE")) {
+        (false, true) => memory.map(|m| m.saturating_add(SCOPE_SUPERVISOR_HEADROOM)),
+        _ => memory,
+    };
+    for (flag, why) in unenforced_caps(&dir, memory, cpus, pids) {
+        eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
+    }
+}
+
+/// Which of the caps the caller ASKED for are not enforced at `dir`, as `(flag, why)` pairs.
+///
+/// The decision, separated from the printing and from every environment read, so a test can drive the
+/// SUBJECT against a synthetic cgroup tree instead of re-deriving the same rule beside it and passing
+/// against a build where the rule is wrong. `warn_unenforced_caps` keeps what only the live process can
+/// answer: which directory to look at, and which ceiling counts.
+///
+/// Each knob carries its OWN enforcement check, so the loop dispatches on the check, not on the
+/// file name. The three differ on purpose:
+///   * memory - VALUE-aware (`AtOrBelow`): an ancestor `memory.max` larger than the request does not
+///     satisfy `--memory 32m`. A finite-but-larger outer cap once masked a box that asked for less
+///     than it got, so this compares against the request, not mere existence.
+///   * cpu - an ancestor ceiling counts (`TreeExists`): a `cpu.max` anywhere up the chain bounds this
+///     box wherever it sits.
+///   * pids - the box's OWN level only (`HereExists`). Measured on a Raspberry Pi 5,
+///     `--pids-limit 999999999`: the walk found `user-1000.slice pids.max=20370` and stayed quiet,
+///     but 20370 is systemd's session-wide `TasksMax`, shared with every other process the user
+///     runs, not a per-box fork-bomb guard. `apply_caps`'s fail-closed block keys on the box's own
+///     read-back for the same reason; the rule was applied in one place and not the other. Checking
+///     only the box's own level costs no false warning: 64/256/1000000 all landed in the box's cgroup
+///     exactly, only 999999999 did not.
+fn unenforced_caps(
+    dir: &std::path::Path,
+    memory: Option<u64>,
+    cpus: Option<f64>,
+    pids: Option<u64>,
+) -> Vec<(&'static str, &'static str)> {
     enum Check<'a> {
         AtOrBelow(u64),
         TreeExists(&'a str),
         HereExists(&'a str),
     }
+    let mut out = Vec::new();
     for (asked, flag, check, why) in [
         (
             memory.is_some(),
@@ -2259,14 +2351,15 @@ pub fn warn_unenforced_caps(memory: Option<u64>, cpus: Option<f64>, pids: Option
         // `asked &&` short-circuits, so the file read only happens for a knob the caller actually set.
         let capped = asked
             && match check {
-                Check::AtOrBelow(req) => memory_capped_at_or_below(&dir, req),
-                Check::TreeExists(file) => capped_in_tree(&dir, file),
-                Check::HereExists(file) => capped_here(&dir, file),
+                Check::AtOrBelow(req) => memory_capped_at_or_below(dir, req),
+                Check::TreeExists(file) => capped_in_tree(dir, file),
+                Check::HereExists(file) => capped_here(dir, file),
             };
         if asked && !capped {
-            eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
+            out.push((flag, why));
         }
     }
+    out
 }
 
 /// Is a REAL cap in force on THIS cgroup, ignoring ancestors? The leaf-only counterpart to
@@ -2390,6 +2483,58 @@ pub fn memory_cap_signal() -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `0::/` MEANS "I CANNOT TELL YOU WHERE I AM", and it used to resolve to the mount root.
+    ///
+    /// The line is ambiguous by construction: it is what a process at the true root of the
+    /// hierarchy reads AND what a process inside a cgroup namespace reads, because the namespace
+    /// re-roots the path. One value, two conditions, and the code picked one of them silently.
+    ///
+    /// Resolving it was never neutral. Joining an empty relative path yields `/sys/fs/cgroup`, and
+    /// the root cgroup carries no `memory.max`, so the check that follows reads a directory where
+    /// the file cannot exist, concludes the cap is absent, and prints "accepted but NOT enforced
+    /// here" about a box that may be capped exactly as asked. A guaranteed false RED for anyone who
+    /// cannot locate themselves.
+    ///
+    /// Found by an external reviewer reading the function with no host, no repo and no binary. The
+    /// asymmetry is the reason it is worth a test rather than a comment: a false red is loud and
+    /// annoying, a false green is silent, and this module's stated policy already picks silence
+    /// when it cannot tell.
+    #[test]
+    fn a_cgroup_line_that_locates_nothing_yields_no_directory() {
+        // THE SUBJECT, not a copy of it. The first version of this test reproduced the parse
+        // inline and passed against a build with the guard deleted: it was verifying its own
+        // duplicate. `own_cgroup_dir` reads /proc/self/cgroup and cannot be handed a string, so
+        // the parse is a function now and this calls it.
+        let resolve = super::cgroup_dir_from_proc_line;
+
+        // THE CASE THAT REGRESSED: namespaced, or at the root. Either way, unusable.
+        assert_eq!(
+            resolve("0::/\n"),
+            None,
+            "`0::/` must not resolve to the root"
+        );
+        assert_eq!(resolve("0::/"), None, "with no trailing newline either");
+        assert_eq!(resolve("0::  /  \n"), None, "nor once trimmed");
+
+        // A real location still resolves, or the fix would have silenced every host.
+        assert_eq!(
+            resolve("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            Some(std::path::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope"
+            ))
+        );
+        assert_eq!(
+            resolve("0::/init.scope\n"),
+            Some(std::path::PathBuf::from("/sys/fs/cgroup/init.scope")),
+            "the WSL2 shape must still resolve: it names a cgroup, unlike `/`"
+        );
+
+        // Lines that are not the unified hierarchy, and garbage, are unchanged: still no answer.
+        assert_eq!(resolve("1:name=systemd:/user.slice\n"), None, "v1 only");
+        assert_eq!(resolve("0::relative\n"), None, "not absolute");
+        assert_eq!(resolve(""), None);
+    }
 
     /// The supervisor's leaf is NOT a box cgroup, and every consumer of the gate depends on that.
     ///
@@ -3185,6 +3330,71 @@ mod tests {
             "`max` (uncapped) does not satisfy any request"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE VANTAGE, not the rule. Reconstructs the layout measured on a Raspberry Pi 5 and a Jetson
+    /// (2026-09-07) under `--memory 256m --pids-limit 64` on the systemd-scope tier:
+    ///
+    ///   kern-box-<id>.scope/                 memory.max = request + SCOPE_SUPERVISOR_HEADROOM
+    ///     kern-box-<id>/                     memory.max = request, pids.max = 64   <- the BOX
+    ///     kern-box-<id>-sup/                 (nothing)                             <- the SUPERVISOR
+    ///
+    /// The supervisor is parked in a SIBLING of the box, so `/proc/self/cgroup` there walks to the
+    /// ANCESTORS and never reaches the box's leaf. Both notices fired over a box capped exactly as
+    /// asked, and they could not have done otherwise: the scope's ceiling is the request plus the
+    /// headroom BY DESIGN, so `<= request` is false at every level the supervisor can see.
+    ///
+    /// The assertion is the DIFFERENCE between the two vantages on one identical tree, because that
+    /// is the whole defect - the rule was right and was asked in the wrong place.
+    #[test]
+    fn unenforced_caps_answers_for_the_box_leaf_not_the_supervisors_sibling() {
+        let scope = std::env::temp_dir().join(format!("kern-vantage-{}", std::process::id()));
+        let boxdir = scope.join("kern-box-1");
+        let sup = scope.join("kern-box-1-sup");
+        std::fs::create_dir_all(&boxdir).unwrap();
+        std::fs::create_dir_all(&sup).unwrap();
+        let req: u64 = 256 * 1024 * 1024;
+        std::fs::write(
+            scope.join("memory.max"),
+            (req + SCOPE_SUPERVISOR_HEADROOM).to_string(),
+        )
+        .unwrap();
+        std::fs::write(scope.join("pids.max"), "64").unwrap();
+        std::fs::write(boxdir.join("memory.max"), req.to_string()).unwrap();
+        std::fs::write(boxdir.join("pids.max"), "64").unwrap();
+
+        // The box's own leaf: capped exactly as asked, so nothing to say. This is what the host was
+        // actually doing while it printed two warnings.
+        assert!(
+            unenforced_caps(&boxdir, Some(req), None, Some(64)).is_empty(),
+            "the box leaf carries memory.max=request and pids.max=64; there is nothing unenforced"
+        );
+
+        // The supervisor's sibling: the same tree, the same rule, the wrong place. Both knobs report
+        // unenforced. This is the shipped behaviour, kept as the negative control - it pins the COST
+        // of the wrong vantage, and it is the reason the two assertions above mean anything. What it
+        // does NOT cover is `warn_unenforced_caps` itself dropping the `dir` it is handed: that is a
+        // property of the wrapper, which reads the environment and prints, and it is checked on a
+        // board rather than here.
+        let from_sup = unenforced_caps(&sup, Some(req), None, Some(64));
+        assert_eq!(
+            from_sup.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+            vec!["--memory", "--pids-limit"],
+            "read from the supervisor's uncapped sibling, both caps look absent"
+        );
+
+        // And the ceiling matters, not just the directory: a box leaf capped ABOVE what was asked is
+        // still a real miss, so the fix cannot be "trust the box leaf whatever it says".
+        std::fs::write(boxdir.join("memory.max"), (req * 2).to_string()).unwrap();
+        assert_eq!(
+            unenforced_caps(&boxdir, Some(req), None, Some(64))
+                .iter()
+                .map(|(f, _)| *f)
+                .collect::<Vec<_>>(),
+            vec!["--memory"],
+            "a leaf capped at twice the request does not enforce the request"
+        );
+        let _ = std::fs::remove_dir_all(&scope);
     }
 
     #[test]

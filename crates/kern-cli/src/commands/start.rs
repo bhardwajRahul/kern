@@ -1634,7 +1634,10 @@ pub fn run(
         // The branch above stays quiet under a scope because the scope is ASSUMED to enforce the
         // caps it was given. systemd accepts `MemoryMax=`/`CPUQuota=` that the kernel cannot honour
         // and reports nothing, so verify the effective chain rather than trusting the assumption.
-        kern_isolation::warn_unenforced_caps(memory, cpus, None);
+        // `None`: `kern run` exec()s the workload IN PLACE, so this process IS the box and
+        // `/proc/self/cgroup` is the right chain to read. The box path passes the box's cgroup
+        // explicitly because its supervisor sits in a sibling leaf; here there is no supervisor.
+        kern_isolation::warn_unenforced_caps(None, memory, cpus, None);
     } else if memory.is_none()
         && cpus.is_none()
         && !kern_common::env_flag("KERN_QUIET")
@@ -2596,8 +2599,22 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         // kern printed nothing at all. Accepting a cap and not enforcing it is the one thing this
         // codebase refuses to do quietly, and this was the last place it still did.
         //
-        // Same function the other unenforceable-cap paths use, so the rule has one definition.
-        kern_isolation::warn_unenforced_caps(memory, cpus, pids_max);
+        // NO WARNING IS EMITTED HERE, and the reason is the whole of the defect above. This point is
+        // BEFORE the box exists: `apply_limits` has not run, no `kern-box-*` cgroup has been created,
+        // and whether the direct path will succeed is not yet known. The sentence this code used to
+        // print, that the caller's own chain "is also the one the box will inherit, since the opt-out
+        // skips the scope entirely", is simply false: the opt-out skips the SCOPE, not the direct
+        // cgroup, and the box lands in a `kern-box-*` leaf of its own either way.
+        //
+        // MEASURED on x86_64 with `KERN_NO_SCOPE=1 --memory 256m`: this printed "accepted but NOT
+        // enforced here - the box can exceed it" while the box's cgroup held `memory.max=268435456`
+        // and a 400 MB load was killed with exit 137. A false red, from the same mistake as the one
+        // it was meant to report: answering about the box from a vantage that is not the box.
+        //
+        // The Pi finding this block was written for is unchanged and still reported, one layer down,
+        // where the answer is knowable: `kern box` warns from `real.rs` after `apply_limits`, against
+        // the box's own cgroup, and `kern run` warns from its own `cg.is_none()` branch above. Both
+        // now speak only about a cgroup that exists.
         return;
     }
     // Gate on a running user manager (so the exec can't strand us in a broken systemd-run). Probe ONCE

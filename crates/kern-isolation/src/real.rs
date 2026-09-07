@@ -2794,14 +2794,29 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         true, // supervisor_forks_workload: `kern box` forks PID 1, which joins the capped cgroup itself
     );
 
+    // The BOX's cgroup, for the two readers below. ONE expression, bound once and shared, because the
+    // human-readable warning and the machine-readable enforcement byte answer the same question and
+    // must not be able to disagree. They did: the byte took this directory and the warning read
+    // `/proc/self/cgroup`, which is the supervisor's uncapped SIBLING leaf on the scope tier, so both
+    // Raspberry Pi 5 and Jetson reported "--memory accepted but NOT enforced here" over a box whose
+    // leaf held exactly the requested `memory.max` and `pids.max`. `None` where the sibling layout was
+    // not built: the supervisor is then inside the capped cgroup and the self-read is correct.
+    let box_cg = cg
+        .as_ref()
+        .filter(|g| g.supervisor_is_outside())
+        .map(crate::cgroup::CgroupGuard::box_dir);
+
     // Under a systemd scope the caps were handed to `systemd-run` as `MemoryMax=`/`CPUQuota=`/
     // `TasksMax=` and nothing re-checked them: systemd accepts a property the kernel cannot honour
-    // and reports nothing. Verify the EFFECTIVE chain from inside the scope, where /proc/self/cgroup
-    // is the box's own. Found on an Arduino UNO Q's Android kernel, whose `cpu` controller exposes
-    // only `cpu.weight` and no `cpu.max`, turning `--cpus` into a share with no message at all.
-    if crate::cgroup::env_flag("KERN_SCOPE") {
-        crate::cgroup::warn_unenforced_caps(spec.memory_max, spec.cpus, spec.pids_max);
-    }
+    // and reports nothing. Verify the EFFECTIVE chain at the box's own cgroup. Found on an Arduino
+    // UNO Q's Android kernel, whose `cpu` controller exposes only `cpu.weight` and no `cpu.max`,
+    // turning `--cpus` into a share with no message at all.
+    // NOT gated on `KERN_SCOPE` any more. The gate assumed the scope tier was the only one that could
+    // accept a cap without enforcing it, and the opt-out path (`KERN_NO_SCOPE`) disproved that: it
+    // warned from before the box existed because nothing here would. Now the check runs on EVERY box
+    // path, always against the box's own cgroup, so there is one place that answers this question and
+    // it is the one that can.
+    crate::cgroup::warn_unenforced_caps(box_cg, spec.memory_max, spec.cpus, spec.pids_max);
 
     // Record whether the memory cap actually binds, for the `KERN_STARTED_FD` enforcement byte. HERE is
     // the one correct point: the box's cgroup exists with its caps written and the box has not yet
@@ -2813,12 +2828,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // OOM cannot take it), so self-reading would answer for that uncapped leaf and report every box as
     // unenforced. Where the layout could not be built the supervisor is still inside and `None` restores
     // the self-read, which is the same answer as before.
-    crate::cgroup::record_memory_cap_signal(
-        spec.memory_max,
-        cg.as_ref()
-            .filter(|g| g.supervisor_is_outside())
-            .map(crate::cgroup::CgroupGuard::box_dir),
-    );
+    crate::cgroup::record_memory_cap_signal(spec.memory_max, box_cg);
 
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
     // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
