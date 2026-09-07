@@ -99,10 +99,9 @@ one crate:
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-The acceptance matrix and the issue-6 battery run on **Ubuntu 24.04, Debian 13, Fedora 44, Rocky 10,
-CentOS Stream 10 and openSUSE**, on real VMs rather than containers, plus a Raspberry Pi 5, a Jetson
-Orin Nano and an Arduino UNO Q. Any distribution with unprivileged user namespaces and cgroup v2
-works; those are the ones a release is checked against.
+Any distribution with unprivileged user namespaces and cgroup v2 works. A release is tested on
+**Ubuntu 24.04, Debian 13, Fedora 44, Rocky 10, CentOS Stream 10 and openSUSE** in real VMs, and on a
+Raspberry Pi 5, a Jetson Orin Nano and an Arduino UNO Q.
 
 [docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
 the Windows and Mac guests step by step, and what the resource caps do on a default VM.
