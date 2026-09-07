@@ -5,7 +5,7 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.9.3 - 2026-09-07
 
 **If you run kern on Ubuntu 23.10 or later, your install needs one action.** That is not a new
 feature, it is the answer to "why does no box start", and it is here rather than under new
