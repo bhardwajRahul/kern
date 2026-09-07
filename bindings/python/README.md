@@ -139,10 +139,14 @@ A refused mount raises `MountRefused` rather than the generic `SandboxError`, so
 `prewarm=N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,
 and refills on a worker thread while your agent thinks. Measured on `python:3.12-slim`:
 
-| | first call | p50 |
+| | first call | p50 within the burst |
 |---|---:|---:|
 | default | 30.9 ms | 14.2 ms |
 | `prewarm=4` | 0.9 ms | **0.8 ms** |
+
+That column is the p50 **inside** a burst of N, and outside one there is no gain to report: measured
+back-to-back on `python:3.12-slim`, four calls with `prewarm=4` read a p50 of 0.6 ms and twenty calls
+read 13.6 ms, which is the default. The pool covers a burst, not a rate.
 
 **The pool also fills on that worker thread, so the first call is fast only once it HAS filled.**
 Measured on `python:3.12-slim`: constructing with `prewarm=4` and calling immediately gives 13.7 ms
