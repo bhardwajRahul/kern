@@ -277,7 +277,8 @@ one to the engines, two orders of magnitude above.
 ## Security
 
 Namespaces, a `pivot_root`, 16 dangerous capabilities dropped before exec, an always-on seccomp
-**allowlist** (a syscall outside the vetted set returns `ENOSYS`), cgroup v2 limits that
+**allowlist** (moby's default filter minus kern's 35 escape syscalls, which stay hard-killed; anything
+outside the vetted set returns `ENOSYS`), cgroup v2 limits that
 `--require-limits` refuses to start without, and a deny-by-default `/dev`. Where a boundary is
 cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 
