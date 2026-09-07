@@ -10,7 +10,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>**3.5 ms is a box from an OCI image**, measured at 3.4 and rounded up. Without an image a **bare box** is ~2.4 ms, which is what the table further down measures. One machine and one workload; [BENCHMARKS.md](BENCHMARKS.md) is how both were taken</sub>
+<sub>One machine, one workload, rounded up from the measurement. [BENCHMARKS.md](BENCHMARKS.md) has the method, the numbers without an image, and how to take them yourself</sub>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
