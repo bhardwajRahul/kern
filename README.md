@@ -32,8 +32,9 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
 ```sh
-# macOS: a Linux VM first, then the line above inside it
+# macOS, two steps: a Linux VM, then kern inside it
 brew install colima && colima start && colima ssh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
 ```
 
 <sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel. [Install](#install).</sub>
