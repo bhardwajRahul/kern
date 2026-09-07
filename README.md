@@ -45,18 +45,18 @@ and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
-- **Sandbox an AI agent, one container per tool-call.** The shell command your agent just decided to
-  run, the snippet the model just wrote, a notebook cell, a CI step: code that executes before
-  anyone has read it. kern gives each call a real container, runs it, deletes it. Fast enough to do
-  it on every call, instead of giving the agent one long-lived sandbox and hoping. Network off,
-  memory and PID caps the kernel enforces, capabilities dropped, seccomp deny-by-default, and the
-  timeout applied from OUTSIDE, so code that hangs cannot outlive it.
-  <br>**Your agent loop reads a field, not a stack trace.** Timeout, OOM-kill, blocked syscall,
-  command not in the image: each comes back as a typed `fault` next to stdout and the exit code.
-  Branch on it and keep going.
-  <br>Wire it to your agent from Python, Node, LangChain, or any MCP client:
-  [below](#run-an-agents-code-python-node-mcp). For code written to attack you rather than merely
-  unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
+- **Sandbox an AI agent, one container per tool-call.** The shell command your agent just decided
+  to run, the snippet the model just wrote, a notebook cell, a CI step: code that executes before
+  anyone has read it. kern starts a box, runs it, deletes it. Fast enough that per-call isolation
+  is the default, not a special case. Network off unless you ask, memory and PID caps the kernel
+  enforces, capabilities dropped, seccomp deny-by-default, and the timeout applied from OUTSIDE, so
+  code that hangs cannot outlive it.
+  <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, command not in
+  the image: each comes back as a typed `fault` next to stdout and the exit code. Branch on it and
+  keep going.
+  <br>**One binary, no daemon.** Wire it to your agent from Python, Node, LangChain, or any MCP
+  client: [below](#run-an-agents-code-python-node-mcp). For code written to attack you rather than
+  merely unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
