@@ -277,36 +277,17 @@ one to the engines, two orders of magnitude above.
 ## Security
 
 Namespaces, a `pivot_root`, 16 dangerous capabilities dropped before exec, an always-on seccomp
-**allowlist** by default (moby's own default filter minus kern's 35 escape syscalls, which stay
-hard-killed; a syscall outside the vetted set returns `ENOSYS`, and the wider denylist is the opt-out
-via `KERN_SECCOMP=denylist`), cgroup v2 limits (`--require-limits` refuses to start unless they bind),
-and a deny-by-default `/dev`. Where a boundary is cooperative rather than kernel-enforced,
-[SECURITY.md](SECURITY.md) says so and names the bypass.
+**allowlist** (a syscall outside the vetted set returns `ENOSYS`), cgroup v2 limits that
+`--require-limits` refuses to start without, and a deny-by-default `/dev`. Where a boundary is
+cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 
-You do not have to take it on trust: [pentest/](pentest/) holds five adversarial suites that assert
-those boundaries against the kernel rather than against kern's own reporting, and they run without a
-registry account or a network.
+You do not have to take it on trust. [pentest/](pentest/) holds five adversarial suites that assert
+those boundaries against the kernel rather than against kern's own reporting, with no registry
+account and no network:
 
 ```sh
 sh pentest/run-with-local-registry.sh ./target/release/kern pentest/pentest-ports.sh
 ```
-
-**Every release is signed and independently timestamped.** The tag is a GPG-signed object, and
-[provenance/](provenance/) carries a file naming that tag and its release commit, stamped with
-[OpenTimestamps](https://opentimestamps.org) and anchored in the Bitcoin blockchain. So the claim is
-not "trust our CI": you can check, from a clone and without asking us anything, that a given release
-existed at a given time and was cut by the holder of that key.
-
-```sh
-git tag -v v0.9.3                                     # the signature on the tag object
-ots info provenance/v0.9.3.provenance.txt.ots         # the timestamp, without a Bitcoin node
-```
-
-`ots verify` is the stronger check and it needs a Bitcoin node to talk to, which most readers will
-not have; `ots info` reads the attestation itself and needs nothing. Either way the anchor is created
-by hand after each tag and starts out PENDING, because a block takes hours rather than minutes.
-`provenance/upgrade-when-ready.sh` completes it once the block confirms, and commits only if the
-anchor actually arrived.
 
 Report a vulnerability privately via GitHub Security Advisories or hello@getkern.dev.
 
