@@ -384,6 +384,32 @@ printf '%s' "$outq2" | grep -q 'unsupported' \
     && fail "the stdin_open note still calls it unsupported" \
     || pass "and it is not phrased as a missing feature"
 
+# THE REMEDY THE NOTE RECOMMENDS MUST WORK. `kern exec -it` is what that sentence sends people to,
+# and a warning that recommends something broken is worse than the warning it replaced. The box
+# under test is DETACHED, so its own stdin is /dev/null: the point is that `exec -it` allocates a
+# PTY independently of that. `script` supplies the controlling terminal, without which the test
+# cannot discriminate (measured: over `ssh -tt` both spellings report a TTY, because ssh already
+# allocated one).
+if ! command -v script >/dev/null 2>&1; then
+    skip "no script(1) here, so a controlling terminal cannot be supplied to test exec -it"
+else
+    XDG_RUNTIME_DIR=$XDG "$KERN" box ttyprobe --rootfs "$RF" -d -- \
+        /bin/busybox sh -c 'while true; do /bin/busybox sleep 5; done' >/dev/null 2>&1
+    sleep 1
+    noit=$(XDG_RUNTIME_DIR=$XDG "$KERN" exec ttyprobe -- \
+        /bin/busybox sh -c 'test -t 0 && echo TTY || echo NOTTY' 2>/dev/null | tr -d '\r')
+    isit=$(script -qec "XDG_RUNTIME_DIR=$XDG $KERN exec -it ttyprobe -- /bin/busybox sh -c 'test -t 0 && echo TTY || echo NOTTY'" /dev/null 2>/dev/null | tr -d '\r' | grep -oE '^(TTY|NOTTY)' | head -1)
+    [ "$isit" = "TTY" ] \
+        && pass "exec -it gives a real PTY in a detached box, so the note's remedy works" \
+        || fail "exec -it did not give a PTY ('$isit'): the stdin_open note recommends a broken command"
+    # The negative control, so the case is not passing on an ambient terminal: without -it the
+    # same box must report no TTY.
+    printf '%s' "$noit" | grep -q NOTTY \
+        && pass "and without -it it is not a TTY, so the flag is what did it" \
+        || fail "exec without -it also reported a TTY ('$noit'): this case cannot discriminate"
+    XDG_RUNTIME_DIR=$XDG "$KERN" stop ttyprobe >/dev/null 2>&1
+fi
+
 # --- A REFUSING PASTA MUST BE REPORTED ONCE, NOT CONTRADICTED -------------------------------------
 # v0.9.2 gave the compose summary its own opinion of the pod's network, derived from a BOOL. Every
 # false printed "install `passt`/`pasta`", so a Fedora user whose pasta was installed and refused to

@@ -1,6 +1,6 @@
 {
   "name": "kern-pi",
-  "version": "0.1.9",
+  "version": "1.0.0",
   "description": "Route pi's bash, read, write, edit, ls, grep and find into a rootless kern box.",
   "license": "Apache-2.0",
   "homepage": "https://getkern.dev",

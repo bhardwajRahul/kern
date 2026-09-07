@@ -186,12 +186,33 @@ that reading could not have found:
   a denial of service the agent could ask for. It is a linear two-pointer matcher now, and the same
   input takes 0 ms
 
-## Status
+## Status: 1.0
 
-Written against pi's operation-injection API (`createBashTool(cwd, { operations })` and its six
-siblings) and the `kern-sandbox` Node SDK. **Not yet exercised against a live pi session**: the
-interfaces are taken from pi's own sources, so the shapes are right, but nothing here has been run
-end to end. Reports welcome.
+**What 1.0 freezes: seven tools and eight environment variables.** They have not changed since
+0.1.1, verified by diffing the published tarballs. Everything that moved between 0.1.1 and 1.0 was
+implementation, and none of it changed what you write.
+
+**What 1.0 claims about the boundary**, and nothing beyond it:
+
+- The `path` argument of every file verb goes through one gate **before anything is spawned**. An
+  absolute path outside the workspace, or a `..` above it, is refused rather than clamped.
+- `bash` and `grep` run **in the box**. What they can reach is the box's mount namespace, so a
+  symlink under the workspace re-roots *inside the box* rather than being refused. That is a real
+  difference from `read`, `ls` and `find`, and it is the row above rather than a footnote.
+- The workspace is a **bind mount**, so it is the host's bytes by design. That is the product, not a
+  gap in the gate.
+- **No network** unless `KERN_PI_EGRESS` names a host.
+- Resource limits are **requested**, and enforced **where the host delegates cgroups**. On a host
+  where `kern doctor` already reports uncapped, they do not bind, and this package cannot invent
+  delegation.
+
+**What 1.0 does not claim.** That a model will choose these tools well; that the same symlink policy
+applies to every verb, because it does not; that caps bind on every Linux.
+
+Exercised end to end against the pi binary, not only against the interfaces: 278 assertions across
+seven suites, on GNU grep and BusyBox, on Node 22 and 24, in CI. Ten versions preceded this one and
+every defect in them was found by running the thing rather than by reading it, five of them by an
+outside reviewer. Reports welcome, and they have been worth more than anything written here.
 
 ## Compatibility, precisely
 

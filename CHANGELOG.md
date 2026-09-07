@@ -7,6 +7,21 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**On a host whose SELinux policy refuses pasta's netns watch, the pod's pasta no longer exits by
+itself.** kern retries with `--no-netns-quit` there ([#6](https://github.com/getkern/kern/issues/6)),
+and a pasta started without the watch does not notice the namespace disappear, so `kern pod rm` and
+`compose down` are what stop it rather than pasta stopping itself. Nothing to do differently; it
+matters if you run a mixed fleet, because the hosts that take the retry and the hosts that do not
+now have two different pasta lifecycles, and only the first depends on teardown running.
+
+**`stdin_open:` and `tty:` in a docker-compose.yml no longer produce an alarm.** They used to warn
+"ignored (unsupported)" matched on the KEY rather than the value, so `tty: false` warned about
+nothing and a working stack was told a feature was missing
+([#7](https://github.com/getkern/kern/issues/7)). A compose service is always detached, so `tty:`
+has nothing to act on and is silent; `kern exec -it <service>` gives a real PTY in the running box
+when one is wanted. `stdin_open: true` still warns, because it is a real difference from Docker: the
+service's stdin is at EOF rather than held open, so a program that blocks on it exits at once.
+
 **The Rust test suite had never been built for aarch64, though the binary always was.** So every
 "the tests pass" statement this project has made was an x86_64 statement, silently, for as long as
 ARM has been a supported target. Two lines caused it, both in test code and both invisible on
