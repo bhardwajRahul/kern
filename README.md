@@ -99,9 +99,9 @@ one crate:
 cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
-Any distribution with unprivileged user namespaces and cgroup v2 works. A release is tested on
-**Ubuntu 24.04, Debian 13, Fedora 44, Rocky 10, CentOS Stream 10 and openSUSE** in real VMs, and on a
-Raspberry Pi 5, a Jetson Orin Nano and an Arduino UNO Q.
+Debian and Ubuntu, Fedora, the RHEL family (Rocky, CentOS Stream), openSUSE, WSL2, and ARM boards:
+any distribution with unprivileged user namespaces and cgroup v2. Each release runs the full suite on
+those, in real VMs and on the boards, before it ships.
 
 [docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
 the Windows and Mac guests step by step, and what the resource caps do on a default VM.
