@@ -51,10 +51,11 @@ and a stack runner at once, in one static binary with no daemon.
 - **Sandbox an AI agent, one container per tool-call.** The command it just decided to run, the
   snippet the model just wrote, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
   fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
-  caps the kernel enforces, capabilities dropped, seccomp deny-by-default, timeout from outside.
+  caps the kernel enforces, capabilities dropped, seccomp deny-by-default, timeout applied from the
+  outside.
   <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, missing command:
-  each next to stdout and the exit code. Branch on it and keep going.
-  <br>**One binary, no daemon.** Python, Node, LangChain or any MCP client:
+  each returned next to stdout and the exit code. Branch on it and keep going.
+  <br>**One binary, no daemon.** Wire it from Python, Node, LangChain, or any MCP client
   [below](#run-an-agents-code-python-node-langchain-mcp-pi). And
   [what it is not](#what-kern-is-not), because the boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
