@@ -376,10 +376,8 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 **The core is done and the CLI is frozen.** 1073 Rust, 458 Python and 93 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
-Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
-inside a patch release. One exit code changed in 0.9, which is why it is a minor bump:
-`kern box --plan` exits 1 when a profile it named cannot attach, where it exited 0. The rest of the
-release is in the [v0.9.2 notes](CHANGELOG.md#v092---2026-09-06).
+A script written against the CLI keeps working: no verb, flag or `--json` field changes meaning
+inside a patch release. What changed in each one is in the [changelog](CHANGELOG.md).
 
 ## What kern is not
 
