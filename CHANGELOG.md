@@ -7,6 +7,61 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**If you run kern on Ubuntu 23.10 or later, your install needs one action.** That is not a new
+feature, it is the answer to "why does no box start", and it is here rather than under new
+capabilities because it is the entry a reader scanning for "does this release affect me" needs to
+find. Those releases ship `kernel.apparmor_restrict_unprivileged_userns=1`, which permits the
+namespace and refuses the rootless uid map, so nothing starts. kern now ships the profile:
+
+```
+kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null
+sudo apparmor_parser -r /etc/apparmor.d/kern
+kern doctor
+```
+
+**CLI, additive:** `kern doctor --apparmor-profile` writes that profile to stdout and exits without
+running any check. It exists because the install line has to be runnable by the person reading it,
+and a repo-relative `packaging/apparmor/kern` is not: the release tarball carries the binary alone
+and `cargo install` copies one file, so most readers have no `packaging/` directory. The binary
+carries the profile instead. Nothing is removed or renamed.
+
+**What that file does NOT do**, because installing one into `/etc/apparmor.d/` on a program's
+say-so deserves the sentence: it grants exactly one permission, `userns`, and confines kern in no
+way at all. Not its paths, not its capabilities, not its syscalls. Removing it returns the machine
+to its previous state. It is deliberately not a confining profile: kern's job is to confine the
+workload, and a second weaker mechanism aimed at kern itself would mostly invite the belief that it
+was doing something.
+
+The third command is not politeness. AppArmor attaches at `execve`, so a kern already running when
+you load the profile does not pick it up. Measured on Ubuntu 24.04 with the restriction left at 1:
+without the profile no box starts, with it `kern box`, `kern pod create` and the full acceptance
+matrix all pass, and the sysctl is never touched.
+
+`kern doctor` prints that install line, names the path it is running from because AppArmor attaches
+by path, and offers `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` only after it, with
+its cost: that one lifts the restriction for every program on the machine and is lost at reboot.
+
+**`kern doctor` said "ready" on a stock Ubuntu 24.04, where no box can start.** Its userns probe
+called `unshare(CLONE_NEWUSER)` and stopped there. Ubuntu 23.10 and later ship
+`kernel.apparmor_restrict_unprivileged_userns=1`, which PERMITS the namespace and refuses the
+rootless uid map, so the probe succeeded on a host where the very command doctor then suggested,
+`kern box hello`, failed. Ubuntu is the most common distribution kern is installed on and that was
+its default state.
+
+The probe now runs the sequence a box actually runs, in the same order: unshare, deny setgroups,
+write the uid map. Measured on a stock cloud image, both directions:
+
+```
+default                       ✘ the namespace is allowed and its uid map is REFUSED - no box can start
+                              not ready - 1 blocker(s)
+apparmor_restrict...userns=0  ✔ enabled
+                              ready - `kern box` will run here
+```
+
+The AppArmor line no longer hedges with "if boxes fail with EPERM". It reports what the knob is set
+to and leaves the verdict to the check that measured it, so a host carrying the restriction with a
+profile for the kern binary is told it is fine rather than warned at.
+
 **On a host whose SELinux policy refuses pasta's netns watch, the pod's pasta no longer exits by
 itself.** kern retries with `--no-netns-quit` there ([#6](https://github.com/getkern/kern/issues/6)),
 and a pasta started without the watch does not notice the namespace disappear, so `kern pod rm` and
@@ -47,6 +102,69 @@ Read out of three installed binaries rather than inferred:
 So a Raspberry Pi on Debian 12 needs no retry and never could have: issue #6 cannot occur against
 the tolerant build. The condition became fatal between March 2023 and February 2024, which is
 exactly the range the retry covers.
+
+**Fixed: `--memory` and `--pids-limit` reported "accepted but NOT enforced here" over a box capped
+exactly as asked.** Reported on WSL2 and reproduced on a Raspberry Pi 5 and a Jetson Orin Nano,
+where `--memory 256m --pids-limit 64` printed both notices while the box's cgroup held
+`memory.max=268435456` and `pids.max=64`. The check was right and was asked in the wrong place. It
+read `/proc/self/cgroup`, and on the systemd-scope tier that is the SUPERVISOR, which kern parks in
+a sibling leaf so a whole-box OOM cannot take it with the workload. From there the walk goes to the
+ancestors and never reaches the box's leaf, which is a sibling rather than a parent; the only
+ancestor carrying a memory ceiling is the scope, deliberately set to the request plus kern's
+supervisor headroom, so "capped at or below the request" was false by design. Both notices were
+wrong on the whole of that tier, and on the direct tier the check never runs at all, so it had never
+once fired correctly.
+
+The same mistake had a second instance, found by adding one diagnostic line to the reproduction
+script rather than by reading the code. The `KERN_NO_SCOPE` opt-out warned from a point BEFORE the
+box exists, where whether the cap will bind is not yet knowable, on the belief that the opt-out
+skips the box's own cgroup as well as the scope. It does not. On x86_64 that printed "accepted but
+NOT enforced here" while the box held `memory.max=268435456` and a 400 MB load was killed with exit
+137. The warning now comes from one place on every box path, after the caps are written, against the
+box's own cgroup. The Raspberry Pi finding the opt-out warning was written for is unchanged and
+still reported: measured on a Pi 5 and a Jetson, the opt-out leaves `memory.max` and `pids.max` at
+`max` and a 400 MB load survives, and kern says so. The notice now follows the cgroup rather than
+the code path.
+
+The enforcement byte on `KERN_STARTED_FD` was already correct: it takes the box's directory
+explicitly, for this exact reason. So an SDK reading the byte saw "enforced" while a human reading
+stderr saw the opposite, in the same run. Both now read one binding, so they cannot disagree. If you
+scripted around the false notice, remove the workaround; if you concluded your caps were not
+working, they were, and `--memory 256m` was killing at 256 MiB throughout.
+
+**Fixed: a box refused for running out of process slots was told to check user namespaces.** A
+reviewer hit it with a tightened `ulimit -u`:
+
+```
+error: sandbox: fork(idmap helper) failed: Resource temporarily unavailable (os error 11)
+hint: needs unprivileged user namespaces and a valid --rootfs directory
+```
+
+The message is exact and the hint names two things that are both already fine, because the code
+could not have reached that fork otherwise. `EAGAIN` on a fork is a process-limit problem, and
+`RLIMIT_NPROC` is per-UID and counted across the whole system, so another program owned by the same
+user can exhaust it, and it counts TASKS rather than processes. That last clause is not a detail:
+the reviewer who reported the hint then compared `ulimit -u` against a process count, got 10 against
+149, and concluded the kernel was accounting something unobservable. Measured here, an x86_64 desktop
+owned 208 processes and 1918 tasks and the limit at which a single fork began to succeed was 1932, so
+against the task count the threshold IS the count. The hint now names `ulimit -u`, the task count and
+`LimitNPROC=`. Every other setup failure keeps the hint it had. Same shape as the pull hints, which branch on the message
+rather than on the variant for exactly this reason.
+
+**`kern --version` now says which build it is.** It answered `0.0.0` for every binary not cut by the
+release workflow, which is every binary anyone compiles from source, so two builds of the same tree
+were indistinguishable. That is not hypothetical: during the work above, a binary built ten minutes
+before the fix was compared against one built after and reported as if it were the same program. A
+reviewer made the same point from the other side, noting that a test script had to print a
+`sha256sum` to tell two builds apart, and that the workaround existed only because the binary could
+not answer.
+
+The version is still the tag and nothing is carved into the source. A release binary prints the tag
+exactly as before (`kern 0.9.3`), because the workflow stamps `Cargo.toml` and that value passes
+through untouched. A build from source prints `git describe` instead
+(`kern v0.9.2-45-gf7622ee-dirty`): the nearest tag, the distance from it, the commit, and whether the
+tree was dirty. Where git cannot answer, a source tarball or a vendored build, it falls back to
+`0.0.0`, which is today's behaviour, so nothing regresses when the information is unavailable.
 
 ## v0.9.2 - 2026-09-06
 
