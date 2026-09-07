@@ -10,8 +10,6 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>One machine, one workload, rounded up from the measurement. [BENCHMARKS.md](BENCHMARKS.md) has the method, the numbers without an image, and how to take them yourself</sub>
-
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
@@ -115,29 +113,16 @@ for behaviour the binary does not have. `kern --version` and
 ## Quickstart
 
 ```sh
-kern box dev --image alpine -it -- sh       # a shell in a real OCI image
-kern box svc --image nginx:alpine -d -p 8080:80    # a service, published
-kern run --memory 256M --cpus 0.5 -- ./crunch      # cap a process, no sandbox
-kern ps                                     # what runs, with PORTS and HEALTH
-kern top                                    # live TUI: boxes, profiles, volumes
-kern compose stack.toml up                  # a whole stack, one command
-```
-
-Untrusted code, one flag:
-
-```sh
+kern box dev --image alpine -it -- sh                  # a shell in a real OCI image
+kern box svc --image nginx:alpine -d -p 8080:80        # a service, published
 kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w/x.py
+kern compose stack.toml up                             # a whole stack, one command
 ```
 
-`--security-profile untrusted` is the seccomp **allowlist** + `--cap-drop ALL` + `--read-only`
-in one flag. No network unless you ask, and seccomp is on either way. One runnable example per
-thing kern does: [examples/](examples/).
-
-Every verb that lists or inspects also answers in JSON, so nothing has to parse a table:
-
-```sh
-kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
-```
+`--security-profile untrusted` is the seccomp allowlist plus `--cap-drop ALL` plus `--read-only`, in
+one flag. `kern ps` and `kern top` show what is running; every verb that lists or inspects also answers
+`--json`, so nothing has to parse a table. One runnable example per thing kern does:
+[examples/](examples/).
 
 ## Run an agent's code: Python, Node, MCP
 
