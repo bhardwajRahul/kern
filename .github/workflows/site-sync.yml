@@ -27,6 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # TAGS, not just the tip: `site-version-current.py` compares the page against the newest
+          # tag, and the default shallow checkout fetches none, so `git describe` would fail on a
+          # repository that has plenty.
+          fetch-depth: 0
       - name: compare the served file with this tree
         run: |
           # A cache-busting query so Cloudflare answers from origin: a HIT could show yesterday's file
@@ -56,3 +61,16 @@ jobs:
         # sentence that is wrapped across lines, so it could only ever fail. Moved into a script so
         # it can be run against a fixture and is covered by `scripts/gates-selftest.py`.
         run: python3 scripts/site-gpu-claims.py /tmp/live.html
+      - name: the live page advertises the version that is actually released
+        # The page's JSON-LD `softwareVersion` is structured data, so it is what a search engine and
+        # an AI answer quote back. MEASURED on 2026-09-07, minutes after v0.9.3 shipped: the page
+        # still said 0.9.2, and nothing in this repo could have noticed, because `stale-numbers.py`
+        # reads `.md` files and the page is HTML on a VPS.
+        #
+        # The expected version comes from the newest TAG in the checkout, not from a constant here:
+        # nothing about a version is carved into this repository, and a constant would be one more
+        # number to forget. `fetch-depth: 0` above is what makes the tags visible.
+        run: |
+          ver=$(git describe --tags --abbrev=0)
+          echo "newest tag in the checkout: $ver"
+          python3 scripts/site-version-current.py /tmp/live.html "$ver"

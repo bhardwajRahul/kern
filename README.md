@@ -28,7 +28,12 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 kern box dev --image alpine -it -- sh
 ```
 
-<sub>No native Windows: use WSL2. No native macOS: run it in a Linux VM. [Install](#install).</sub>
+```powershell
+# Windows: the same binary under WSL2, and the script sets WSL2 up for you
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+
+<sub>No native Windows and no native macOS: on both it is the same binary and the same CLI under a Linux kernel, not a port. Windows uses WSL2, a Mac needs colima, Lima or OrbStack. [Install](#install).</sub>
 
 ---
 
