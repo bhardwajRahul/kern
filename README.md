@@ -58,7 +58,7 @@ and a stack runner at once, in one static binary with no daemon.
   the image: each comes back as a typed `fault` next to stdout and the exit code. Branch on it and
   keep going.
   <br>**One binary, no daemon.** Wire it to your agent from Python, Node, LangChain, or any MCP
-  client: [below](#run-an-agents-code-python-node-mcp). For code written to attack you rather than
+  client: [below](#run-an-agents-code-python-node-langchain-mcp-pi). For code written to attack you rather than
   merely unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
@@ -124,7 +124,7 @@ one flag. `kern ps` and `kern top` show what is running; every verb that lists o
 `--json`, so nothing has to parse a table. One runnable example per thing kern does:
 [examples/](examples/).
 
-## Run an agent's code: Python, Node, MCP
+## Run an agent's code: Python, Node, LangChain, MCP, pi
 
 An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
 is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
