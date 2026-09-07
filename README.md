@@ -45,16 +45,14 @@ and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
-- **The sandbox an AI agent can afford to use on every call.** An agent's tool-call, a model's
-  generated snippet, a notebook cell, a CI step: code that runs before anyone reads it. kern gives
-  each call **its own box in ~2.4 ms** and throws it away after, which is cheap enough that "one
-  sandbox per tool-call" stops being a design you argue about and becomes the default. Network off,
-  memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp allowlist,
-  and the timeout applied from OUTSIDE the box, so code that hangs cannot outlive it.
-  <br>**Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall and a
-  command that was not in the image each arrive as a typed `fault` on the result, beside stdout and
-  the exit code. The agent branches on a value and keeps going, instead of parsing text to work out
-  whether the sandbox stopped the run or the code did.
+- **A fresh sandbox on every call, and you can afford it.** A tool-call, a generated snippet, a
+  notebook cell, a CI step: code that runs before anyone has read it. Give each one its own box,
+  throw it away, do it again. **One sandbox per tool-call stops being a debate and becomes the
+  default.** Network off, memory and PID caps the kernel enforces, capabilities dropped, seccomp
+  deny-by-default, and the timeout applied from OUTSIDE, so code that hangs cannot outlive it.
+  <br>**Your loop reads a field, not a stack trace.** Timeout, OOM-kill, blocked syscall, command not
+  in the image: each arrives as a typed `fault` next to stdout and the exit code. Branch on a value
+  and move on. No parsing text to work out whether the sandbox stopped the run or the code did.
   <br>Python, Node, LangChain and MCP: [below](#run-an-agents-code-python-node-mcp). For code written
   to attack you rather than merely unread, read [What kern is not](#what-kern-is-not) first: the
   boundary is the Linux kernel.
