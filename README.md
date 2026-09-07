@@ -33,6 +33,11 @@ kern box dev --image alpine -it -- sh
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
+```sh
+# macOS: a Linux VM first, then the line above inside it
+brew install colima && colima start && colima ssh
+```
+
 <sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel. [Install](#install).</sub>
 
 ---
