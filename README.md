@@ -48,18 +48,15 @@ and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
-- **Sandbox an AI agent, one container per tool-call.** The shell command your agent just decided
-  to run, the snippet the model just wrote, a notebook cell, a CI step: code that executes before
-  anyone has read it. kern starts a box, runs it, deletes it. Fast enough that per-call isolation
-  is the default, not a special case. Network off unless you ask, memory and PID caps the kernel
-  enforces, capabilities dropped, seccomp deny-by-default, and the timeout applied from OUTSIDE, so
-  code that hangs cannot outlive it.
-  <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, command not in
-  the image: each comes back as a typed `fault` next to stdout and the exit code. Branch on it and
-  keep going.
-  <br>**One binary, no daemon.** Wire it to your agent from Python, Node, LangChain, or any MCP
-  client: [below](#run-an-agents-code-python-node-langchain-mcp-pi). For code written to attack you rather than
-  merely unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
+- **Sandbox an AI agent, one container per tool-call.** The command it just decided to run, the
+  snippet the model just wrote, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
+  fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
+  caps the kernel enforces, capabilities dropped, seccomp deny-by-default, timeout from outside.
+  <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, missing command:
+  each next to stdout and the exit code. Branch on it and keep going.
+  <br>**One binary, no daemon.** Python, Node, LangChain or any MCP client:
+  [below](#run-an-agents-code-python-node-langchain-mcp-pi). And
+  [what it is not](#what-kern-is-not), because the boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
