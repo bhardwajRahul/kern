@@ -179,44 +179,6 @@ Every verb that lists or inspects also answers in JSON, so nothing has to parse 
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 ```
 
-## Run an agent's code: Python, Node, MCP
-
-An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
-is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
-
-```sh
-pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
-npm  install kern-sandbox       # npm  · same
-```
-
-```python
-from kern_sandbox import run_code
-
-r = run_code("import platform; print(platform.python_version())")
-print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
-```
-
-Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
-bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
-back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
-stderr without kern's own notes, which is what belongs in a context window.
-
-It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
-local code interpreter, and the server is stdio, so the same one line points a client at a box on
-another machine.
-
-```json
-{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
-```
-
-The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
-prewarming and the LangChain integration in
-[bindings/python/README.md](bindings/python/README.md) and
-[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
-[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
-into a box, with a README that states which half is the kernel's boundary and which is a path check,
-in [integrations/pi/](integrations/pi/).
-
 ## Stacks
 
 One file, one command. kern reads its own format, and it reads the `docker-compose.yml` you already
@@ -288,6 +250,44 @@ chip-granular, not per-line**: asking for `pins` binds the whole `/dev/gpiochipN
 line of that controller, so `pins = [17]` is cooperative metadata rather than a boundary. Naming a
 device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCES.md)
 
+## Run an agent's code: Python, Node, MCP
+
+An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
+is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
+
+```sh
+pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
+npm  install kern-sandbox       # npm  · same
+```
+
+```python
+from kern_sandbox import run_code
+
+r = run_code("import platform; print(platform.python_version())")
+print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+```
+
+Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
+bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
+back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
+stderr without kern's own notes, which is what belongs in a context window.
+
+It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
+local code interpreter, and the server is stdio, so the same one line points a client at a box on
+another machine.
+
+```json
+{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
+```
+
+The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
+prewarming and the LangChain integration in
+[bindings/python/README.md](bindings/python/README.md) and
+[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
+[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
+into a box, with a README that states which half is the kernel's boundary and which is a path check,
+in [integrations/pi/](integrations/pi/).
+
 ## kern vs Docker vs Podman
 
 All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
@@ -337,6 +337,23 @@ registry account or a network.
 ```sh
 sh pentest/run-with-local-registry.sh ./target/release/kern pentest/pentest-ports.sh
 ```
+
+**Every release is signed and independently timestamped.** The tag is a GPG-signed object, and
+[provenance/](provenance/) carries a file naming that tag and its release commit, stamped with
+[OpenTimestamps](https://opentimestamps.org) and anchored in the Bitcoin blockchain. So the claim is
+not "trust our CI": you can check, from a clone and without asking us anything, that a given release
+existed at a given time and was cut by the holder of that key.
+
+```sh
+git tag -v v0.9.3                                     # the signature on the tag object
+ots info provenance/v0.9.3.provenance.txt.ots         # the timestamp, without a Bitcoin node
+```
+
+`ots verify` is the stronger check and it needs a Bitcoin node to talk to, which most readers will
+not have; `ots info` reads the attestation itself and needs nothing. Either way the anchor is created
+by hand after each tag and starts out PENDING, because a block takes hours rather than minutes.
+`provenance/upgrade-when-ready.sh` completes it once the block confirms, and commits only if the
+anchor actually arrived.
 
 Report a vulnerability privately via GitHub Security Advisories or hello@getkern.dev.
 
