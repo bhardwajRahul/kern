@@ -11,6 +11,13 @@ reads it gets its own box, and the box is thrown away after.
 pip install kern-sandbox
 ```
 
+**It needs the `kern` binary**, because the isolation is the binary's and this package is the API in
+front of it. One line, no toolchain, and `$KERN_BIN` overrides where it looks:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+```
+
 ```python
 import kern_sandbox as kern
 
