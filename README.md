@@ -33,7 +33,7 @@ kern box dev --image alpine -it -- sh
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-<sub>No native Windows and no native macOS: on both it is the same binary and the same CLI under a Linux kernel, not a port. Windows uses WSL2, a Mac needs colima, Lima or OrbStack. [Install](#install).</sub>
+<sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel. [Install](#install).</sub>
 
 ---
 
@@ -81,15 +81,14 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 
 ## Install
 
-kern needs a Linux kernel with unprivileged user namespaces and cgroup v2. It runs on **Linux, WSL2
-and ARM boards** (Raspberry Pi · Jetson · Arduino UNO Q); there is **no native Windows** build, use
-WSL2 (kern ships a pre-baked WSL rootfs).
+A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
+boards** (Raspberry Pi · Jetson · Arduino UNO Q) directly, and **Windows through WSL2**, for which
+kern ships a pre-baked rootfs and an installer that sets WSL2 up for you.
 
-**On a Mac** there is no native build either, and there will not be one: macOS has no namespaces and
-no cgroups. kern runs on a Mac **inside a Linux VM** (colima, Lima, OrbStack, UTM, or one you already run), where it is the ordinary Linux kern, same binary and same CLI as your CI box.
-Verified on Apple Silicon with an Ubuntu 24.04 guest. Read
-[docs/INSTALL.md](docs/INSTALL.md) first: two obstacles are certain there, and the resource caps do
-not bite on a default guest.
+**On a Mac** it runs inside a Linux VM (colima, Lima, OrbStack, UTM, or one you already have), where
+it is the ordinary Linux kern: same binary, same CLI, same behaviour as your CI box. Verified on
+Apple Silicon with an Ubuntu 24.04 guest. Start from [docs/INSTALL.md](docs/INSTALL.md), which names
+the two steps a Mac guest needs and what the resource caps do on a default one.
 
 The quickest route is the release binary: one static file, no toolchain, and the script verifies its
 SHA256 before installing it.
