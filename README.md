@@ -133,8 +133,10 @@ because the box is an OCI image: Python, Node, Go and Rust all run with the same
 different `--image`, and so does anything else that ships one.
 
 
-An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
-is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
+An agent needs somewhere to run what the model just wrote. **`kern-sandbox`** is that place: a thin,
+dependency-free wrapper over the `kern` binary, called from your own program. On
+[PyPI](https://pypi.org/project/kern-sandbox/) and [npm](https://www.npmjs.com/package/kern-sandbox);
+the API is in [bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md).
 
 ```sh
 pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
@@ -165,9 +167,10 @@ The rest is on the pages that own it, none of it repeated here: the full API, th
 prewarming and the LangChain integration in
 [bindings/python/README.md](bindings/python/README.md) and
 [bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
-[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
-into a box, with a README that states which half is the kernel's boundary and which is a path check,
-in [integrations/pi/](integrations/pi/).
+[docs/MCP.md](docs/MCP.md); and, for the [pi](https://github.com/earendil-works/pi) coding agent,
+[`kern-pi`](https://www.npmjs.com/package/kern-pi) routing its `bash`, `read`, `write`, `edit`, `ls`,
+`grep` and `find` into a box, with a README that states which half is the kernel's boundary and which
+is a path check, in [integrations/pi/](integrations/pi/).
 
 ## Run a whole stack: your `docker-compose.yml`, unchanged
 
