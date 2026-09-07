@@ -182,7 +182,45 @@ Every verb that lists or inspects also answers in JSON, so nothing has to parse 
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 ```
 
-## Stacks
+## Run an agent's code: Python, Node, MCP
+
+An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
+is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
+
+```sh
+pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
+npm  install kern-sandbox       # npm  · same
+```
+
+```python
+from kern_sandbox import run_code
+
+r = run_code("import platform; print(platform.python_version())")
+print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+```
+
+Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
+bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
+back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
+stderr without kern's own notes, which is what belongs in a context window.
+
+It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
+local code interpreter, and the server is stdio, so the same one line points a client at a box on
+another machine.
+
+```json
+{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
+```
+
+The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
+prewarming and the LangChain integration in
+[bindings/python/README.md](bindings/python/README.md) and
+[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
+[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
+into a box, with a README that states which half is the kernel's boundary and which is a path check,
+in [integrations/pi/](integrations/pi/).
+
+## Run a whole stack: your `docker-compose.yml`, unchanged
 
 One file, one command. kern reads its own format, and it reads the `docker-compose.yml` you already
 have, unchanged.
@@ -253,44 +291,6 @@ chip-granular, not per-line**: asking for `pins` binds the whole `/dev/gpiochipN
 line of that controller, so `pins = [17]` is cooperative metadata rather than a boundary. Naming a
 device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCES.md)
 
-## Run an agent's code: Python, Node, MCP
-
-An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
-is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
-
-```sh
-pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
-npm  install kern-sandbox       # npm  · same
-```
-
-```python
-from kern_sandbox import run_code
-
-r = run_code("import platform; print(platform.python_version())")
-print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
-```
-
-Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
-bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
-back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
-stderr without kern's own notes, which is what belongs in a context window.
-
-It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
-local code interpreter, and the server is stdio, so the same one line points a client at a box on
-another machine.
-
-```json
-{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
-```
-
-The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
-prewarming and the LangChain integration in
-[bindings/python/README.md](bindings/python/README.md) and
-[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
-[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
-into a box, with a README that states which half is the kernel's boundary and which is a path check,
-in [integrations/pi/](integrations/pi/).
-
 ## kern vs Docker vs Podman: what a container costs, and what kern does not have
 
 All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
@@ -306,7 +306,7 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is ([one caveat](#stacks)) | yes | partial |
+| `docker-compose.yml` | yes, read as-is ([one caveat](#run-a-whole-stack-your-docker-composeyml-unchanged)) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
 | GPU passed into the container | no | yes | yes |
 
