@@ -55,6 +55,48 @@ impl Error {
             // Operational/validation errors are self-explanatory - no generic hint (it used to
             // wrongly show the userns/rootfs hint on `-v`/secret/port errors).
             Error::Sandbox(_) => None,
+            // Branch on the message, for the same reason `oci_hint` does: the setup step that failed
+            // decides what the reader should do next, and the variant alone does not know it. An
+            // external reviewer measured a box refused by `RLIMIT_NPROC` and got
+            //
+            //   error: sandbox: fork(idmap helper) failed: Resource temporarily unavailable (os error 11)
+            //   hint: needs unprivileged user namespaces and a valid --rootfs directory
+            //
+            // The message is exact and the hint sends the reader to two places that are both fine.
+            // EAGAIN on a fork is a process-limit problem: user namespaces are enabled and the rootfs
+            // is valid, or the code would not have reached the fork.
+            //
+            // Matched on `(os error 11)` rather than on the prose, and the reason is structural
+            // rather than empirical: that suffix is APPENDED by `io::Error`'s Display impl, so only
+            // the text before it can ever come from libc. It is invariant by construction, which also
+            // means a glibc build is as safe as the shipped musl one. Checking locales instead would
+            // have proved nothing on the shipped binary, which is static musl with no locale
+            // machinery in it at all.
+            //
+            // The key is asserted from a REAL failure, not from a rendering a test built: see
+            // `eagain_hint_survives_a_real_failure_not_a_constructed_one` in tests/smoke.rs. The
+            // gap that closes is an errno reaching here through something that is not an
+            // `io::Error`, which drops the suffix and reverts this hint in silence.
+            // "TASKS (threads), not processes" is not a detail. The reviewer who reported this hint
+            // then read `ulimit -u` against a PROCESS count, got 10 against 149, and concluded the
+            // kernel was accounting something unobservable. It costs two rounds and a wrong mechanism
+            // to omit it, to a reader who already had the errno and a reason to care. Measured here:
+            // an x86_64 desktop owned 208 processes and 1918 TASKS, and the limit at which a single
+            // fork started succeeding was 1932. Against the task count the threshold IS the count;
+            // against the process count it looks like a factor of nine.
+            //
+            // What is deliberately NOT said: the charge is per-UID across the whole KERNEL, so on a
+            // shared-kernel host (WSL2 runs several distributions on one) the tasks are spread over
+            // PID namespaces and no single `/proc` can see them all. True, and measured, and it would
+            // read as noise to the reader on a laptop. The threads clause is the half that is true
+            // everywhere and wrong to omit.
+            Error::Setup(msg) if msg.contains("os error 11") => Some(
+                "out of process slots: `ulimit -u` is per-UID and counts TASKS (threads), not \
+                 processes, across the whole system, so another program owned by this user, or one \
+                 with many threads, can exhaust it. Compare `ulimit -u` against the task count, or \
+                 raise `LimitNPROC=`/`DefaultLimitNPROC=` for this session"
+                    .into(),
+            ),
             Error::Setup(_) => {
                 Some("needs unprivileged user namespaces and a valid --rootfs directory".into())
             }
@@ -158,6 +200,37 @@ mod tests {
         // A real build error keeps the Dockerfile hint.
         let real = Error::Build("RUN failed (exit 1)".into()).hint().unwrap();
         assert!(real.contains("FROM"));
+    }
+
+    /// A setup failure caused by EAGAIN on a fork is a process-limit problem, and the userns/rootfs
+    /// hint sends the reader to two places that are both already fine: the code could not have
+    /// reached the fork otherwise. Reported by an external reviewer who hit it with a tightened
+    /// `ulimit -u`, message exact and hint pointing elsewhere.
+    ///
+    /// The subject is the REAL rendering, not a hand-written string: the message is built from
+    /// `std::io::Error::from_raw_os_error(EAGAIN)` exactly as `Error::last` builds it, so a change in
+    /// how Rust renders errno breaks this test rather than the hint in the field.
+    #[test]
+    fn setup_hint_names_the_process_limit_on_eagain() {
+        let rendered = format!(
+            "fork(idmap helper) failed: {}",
+            std::io::Error::from_raw_os_error(libc::EAGAIN)
+        );
+        assert!(
+            rendered.contains("os error 11"),
+            "the match key is gone from the rendering: {rendered}"
+        );
+        let h = Error::Setup(rendered).hint().unwrap();
+        assert!(h.contains("ulimit -u"), "got: {h}");
+        assert!(
+            !h.contains("user namespaces"),
+            "still pointing at userns for a fork that ran out of process slots: {h}"
+        );
+        // Every other setup failure keeps the hint it had.
+        let other = Error::Setup("pivot_root failed: Invalid argument (os error 22)".into())
+            .hint()
+            .unwrap();
+        assert!(other.contains("user namespaces"), "got: {other}");
     }
 
     #[test]

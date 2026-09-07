@@ -3,8 +3,12 @@
 //! Newtypes live here so units (bytes vs MiB, names vs paths) can't be mixed up by accident.
 //! This is a 0.1 scaffold - see the roadmap in README.md / ARCHITECTURE.md.
 
-/// The kern version, sourced from the workspace `Cargo.toml`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The kern version. On a release binary this is the tag, exactly as before: the release workflow
+/// rewrites `Cargo.toml` from the tag and `build.rs` passes that through untouched. On a build from
+/// source, where `Cargo.toml` still reads the de-versioned `0.0.0`, this is `git describe` instead
+/// (`v0.9.2-45-gf7622ee-dirty`), because a binary that cannot say which build it is turns any
+/// comparison of two builds into a guess. See `build.rs` for why that is not a hypothetical.
+pub const VERSION: &str = env!("KERN_VERSION");
 
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
 pub mod registry_auth;

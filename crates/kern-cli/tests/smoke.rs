@@ -12,9 +12,85 @@ fn version_prints_and_succeeds() {
     let out = kern().arg("--version").output().expect("run kern");
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
-    // Version-agnostic: assert the binary reports its own crate version, so a bump never breaks this.
-    let want = format!("kern {}", env!("CARGO_PKG_VERSION"));
+    // Version-agnostic: assert the binary reports the version it was BUILT with, so a bump never
+    // breaks this. Not `CARGO_PKG_VERSION`: since the version is derived at build time (the tag on a
+    // release, `git describe` from source) that constant is `0.0.0` on every developer machine while
+    // the binary prints something else, and this test would fail for everyone but CI.
+    let want = format!("kern {}", kern_common::VERSION);
     assert!(s.starts_with(&want), "want prefix {want:?}, got: {s}");
+    // The whole point of the change: a build from source must not answer `0.0.0`, because two builds
+    // that both say `0.0.0` cannot be told apart, and that is how a fix and its predecessor got
+    // compared as if they were one program. A release build says the tag, which is never `0.0.0`.
+    //
+    // SKIPPED, not failed, where git cannot answer: `0.0.0` is then the DELIBERATE fallback (a source
+    // tarball, a vendored build), so asserting against it would be a false red about a designed
+    // behaviour. The skip prints its reason, so a silently-skipped check cannot masquerade as a pass.
+    if std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert_ne!(
+            kern_common::VERSION,
+            "0.0.0",
+            "in a git checkout the binary must be able to say which build it is; \
+             `git describe` did not reach it"
+        );
+    } else {
+        eprintln!("SKIP: not a git checkout, so `0.0.0` is the intended fallback here");
+    }
+}
+
+/// The EAGAIN hint asserted from a REAL failure, not from a rendering this test built itself.
+///
+/// The unit test beside `Error::hint` constructs the message with `from_raw_os_error` and checks the
+/// matcher against it. That proves the matcher matches a string this repo wrote. It does NOT prove
+/// that the string a live failure produces still contains the key: an errno carried through anything
+/// that is not an `io::Error` loses the `(os error 11)` suffix, the match fails, and the hint
+/// silently reverts to the misleading one while the unit test stays green. An external reviewer named
+/// that gap; this closes it, and it costs one `setrlimit`.
+///
+/// `RLIMIT_NPROC` is lowered in the CHILD only, between fork and exec, so the test runner's own
+/// limit is untouched. `--rootfs /tmp` rather than an image, so no pull and no cache dependency.
+#[test]
+fn eagain_hint_survives_a_real_failure_not_a_constructed_one() {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = kern();
+    cmd.args(["box", "hintprobe", "--rootfs", "/tmp", "--", "/bin/true"]);
+    // SAFETY: async-signal-safe between fork and exec. `setrlimit` is on the permitted list and
+    // nothing here allocates or takes a lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            let r = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            if libc::setrlimit(libc::RLIMIT_NPROC, &r) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let Ok(out) = cmd.output() else {
+        eprintln!("SKIP: could not spawn kern under a lowered RLIMIT_NPROC");
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    // SKIP, not FAIL, where the host did not produce the failure we are asking about: a kernel that
+    // does not refuse the fork here has nothing to say about the hint, and asserting anyway would be
+    // a red about the environment. The skip prints its reason so it cannot pass for a pass.
+    if !err.contains("os error 11") {
+        eprintln!("SKIP: this host did not refuse the fork with EAGAIN; stderr was: {err}");
+        return;
+    }
+    assert!(
+        err.contains("ulimit -u"),
+        "a real EAGAIN failure did not get the process-limit hint: {err}"
+    );
+    assert!(
+        !err.contains("user namespaces"),
+        "a real EAGAIN failure was still pointed at user namespaces: {err}"
+    );
 }
 
 #[test]
