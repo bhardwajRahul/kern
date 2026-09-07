@@ -80,6 +80,40 @@ ok(!!endOf(ev, "write"), "pi reports tool_execution_end for write");
 ok(textOf(endOf(ev, "read")).includes("written through pi"), "read returns what write wrote", textOf(endOf(ev, "read")));
 ok(fs.existsSync(path.join(ws, "note.txt")), "and it landed in the host workspace, which is the point of the mount");
 
+console.log("\n== every remaining verb, through pi's dispatch");
+// Eight external review rounds went almost entirely to `grep`; `edit`, `ls` and `find` had one, at
+// 0.1.1, and their code has moved since. Nothing had ever driven them through pi rather than through
+// execute() directly, which is the half pi owns: schema validation, argument marshalling, the result
+// shape it hands back to a model.
+fs.writeFileSync(path.join(ws, "edit-me.txt"), "alpha\nbeta\n");
+fs.mkdirSync(path.join(ws, "deep"), { recursive: true });
+fs.writeFileSync(path.join(ws, "deep", "found-me.txt"), "NEEDLE_E2E\n");
+ev = drive([
+	{ name: "edit", arguments: { path: "edit-me.txt", edits: [{ oldText: "alpha", newText: "OMEGA" }] } },
+	{ name: "ls", arguments: { path: "." } },
+	{ name: "find", arguments: { pattern: "**/found-me.txt" } },
+	{ name: "grep", arguments: { pattern: "NEEDLE_E2E" } },
+]);
+ok(!!endOf(ev, "edit"), "pi reports tool_execution_end for edit", ev.map((e) => e.type));
+ok(fs.readFileSync(path.join(ws, "edit-me.txt"), "utf8").includes("OMEGA"), "and edit changed the host file");
+ok(textOf(endOf(ev, "ls")).includes("edit-me.txt"), "ls lists the workspace", textOf(endOf(ev, "ls")));
+ok(textOf(endOf(ev, "find")).includes("found-me.txt"), "find reaches a nested file", textOf(endOf(ev, "find")));
+ok(textOf(endOf(ev, "grep")).includes("deep/found-me.txt"), "grep names the file it matched", textOf(endOf(ev, "grep")));
+
+console.log("\n== and every one of them refuses to leave the workspace, from pi");
+for (const [tool, args] of [
+	["ls", { path: "/etc" }],
+	["find", { pattern: "*", path: "/etc" }],
+	["grep", { pattern: "^root:", path: "/etc/passwd" }],
+	["edit", { path: "/etc/passwd", edits: [{ oldText: "root", newText: "pwned" }] }],
+	["write", { path: "/tmp/e2e-pwned.txt", content: "x" }],
+] as Array<[string, Record<string, unknown>]>) {
+	const one = endOf(drive([{ name: tool, arguments: args }]), tool);
+	const said = textOf(one);
+	ok(one?.isError === true || /refus|outside|workspace|escape/i.test(said), `${tool} refuses ${JSON.stringify(args.path ?? args.pattern)}`, said);
+}
+ok(!fs.existsSync("/tmp/e2e-pwned.txt"), "and write left nothing outside");
+
 console.log("\n== the gate holds when the call comes from pi, not from a test");
 ev = drive([{ name: "read", arguments: { path: "/etc/passwd" } }]);
 const denied = endOf(ev, "read");

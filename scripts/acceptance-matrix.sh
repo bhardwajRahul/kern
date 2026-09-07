@@ -373,6 +373,13 @@ outq2=$(XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/tty2.yml" config 2>&1)
 printf '%s' "$outq2" | grep -q "kern exec -it q" \
     && pass "stdin_open: true still states the difference and names the remedy" \
     || fail "stdin_open: true went silent too, so the noise fix silenced the signal"
+# THE REMEDY MUST ANSWER THE KEY THAT WAS WRITTEN. `exec -it` answers `tty:`, and for a while it
+# was the only thing offered, so a reader who wrote `stdin_open: true` alone got a PTY they had
+# not asked for and nothing about stdin. Both halves are checked here because this file and the
+# unit test read the same sentence: change one corpus and the other drifts.
+printf '%s' "$outq2" | grep -q "as a file, an argument, or an environment variable" \
+    && pass "and it says how to get input in, which is what stdin_open was asking for" \
+    || fail "the note offers only the tty remedy for a stdin key"
 printf '%s' "$outq2" | grep -q 'unsupported' \
     && fail "the stdin_open note still calls it unsupported" \
     || pass "and it is not phrased as a missing feature"

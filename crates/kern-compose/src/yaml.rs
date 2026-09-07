@@ -3347,11 +3347,27 @@ fn warn(msg: &str) {
 /// files out of habit on daemons that never read one. Both keys used to produce
 /// "ignored (unsupported)" off the KEY rather than the value, so `tty: false` warned about nothing
 /// and a working daemon was told a feature was missing.
+///
+/// TWO SENTENCES, TWO REMEDIES, and the first version had one of each pointing at different
+/// things. It told the reader what kern does about stdin and then offered `exec -it`, which
+/// answers `tty:`. Somebody who wrote `stdin_open: true` ALONE was handed a PTY they never asked
+/// for and nothing at all about the thing they did write. The remedy for a program that needs
+/// input is to give it that input another way; the `exec -it` pointer stays because a reader who
+/// typed `-it` is heading there, but as its own sentence.
+///
+/// NOT IMPLEMENTED, and that is a decision rather than a gap. Holding stdin open for a detached
+/// box means leaking a pipe write end into the box, since kern exits and cannot hold it. That
+/// turns "the program exits at once, in front of the person who just typed `compose up`, with the
+/// reason one line away" into "the program blocks forever on a read that never returns, `kern ps`
+/// says up, and nothing ever fires". A loud immediate failure traded for a silent permanent one.
+/// It would also change shutdown: a program that exits cleanly on EOF would then have to be
+/// killed, so `compose down` becomes SIGTERM-and-wait for that service.
 fn stdin_open_note(service: &str) -> String {
     format!(
         "service '{service}': 'stdin_open: true' - a compose service runs detached, so its stdin is \
-         at EOF rather than held open. A program that blocks on stdin will exit immediately; for an \
-         interactive shell use `kern exec -it {service}`"
+         at EOF rather than held open. A program that blocks on stdin will exit immediately; give \
+         it its input as a file, an argument, or an environment variable instead. For an \
+         interactive shell in the running service, `kern exec -it {service}`"
     )
 }
 
@@ -4208,6 +4224,14 @@ mod tests {
             "{n}"
         );
         assert!(n.contains("EOF"), "it must say what actually differs: {n}");
+        // AND IT ANSWERS THE KEY THE READER WROTE. The first version's only remedy was `exec -it`,
+        // which answers `tty:`, so somebody who wrote `stdin_open: true` alone was handed a PTY
+        // they had not asked for and nothing at all about stdin. A program that needs input needs
+        // another way in, and that is the sentence this asserts exists.
+        assert!(
+            n.contains("as a file, an argument, or an environment variable"),
+            "the stdin half needs its own remedy, not the tty one: {n}"
+        );
         // NOT "unsupported": nothing is missing, the behaviour is different and that is the point.
         assert!(!n.contains("unsupported"), "{n}");
         assert!(!n.contains("ignored"), "{n}");
