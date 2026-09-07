@@ -11,6 +11,13 @@ images the client can render.
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
+To run it without installing anything, name the package, not the command: `uvx kern-mcp` fails,
+because the command and the package have different names and there is no `kern-mcp` on PyPI.
+
+```json
+{ "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
+```
+
 ## The tools
 
 | tool | what it does |
@@ -99,6 +106,17 @@ What repeats is the per-call column, and prewarming removes ~36 ms of it while t
 columns stay identical: **a prewarmed call gets the same thing a cold call gets.** Each prewarmed box
 serves exactly one cell and is then destroyed. Same stdout, same exit status, same rich results, same
 file diff, same truncation, same faults, same network posture: there is a test for each.
+
+The pool is a budget, not a rate, and it comes up with the SESSION: it is built on the first
+`tools/call`, so the first call of a session is cold whatever the setting is. After that it holds up
+to `KERN_MCP_PREWARM` boxes and refills in the background, and starting one box costs more than
+serving one call, so a client that calls with no pause drains the budget and then pays the cold price
+for the rest. Twelve back-to-back calls at `KERN_MCP_PREWARM=8`, the pool given four seconds to fill
+first: the first eight are warm and the ninth is not, in three repetitions out of three. What
+reproduces is that cliff, not the digits either side of it, which moved by an order of magnitude
+between repetitions run back to back on one machine. Eight warm boxes, eight fast calls: a bigger
+number buys a longer burst, never a higher rate, which is why the table above is measured with a
+pause. A benchmark that does not pause is timing the cold path.
 
 One observable does differ, and the honest form of the claim says so: the interpreter is older than
 the call. Code that reads its own start time out of `/proc/self/stat` sees ~0 s on a cold call and up
