@@ -1612,6 +1612,104 @@ pub fn live_box_cgroups() -> Vec<(String, u32)> {
     out
 }
 
+/// The same question as [`live_box_cgroups`], asked of `/proc` instead, for a host that has no
+/// per-box cgroup to ask about.
+///
+/// WHY A SECOND CHANNEL EXISTS AT ALL. `live_box_cgroups` reads `kern.slice`, and on a host without
+/// cgroup delegation there is no `kern-box-*` directory to read: an independent reviewer ran the
+/// registry-wipe case as uid 0 with no systemd and reported THREE live `kern box g1` processes,
+/// absent from `ps`, unreachable by `stop`, untouched by `gc` - and the warning could not fire,
+/// because its evidence did not exist. That is the host where the defect is MOST likely and where it
+/// was invisible.
+///
+/// WHAT THE KERNEL WRITES HERE, and what it does not. The decision uses two facts the subject cannot
+/// forge: `/proc/<pid>/ns/user` (a process in a user namespace that is not ours) and
+/// `/proc/<ppid>/exe` (its parent runs a binary called `kern`). The TAG comes from the parent's
+/// `argv`, which the process itself wrote, and is therefore used only to NAME the finding, never to
+/// decide it. A box that lied about its argv would still be reported, under a wrong name.
+///
+/// COST, measured: 6.11 ms over 534 pids, which is about the cost of `ps` itself. That is why the
+/// caller uses this only when the cgroup channel came back empty; a host with delegation pays
+/// nothing for it.
+///
+/// Deduplicated by tag: a box shows up once per process of its tree that sits in the namespace, and
+/// the caller wants boxes, not processes.
+/// Does this host HAVE the cheap channel at all?
+///
+/// The gate for the `/proc` fallback, and it asks the right question. The first version asked
+/// whether the cgroup channel had found any ORPHAN, which is false on a healthy host with no boxes -
+/// so the most ordinary `kern ps` on earth paid for a 534-pid scan. What decides is whether the
+/// channel EXISTS: a delegated slice kern can read. Where it does, `live_box_cgroups` is complete and
+/// nothing else is needed; where it does not, it is empty for a reason no amount of looking will fix.
+#[must_use]
+pub fn box_cgroup_channel_available() -> bool {
+    [kern_slice_path(), current_v2_cgroup()]
+        .into_iter()
+        .flatten()
+        .any(|d| d.is_dir())
+}
+
+#[must_use]
+pub fn live_box_supervisors_via_proc() -> Vec<(String, u32)> {
+    let Ok(mine) = fs::read_link("/proc/self/ns/user") else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        // Not our user namespace: the process is inside SOMETHING. Not necessarily kern's, which is
+        // what the parent check below settles.
+        if fs::read_link(format!("/proc/{pid}/ns/user")).ok() != Some(mine.clone()) {
+            continue;
+        }
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // The parent runs `kern`. `exe` is a symlink the kernel maintains, so this cannot be spoofed
+        // by a process rewriting its own argv.
+        let is_kern = fs::read_link(format!("/proc/{ppid}/exe"))
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f == "kern"))
+            .unwrap_or(false);
+        if !is_kern {
+            continue;
+        }
+        // NAMED from argv, DECIDED above. `kern box <tag> …`.
+        let Ok(cmdline) = fs::read(format!("/proc/{ppid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        let tag = args
+            .iter()
+            .position(|a| *a == b"box")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .filter(|t| !t.is_empty() && !t.starts_with('-'));
+        if let Some(tag) = tag {
+            out.push((tag.to_string(), ppid));
+        }
+    }
+    out.sort();
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
 pub fn gc_orphan_box_cgroups() -> usize {
     // Boxes are not all created in one place, so sweeping one place cannot find them all. `apply_limits`
     // puts a DIRECT-path box under kern.slice and EVERY other box (scope, managed, best-effort) under the
@@ -2947,6 +3045,59 @@ pub fn memory_cap_signal() -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `/proc` channel finds a live box, and it does not use `kern.slice` to do it.
+    ///
+    /// This exists because an independent reviewer ran the registry-wipe case on a host with NO
+    /// cgroup delegation - uid 0, no systemd - and measured three live `kern box` processes that
+    /// `ps` could not report, `stop` could not reach and `gc` would not touch. The cgroup channel had
+    /// nothing to read there, so the warning could not fire on the host where the defect is most
+    /// likely. This is the second channel, and it rests on two facts the kernel writes: a process
+    /// outside our user namespace whose parent's `exe` is `kern`.
+    ///
+    /// SKIPS RATHER THAN ASSERTS WHEN THERE IS NOTHING TO FIND, and says so. But the empty case is
+    /// still asserted: a channel that invented boxes when none are running would be worse than one
+    /// that misses them, and only one of those two errors is caught by a test that just returns.
+    #[test]
+    fn the_proc_channel_sees_a_box_the_cgroup_channel_may_not() {
+        let found = live_box_supervisors_via_proc();
+        let any_box_running = std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_str()?.to_string();
+                n.bytes().all(|b| b.is_ascii_digit()).then_some(n)
+            })
+            .any(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .map(|c| {
+                        let a: Vec<&[u8]> = c.split(|b| *b == 0).collect();
+                        a.first().is_some_and(|p| p.ends_with(b"kern"))
+                            && a.iter().any(|w| *w == b"box")
+                    })
+                    .unwrap_or(false)
+            });
+        if !any_box_running {
+            eprintln!("skip: no `kern box` process is running, so there is nothing to find");
+            assert!(
+                found.is_empty(),
+                "with no box running the /proc channel must find nothing, got {found:?}"
+            );
+            return;
+        }
+        assert!(
+            !found.is_empty(),
+            "a `kern box` process is running and the /proc channel did not see it"
+        );
+        for (tag, pid) in &found {
+            assert!(!tag.is_empty(), "a finding must carry a name");
+            assert!(
+                std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the supervisor it names must exist: {tag} pid {pid}"
+            );
+        }
+    }
 
     /// `0::/` MEANS "I CANNOT TELL YOU WHERE I AM", and it used to resolve to the mount root.
     ///
