@@ -174,50 +174,6 @@ impl CgroupRef {
         Some(s)
     }
 
-    /// Read a control file into a CALLER-OWNED buffer, allocating nothing.
-    ///
-    /// [`read_control`] builds a `String` and cannot be used where this one is: after a `fork`, in a
-    /// child whose only job is to read one number. The allocator's lock can have been copied held
-    /// from a thread that no longer exists in that child, so a single allocation is a permanent
-    /// hang. Everything here is `openat` / `read` / `close` over a caller's slice.
-    ///
-    /// Returns the filled prefix, or `None` if the file could not be opened or read. A file longer
-    /// than `buf` is truncated to what fits, which is correct for the flat-keyed control files this
-    /// is used on only because the caller is looking for a key, not for the whole content; a caller
-    /// that needs completeness must size `buf` for it.
-    fn read_control_raw<'b>(&self, name: &CStr, buf: &'b mut [u8]) -> Option<&'b [u8]> {
-        let fd = self.raw();
-        if fd < 0 || buf.is_empty() {
-            return None;
-        }
-        let f = unsafe { libc::openat(fd, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if f < 0 {
-            return None;
-        }
-        let mut n = 0usize;
-        loop {
-            if n == buf.len() {
-                break;
-            }
-            let r = unsafe { libc::read(f, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
-            if r > 0 {
-                // `r` is positive and at most the length passed in, so this cannot exceed `buf`.
-                n += r as usize;
-                continue;
-            }
-            if r == 0 {
-                break; // EOF
-            }
-            // A signal during the read is not an error; anything else is, and the partial content is
-            // still worth returning because a truncated read of a flat-keyed file can hold the key.
-            if unsafe { *libc::__errno_location() } != libc::EINTR {
-                break;
-            }
-        }
-        unsafe { libc::close(f) };
-        Some(&buf[..n])
-    }
-
     /// Does this cgroup carry a REAL memory ceiling (a number, not the `max` no-limit sentinel)?
     ///
     /// Used to decide whether a whole-box OOM is even possible, so the diagnostic that watches for
@@ -227,40 +183,73 @@ impl CgroupRef {
         self.read_control(c"memory.max")
             .is_some_and(|v| is_real_limit(&v))
     }
+}
 
-    /// The `oom_group_kill` counter from `memory.events`, allocation-free.
-    ///
-    /// `memory.events` is flat-keyed (`<key> <value>\n` per line). Only `oom_group_kill` is read and
-    /// not `oom_kill`: the first counts times the WHOLE cgroup was killed as a unit, which is the
-    /// event that takes a `kern exec` down with the box, while `oom_kill` also counts a single task
-    /// being reaped inside a box that survives, which is not the caller's business.
-    ///
-    /// `None` when the file cannot be read or the key is absent, and the caller must treat that as
-    /// "I could not look" rather than as zero. Reporting an OOM that did not happen would be the same
-    /// class of defect as the silence this exists to fix, pointed the other way.
-    #[must_use]
-    pub fn oom_group_kill_count(&self) -> Option<u64> {
-        // `memory.events` has a fixed, small set of keys; 512 B holds all of them with room to spare,
-        // and the buffer is on the stack because this runs in a forked child.
-        let mut buf = [0u8; 512];
-        let raw = self.read_control_raw(c"memory.events", &mut buf)?;
-        for line in raw.split(|b| *b == b'\n') {
-            let mut it = line.splitn(2, |b| *b == b' ');
-            if it.next() != Some(b"oom_group_kill".as_slice()) {
-                continue;
-            }
-            let digits = it.next()?;
-            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-                return None;
-            }
-            // Saturating, so a value wider than `u64` can never wrap into a smaller one and read as
-            // "the count went down".
-            return Some(digits.iter().fold(0u64, |a, d| {
-                a.saturating_mul(10).saturating_add((d - b'0') as u64)
-            }));
-        }
-        None
+/// Read a whole file from an ALREADY-OPEN descriptor into a caller-owned buffer, from offset zero,
+/// allocating nothing.
+///
+/// The `lseek` back to the start is not tidiness: a caller that re-reads a pollable cgroup file to
+/// re-arm its notification reads the SAME descriptor over and over, and without the rewind every
+/// read after the first returns zero bytes, which parses as "the key is not there" and looks exactly
+/// like a cgroup that never had an event.
+///
+/// A file longer than `buf` is truncated to what fits. Correct for the flat-keyed control files this
+/// serves because the caller looks for a key rather than for the whole content; a caller that needs
+/// completeness must size `buf` for it.
+fn read_fd_raw(fd: libc::c_int, buf: &mut [u8]) -> Option<&[u8]> {
+    if fd < 0 || buf.is_empty() {
+        return None;
     }
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+        return None;
+    }
+    let mut n = 0usize;
+    while n < buf.len() {
+        let r = unsafe { libc::read(fd, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
+        if r > 0 {
+            // `r` is positive and at most the length passed in, so this cannot exceed `buf`.
+            n += r as usize;
+            continue;
+        }
+        if r == 0 {
+            break; // EOF
+        }
+        // A signal during the read is not an error; anything else is, and the partial content is
+        // still worth returning because a truncated read of a flat-keyed file can hold the key.
+        if unsafe { *libc::__errno_location() } != libc::EINTR {
+            break;
+        }
+    }
+    Some(&buf[..n])
+}
+
+/// One key's value out of a flat-keyed cgroup file (`<key> <value>\n` per line), allocating nothing.
+///
+/// `None` when the key is absent or its value is not a plain decimal, and the caller must treat that
+/// as "I could not look" rather than as zero: reporting an OOM that did not happen is the same class
+/// of defect as staying silent about one that did, pointed the other way.
+///
+/// ONE parser for every reader of these files, because the keys are near-misses of each other:
+/// `oom_kill` and `oom_group_kill` differ by a word, a `strip_prefix("oom_kill ")` does not match the
+/// second, and a second copy of the rule is how the two of them drift apart. The whole first token is
+/// compared rather than a prefix, so no key can be a prefix of another.
+fn parse_flat_key(raw: &[u8], key: &[u8]) -> Option<u64> {
+    for line in raw.split(|b| *b == b'\n') {
+        let mut it = line.splitn(2, |b| *b == b' ');
+        if it.next() != Some(key) {
+            continue;
+        }
+        let digits = it.next()?;
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        // Saturating, so a value wider than `u64` can never wrap into a smaller one and read as
+        // "the count went down".
+        return Some(digits.iter().fold(0u64, |a, d| {
+            a.saturating_mul(10).saturating_add((d - b'0') as u64)
+        }));
+    }
+    None
 }
 
 impl Drop for CgroupRef {
@@ -555,11 +544,62 @@ pub fn oom_kill_dir_for_pid(pid: i32) -> Option<PathBuf> {
 
 /// `oom_kill` from a directory [`oom_kill_dir_for_pid`] already resolved. `None` if it went away.
 pub fn oom_kill_count_at(dir: &Path) -> Option<u64> {
-    fs::read_to_string(dir.join("memory.events"))
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("oom_kill "))
-        .and_then(|n| n.trim().parse().ok())
+    parse_flat_key(
+        fs::read_to_string(dir.join("memory.events"))
+            .ok()?
+            .as_bytes(),
+        b"oom_kill",
+    )
+}
+
+/// Open `memory.events` in `dir` and KEEP the descriptor, for a reader that must survive the box.
+///
+/// The descriptor exists because of a race this codebase has already documented once and that I
+/// re-measured the hard way: a box killed by `memory.oom.group` takes its own cgroup directory with
+/// it, and reading that directory afterwards is a coin toss. Measured on this host, sampling every
+/// 2 ms from the moment the workload started: the box's cgroup was GONE 10.7 ms later, and
+/// `oom_group_kill` was never observed non-zero there at all, because the counter increments at the
+/// same instant the directory is torn down.
+///
+/// `dir` is therefore an ANCESTOR that outlives the box, from [`oom_kill_dir_for_pid`], and its
+/// counters are hierarchical so the box's event lands in them. Measured on the same host, before and
+/// after one group kill: `kern.slice` went `oom_group_kill 228 -> 229` and `oom_kill 622 -> 625`, and
+/// the directory was still there.
+///
+/// The caller owns the descriptor. Pair it with [`oom_group_kill_from_fd`], which re-reads it without
+/// allocating, so a forked child can use it.
+#[must_use]
+pub fn open_oom_events_fd(dir: &Path) -> Option<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = dir.join("memory.events");
+    let bytes = p.as_os_str().as_bytes();
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // `<` and not `<=`: the last byte must stay NUL, and `buf` is zeroed, so no terminator is written.
+    if bytes.is_empty() || bytes.len() >= buf.len() || bytes.contains(&0) {
+        return None;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let fd = unsafe {
+        libc::open(
+            buf.as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    (fd >= 0).then_some(fd)
+}
+
+/// `oom_group_kill` re-read from a descriptor opened by [`open_oom_events_fd`], allocating nothing.
+///
+/// `oom_group_kill` and not `oom_kill`: the first counts times a whole cgroup was killed AS A UNIT,
+/// which is the event that takes a `kern exec` down with its box, while the second also counts a
+/// single task being reaped inside a box that survives, which is not the caller's business.
+///
+/// The read rewinds first, so the same descriptor can be read repeatedly. Nothing here allocates, so
+/// it is usable after a `fork`.
+#[must_use]
+pub fn oom_group_kill_from_fd(fd: libc::c_int) -> Option<u64> {
+    let mut buf = [0u8; 512];
+    parse_flat_key(read_fd_raw(fd, &mut buf)?, b"oom_group_kill")
 }
 
 /// `oom_kill` from the nearest ancestor of `dir` that exposes `memory.events`, `dir` itself excluded.

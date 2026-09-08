@@ -4410,6 +4410,13 @@ struct OomReporter {
 impl Drop for OomReporter {
     fn drop(&mut self) {
         if self.write_fd >= 0 {
+            // ONE BYTE THAT MEANS "I LEFT ON MY OWN FEET", and it is the whole reason the reporter
+            // can afford to wait. A `SIGKILL` cannot run this, so the reporter tells a clean exit
+            // from a killed one by whether the byte arrived before the EOF: on a clean exit it stops
+            // immediately and costs the caller nothing, and only in the killed case does it wait for
+            // the counter to catch up.
+            let b = *b".";
+            unsafe { libc::write(self.write_fd, b.as_ptr().cast(), 1) };
             unsafe { libc::close(self.write_fd) };
         }
     }
@@ -4442,11 +4449,29 @@ impl Drop for OomReporter {
 ///
 /// The pipe is `O_CLOEXEC` on both ends: the exec'd program must not inherit the write end and hold
 /// the reporter open for its whole life, and the reporter never execs.
-fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef) -> Option<OomReporter> {
+fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef, pid1: i32) -> Option<OomReporter> {
     if !cg.has_real_memory_cap() {
         return None;
     }
-    let baseline = cg.oom_group_kill_count()?;
+    // NOT THE BOX'S OWN CGROUP, an ANCESTOR of it. The first version read the box's own
+    // `memory.events` after the launcher died and it was a coin toss, because `memory.oom.group`
+    // takes the directory down with the processes: sampling every 2 ms from the host, the box's
+    // cgroup was gone 10.7 ms in and `oom_group_kill` was never seen non-zero there, since the
+    // counter increments at the instant the directory is torn down. The same command reported the
+    // OOM under one harness and stayed silent under another, which is worse than never reporting:
+    // the one run that matters is the one nobody repeats.
+    //
+    // The counters are hierarchical and the ancestor outlives the box, so the event lands somewhere
+    // that is still readable afterwards. Measured across one group kill: `kern.slice` went
+    // `oom_group_kill 228 -> 229`. This is the mechanism `oom_kill_dir_for_pid` already existed for
+    // on the `kern run` path, and reusing it is the point: the rule for which directory outlives a
+    // box is not one to hold two opinions about.
+    let anc = crate::cgroup::oom_kill_dir_for_pid(pid1)?;
+    let events_fd = crate::cgroup::open_oom_events_fd(&anc)?;
+    let Some(baseline) = crate::cgroup::oom_group_kill_from_fd(events_fd) else {
+        unsafe { libc::close(events_fd) };
+        return None;
+    };
 
     let mut fds = [0 as libc::c_int; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -4463,22 +4488,56 @@ fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef) -> Option<OomReporter> {
     if pid == 0 {
         // THE REPORTER. NOTHING BELOW MAY ALLOCATE: this is a forked child, and the allocator's lock
         // can have been copied held from a thread that does not exist here, which would make a
-        // single allocation a permanent hang. `oom_group_kill_count` reads into a stack buffer for
+        // single allocation a permanent hang. `oom_group_kill_from_fd` reads into a stack buffer for
         // exactly this reason, and the message is a literal.
         unsafe { libc::close(w) };
         let mut byte = [0u8; 1];
-        loop {
+        // One byte means the launcher ran its `Drop`, so it was not killed and there is nothing to
+        // explain. EOF or an error means it went without one.
+        let clean = loop {
             let n = unsafe { libc::read(r, byte.as_mut_ptr().cast(), 1) };
             if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
                 continue;
             }
-            // EOF (0), an error, or the impossible case of a byte: nobody ever writes to this pipe,
-            // so every outcome other than EINTR means the launcher is gone and it is time to look.
-            break;
+            break n == 1;
+        };
+        if clean {
+            unsafe { libc::_exit(0) };
         }
-        if cg.oom_group_kill_count().is_some_and(|now| now > baseline) {
-            const MSG: &[u8] = b"kern: exec: the box exceeded its --memory cap and the whole box \
-                was killed (memory.oom.group), including this command\n";
+
+        // KILLED, so wait for the counter instead of sampling it once. Reading after the death is
+        // safe here and was not in the first version - this descriptor is on an ancestor that
+        // outlives the box - but "safe to read" is not "already updated": measured, one sample taken
+        // the instant the pipe closed reported the OOM in only 3 runs out of 10, because the process
+        // dies before the count that explains it lands. Retrying turns a race into a bounded wait.
+        //
+        // The wait costs NOTHING on a healthy exec: that path exited above on the byte. It is only
+        // ever paid by a command that has already been killed, where a few hundred milliseconds are
+        // invisible next to the fact that the caller is about to be told why.
+        let deadline = 400; // ms, in 2 ms steps
+        let mut waited = 0;
+        let mut fired =
+            crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
+        while !fired && waited < deadline {
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000,
+            };
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            waited += 2;
+            fired =
+                crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
+        }
+        if fired {
+            // WHAT THIS CLAIMS, AND WHAT IT DOES NOT. A group kill happened in the slice this box
+            // lives in while this command was running, and this command died. The slice is shared
+            // with kern's other boxes, so the counter does not name THIS box the way the `kern run`
+            // path's does; the sentence says "its box", which is what the caller can act on, and
+            // stops short of naming the process. Overclaiming here would be the same defect as the
+            // silence it replaces, pointed the other way.
+            const MSG: &[u8] = b"kern: exec: this command was killed with its box by the kernel's \
+                OOM killer, against the box's memory cap (memory.oom.group kills the whole box, the \
+                exec'd command included). Raise it with `--memory <size>`.\n";
             unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
         }
         unsafe { libc::_exit(0) };
@@ -4672,7 +4731,7 @@ pub fn exec_in_box(
     // BEFORE the migration below, because a reporter forked after it would be inside the group and
     // would die with everything else. `_reporter` keeps the pipe's write end alive for exactly as
     // long as this process is alive; that is the whole signal.
-    let _reporter = box_cg.as_ref().and_then(spawn_oom_reporter);
+    let _reporter = box_cg.as_ref().and_then(|c| spawn_oom_reporter(c, pid1));
 
     let placed = box_cg.as_ref().is_some_and(crate::cgroup::join_box_cgroup);
     if !placed && box_has_explicit_caps {
