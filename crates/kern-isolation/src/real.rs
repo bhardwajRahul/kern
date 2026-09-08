@@ -3469,6 +3469,19 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // write below still runs and still refuses.
         if let Some(cgr) = cg_ref.as_ref() {
             if !born_in_cgroup && !crate::cgroup::join_box_cgroup(cgr) {
+                // AND SAY SO, because refusing in silence is its own defect. Measured by forcing
+                // `EACCES` on the `cgroup.procs` open: the box exited 126 with ZERO bytes on either
+                // stream, so a host that cannot delegate a cgroup answered `kern box --memory 64m`
+                // with a bare 126 and nothing that named the cause. The safe branch was taken and
+                // told nobody, which is the same defect as the silent unsafe branch read backwards.
+                //
+                // A literal through `write(2)` and not `eprintln!`: this is a forked child, and the
+                // allocator's lock can have been copied held from a thread that no longer exists
+                // here. Async-signal-safe or nothing.
+                const MSG: &[u8] = b"kern: refusing to start: the box could not be placed in its \
+                    own cgroup, so its --memory/--pids caps would not apply (cgroup delegation \
+                    unavailable or not writable here)\n";
+                unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
                 if let Some(fd) = ready_fd {
                     let b = [1u8];
                     unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
@@ -4387,6 +4400,93 @@ fn exec_fail_closed(reason: &str) -> ! {
 /// Not a descendant of PID 1, so the box's own seccomp filter doesn't block the `setns` calls
 /// here; the new process gets its own copy of the filter for parity. Requires that the caller is
 /// the same user that created the box (its user namespace owner).
+/// The live end of the pipe that tells the OOM reporter this process is gone. Closing it, whether by
+/// `Drop` on a normal return or by the kernel on a `SIGKILL`, is the only signal the reporter waits
+/// on, so this must stay owned for as long as the exec runs.
+struct OomReporter {
+    write_fd: libc::c_int,
+}
+
+impl Drop for OomReporter {
+    fn drop(&mut self) {
+        if self.write_fd >= 0 {
+            unsafe { libc::close(self.write_fd) };
+        }
+    }
+}
+
+/// Fork a process that OUTLIVES a whole-box OOM and reports it, because nothing inside the box's
+/// cgroup can.
+///
+/// `kern exec` migrates the launcher into the box's cgroup so the command it forks inherits the
+/// caps. With `memory.oom.group = 1` that means a box that blows its memory ceiling takes the
+/// launcher with it, and it goes by `SIGKILL`, which cannot be caught. Measured on a `--memory 32m`
+/// box before this existed: the `kern exec` process itself returned `-9`, with empty stdout and
+/// empty stderr, while `memory.events` recorded `oom_group_kill 1`. The person who typed the command
+/// saw it die and got no reason.
+///
+/// So the reporter is forked BEFORE the migration and stays in the caller's cgroup and namespaces.
+/// It holds the read end of a pipe whose only writer is the launcher; when the launcher dies, for
+/// any reason, the write end closes and the read returns EOF. The reporter then compares
+/// `oom_group_kill` against the value it captured before anything ran, and speaks only if it grew.
+///
+/// FAILURE MODES, all of them deliberately silent, because this is a diagnostic and must never be
+/// the reason an exec does not happen:
+///
+/// * the box has no real `memory.max`, so a group OOM is not possible here -> no reporter,
+///   and no process spent on a box that cannot produce the event;
+/// * `memory.events` unreadable NOW -> no reporter, because without a baseline an increase cannot
+///   be told from a count that was already there, and announcing an OOM that did not happen is the
+///   same defect as the silence, pointed the other way;
+/// * `pipe2` or `fork` fails -> no reporter, and the exec proceeds untouched.
+///
+/// The pipe is `O_CLOEXEC` on both ends: the exec'd program must not inherit the write end and hold
+/// the reporter open for its whole life, and the reporter never execs.
+fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef) -> Option<OomReporter> {
+    if !cg.has_real_memory_cap() {
+        return None;
+    }
+    let baseline = cg.oom_group_kill_count()?;
+
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
+    }
+    let (r, w) = (fds[0], fds[1]);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(r) };
+        unsafe { libc::close(w) };
+        return None;
+    }
+    if pid == 0 {
+        // THE REPORTER. NOTHING BELOW MAY ALLOCATE: this is a forked child, and the allocator's lock
+        // can have been copied held from a thread that does not exist here, which would make a
+        // single allocation a permanent hang. `oom_group_kill_count` reads into a stack buffer for
+        // exactly this reason, and the message is a literal.
+        unsafe { libc::close(w) };
+        let mut byte = [0u8; 1];
+        loop {
+            let n = unsafe { libc::read(r, byte.as_mut_ptr().cast(), 1) };
+            if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            // EOF (0), an error, or the impossible case of a byte: nobody ever writes to this pipe,
+            // so every outcome other than EINTR means the launcher is gone and it is time to look.
+            break;
+        }
+        if cg.oom_group_kill_count().is_some_and(|now| now > baseline) {
+            const MSG: &[u8] = b"kern: exec: the box exceeded its --memory cap and the whole box \
+                was killed (memory.oom.group), including this command\n";
+            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(r) };
+    Some(OomReporter { write_fd: w })
+}
+
 #[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
 pub fn exec_in_box(
     pid1: i32,
@@ -4543,6 +4643,17 @@ pub fn exec_in_box(
     // of its life, where a whole-box OOM can take it down. Recovering that without losing the cap needs
     // the child to be created in the cgroup before the namespaces are joined and then to enter the PID
     // namespace itself, which takes a second fork - a restructure, not an ordering change.
+    //
+    // WHAT THE CALLER USED TO SEE WHEN THAT HAPPENED, measured rather than guessed. A `--memory 32m`
+    // box, an exec'd command that allocates past it:
+    //
+    //     returncode -9 (SIGKILL) on the `kern exec` process ITSELF
+    //     stdout b''   stderr b''
+    //     memory.events: max 20 oom 1 oom_kill 4 oom_group_kill 1
+    //
+    // Zero bytes explaining it, because `memory.oom.group = 1` kills the launcher along with the box
+    // and SIGKILL cannot be caught. Nothing inside the group can report it, by construction, so
+    // `spawn_oom_reporter` below puts one process OUTSIDE the group whose only job is to say it.
     let box_cg = crate::cgroup::box_cgroup_dir_for_exec(pid1).and_then(|d| {
         let cg = crate::cgroup::CgroupRef::open(&d);
         if cg.is_none() && box_has_explicit_caps {
@@ -4558,6 +4669,11 @@ pub fn exec_in_box(
     });
     // Migrate NOW, while the caller is still in its own namespaces, so the child forked after the
     // `setns` inherits the cgroup. Reported from the outcome, exactly as before.
+    // BEFORE the migration below, because a reporter forked after it would be inside the group and
+    // would die with everything else. `_reporter` keeps the pipe's write end alive for exactly as
+    // long as this process is alive; that is the whole signal.
+    let _reporter = box_cg.as_ref().and_then(spawn_oom_reporter);
+
     let placed = box_cg.as_ref().is_some_and(crate::cgroup::join_box_cgroup);
     if !placed && box_has_explicit_caps {
         if let Some(cg) = box_cg.as_ref() {

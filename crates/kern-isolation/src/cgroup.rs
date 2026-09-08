@@ -173,6 +173,94 @@ impl CgroupRef {
         f.read_to_string(&mut s).ok()?;
         Some(s)
     }
+
+    /// Read a control file into a CALLER-OWNED buffer, allocating nothing.
+    ///
+    /// [`read_control`] builds a `String` and cannot be used where this one is: after a `fork`, in a
+    /// child whose only job is to read one number. The allocator's lock can have been copied held
+    /// from a thread that no longer exists in that child, so a single allocation is a permanent
+    /// hang. Everything here is `openat` / `read` / `close` over a caller's slice.
+    ///
+    /// Returns the filled prefix, or `None` if the file could not be opened or read. A file longer
+    /// than `buf` is truncated to what fits, which is correct for the flat-keyed control files this
+    /// is used on only because the caller is looking for a key, not for the whole content; a caller
+    /// that needs completeness must size `buf` for it.
+    fn read_control_raw<'b>(&self, name: &CStr, buf: &'b mut [u8]) -> Option<&'b [u8]> {
+        let fd = self.raw();
+        if fd < 0 || buf.is_empty() {
+            return None;
+        }
+        let f = unsafe { libc::openat(fd, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if f < 0 {
+            return None;
+        }
+        let mut n = 0usize;
+        loop {
+            if n == buf.len() {
+                break;
+            }
+            let r = unsafe { libc::read(f, buf[n..].as_mut_ptr().cast(), buf.len() - n) };
+            if r > 0 {
+                // `r` is positive and at most the length passed in, so this cannot exceed `buf`.
+                n += r as usize;
+                continue;
+            }
+            if r == 0 {
+                break; // EOF
+            }
+            // A signal during the read is not an error; anything else is, and the partial content is
+            // still worth returning because a truncated read of a flat-keyed file can hold the key.
+            if unsafe { *libc::__errno_location() } != libc::EINTR {
+                break;
+            }
+        }
+        unsafe { libc::close(f) };
+        Some(&buf[..n])
+    }
+
+    /// Does this cgroup carry a REAL memory ceiling (a number, not the `max` no-limit sentinel)?
+    ///
+    /// Used to decide whether a whole-box OOM is even possible, so the diagnostic that watches for
+    /// one is not installed on a box that cannot have it.
+    #[must_use]
+    pub fn has_real_memory_cap(&self) -> bool {
+        self.read_control(c"memory.max")
+            .is_some_and(|v| is_real_limit(&v))
+    }
+
+    /// The `oom_group_kill` counter from `memory.events`, allocation-free.
+    ///
+    /// `memory.events` is flat-keyed (`<key> <value>\n` per line). Only `oom_group_kill` is read and
+    /// not `oom_kill`: the first counts times the WHOLE cgroup was killed as a unit, which is the
+    /// event that takes a `kern exec` down with the box, while `oom_kill` also counts a single task
+    /// being reaped inside a box that survives, which is not the caller's business.
+    ///
+    /// `None` when the file cannot be read or the key is absent, and the caller must treat that as
+    /// "I could not look" rather than as zero. Reporting an OOM that did not happen would be the same
+    /// class of defect as the silence this exists to fix, pointed the other way.
+    #[must_use]
+    pub fn oom_group_kill_count(&self) -> Option<u64> {
+        // `memory.events` has a fixed, small set of keys; 512 B holds all of them with room to spare,
+        // and the buffer is on the stack because this runs in a forked child.
+        let mut buf = [0u8; 512];
+        let raw = self.read_control_raw(c"memory.events", &mut buf)?;
+        for line in raw.split(|b| *b == b'\n') {
+            let mut it = line.splitn(2, |b| *b == b' ');
+            if it.next() != Some(b"oom_group_kill".as_slice()) {
+                continue;
+            }
+            let digits = it.next()?;
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // Saturating, so a value wider than `u64` can never wrap into a smaller one and read as
+            // "the count went down".
+            return Some(digits.iter().fold(0u64, |a, d| {
+                a.saturating_mul(10).saturating_add((d - b'0') as u64)
+            }));
+        }
+        None
+    }
 }
 
 impl Drop for CgroupRef {

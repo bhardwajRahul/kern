@@ -6358,6 +6358,175 @@ fn compose_full_schema_brings_box_up() {
     let _ = fs::remove_file(&toml);
 }
 
+/// A running box's own cgroup directory ON THE HOST, from its PID 1's host pid. `None` when this
+/// host gave the box no `kern-box-*` cgroup of its own, which is a genuine skip and not a failure.
+///
+/// FROM THE HOST, AND THAT IS THE POINT. The obvious version of this reads `/proc/1/cgroup` from
+/// inside the box, and it cannot work: inside the box's cgroup namespace the box's own cgroup is the
+/// root, so PID 1's line is `0::/` for a capped box and an uncapped one alike. A test that asked
+/// whether that path named a `kern-box-*` directory therefore skipped on every host where the caps
+/// actually apply, while reporting the opposite. The kernel writes `/proc/<host pid>/cgroup`, the
+/// box cannot rewrite it, and the pid comes from `inspect --json`, so the reading and the subject are
+/// independent.
+///
+/// Shared by every test that needs it rather than copied into each: the derived condition here (what
+/// counts as "this box has its own cgroup") is exactly the kind that rots when it exists twice.
+fn box_cgroup_dir(tag: &str) -> Option<PathBuf> {
+    let js = kern().args(["inspect", tag, "--json"]).output().ok()?;
+    let txt = String::from_utf8_lossy(&js.stdout).to_string();
+    let pid1: i64 = txt
+        .split("\"pid1\"")
+        .nth(1)?
+        .trim_start_matches([':', ' '])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let rel = fs::read_to_string(format!("/proc/{pid1}/cgroup")).ok()?;
+    let rel = rel.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    dir.file_name()?
+        .to_str()?
+        .starts_with("kern-box-")
+        .then_some(dir)
+}
+
+/// A cgroup control file read as a number, or `None` when it is absent, unreadable, or the `max`
+/// no-limit sentinel. Callers use `None` as "there is no cap to test here" and skip.
+fn cgroup_num(p: PathBuf) -> Option<u64> {
+    fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
+}
+
+/// A command that grows the shell's own ANONYMOUS memory until something stops it.
+///
+/// Anonymous and not a file, on purpose: page cache is reclaimable, so a `dd` into a file can push a
+/// cgroup to its ceiling and be reclaimed instead of killed, which would make this test depend on
+/// how much the host felt like reclaiming. Concatenating into a shell variable cannot be reclaimed.
+const MEMORY_HOG: &str = r#"A=""; while :; do A="$A$(/bin/busybox dd if=/dev/zero bs=1M count=4 2>/dev/null | /bin/busybox tr "\0" "x")"; done"#;
+
+/// A `kern exec` that dies because the BOX blew its memory ceiling must say so.
+///
+/// MEASURED DEFECT this pins. `kern exec` migrates the launcher into the box's cgroup so the command
+/// it forks inherits the caps, and the box carries `memory.oom.group = 1`, so a box that exceeds
+/// `--memory` is killed as a unit and the launcher goes with it. By `SIGKILL`, which cannot be
+/// caught. On a `--memory 32m` box, measured before the reporter existed:
+///
+///     returncode -9 (SIGKILL)   stdout b''   stderr b''   memory.events: oom_group_kill 1
+///
+/// The caller's command was killed and nothing anywhere said why. Nothing INSIDE the cgroup can say
+/// it, by construction, so a reporter is forked before the migration and waits outside on a pipe the
+/// launcher holds.
+///
+/// The exit code stays `SIGKILL` and this test does not assert otherwise: that part is the kernel's
+/// and is not fixable. What is asserted is that the reason reaches stderr.
+///
+/// THE SILENT HALF IS ASSERTED FIRST, and it is the half that can rot: a reporter that always fires
+/// is not a detector, and "the message appeared" would be true of one. So a healthy exec on an
+/// equally capped box must produce nothing, and only then is the killed one allowed to speak.
+#[test]
+fn an_exec_killed_by_the_box_oom_cap_says_why() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let start = |tag: &str, rootfs: &str, mem: &str| {
+        kern()
+            .args([
+                "box",
+                tag,
+                "--rootfs",
+                rootfs,
+                "--memory",
+                mem,
+                "--pids-limit",
+                "40",
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "sleep 40",
+            ])
+            .output()
+    };
+    let says_oom =
+        |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).contains("memory.oom.group");
+
+    // ---- the silent half.
+    let quiet = "oomquiet";
+    let _ = kern().args(["stop", quiet]).output();
+    let root_q = build_rootfs(&busybox, quiet);
+    let q_up = start(quiet, root_q.to_str().unwrap(), "64m")
+        .expect("start detached box")
+        .status
+        .success();
+    let capped = q_up
+        .then(|| box_cgroup_dir(quiet))
+        .flatten()
+        .and_then(|d| cgroup_num(d.join("memory.max")))
+        .is_some();
+    let quiet_out = capped.then(|| {
+        kern()
+            .args(["exec", quiet, "--", "/bin/busybox", "true"])
+            .output()
+            .expect("run exec")
+    });
+    let _ = kern().args(["stop", quiet]).output();
+    let _ = fs::remove_dir_all(&root_q);
+
+    let Some(quiet_out) = quiet_out else {
+        eprintln!(
+            "skip: this host gave the box no enforced memory.max, so it cannot OOM as a group"
+        );
+        return;
+    };
+    assert!(
+        !says_oom(&quiet_out),
+        "an exec that was never OOM-killed must say nothing about it, or the message proves \
+         nothing when it does appear; got {:?}",
+        String::from_utf8_lossy(&quiet_out.stderr)
+    );
+
+    // ---- the killed half.
+    let loud = "oomloud";
+    let _ = kern().args(["stop", loud]).output();
+    let root_l = build_rootfs(&busybox, loud);
+    let l_up = start(loud, root_l.to_str().unwrap(), "32m")
+        .expect("start detached box")
+        .status
+        .success();
+    let loud_out = l_up.then(|| {
+        kern()
+            .args(["exec", loud, "--", "/bin/busybox", "sh", "-c", MEMORY_HOG])
+            .output()
+            .expect("run exec")
+    });
+    let _ = kern().args(["stop", loud]).output();
+    let _ = fs::remove_dir_all(&root_l);
+
+    let Some(loud_out) = loud_out else {
+        eprintln!("skip: the capped box did not start");
+        return;
+    };
+    // If the workload somehow survived, there was no OOM to report and the test has measured
+    // nothing. Say so rather than assert on a message that would be wrong to print.
+    if loud_out.status.success() {
+        eprintln!("skip: the memory hog was not killed, so no group OOM happened here");
+        return;
+    }
+    assert!(
+        says_oom(&loud_out),
+        "a command killed by the box's group OOM must be told why; it exited {:?} with stderr {:?}",
+        loud_out.status,
+        String::from_utf8_lossy(&loud_out.stderr)
+    );
+}
+
 /// Regression: `kern exec` must place the exec'd process in the BOX'S cgroup, so a command run via
 /// `kern exec` is bound by the box's `--memory`/`--pids` caps (like `docker exec`), not the
 /// launcher's ambient cgroup. Without that placement a fork bomb or a memory hog run through
@@ -6394,30 +6563,6 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
         return;
     }
 
-    // The box's own cgroup directory on the HOST, from its PID 1's host pid. `None` when the host
-    // gave the box no `kern-box-*` cgroup of its own, which is a genuine skip.
-    let box_cgroup_dir = |tag: &str| -> Option<PathBuf> {
-        let js = kern().args(["inspect", tag, "--json"]).output().ok()?;
-        let txt = String::from_utf8_lossy(&js.stdout).to_string();
-        let pid1: i64 = txt
-            .split("\"pid1\"")
-            .nth(1)?
-            .trim_start_matches([':', ' '])
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .ok()?;
-        let rel = fs::read_to_string(format!("/proc/{pid1}/cgroup")).ok()?;
-        let rel = rel.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
-        let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-        dir.file_name()?
-            .to_str()?
-            .starts_with("kern-box-")
-            .then_some(dir)
-    };
-    let read_num =
-        |p: PathBuf| -> Option<u64> { fs::read_to_string(p).ok()?.trim().parse::<u64>().ok() };
     // A workload of exactly TWO processes (the shell plus the sleep it waits on), so a `--pids-limit
     // 2` box is saturated the moment it is up and any correctly placed exec must be refused.
     let two_procs = "/bin/busybox sleep 30 & wait";
@@ -6455,7 +6600,7 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
     let dir_ok = ok_started.then(|| box_cgroup_dir(roomy)).flatten();
     let mut grew = None;
     if let Some(dir) = dir_ok.as_ref() {
-        let base = read_num(dir.join("pids.current")).unwrap_or(0);
+        let base = cgroup_num(dir.join("pids.current")).unwrap_or(0);
         let mut child = kern()
             .args(["exec", roomy, "--", "/bin/busybox", "sleep", "3"])
             .spawn()
@@ -6463,7 +6608,7 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
         let mut peak = base;
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            peak = peak.max(read_num(dir.join("pids.current")).unwrap_or(0));
+            peak = peak.max(cgroup_num(dir.join("pids.current")).unwrap_or(0));
         }
         let _ = child.wait();
         grew = Some((base, peak));
@@ -6496,7 +6641,7 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
     // Confirm the precondition rather than assume it: the cap must be REACHED, or a refusal would
     // mean nothing and an acceptance would not be a defect.
     let saturated = dir_full.as_ref().is_some_and(|d| {
-        read_num(d.join("pids.max")) == Some(2) && read_num(d.join("pids.current")) == Some(2)
+        cgroup_num(d.join("pids.max")) == Some(2) && cgroup_num(d.join("pids.current")) == Some(2)
     });
     let exec_rc = saturated.then(|| {
         kern()
