@@ -5,6 +5,7 @@
 //! isn't delegated/writable (no systemd user delegation), it degrades gracefully: the namespace
 //! isolation still holds; only the resource cap is skipped. cgroup v2 only.
 
+use std::ffi::CStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -92,15 +93,243 @@ pub fn this_box_cgroup_dir() -> Option<&'static std::path::Path> {
     BOX_CGROUP_DIR.get().map(PathBuf::as_path)
 }
 
-/// Put the CALLING process into `dir`, the box's capped cgroup. Called by the forked child before it
-/// execs, because the supervisor stays outside so a whole-box OOM cannot take it.
+/// An OPEN DESCRIPTOR on a box's cgroup directory, and the reason it is a descriptor and not a path.
+///
+/// `kern exec` enters the box's namespaces with `setns` and then places its child in the box's cgroup.
+/// A PATH does not survive that crossing: inside the box's mount and cgroup namespaces `/sys/fs/cgroup`
+/// is the box's own cgroup mounted at the root, so the absolute host path
+/// `/sys/fs/cgroup/user.slice/.../kern-box-<name>-<pid>` names nothing at all. Measured on the shipped
+/// binary before this type existed, `--pids-limit 2 --memory 64M`, reading each process's cgroup from
+/// the HOST by pid, with the box's own PID 1 as the positive control:
+///
+/// ```text
+/// box PID 1                 .../kern.slice/kern-box-td2-2312282   <- capped
+/// the kern exec'd process   .../app.slice/app-<the caller>.scope   <- the CALLER's cgroup
+/// ```
+///
+/// and the exec'd process was verified to be in the box's PID namespace, so it was the right process.
+/// Worse than the miss was its silence: the fallback join wrote to the same unreachable path and
+/// failed, and then the probe that decides whether a failed placement COSTS a cap read `memory.max`
+/// and `pids.max` from that same unreachable path, found neither, and concluded "no real cap here,
+/// nothing to report". The warning written for exactly this situation could not fire. A missing read
+/// and a benign answer were the same value, which is the failure this codebase keeps meeting.
+///
+/// The descriptor is opened BEFORE any `setns` and everything afterwards goes through it, so the
+/// hazard is gone by construction rather than by remembering the ordering.
+pub struct CgroupRef {
+    /// `Cell` so a forked CHILD can close its own copy through a shared reference, without the parent
+    /// (a different address space after the fork) losing its own. `-1` means already closed, which is
+    /// what keeps [`Drop`] from closing twice.
+    fd: std::cell::Cell<libc::c_int>,
+}
+
+impl CgroupRef {
+    /// Open `dir` as a directory descriptor, or `None` if it cannot be opened or cannot be represented
+    /// (see [`open_cgroup_dir_fd`]).
+    #[must_use]
+    pub fn open(dir: &Path) -> Option<Self> {
+        open_cgroup_dir_fd(dir).map(|fd| Self {
+            fd: std::cell::Cell::new(fd),
+        })
+    }
+
+    fn raw(&self) -> libc::c_int {
+        self.fd.get()
+    }
+
+    /// Close it now, before the caller goes on to do work this descriptor should not be carried
+    /// through. It is `O_CLOEXEC`, so an `execvp` would close it anyway; this covers the window
+    /// between the fork and that exec, in which the child does its mount and namespace setup and has
+    /// no business holding a descriptor on `/sys/fs/cgroup`.
+    pub fn close(&self) {
+        let fd = self.fd.replace(-1);
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// Open a file inside the cgroup directory relative to the descriptor, never by path.
+    fn open_at(&self, name: &CStr, flags: libc::c_int) -> Option<fs::File> {
+        use std::os::fd::FromRawFd;
+        let fd = self.raw();
+        if fd < 0 {
+            return None;
+        }
+        let f = unsafe { libc::openat(fd, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        // SAFETY: `openat` returned a fresh descriptor this process owns; `File` takes ownership and
+        // closes it. Checked non-negative first, so no `-1` is ever adopted.
+        (f >= 0).then(|| unsafe { fs::File::from_raw_fd(f) })
+    }
+
+    /// Read a control file's contents, or `None` if it cannot be read.
+    ///
+    /// The distinction between `None` and `Some("max")` is the whole point of returning an `Option`
+    /// here: "I could not look" and "there is no limit" must not collapse into one value, because they
+    /// did, and the collapse is what silenced the warning above.
+    fn read_control(&self, name: &CStr) -> Option<String> {
+        use std::io::Read;
+        let mut f = self.open_at(name, libc::O_RDONLY)?;
+        let mut s = String::new();
+        f.read_to_string(&mut s).ok()?;
+        Some(s)
+    }
+}
+
+impl Drop for CgroupRef {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Put the CALLING process into the box's capped cgroup. Called by the forked child before it execs,
+/// because the supervisor stays outside so a whole-box OOM cannot take it.
 ///
 /// Returns false if the write failed, which the caller must treat as "this box would run UNCAPPED" and
 /// refuse: a box outside its own cgroup has no memory ceiling and no fork-bomb guard, and running it
 /// anyway would be the silent-uncapped failure this codebase refuses everywhere else.
+///
+/// Writes `0`, which cgroup v2 defines as "the process doing the writing", rather than a pid read from
+/// `getpid`. On the `kern exec` path this runs after the child has entered the box's PID NAMESPACE, so
+/// a pid taken there is a namespaced one, and whether the kernel resolves it in the writer's namespace
+/// or the file's is a question `0` never has to ask.
 #[must_use]
-pub fn join_box_cgroup(dir: &std::path::Path) -> bool {
-    fs::write(dir.join("cgroup.procs"), std::process::id().to_string()).is_ok()
+pub fn join_box_cgroup(cg: &CgroupRef) -> bool {
+    use std::io::Write;
+    let Some(mut f) = cg.open_at(c"cgroup.procs", libc::O_WRONLY) else {
+        return false;
+    };
+    f.write_all(b"0").is_ok()
+}
+
+/// `CLONE_INTO_CGROUP`, from `include/uapi/linux/sched.h`. Not exposed by the pinned `libc` crate, so
+/// it is declared here and pinned by `clone_into_cgroup_constant_matches_the_uapi_header` below.
+///
+/// THE VALUE ONE BIT AWAY IS A DIFFERENT FEATURE AND FAILS SILENTLY: `CLONE_CLEAR_SIGHAND` is
+/// `0x1_0000_0000`. Pass it by mistake and `clone3` SUCCEEDS, the `cgroup` field is ignored, the child
+/// is created in the caller's cgroup, and the only symptom is that the box runs uncapped. That
+/// mistake was made while prototyping this change and it produced a plausible timing win from a call
+/// that did nothing, which is why every test below asserts MEMBERSHIP and not duration.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// `struct clone_args` at `CLONE_ARGS_SIZE_VER2` (Linux 5.7), the version that added `cgroup`.
+///
+/// The kernel versions this structure BY SIZE: it reads exactly the number of bytes passed in the
+/// second argument of `clone3` and rejects a size it does not know with `EINVAL`. Adding a field here
+/// without a kernel that knows it is therefore a refusal, not corruption, and the refusal takes the
+/// `fork` path below.
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+/// Open `dir` as an `O_DIRECTORY` fd for `clone3`, without touching the heap.
+///
+/// `PATH_MAX` on the stack rather than a `CString`: this runs immediately before a fork in the box
+/// start path, and an allocation there is one more failure mode for no benefit. A path that does not
+/// fit, or that will not open, yields `None`, which the caller reads as "take the `fork` path".
+fn open_cgroup_dir_fd(dir: &Path) -> Option<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = dir.as_os_str().as_bytes();
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // `<` and not `<=`: the last byte must stay NUL, and `buf` is zeroed, so no terminator is written.
+    if bytes.is_empty() || bytes.len() >= buf.len() || bytes.contains(&0) {
+        return None;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let fd = unsafe {
+        libc::open(
+            buf.as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    (fd >= 0).then_some(fd)
+}
+
+/// Fork the box's PID 1, placing it in `dir` AT CREATION when the kernel allows it.
+///
+/// Returns `(pid, born_inside)` with the `fork(2)` convention: the child's pid in the parent, `0` in
+/// the child, and a negative value with `errno` set on failure. `born_inside` is true only when the
+/// child is already in `dir` and must NOT then write `cgroup.procs`.
+///
+/// # Why this exists, measured
+///
+/// Moving a task into a cgroup by writing `cgroup.procs` takes `cgroup_threadgroup_rwsem` for write,
+/// which is a percpu-rwsem, which needs an RCU grace period. Under a back-to-back loop a grace period
+/// closes in microseconds; on an OTHERWISE IDLE machine it waits for a tick. Measured on this host,
+/// outside kern, with the child reporting its own `/proc/self/cgroup` as a positive control:
+///
+/// | form                        | back to back | after 100 ms idle       |
+/// |-----------------------------|--------------|-------------------------|
+/// | `fork` + write `cgroup.procs` | 0.1-0.2 ms | 5.7-19.8 ms (median ~9) |
+/// | `clone3(CLONE_INTO_CGROUP)`   | 0.1-0.2 ms | 0.7-1.1 ms (median 0.8) |
+///
+/// In the whole program the same effect showed as a box start of 3.7 ms in a loop against 12-29 ms
+/// for the FIRST box on a quiet machine, while bubblewrap doing the same namespace work on the same
+/// host paid nothing (4.4 ms against 4.7 ms) - because bubblewrap creates no cgroup. Every published
+/// kern start figure was a hot-loop figure for this reason.
+///
+/// # Failure modes, each taking the `fork` path rather than failing the box
+///
+/// * kernel older than 5.3: `clone3` is absent, `ENOSYS`.
+/// * kernel 5.3 to 5.6: `clone3` exists, `CLONE_INTO_CGROUP` does not, `EINVAL`.
+/// * cgroup v1, or a `dir` that will not open: no fd, so the syscall is never attempted.
+/// * **inside a kern box**: kern's own seccomp allowlist denies `clone3` by number with `ENOSYS` (see
+///   `seccomp.rs`, and the test `clone3_is_denied_by_enosys_not_by_a_kill` that pins it there). This
+///   is the case that decided the shape of this function: a denial that KILLED instead of returning
+///   would make a nested `kern box` die here, so the fallback is not a nicety.
+/// * Docker's default seccomp profile also answers `ENOSYS` for `clone3`, which is the same path.
+///
+/// A caller that passes `None` gets a plain `fork`, which is what the layouts that keep the
+/// supervisor INSIDE the capped cgroup need: there the workload inherits the cgroup and must not be
+/// placed anywhere.
+#[must_use]
+pub fn fork_into_cgroup(cg: Option<&CgroupRef>) -> (libc::pid_t, bool) {
+    if let Some(c) = cg {
+        let fd = c.raw();
+        if fd >= 0 {
+            let mut args = CloneArgs {
+                flags: CLONE_INTO_CGROUP,
+                // Without this the parent gets NO signal on exit and `waitpid` still works, but every
+                // existing SIGCHLD-based path in kern would silently stop seeing the box. `fork(2)`
+                // implies SIGCHLD; `clone3` does not, so it is stated.
+                exit_signal: libc::SIGCHLD as u64,
+                cgroup: fd as u64,
+                ..CloneArgs::default()
+            };
+            // `stack` and `stack_size` left zero: without `CLONE_VM` that is fork semantics, a
+            // copy-on-write duplicate of the caller's stack. Passing a stack here would be for a
+            // shared-memory thread, which this is not.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_clone3,
+                    std::ptr::addr_of_mut!(args),
+                    std::mem::size_of::<CloneArgs>(),
+                )
+            };
+            // BOTH processes continue from here, and the descriptor is NOT closed here any more: on
+            // the failure path the child needs it to place itself, which is the whole fallback. Each
+            // side closes it when it is done - the child through [`CgroupRef::close`] right after the
+            // placement decision, the parent through `Drop`.
+            if rc >= 0 {
+                // A pid does not exceed `pid_t`; the kernel returns it in the low bits of a `c_long`.
+                return (rc as libc::pid_t, true);
+            }
+            // Any error at all: fall through. `errno` is overwritten by the `fork` below, which is
+            // correct - the caller reports the failure that actually stopped it, not this one.
+        }
+    }
+    (unsafe { libc::fork() }, false)
 }
 
 impl Drop for CgroupGuard {
@@ -110,7 +339,26 @@ impl Drop for CgroupGuard {
         // is just as un-removable while populated as `dir` was. (On the scope path an outer `--collect`
         // also cleans up; this is harmless there.) Best-effort: if the move fails the rmdir just no-ops on
         // the non-empty dir, as before.
-        if let Some(origin) = &self.origin {
+        //
+        // ONLY WHEN THE SUPERVISOR ACTUALLY LEFT, and the guard already records whether it did. It sits
+        // outside `origin` on exactly two paths: parked in the sibling leaf (`sup.is_some()`), or joined
+        // to the capped cgroup itself because the leaf could not be built (`!outside`). On every other
+        // path it never moved, and writing its pid back to `origin` migrates it to the cgroup it is
+        // ALREADY IN.
+        //
+        // A NO-OP MIGRATION IS NOT FREE, which is the whole reason this condition exists. Moving a task
+        // between cgroups takes `cgroup_threadgroup_rwsem` for write; that is a percpu-rwsem, and taking
+        // one for write needs an RCU grace period. Under a back-to-back loop a grace period closes in
+        // microseconds and the write looks free; on an otherwise IDLE machine it waits for a tick.
+        // MEASURED with `strace -T` on a quiet host: this single write took 19.04 ms, and it was the
+        // ONLY syscall in the whole box teardown above one millisecond. The `-sup` leaf did not exist in
+        // that run, so those 19 ms bought a move to where the process already was.
+        //
+        // See `fork_into_cgroup` for the same mechanism on the other side of the box: together they are
+        // why kern's first box on a quiet machine cost four to six times its own hot-loop figure, while
+        // bubblewrap - which creates no cgroup - showed no such gap on the same host.
+        let supervisor_left_origin = self.sup.is_some() || !self.outside;
+        if let Some(origin) = self.origin.as_ref().filter(|_| supervisor_left_origin) {
             let _ = fs::write(origin.join("cgroup.procs"), std::process::id().to_string());
         }
         // Best-effort: a non-empty cgroup or an already-removed dir (ENOENT - an outer `--collect` beat
@@ -1295,7 +1543,7 @@ fn proc_cgroup_dir(pid: i32) -> Option<PathBuf> {
 }
 
 /// Outcome of trying to place a `kern exec`'d process into its box's cgroup - see
-/// [`join_box_cgroup_for_exec`].
+/// [`exec_join_outcome_after_failure`], which decides whether a failed placement actually costs a cap.
 pub enum ExecCgroupJoin {
     /// Joined the box's cgroup (so the exec'd workload inherits its caps), OR the box has no cap to
     /// inherit - either way there is nothing to flag.
@@ -1308,27 +1556,44 @@ pub enum ExecCgroupJoin {
     Unbounded,
 }
 
-/// Move THIS process into the cgroup that box PID 1 (`pid1`) lives in, so a child forked afterwards
-/// (the `kern exec`'d command) inherits the box's memory/pids caps - the same "cap before fork"
-/// order the box's own PID 1 uses. Side-effect-only (never creates/removes a cgroup, only ADDS this
-/// pid), so it's safe against any target. On the delegated direct-cap path the target is the box's
-/// `kern-box-*` cgroup and the write succeeds ([`ExecCgroupJoin::Bound`]); where the kernel forbids
-/// the migration (rootless per-box scope) it returns [`ExecCgroupJoin::Unbounded`] IFF the box is
-/// really capped, so the caller warns instead of silently running the command uncapped.
-pub fn join_box_cgroup_for_exec(pid1: i32) -> ExecCgroupJoin {
-    let Some(cg) = proc_cgroup_dir(pid1) else {
-        return ExecCgroupJoin::Bound; // no v2 cgroup to speak of - nothing to inherit
-    };
-    if cg.as_path() == std::path::Path::new("/sys/fs/cgroup") {
-        return ExecCgroupJoin::Bound; // the root - never "join" it
-    }
-    if fs::write(cg.join("cgroup.procs"), std::process::id().to_string()).is_ok() {
-        return ExecCgroupJoin::Bound;
-    }
-    // Couldn't migrate in. Only a resource concern if the box's own cgroup enforces a real cap
-    // (its `memory.max`/`pids.max` reads a value, not the `max` no-limit sentinel).
-    let real = |f: &str| fs::read_to_string(cg.join(f)).is_ok_and(|v| is_real_limit(&v));
-    if real("memory.max") || real("pids.max") {
+/// The cgroup an `exec`'d command must end up in, or `None` when there is nothing to join.
+///
+/// THE LAUNCHER USED TO MOVE ITSELF HERE so a child forked afterwards would inherit the box's caps,
+/// the same "cap before fork" order the box's own PID 1 used. It no longer does: the child is created
+/// directly in this cgroup with `clone3(CLONE_INTO_CGROUP)` (see [`fork_into_cgroup`]), because the
+/// migration cost an RCU grace period - 11.7 to 25.8 ms for a `kern exec` on a quiet host against
+/// 1.7 to 2.2 ms for the same command run back to back. Where the kernel refuses the placement (the
+/// rootless per-box scope: a process in the caller's session scope cannot be moved into a sibling
+/// `--user` scope, verified EPERM on a Pi 5) the child places itself and reports the outcome through
+/// [`exec_join_outcome_after_failure`].
+///
+/// SPLIT OUT SO IT CAN BE READ BEFORE THE `setns`, which is the only window in which it is readable:
+/// once this process has entered the box's cgroup namespace, `/proc/<pid1>/cgroup` reports a path
+/// relative to that namespace and no longer names a directory under `/sys/fs/cgroup`.
+///
+/// `None` covers the two cases that were already no-ops: a host with no cgroup v2 line for `pid1`,
+/// and the v2 ROOT, which is never something to "join".
+#[must_use]
+pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
+    let cg = proc_cgroup_dir(pid1)?;
+    (cg.as_path() != std::path::Path::new("/sys/fs/cgroup")).then_some(cg)
+}
+
+/// After a placement into `cg` failed: does that failure actually cost the caller a cap?
+///
+/// Only a resource concern if the box's own cgroup enforces a REAL cap - `memory.max`/`pids.max`
+/// reading a value rather than the `max` no-limit sentinel. A default box on a scope host also sits
+/// in a scope with a default `MemoryMax`, so reporting every failure would fire on every exec on
+/// every rootless host.
+/// THROUGH THE DESCRIPTOR, not through a path, and that is not a refactor. This ran after `setns` and
+/// read `memory.max`/`pids.max` from a host path that does not exist inside the box's namespaces, so
+/// both reads failed, neither looked like a real limit, and a box capped at `--pids-limit 2
+/// --memory 64M` was reported as having nothing worth warning about. The failure to read and the
+/// absence of a cap produced the same answer.
+#[must_use]
+pub fn exec_join_outcome_after_failure(cg: &CgroupRef) -> ExecCgroupJoin {
+    let real = |f: &CStr| cg.read_control(f).is_some_and(|v| is_real_limit(&v));
+    if real(c"memory.max") || real(c"pids.max") {
         ExecCgroupJoin::Unbounded
     } else {
         ExecCgroupJoin::Bound
@@ -3979,5 +4244,192 @@ mod tests {
         let c = missing_manager_clause_from(501, Some(std_dir), true, true);
         assert!(c.contains("IS reachable at `/run/user/501`"), "{c}");
         assert!(!c.contains("no systemd user manager"), "{c}");
+    }
+
+    /// The two numbers `clone3` is versioned and gated by, pinned against `include/uapi/linux/sched.h`.
+    ///
+    /// A CONSTANT ONE BIT OFF DOES NOT FAIL, IT SUCCEEDS AND DOES NOTHING. `CLONE_CLEAR_SIGHAND` is
+    /// `0x1_0000_0000` and `CLONE_INTO_CGROUP` is `0x2_0000_0000`; pass the first and `clone3` returns
+    /// a pid, ignores the `cgroup` field, and leaves the box in the caller's cgroup, which is a box
+    /// running without its memory ceiling. That substitution was actually made while prototyping this
+    /// change and produced a convincing 20x timing win from a call that placed nothing.
+    #[test]
+    fn clone_into_cgroup_constant_matches_the_uapi_header() {
+        assert_eq!(
+            CLONE_INTO_CGROUP, 0x2_0000_0000,
+            "CLONE_INTO_CGROUP from include/uapi/linux/sched.h"
+        );
+        assert_ne!(
+            CLONE_INTO_CGROUP, 0x1_0000_0000,
+            "that is CLONE_CLEAR_SIGHAND: it succeeds, ignores the cgroup, and uncaps the box"
+        );
+        // CLONE_ARGS_SIZE_VER2. The kernel dispatches on this size and answers EINVAL for one it does
+        // not know, so a wrong size degrades to the `fork` path rather than corrupting anything - but
+        // it would silently cost the whole optimisation, which no other test would notice.
+        assert_eq!(std::mem::size_of::<CloneArgs>(), 88);
+        assert_eq!(std::mem::align_of::<CloneArgs>(), 8);
+    }
+
+    /// A path that cannot become a C string must not become a truncated one.
+    #[test]
+    fn the_cgroup_dir_fd_refuses_what_it_cannot_represent() {
+        assert!(
+            open_cgroup_dir_fd(Path::new("")).is_none(),
+            "an empty path is not a directory to open"
+        );
+        // An interior NUL would be silently truncated by every C API downstream, turning a path into
+        // its own prefix. `/sys/fs/cgroup\0/evil` must not open `/sys/fs/cgroup`.
+        let with_nul = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/sys/fs/cgroup\0/evil"))
+        };
+        assert!(open_cgroup_dir_fd(&with_nul).is_none());
+        // Longer than PATH_MAX: refused, not truncated.
+        let long = PathBuf::from(format!("/{}", "a".repeat(libc::PATH_MAX as usize)));
+        assert!(open_cgroup_dir_fd(&long).is_none());
+        // A directory that does exist opens, so the refusals above are about the input and not about
+        // the function being unable to open anything at all.
+        match open_cgroup_dir_fd(Path::new("/proc/self")) {
+            Some(fd) => {
+                assert!(fd >= 0);
+                unsafe { libc::close(fd) };
+            }
+            None => panic!("/proc/self is a directory and must open"),
+        }
+    }
+
+    /// `fork_into_cgroup(None)` is a plain `fork`, and the child is reachable and reapable.
+    ///
+    /// The value of this test is the SECOND half of the tuple: a `None` caller must never be told the
+    /// child was placed, because that is the flag the box start path uses to skip the `cgroup.procs`
+    /// write. A `true` here would ship a box that never enters its own cgroup.
+    #[test]
+    fn a_fork_with_no_target_reports_that_it_placed_nothing() {
+        let (pid, born) = fork_into_cgroup(None);
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        assert!(
+            !born,
+            "no target was given, so nothing can have been placed"
+        );
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    /// The teardown vacate must fire exactly when the supervisor left `origin`, and never otherwise.
+    ///
+    /// This is a pure decision table because the cost of getting it wrong is asymmetric and neither
+    /// direction is visible from a passing box: vacating when the process never moved spends an RCU
+    /// grace period (19 ms measured on a quiet host) to migrate it to the cgroup it is already in,
+    /// while NOT vacating when it did move leaves a populated cgroup that `remove_dir` cannot take,
+    /// and those leaves accumulated 434-deep in one session before the sweep learned to reap them.
+    #[test]
+    fn the_teardown_vacates_only_when_the_supervisor_actually_left() {
+        // (sup built, supervisor outside the capped cgroup) -> must it write itself back?
+        let must_vacate = |sup_built: bool, outside: bool| sup_built || !outside;
+
+        // Parked in the sibling leaf: it is inside `sup`, which cannot be removed while populated.
+        assert!(must_vacate(true, true), "parked in the leaf: must leave it");
+        // The leaf could not be built, so it joined the capped cgroup itself: same, for `dir`.
+        assert!(must_vacate(false, false), "joined `dir`: must leave it");
+        // Never moved: `origin` is still its cgroup. Writing there is a migration to itself.
+        assert!(
+            !must_vacate(false, true),
+            "it never left `origin`; a write here is a no-op migration that still costs a grace period"
+        );
+        // Both markers set is the leaf layout again, and it is inside the leaf either way.
+        assert!(must_vacate(true, false));
+    }
+
+    /// THE ASSERTION IS MEMBERSHIP, NOT DURATION: the child must report the target cgroup as its own.
+    ///
+    /// Reads `/proc/self/cgroup` IN THE CHILD and hands it back over a pipe, because that is the one
+    /// channel the thing being measured cannot rewrite. Asserting on timing instead is exactly how a
+    /// `clone3` carrying the wrong flag passed for a working one.
+    ///
+    /// SKIPS rather than fails wherever the case cannot be built: cgroup v2 absent, no writable
+    /// delegated subtree, `clone3` denied (inside a container, or a kernel under 5.7). A skip here is
+    /// not a pass and says so; the box start path still works on every one of those hosts, by the
+    /// `fork` fallback that this test cannot reach.
+    #[test]
+    fn a_child_born_into_a_cgroup_reports_that_cgroup_as_its_own() {
+        let Some(parent) = current_v2_cgroup() else {
+            eprintln!("SKIP: no cgroup v2 line in /proc/self/cgroup");
+            return;
+        };
+        let dir = parent.join(format!("kern-clone3-test-{}", std::process::id()));
+        if fs::create_dir(&dir).is_err() {
+            eprintln!("SKIP: cannot create a cgroup under {}", parent.display());
+            return;
+        }
+        let want = format!("0::/{}", {
+            let full = dir.to_string_lossy().into_owned();
+            full.trim_start_matches("/sys/fs/cgroup/").to_owned()
+        });
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (r, w) = (fds[0], fds[1]);
+
+        let Some(cgref) = CgroupRef::open(&dir) else {
+            eprintln!("SKIP: cannot open {} as a directory", dir.display());
+            let _ = fs::remove_dir(&dir);
+            return;
+        };
+        let (pid, born) = fork_into_cgroup(Some(&cgref));
+        if pid == 0 {
+            // NOTHING HERE MAY ALLOCATE. This is the child of a `fork` in cargo's MULTITHREADED test
+            // harness: another thread can hold the allocator's lock at the instant of the fork, and
+            // that lock is copied held into a child that has no thread to release it. `fs::read`
+            // would allocate and could deadlock forever. Raw syscalls and a stack buffer only.
+            unsafe { libc::close(r) };
+            let mut mine = [0u8; 512];
+            let fd = unsafe {
+                libc::open(
+                    c"/proc/self/cgroup".as_ptr().cast::<libc::c_char>(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                let n = unsafe { libc::read(fd, mine.as_mut_ptr().cast(), mine.len()) };
+                if n > 0 {
+                    unsafe { libc::write(w, mine.as_ptr().cast(), n as usize) };
+                }
+                unsafe { libc::close(fd) };
+            }
+            unsafe { libc::close(w) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(w) };
+        assert!(pid > 0, "fork failed: {}", std::io::Error::last_os_error());
+
+        let mut buf = [0u8; 4096];
+        let n = unsafe { libc::read(r, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe { libc::close(r) };
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let reported = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+        let _ = fs::remove_dir(&dir);
+
+        if !born {
+            // The fallback ran. That is a supported outcome on this host, and the ONE thing that must
+            // still hold is the tuple's honesty: the caller was told to do the write itself.
+            eprintln!("SKIP: clone3(CLONE_INTO_CGROUP) unavailable here; the fork fallback ran");
+            assert!(
+                !reported.trim().is_empty(),
+                "the child must still run under the fallback"
+            );
+            return;
+        }
+        assert_eq!(
+            reported.trim(),
+            want,
+            "a child reported born into {} says it is in {reported:?}",
+            dir.display()
+        );
     }
 }
