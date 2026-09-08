@@ -43,9 +43,21 @@ jobs:
   build:
     needs: evidence
     name: build ${{ matrix.target }}
-    # A tag push builds everything; a manual dispatch only backfills the Windows assets (below) onto an
-    # existing release - the Linux binaries + SBOM are already attached from the tag's original run.
-    if: github.event_name == 'push'
+    # A TAG PUSH BUILDS EVERYTHING, AND A DISPATCH NOW DOES TOO. This used to read
+    # `if: github.event_name == 'push'`, on the reasoning that a manual dispatch only backfills the
+    # Windows assets because "the Linux binaries are already attached from the tag's original run".
+    # v0.9.31 falsified that: its original run's `evidence` gate went red, `build` was SKIPPED behind
+    # it, and the release published with the Windows assets and NO Linux binaries. `install.sh`
+    # downloads from there, so the release was broken for every Linux user, and the one path that
+    # could repair it declined to.
+    #
+    # `needs: evidence` is kept, and the condition below is what makes it survive a dispatch: on that
+    # event `evidence` is SKIPPED, and a job whose `needs` was skipped is skipped too unless it says
+    # otherwise. Skipped is accepted, FAILED is not - a dispatch may repair a release, and may not
+    # walk past a gate that actually fired.
+    if: >-
+      !cancelled()
+      && (needs.evidence.result == 'success' || needs.evidence.result == 'skipped')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -56,7 +68,13 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     steps:
+      # THE TAG, NOT THE DEFAULT BRANCH. On a dispatch `github.ref` is `main`, so a bare checkout
+      # would build whatever `main` happens to be and stamp the tag's version onto it: an asset that
+      # claims to be v0.9.31 and is not. `fetch-depth: 0` because the version comes from the tag.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
       # A PINNED nightly, used ONLY to shrink the shipped artifact. The source is 100% stable Rust
       # (no `#![feature]`), so `cargo build --release` on stable still produces a working binary - this
       # only makes the released one ~22% smaller. Pinned for a reproducible build; bump deliberately and
@@ -73,7 +91,11 @@ jobs:
         # The source is de-versioned (Cargo.toml pins 0.0.0, so no stale number lives in git); the
         # SHIPPED binary should still report the tag - `kern --version` on a release build says the
         # tag's version, not 0.0.0. Runs ONLY in CI, on the tag; the committed source is never touched.
-        run: sed -i "s/^version = \"0.0.0\"/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
+        # `github.ref_name` is `main` on a dispatch, and stamping `version = "main"` is the shape of
+        # this bug, not a typo: the same resolution the windows job already uses is used here.
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          sed -i "s/^version = \"0.0.0\"/version = \"${TAG#v}\"/" Cargo.toml
       - name: Build (static, size-extreme)
         # `-Zbuild-std` rebuilds std/core under the release profile's opt-level="z"; `panic=immediate-abort`
         # drops std's panic-formatting machinery (the code is panic-free in production, and a panic that
@@ -109,6 +131,8 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          # Without this a dispatch attaches to `github.ref`, which is the branch and not the release.
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             kern-${{ matrix.target }}.tar.gz
             kern-${{ matrix.target }}.tar.gz.sha256
@@ -121,7 +145,11 @@ jobs:
     # backfill onto an EXISTING release, where the tag was already gated when it was cut, and
     # `needs:` on a push-only job would make that path unrunnable.
     needs: evidence
-    if: github.event_name == 'push'
+    # Same reasoning as `build`: a dispatch that repairs a release must be able to attach the SBOM
+    # the original run never produced.
+    if: >-
+      !cancelled()
+      && (needs.evidence.result == 'success' || needs.evidence.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write # anchore/sbom-action attaches the SBOM to the tag's release
@@ -130,6 +158,8 @@ jobs:
     # kern.spdx.json to the release itself (upload-release-assets defaults to true).
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
       - name: Generate SPDX SBOM (Syft) and attach to the release
         uses: anchore/sbom-action@v0
         with:
@@ -153,7 +183,13 @@ jobs:
     permissions:
       contents: write # attach the Windows assets to the release
     steps:
+      # THE TAG, for the reason the build job states: on a dispatch a bare checkout builds `main` and
+      # then stamps the tag's version onto it. The assets on v0.9.31 were produced that way before
+      # this line existed.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu, x86_64-unknown-linux-musl
