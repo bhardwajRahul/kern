@@ -2322,7 +2322,7 @@ fn service_to_box(
             "hostname" => b.hostname = node.scalar.as_deref().map(scalar_str),
             "cap_add" => b.cap_add = list_value(node),
             "cap_drop" => b.cap_drop = list_value(node),
-            "tmpfs" => b.tmpfs = tmpfs_value(node, name),
+            "tmpfs" => b.tmpfs = tmpfs_value(node),
             "read_only" => b.read_only = scalar_is_true(node),
             // `privileged: true` has no kern equivalent (rootless by design) - warn, don't silently
             // pretend. The box runs UNprivileged; a workload needing real privilege will notice.
@@ -3166,7 +3166,7 @@ fn reconstruct_port_item(item: &str, svc: &str) -> String {
 ///
 /// `parse_tmpfs` now parses the option list itself, so there is one grammar and nothing to keep in
 /// step. Found on 245 real compose files; `scripts/compose-corpus-gate.py` keeps it found.
-fn tmpfs_value(node: &Node, _svc: &str) -> Vec<String> {
+fn tmpfs_value(node: &Node) -> Vec<String> {
     list_value(node)
 }
 
