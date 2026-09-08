@@ -14,7 +14,34 @@ permissions:
   contents: write # create/upload release assets
 
 jobs:
+  # THE EVIDENCE GATE RUNS BEFORE ANYTHING IS BUILT, AND IT REFUSES THE TAG.
+  #
+  # `scripts/check-pentest-freshness.py` already existed and already went red: on 2026-09-08 it read
+  # "v0.9.3 is not contained in 3195fd4b0255", meaning the five suites behind SECURITY.md had never
+  # been run on the code that shipped as v0.9.3. It had been red since that tag and nobody looked,
+  # because it ran only on a schedule. The check worked; the READING of it did not, which is a
+  # failure one layer above the one it was built for.
+  #
+  # A check whose failure stops nothing is a check that gets ignored, so this is the same move as
+  # `record_pod_boot` going fail-fast: the moment that must not proceed on stale evidence is the tag,
+  # so the refusal belongs at the tag. It reads a stamp file and needs no privileges, which is why it
+  # can gate here even though the suites it vouches for cannot run on a GitHub runner at all.
+  #
+  # `fetch-depth: 0` is load-bearing: the check asks whether the stamped commit CONTAINS the tag, and
+  # a shallow clone has neither the history to answer nor a way to say so.
+  evidence:
+    name: pentest evidence is fresh for this tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: pentest freshness
+        run: python3 scripts/check-pentest-freshness.py
+
   build:
+    needs: evidence
     name: build ${{ matrix.target }}
     # A tag push builds everything; a manual dispatch only backfills the Windows assets (below) onto an
     # existing release - the Linux binaries + SBOM are already attached from the tag's original run.
@@ -89,6 +116,11 @@ jobs:
 
   sbom:
     name: SBOM (SPDX)
+    # Gated too: an SBOM attached to a release whose evidence is stale asserts a provenance the
+    # suites have not vouched for. `windows` is deliberately NOT gated - it also serves the manual
+    # backfill onto an EXISTING release, where the tag was already gated when it was cut, and
+    # `needs:` on a push-only job would make that path unrunnable.
+    needs: evidence
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -106,6 +138,16 @@ jobs:
           artifact-name: kern.spdx.json
 
   windows:
+    # NOT GATED ON `evidence`, AND THIS IS THE EXEMPTION THAT DECAYS IF NOBODY WRITES IT DOWN.
+    #
+    # This job serves two paths: a tag push, and the manual backfill of Windows assets onto an
+    # ALREADY-EXISTING release. The exemption is sound only because a backfill targets a tag that was
+    # gated when it was cut, so the evidence question was already answered for it. `needs: evidence`
+    # would make the backfill unrunnable, since `evidence` is push-only.
+    #
+    # WHAT WOULD MAKE THE EXEMPTION FALSE: a backfill targeting a tag cut BEFORE the gate existed, or
+    # any new job copied from this one because it is the simpler template. A job that builds release
+    # artefacts and is not gated needs its own reason, not this one.
     name: windows shim + WSL rootfs
     runs-on: ubuntu-latest
     permissions:
