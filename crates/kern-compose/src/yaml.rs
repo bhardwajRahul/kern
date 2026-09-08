@@ -46,6 +46,39 @@ use super::{BuildDirective, ComposeBox, ABSENT_PROFILE_KINDS, PROFILE_KINDS};
 
 /// Max indentation depth we track - a compose service tree is 3-4 deep; anything past this is refused
 /// rather than parsed, bounding work and stack (we're iterative, but this caps pathological input).
+/// What a compose file loses when kern ignores `networks:`, stated as a loss and not as a feature.
+///
+/// The line used to read "kern connects pod members by name (shared netns)". Every word of that is
+/// true and it describes what the reader GAINS, so a reader who separated frontend from backend
+/// concluded "convenient, they resolve each other" and moved on. What actually happened to their file
+/// is the opposite, and it was MEASURED with a payload rather than a connection, because a connection
+/// succeeding proves nothing about an arc:
+///
+/// * a service on `rete_a` read `TOKEN-BETA` off a service on `rete_b`. Docker refuses that; here the
+///   two networks are one namespace, so segmentation put in the file to contain a compromised service
+///   does not exist.
+/// * a network marked `internal: true` reached `1.1.1.1:443` and `8.8.8.8:443` and resolved DNS,
+///   exactly like an ordinary one - verified against a service on a normal network as the positive
+///   control, and against the host, so "blocked" could not be a dead target. That is the declaration
+///   people use to keep a database off the internet.
+///
+/// So the warning names both consequences and then names the tool kern actually has, because a
+/// warning that leaves the reader without a remedy gets read once and skipped after that. Aliases are
+/// mentioned in the same breath since they ARE honoured, and a reader who thinks nothing works would
+/// rewrite a file that needs no rewriting.
+const NETWORKS_IGNORED: &str = "'networks:' ignored - every service shares ONE namespace, so services you put on separate networks CAN reach each other. Names and aliases still resolve. Keep services that must not see each other in separate stacks";
+
+/// The `internal: true` half of the networks warning, said ONLY when it is true.
+///
+/// It cannot live in [`NETWORKS_IGNORED`] because it is not always a fact: when EVERY service in the
+/// file is exclusively on internal networks, the driver creates the pod with no outbound and the key
+/// IS honoured. Printing "does NOT block outbound" there would be the parser contradicting what the
+/// run then does, which is worse than the silence this warning replaced.
+const INTERNAL_NOT_APPLIED: &str = "a network is marked `internal: true` but at least one \
+     service is not confined to internal networks, and kern gives the stack ONE namespace - so \
+     outbound and DNS stay open for every service. Put the confined services in their own stack, or \
+     use --egress-allow";
+
 const MAX_DEPTH: usize = 32;
 /// Total nodes an anchor/alias/merge expansion may materialize. Every aliased clone spends from this
 /// budget; exhausting it is the billion-laughs defence (a `&a [*a,*a]`…`&z [*y,*y]` bomb blows the
@@ -103,6 +136,7 @@ pub(crate) fn parse_with_env(
     // `secrets: [name]` reference can be resolved to its file. Only the `file:`-backed form maps to
     // kern (`--secret <file>:<name>` → `/run/secrets/<name>`); `external:`/`environment:` secrets warn.
     let secret_files = collect_secret_files(&root);
+    let internal_networks = collect_internal_networks(&root);
 
     let mut boxes = Vec::new();
 
@@ -129,7 +163,7 @@ pub(crate) fn parse_with_env(
                     if !seen_names.insert(name.clone()) {
                         return Err(format!("duplicate service '{name}'"));
                     }
-                    let b = service_to_box(name, svc, &secret_files)?;
+                    let b = service_to_box(name, svc, &secret_files, &internal_networks)?;
                     // Docker profiles: a service with a non-empty profile list is INACTIVE unless one
                     // of its profiles is enabled via COMPOSE_PROFILES. A plain `up` starts only the
                     // profile-less services - so we SKIP an inactive one (never start it by accident),
@@ -155,9 +189,7 @@ pub(crate) fn parse_with_env(
                 if key == "networks" {
                     // `warn_once`: the same fact is also reachable from a per-service `networks:`,
                     // and a file with both would otherwise say it twice (plus once per service).
-                    warn_once(
-                        "'networks:' ignored - kern connects pod members by name (shared netns)",
-                    );
+                    warn_once(NETWORKS_IGNORED);
                 }
             }
             // `x-…` is the Compose Specification's EXTENSION mechanism, not an unknown key: it is
@@ -169,6 +201,13 @@ pub(crate) fn parse_with_env(
     }
     if !have_services {
         return Err("no `services:` block found".to_string());
+    }
+    // SAID AFTER THE LOOP, because it is a fact about the WHOLE file. `internal: true` is
+    // all-or-nothing under one namespace: it is honoured when every service is confined to internal
+    // networks, and dropped otherwise. Deciding it per service would print "not applied" on a file
+    // where it IS applied, one line per service, which is the shape of a warning nobody reads.
+    if !internal_networks.is_empty() && !super::stack_is_internal_only(&boxes) {
+        warn_once(INTERNAL_NOT_APPLIED);
     }
     if boxes.is_empty() {
         // Distinguish "the block has nothing in it" from "everything in it is behind an inactive
@@ -485,8 +524,25 @@ fn fold_multiline(text: &str) -> Result<String, String> {
                     let nc = split_at_comment(nl).0;
                     let ni = nc.len() - nc.trim_start_matches(' ').len();
                     let nt = nc.trim();
+                    // `- ` AND A BARE `-`, NOT ANY LEADING DASH. A block sequence entry is a dash
+                    // followed by whitespace, or a dash alone on the line; `--source`, `-drive` and
+                    // `-netdev` are plain scalars and YAML folds them. Breaking on the first `-`
+                    // character refused exactly the continuations that carry command-line flags,
+                    // which is the form every long `command:` and every QEMU argument list takes -
+                    // the compose files complex enough to be worth proving kern handles.
+                    //
+                    // MEASURED against PyYAML on the case from `adrianursu/s7pot`: a real parser
+                    // reads `command: python3 x.py` + `--source a.json` + `--output b.ndjson` as one
+                    // scalar, kern answered `expected key: value` at the first continuation. Six
+                    // files of a 240-compose corpus died here.
+                    //
+                    // AND THE COMMENT ABOVE ALREADY SAID `- `, WITH THE SPACE. The intent was written
+                    // down correctly and the code did not implement it, which is why re-reading this
+                    // function never found the defect: the prose and the predicate disagreed, and the
+                    // prose is what a reader checks.
+                    let is_seq_entry = nt == "-" || nt.starts_with("- ") || nt.starts_with("-\t");
                     if ni <= indent
-                        || nt.starts_with('-')
+                        || is_seq_entry
                         || colon_index(nc).is_some()
                         || block_intro(nc).is_some()
                     {
@@ -601,8 +657,40 @@ fn flow_intro(code: &str) -> Option<(String, String)> {
 
 /// Reject structural YAML we don't support, up front, with a precise reason. This is the billion-laughs
 /// / tab-indent / multi-doc guard - cheaper and safer than parsing-then-detecting.
+/// Is this value introduced by the `!!str` tag, as a whole token?
+///
+/// `!!str` is the one explicit type tag this parser accepts, and refusing it was refusing a file
+/// whose semantics it already implements: every value here is carried as a RAW STRING and coerced by
+/// whoever consumes it, never by the parser, so "read this scalar as a string" asks for exactly what
+/// already happens. Every other `!!` still fails - `!!float`, `!!int`, `!!binary` request a
+/// conversion nothing here performs, and accepting one would mean accepting a file and then doing
+/// something else with it.
+///
+/// A WHOLE TOKEN, not a prefix: `!!strange` is not `!!str`, and treating it as one would silently
+/// swallow a tag kern cannot honour.
+fn is_str_tag(v: &str) -> bool {
+    v.strip_prefix("!!str")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// The refusal for `!!str` applied to a list or a map, in one place because two call sites reach it
+/// from opposite directions: the flow forms (`!!str [a, b]`, `!!str {a: b}`) are visible on the tag's
+/// own line, the block form is only visible on the line AFTER it.
+///
+/// The message names the node kind rather than the tag, because the tag is not the mistake - `!!str`
+/// over a scalar is accepted. Removing it is the fix in every case, so the message says so.
+fn str_tag_on_collection(ln: usize) -> String {
+    format!("line {ln}: `!!str` applies to a list/map (it can only tag a scalar); remove the tag")
+}
+
 fn prescreen(text: &str) -> Result<(), String> {
     let mut seen_content = false; // has a real (non-comment, non-marker) line appeared yet?
+                                  // A `key: !!str` with NOTHING after the tag, remembered as (line number, indent width) until the
+                                  // next content line tells us what the tag was actually applied to. `key: !!str` alone is an empty
+                                  // string and legal; `key: !!str` followed by a deeper-indented block collection applies the tag to
+                                  // a sequence or a map, which is not a scalar and not something this parser can honour. Only the
+                                  // NEXT line distinguishes the two, so the decision has to wait for it. See `str_tag_on_collection`.
+    let mut bare_str_tag: Option<(usize, usize)> = None;
     for (i, raw) in text.lines().enumerate() {
         let ln = i + 1;
         // Strip a trailing comment for this scan (a `#` inside quotes is handled by the lexer; here we
@@ -624,6 +712,16 @@ fn prescreen(text: &str) -> Result<(), String> {
             return Err(format!(
                 "line {ln}: tab indentation not supported (use spaces)"
             ));
+        }
+        // Resolve a `!!str` left pending by the previous line: if THIS line is nested under that key,
+        // the tag sits on a block collection, not on a scalar. Deeper indentation is the test, and it
+        // holds for both shapes a block collection can take (`  - a` and `  a: b`). A line at the same
+        // indent or shallower ends the key, which means the tag was on an empty scalar - legal, and
+        // what every YAML reader makes of `key: !!str` with nothing after it.
+        if let Some((tag_ln, tag_indent)) = bare_str_tag.take() {
+            if indent.len() > tag_indent {
+                return Err(str_tag_on_collection(tag_ln));
+            }
         }
         // A `---`/`...` marker: a LEADING one (only comments/blanks before it - as a licensed header
         // like Apache Airflow's produces) is a document-start and fine; one AFTER real content begins a
@@ -675,8 +773,44 @@ fn prescreen(text: &str) -> Result<(), String> {
         // Explicit type tags (`!!str`, `!!float`, …) - refuse ONLY when the tag is at value position
         // (right after `key:`), not when `!!` appears inside a value's text (a `WARNING!!!` in a shell
         // command, an image tag, …), which is a plain scalar and perfectly fine.
-        if value_after_colon(line).is_some_and(|v| v.trim_start().starts_with("!!")) {
-            return Err(format!("line {ln}: YAML type tags (`!!`) not supported"));
+        //
+        // `!!str` IS THE EXCEPTION, and refusing it was refusing a file whose semantics this parser
+        // already implements. Every value here is carried as a raw string and coerced by whoever
+        // consumes it, never by the parser, so "read this scalar as a string" is a request for what
+        // already happens. The tag is stripped and the value parsed as usual; every OTHER `!!` still
+        // fails, because `!!float`, `!!int`, `!!binary` and friends ask for a conversion nothing here
+        // performs, and accepting them would mean accepting a file and doing something else with it.
+        //
+        // And `!!str` is honoured only over a SCALAR, which is the only node a "read this as a string"
+        // request means anything for. Over a collection it was accepted and then quietly meant
+        // something else - the exact outcome this paragraph says it refuses. Measured against PyYAML
+        // 6.0.1 before the guard existed:
+        //
+        //     command: !!str [sh, -c, "echo A"]   PyYAML ConstructorError   kern ACCEPTED, box DIED
+        //     command: !!str {a: b}               PyYAML ConstructorError   kern ACCEPTED, box DIED
+        //     command: !!str \n  - sh \n  - -c    PyYAML ConstructorError   kern ACCEPTED, box RAN
+        //     command: !!str echo E               PyYAML 'echo E'           kern 'echo E'      OK
+        //
+        // The third line is the one that decided this: it SUCCEEDS, with the tag dropped and the
+        // sequence read as a list, so nothing anywhere tells the author their file was reinterpreted.
+        // The flow forms were not caught by the unbalanced-`[` guard below either, because that guard
+        // asks whether the value STARTS with `[` and after a tag it starts with `!`.
+        if let Some(v) = value_after_colon(line) {
+            let v = v.trim_start();
+            if v.starts_with("!!") && !is_str_tag(v) {
+                return Err(format!("line {ln}: YAML type tags (`!!`) not supported"));
+            }
+            if is_str_tag(v) {
+                let rest = v["!!str".len()..].trim();
+                if rest.starts_with('[') || rest.starts_with('{') {
+                    return Err(str_tag_on_collection(ln));
+                }
+                if rest.is_empty() {
+                    // Nothing on this line to apply the tag to. Whether that is an empty scalar or a
+                    // block collection is decided by the next content line, at the top of this loop.
+                    bare_str_tag = Some((ln, indent.len()));
+                }
+            }
         }
         // Unbalanced inline collection at value position - a `[` / `{` that doesn't close on the same
         // line. Without this a `command: [unterminated` would be SILENTLY accepted as the single
@@ -1351,6 +1485,14 @@ fn strip_quotes(s: &str) -> &str {
 /// thing to revisit, not a decision to leave undocumented.
 fn scalar_str(s: &str) -> String {
     let t = s.trim();
+    // `!!str` is stripped HERE, at the single place a scalar becomes a value, so every consumer sees
+    // the same thing and none of them has to know the tag existed. See `is_str_tag` for why this one
+    // tag is honoured and the others are refused.
+    if let Some(rest) = t.strip_prefix("!!str") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return scalar_str(rest);
+        }
+    }
     let b = t.as_bytes();
     let dq = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
     let sq = b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'';
@@ -1929,6 +2071,45 @@ fn collect_extra_hosts(node: &Node, svc: &str) -> Vec<String> {
     out
 }
 
+/// The network names a service declares, in BOTH spellings compose allows.
+///
+/// The mapping form (`networks: {rete: {aliases: [...]}}`) puts the names in `children`; the list
+/// form (`networks: [rete_a, rete_b]`) puts them in `items`. Reading only one of the two would make
+/// the internal-network decision below depend on how the author wrote the file, and the list form is
+/// the more common of the two.
+fn collect_net_names(networks: &Node) -> Vec<String> {
+    if !networks.children.is_empty() {
+        return networks
+            .children
+            .iter()
+            .map(|(n, _)| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
+    list_value(networks)
+        .into_iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// The top-level networks marked `internal: true`.
+///
+/// Collected from the whole document before any service is read, the same way `collect_secret_files`
+/// is, because the top-level `networks:` block may appear AFTER `services:` in the file and a
+/// single-pass decision would then depend on key order.
+fn collect_internal_networks(root: &Node) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Some(nets) = root.child("networks") {
+        for (name, def) in &nets.children {
+            if def.child("internal").is_some_and(scalar_is_true) {
+                out.insert(name.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
 fn collect_net_aliases(networks: &Node) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_net, def) in &networks.children {
@@ -2005,6 +2186,7 @@ fn service_to_box(
     name: &str,
     svc: &Node,
     secret_files: &std::collections::HashMap<String, String>,
+    internal_networks: &std::collections::HashSet<String>,
 ) -> Result<ComposeBox, String> {
     kern_common::BoxName::parse(name)
         .map_err(|e| format!("service '{name}': invalid name: {e}"))?;
@@ -2178,6 +2360,13 @@ fn service_to_box(
             // list form (`networks: [net]`) has none.
             "networks" => {
                 b.net_aliases = collect_net_aliases(node);
+                // POSITIVE EVIDENCE ONLY: at least one network, and every one of them marked
+                // `internal: true` at the top level. A name the file does not mark internal, or a
+                // service with no networks at all, leaves this false and keeps the stack's outbound
+                // ON. Uncertainty must not turn the internet off for a stack that needs it.
+                let names = collect_net_names(node);
+                b.only_internal_networks =
+                    !names.is_empty() && names.iter().all(|n| internal_networks.contains(n));
                 // Only RECORDED here, announced once for the whole document. A per-service
                 // `networks:` used to pass in total silence when the file declared no top-level
                 // block (Docker rejects such a file; kern accepted it and said nothing about the
@@ -2187,9 +2376,7 @@ fn service_to_box(
                 // Not flagged when aliases came out of it: something WAS honoured, and "ignored"
                 // would then be the lie.
                 if b.net_aliases.is_empty() {
-                    warn_once(
-                        "'networks:' ignored - kern connects pod members by name (shared netns)",
-                    );
+                    warn_once(NETWORKS_IGNORED);
                 }
             }
             // `init: true` → `--init`. kern already ships the reaping PID 1; this only wires the
@@ -5198,5 +5385,190 @@ services:
         let b = super::super::parse("\u{feff}services:\n  w:\n    image: alpine\n").unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].image.as_deref(), Some("alpine"));
+    }
+
+    /// A continuation line that begins with `-` is a plain scalar, not a sequence entry.
+    ///
+    /// The predicate used to break on the first `-` character, which refused exactly the
+    /// continuations that carry command-line flags: `--source`, `-drive`, `-netdev`. Six files of a
+    /// 240-compose corpus died on it, and the case is the ordinary long `command:`.
+    ///
+    /// THE COMMENT ABOVE THE PREDICATE ALREADY SAID `- `, WITH THE SPACE. Prose and code disagreed,
+    /// and prose is what a reader checks, which is why re-reading the function never found it. The
+    /// assertions below pin both directions so they cannot drift apart again.
+    #[test]
+    fn a_continuation_starting_with_a_dash_folds_and_a_real_sequence_entry_does_not() {
+        // Cross-checked against PyYAML, which reads this as one scalar:
+        // 'python3 /a/b.py --source /c/d.json --output /c/e.ndjson'
+        let folded = fold_multiline(
+            "services:\n  a:\n    image: alpine\n    command: python3 /a/b.py\n               \
+             --source /c/d.json\n               --output /c/e.ndjson\n",
+        )
+        .expect("a plain multi-line scalar must parse");
+        assert!(
+            folded.contains("command: python3 /a/b.py --source /c/d.json --output /c/e.ndjson"),
+            "the flag continuations must fold into one scalar, got:\n{folded}"
+        );
+
+        // A REAL sequence entry still stops the fold: `- ` and a bare `-`. Without this the fix
+        // would swallow a list into the previous value, which is the opposite defect.
+        let seq = fold_multiline(
+            "services:\n  a:\n    image: alpine\n    command: echo uno\n      - due\n",
+        )
+        .expect("parse");
+        assert!(
+            !seq.contains("echo uno - due"),
+            "`- due` is a sequence entry and must not fold, got:\n{seq}"
+        );
+
+        // And the guard that predates this fix is untouched: a `key: value` continuation still stops
+        // the fold, so an over-indented key cannot be swallowed into the value above it.
+        let keyed = fold_multiline(
+            "services:\n  a:\n    image: alpine\n    command: echo uno\n      chiave: valore\n",
+        )
+        .expect("parse");
+        assert!(
+            !keyed.contains("echo uno chiave: valore"),
+            "an over-indented key must not fold, got:\n{keyed}"
+        );
+    }
+
+    /// `internal: true` is honoured only on positive evidence for EVERY service, and never guessed.
+    ///
+    /// kern gives a stack ONE network namespace, so the key is all-or-nothing: it maps onto the pod's
+    /// `--no-outbound` when every service is confined to internal networks, and is dropped otherwise.
+    /// Both directions are pinned because the wrong one is costly in opposite ways: honouring it too
+    /// eagerly takes the internet away from a stack that needs it, and never honouring it accepts a
+    /// declaration people use to keep a database off the internet and does nothing with it.
+    ///
+    /// The list spelling is tested alongside the mapping one because reading only `children` would
+    /// make the decision depend on how the author wrote the file, and the list form is the common one.
+    #[test]
+    fn internal_networks_are_recognised_only_on_positive_evidence() {
+        let all_internal = "services:\n  a:\n    image: alpine\n    networks: [priv]\n  \
+             b:\n    image: alpine\n    networks:\n      priv:\n        aliases: [x]\n\
+             networks:\n  priv:\n    internal: true\n";
+        let boxes = parse(all_internal).expect("parse");
+        assert_eq!(boxes.len(), 2);
+        assert!(
+            super::super::stack_is_internal_only(&boxes),
+            "both spellings of `networks:` must count as confined"
+        );
+
+        // One service on an ordinary network: the whole stack keeps its egress.
+        let mixed = "services:\n  a:\n    image: alpine\n    networks: [priv]\n  \
+             b:\n    image: alpine\n    networks: [pub]\n\
+             networks:\n  priv:\n    internal: true\n  pub:\n    driver: bridge\n";
+        let boxes = parse(mixed).expect("parse");
+        assert!(!super::super::stack_is_internal_only(&boxes));
+
+        // A service with NO `networks:` key is not confined, whatever the file declares elsewhere.
+        let bare = "services:\n  a:\n    image: alpine\n\
+             networks:\n  priv:\n    internal: true\n";
+        let boxes = parse(bare).expect("parse");
+        assert!(!boxes[0].only_internal_networks);
+
+        // A network the file does NOT mark internal never counts, even if another one is.
+        let unmarked = "services:\n  a:\n    image: alpine\n    networks: [pub]\n\
+             networks:\n  priv:\n    internal: true\n  pub:\n    driver: bridge\n";
+        let boxes = parse(unmarked).expect("parse");
+        assert!(!boxes[0].only_internal_networks);
+
+        // And `internal: false` is not `internal:` present - the value decides, not the key.
+        let explicit_false = "services:\n  a:\n    image: alpine\n    networks: [priv]\n\
+             networks:\n  priv:\n    internal: false\n";
+        let boxes = parse(explicit_false).expect("parse");
+        assert!(!boxes[0].only_internal_networks);
+    }
+
+    /// `!!str` is honoured; every other explicit tag is still refused.
+    ///
+    /// Accepting it is not laxity: this parser carries every value as a raw string and lets the
+    /// consumer coerce, so `!!str` asks for what already happens and refusing it rejected a file
+    /// whose semantics kern implements. The other direction is the half that matters - `!!float`
+    /// asks for a conversion nothing here performs, and accepting it would mean taking the file and
+    /// doing something else with it.
+    #[test]
+    fn only_the_str_tag_is_honoured_and_it_is_matched_as_a_whole_token() {
+        let boxes =
+            parse("services:\n  a:\n    image: alpine\n    environment:\n      X: !!str 123\n")
+                .expect("`!!str` must parse");
+        assert!(
+            boxes[0].env.iter().any(|e| e == "X=123"),
+            "the tag must be stripped and the value kept, got {:?}",
+            boxes[0].env
+        );
+
+        for tag in ["!!float 1.5", "!!int 3", "!!binary aGk=", "!!strange 1"] {
+            let text =
+                format!("services:\n  a:\n    image: alpine\n    environment:\n      X: {tag}\n");
+            assert!(
+                parse(&text).is_err(),
+                "`{tag}` must still be refused: nothing here performs that conversion"
+            );
+        }
+    }
+
+    /// `!!str` over a LIST or a MAP is refused, and over every shape of scalar it is still honoured.
+    ///
+    /// Accepting the tag opened this, and the reason it is a defect and not a curiosity is the third
+    /// refusal below: `command: !!str` over a block sequence was accepted, the tag silently dropped,
+    /// the sequence read as a list, and THE BOX STARTED. A file was taken and something else was done
+    /// with it, with nothing anywhere saying so - the exact outcome `is_str_tag`'s own comment claims
+    /// to refuse. The two flow forms did fail, but late and mutely: the box died 150 ms in and the
+    /// message named no cause the file could explain. They also slipped past the unbalanced-`[` guard,
+    /// which asks whether a value STARTS with `[` and after a tag it starts with `!`.
+    ///
+    /// Measured against PyYAML 6.0.1: all four refusals below are `ConstructorError`/`ParserError`
+    /// there, and all three acceptances load.
+    ///
+    /// The `pending` case is the one that fixes the rule's shape. `key: !!str` with nothing after it
+    /// is an EMPTY STRING and legal, so "nothing follows the tag" cannot be the test; only the next
+    /// content line separates the empty scalar from the block collection. A guard that refused on the
+    /// bare tag alone would reject the last case here, which is why it is asserted.
+    #[test]
+    fn the_str_tag_is_refused_over_a_collection_and_kept_over_every_scalar() {
+        let svc = |v: &str| format!("services:\n  a:\n    image: alpine\n{v}");
+
+        for (what, body) in [
+            ("flow sequence", "    command: !!str [sh, -c, echo]\n"),
+            ("flow map", "    command: !!str {a: b}\n"),
+            (
+                "block sequence",
+                "    command: !!str\n      - sh\n      - -c\n",
+            ),
+            ("block map", "    labels: !!str\n      a: b\n"),
+        ] {
+            let err = parse(&svc(body)).err().unwrap_or_else(|| {
+                panic!("`!!str` over a {what} must be refused, it was accepted")
+            });
+            assert!(
+                err.contains("list/map"),
+                "the {what} refusal must name the node kind, not just the tag, got {err:?}"
+            );
+        }
+
+        // Plain scalar: the case the tag was accepted for. The STRING form of `command:` goes
+        // through a shell, as Compose specifies, so the tag being stripped shows up as the shell
+        // receiving `echo hi` and not `!!str echo hi`.
+        let b = parse(&svc("    command: !!str echo hi\n")).expect("`!!str` over a scalar parses");
+        assert_eq!(
+            b[0].command,
+            vec!["sh", "-c", "echo hi"],
+            "the tag must be stripped before the value reaches the shell"
+        );
+
+        // Block scalar: still a scalar, and `|` must not be mistaken for the start of a collection.
+        let b = parse(&svc("    command: !!str |\n      echo hi\n")).expect("`!!str |` parses");
+        assert!(
+            b[0].command.iter().any(|c| c.contains("echo hi")),
+            "a tagged block scalar must keep its body, got {:?}",
+            b[0].command
+        );
+
+        // Bare tag, then a SIBLING key: an empty scalar, not a collection. This is the positive
+        // control for the lookahead - refusing every bare `!!str` would fail here.
+        parse(&svc("    command: !!str\n    entrypoint: /bin/sh\n"))
+            .expect("`!!str` with nothing after it is an empty string, not a collection");
     }
 }
