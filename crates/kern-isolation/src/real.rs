@@ -1,5 +1,15 @@
 //! Real-syscall sandbox execution (Linux).
 //!
+//! ONE RULE THAT EVERY FORKED CHILD IN THIS FILE OBEYS, STATED HERE BECAUSE THREE PLACES OBEY IT AND
+//! NONE OF THEM SAID IT: **between `fork` and `exec`, nothing may allocate, take a lock, or format a
+//! string.** A child of `fork` inherits the address space of a process that may have had other
+//! threads, and the allocator's lock can have been copied while another thread held it; that thread
+//! does not exist in the child, so it will never release it and the first allocation hangs forever.
+//! Diagnostics on those paths are therefore `libc::write(2, …)` over a `const` byte literal, and file
+//! reads fill a caller-owned stack buffer instead of building a `String`. The three places are the
+//! box-start child's fail-closed refusal, the `kern exec` child, and the OOM reporter; a fourth
+//! should read this line rather than rediscover it.
+//!
 //! [`RealMounts`] performs the mount/pivot/remount ops the [`crate::Rootfs`] typestate issues;
 //! [`run_in_sandbox`] sets up an unprivileged user namespace + PID namespace, builds the root
 //! through that same typestate, mounts a fresh `/proc`, remounts the root read-only (last -
@@ -4514,6 +4524,27 @@ fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef, pid1: i32) -> Option<OomRep
         // The wait costs NOTHING on a healthy exec: that path exited above on the byte. It is only
         // ever paid by a command that has already been killed, where a few hundred milliseconds are
         // invisible next to the fact that the caller is about to be told why.
+        //
+        // WHY A BARE CONSTANT IS ALLOWED TO STAND HERE, which is the part worth reading and not the
+        // number. This is the longest this process will spend EXPLAINING A FAILURE THAT HAS ALREADY
+        // HAPPENED, and both directions of getting it wrong are harmless:
+        //
+        //   too short  the reporter gives up before the counter lands and the caller sees `-9` with
+        //              no reason. That is the state before this reporter existed, on a path that had
+        //              already failed. No cap is lost, no process escapes, nothing regresses.
+        //   too long   someone who has just been killed waits a fraction of a second longer to read
+        //              why. Nobody perceives it after a `-9`.
+        //
+        // A constant whose two failure directions are both innocuous does not need a distribution to
+        // justify it, and measuring one would be an activity rather than an answer. This is NOT the
+        // class of a timeout on a live path, where being short is a wrong result and the number has
+        // to be earned. Raise it or lower it freely; the only thing lowering it too far costs is the
+        // sentence, never the enforcement.
+        //
+        // The margin IS measured, because it is one timestamp inside the ten runs that were needed
+        // anyway: over ten group kills the counter landed after ONE 2 ms step every time (median 2 ms,
+        // max 2 ms, one run at 0). The ceiling is 200x the slowest observed, which is what makes it
+        // generous rather than lucky.
         let deadline = 400; // ms, in 2 ms steps
         let mut waited = 0;
         let mut fired =
