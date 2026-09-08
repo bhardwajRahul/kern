@@ -69,9 +69,11 @@ pub fn ps(
     if !quiet && format.is_none() && filters.is_empty() {
         let known: std::collections::HashSet<&str> =
             boxes.iter().map(|b| b.name.as_str()).collect();
-        let mut lost: Vec<(String, u32)> = kern_isolation::live_box_cgroups()
-            .into_iter()
+        let cg_candidates = kern_isolation::live_box_cgroups();
+        let mut lost: Vec<(String, u32)> = cg_candidates
+            .iter()
             .filter(|(tag, _)| !known.contains(tag.as_str()))
+            .cloned()
             .collect();
         // FALLBACK, and only when the first channel had nothing to say. A host without cgroup
         // delegation has no `kern-box-*` directory, so the evidence above does not exist there -
@@ -80,11 +82,25 @@ pub fn ps(
         // unreachable by `stop`, untouched by `gc`, and unreported, because the warning had nothing
         // to read. Asking `/proc` costs about as much as `ps` itself (6.11 ms over 534 pids), so a
         // host that HAS the cheap channel never pays for the expensive one.
-        // THE GATE IS "DOES THE CHEAP CHANNEL EXIST HERE", not "did it find an orphan". The first
-        // version asked the second question, so the most ordinary `kern ps` on earth - a healthy host
-        // with no boxes - fell through to a 534-pid scan every time, measured at 3.9 ms against 1.1.
-        // Where a delegated slice exists, `live_box_cgroups` is complete and nothing else is needed.
-        if !kern_isolation::box_cgroup_channel_available() {
+        // THE FALLBACK RUNS WHENEVER THE CGROUP CHANNEL PRODUCED NO EVIDENCE, and getting this
+        // condition right took two wrong answers, both reported by the same reviewer.
+        //
+        // First I asked "did the cgroup channel find an ORPHAN", which is false on a healthy host
+        // with no boxes, so the most ordinary `kern ps` on earth fell through to the scan every time:
+        // 3.9 ms against 1.1. So I gated on "does the cheap channel EXIST here", meaning `kern.slice`
+        // is a directory. That was worse, and the reviewer's host proved it in one command: there
+        // `kern.slice` EXISTS and has no `kern-box-*` children at all, so the gate said yes, the
+        // fallback never ran, and three live boxes stayed invisible after a registry wipe - the exact
+        // case the fallback was written for. ⛔ A directory existing is not a channel answering.
+        //
+        // The condition that is actually true is the simplest one: if the cgroup channel produced no
+        // CANDIDATES - not "no orphans", no candidates at all - then it has told us nothing, whether
+        // because nothing runs or because it cannot see. Ask the other one.
+        //
+        // The cost that made me reach for a gate is gone: reordering the scan to read the two cheap
+        // kernel facts first took it from 3.55 ms to 1.69, and narrowed it from 423 candidates to 2.
+        // 1.7 ms on a command a human reads is not worth a gate that can be wrong.
+        if cg_candidates.is_empty() {
             lost = kern_isolation::live_box_supervisors_via_proc()
                 .into_iter()
                 .filter(|(tag, _)| !known.contains(tag.as_str()))

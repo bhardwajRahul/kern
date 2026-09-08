@@ -92,7 +92,6 @@ pub use cgroup::box_was_oom_killed;
 pub use real::bring_loopback_up;
 
 /// The same question asked of /proc, for a host with no per-box cgroup. See [`cgroup::live_box_supervisors_via_proc`].
-pub use cgroup::box_cgroup_channel_available;
 pub use cgroup::env_flag;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
