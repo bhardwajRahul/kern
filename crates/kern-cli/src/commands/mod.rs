@@ -1521,6 +1521,19 @@ fn validate_hostname(h: Option<&str>) -> Result<Option<String>, Error> {
     }
 }
 
+/// Is this path `/dev/pts`, however it is spelled?
+///
+/// Split out so the refusal above and the test below read the SAME predicate: a message that fires on
+/// the wrong path is worse than the generic one it replaces, so both directions have to be pinned to
+/// one definition rather than to two that can drift.
+///
+/// Empty components are dropped exactly as the mount resolves them, so `//dev/pts`, `/dev//pts` and a
+/// trailing slash all fold onto the same answer, while `/dev/ptsx` and `/dev/pts/x` do not.
+fn is_dev_pts_path(path: &str) -> bool {
+    let mut parts = path.split('/').filter(|c| !c.is_empty());
+    parts.next() == Some("dev") && parts.next() == Some("pts") && parts.next().is_none()
+}
+
 /// Parse `--tmpfs PATH[:size]` specs into `(path, size)` - `size` a tmpfs `size=` token (`"64m"`),
 /// empty for the kernel default. The path must be absolute, `.`/`..`/NUL-free, and not shadow a
 /// hardened mount (`/proc`, `/sys`, `/dev`). A bad size (not digits + optional k/m/g/t) is rejected.
@@ -1544,6 +1557,26 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
         // path component being proc/sys/dev is the test.
         let first = path.split('/').find(|c| !c.is_empty());
         if matches!(first, Some("proc") | Some("sys") | Some("dev")) {
+            // `/dev/pts` GETS ITS OWN SENTENCE, because the generic refusal sends the reader to the
+            // wrong conclusion at the one place they are most likely to hit it. Issue #8 is
+            // `forkpty(3)` failing in a box with no devpts; the reporter's workaround was
+            // `tmpfs: /dev/pts`, and that spelling now lives in a public issue thread. Someone who
+            // arrives there, copies the compose as written and retries on a FIXED binary gets
+            // "refused" and concludes kern still does not work - when their problem is already
+            // solved and the fix is to delete two lines.
+            //
+            // The refusal itself stays: a tmpfs over `/dev/pts` would cover the private devpts the
+            // box now mounts and reintroduce exactly the failure. What changes is that the message
+            // states the mount is already there, which is what makes the refusal actionable instead
+            // of terminal.
+            if is_dev_pts_path(path) {
+                return Err(Error::Sandbox(
+                    "--tmpfs '/dev/pts' is refused: the box already mounts a private devpts there \
+                     (so forkpty/openpty work), and a tmpfs over it would break exactly that. \
+                     Remove the entry."
+                        .to_string(),
+                ));
+            }
             return Err(Error::Sandbox(format!(
                 "--tmpfs '{path}' is refused (it would shadow the sandbox's hardened /proc, /sys or /dev)"
             )));
@@ -2695,6 +2728,13 @@ struct StagePrep {
     pulled_from_stage: bool,
     /// The stage has ≥1 plain `COPY` from the real build context.
     stage_uses_context: bool,
+    /// This stage's `FROM` named an EARLIER STAGE and was rewritten to that stage's temp tag.
+    ///
+    /// The caller needs it because the consequence outlives this function: the built image's overlay
+    /// chain then rests on a tag that gets deleted, so the FINAL image has to be materialised before
+    /// the temp tags go. Returning the fact is cheaper and harder to get wrong than re-deriving it
+    /// from the instruction slice at the call site.
+    from_stage: bool,
 }
 
 /// Rewrite a stage's instruction slice, turning every `COPY --from=<stage|image>` into a plain COPY
@@ -2714,6 +2754,7 @@ fn prepare_stage(
     let mut stage_instrs: Vec<Instr> = Vec::with_capacity(slice.len());
     let mut stage_uses_context = false;
     let mut pulled_from_stage = false;
+    let mut from_stage = false;
     // Resolve each SOURCE STAGE's overlay chain at most once per stage. We copy files DIRECTLY from the
     // chain (no full-rootfs squash) - the squash only happens as a fallback for a directory source,
     // inside copy_from_stage_chain. Caching the chain dedups N `COPY --from=X`.
@@ -2797,6 +2838,37 @@ fn prepare_stage(
                     stage_uses_context = true;
                     stage_instrs.push(ins.clone());
                 }
+                // `FROM <earlier-stage>` - the OTHER half of multi-stage, and it was missing.
+                //
+                // `COPY --from=<stage>` already worked, by name and by index, so the stage table and
+                // the per-stage temp tags were here; `FROM` never consulted them. A stage name fell
+                // through as an image reference and kern tried to PULL it: `FROM base AS finale`
+                // warned "no tag pinned" and died with `cannot access 'library/base' on
+                // registry-1.docker.io`, naming a registry the author never mentioned.
+                //
+                // The rewrite is the one the COPY arm does: point at `stage_tags[src_idx]`, the local
+                // tag that stage was built under. `resolve_from` validates against EARLIER stages
+                // only, so a forward or self reference still falls through to the image path and
+                // fails as an unknown image, which is what Docker does with the same input.
+                //
+                // THIS REWRITE ALONE SHIPS A BROKEN IMAGE, and `build_multi_stage` is where that is
+                // closed. `COPY --from` takes FILES out of a stage, so the product owns them;
+                // `FROM <stage>` makes the stage the product's BASE, so the final image's overlay
+                // chain points at a temp tag that `cleanup_stage_tags` deletes. Measured: the build
+                // printed `built` and the image would not run (`no layers in manifest`). The caller
+                // therefore MATERIALISES the final image before that cleanup - see `from_stage`.
+                Instr::From { image, as_name } => {
+                    match crate::dockerfile::resolve_from(image, stage_names, si) {
+                        Some(src_idx) => {
+                            from_stage = true;
+                            stage_instrs.push(Instr::From {
+                                image: stage_tags[src_idx].clone(),
+                                as_name: as_name.clone(),
+                            });
+                        }
+                        None => stage_instrs.push(ins.clone()),
+                    }
+                }
                 other => stage_instrs.push(other.clone()),
             }
         }
@@ -2809,6 +2881,7 @@ fn prepare_stage(
         stage_instrs,
         pulled_from_stage,
         stage_uses_context,
+        from_stage,
     })
 }
 
@@ -4540,7 +4613,24 @@ fn run_terminal_verb(
                     b.ports
                         .iter()
                         .filter(|spec| crate::ports::parse(spec).is_none())
-                        .map(move |spec| format!("  {}: invalid port '{spec}'", b.name))
+                        // NAME THE REASON WHEN IT IS KNOWN. An IPv6 or empty bind address is not a
+                        // typo, it is a feature kern does not have, and "invalid port spec" sends the
+                        // reader hunting for a mistake that is not in the line. Measured on a
+                        // 240-file corpus: mailcow's `${HTTPS_BIND:-:}:443:443` expands to
+                        // `::443:443` and cost an author a spec-by-spec bisection of fourteen ports.
+                        .map(move |spec| {
+                            if crate::ports::names_ipv6_or_empty_bind(spec) {
+                                format!(
+                                    "  {}: port '{spec}' - kern publishes on IPv4 only, so an IPv6 \
+                                     or empty bind address cannot be expressed; use \
+                                     `0.0.0.0:HOST:BOX` for every interface or `127.0.0.1:HOST:BOX` \
+                                     for loopback",
+                                    b.name
+                                )
+                            } else {
+                                format!("  {}: invalid port '{spec}'", b.name)
+                            }
+                        })
                 })
                 .collect();
             if !bad.is_empty() {
@@ -4549,6 +4639,26 @@ fn run_terminal_verb(
                     bad.len(),
                     bad.join("\n")
                 )));
+            }
+            // `tmpfs:` GOES THROUGH THE SAME PARSER, for the same reason as `ports:` above and with
+            // the same words in front of it: `config` exists so a file can be checked without
+            // starting anything. It was not checked, and the gap has a name.
+            //
+            // Issue #8's published workaround is `tmpfs: - /dev/pts`. On a fixed binary `config`
+            // answered "1 service(s)" and exited 0, and `up` then refused - so the verb whose whole
+            // job is "tell me if this file is good" said yes about a file that cannot run. A reader
+            // who trusts it concludes the refusal at `up` is a bug rather than the answer.
+            //
+            // `parse_tmpfs` is the SAME function the box start calls, so the two cannot disagree
+            // about what is acceptable, and its message (including the devpts-specific one) is
+            // reused verbatim rather than restated here.
+            for b in boxes.iter() {
+                if b.tmpfs.is_empty() {
+                    continue;
+                }
+                if let Err(e) = parse_tmpfs(&b.tmpfs) {
+                    return Err(Error::Compose(format!("service '{}': {e}", b.name)));
+                }
             }
             // `config` REFUSES WHAT `up` WOULD REFUSE, and resource profiles were the one thing it
             // did not check. A file naming `x-kern-vgpio: leds` printed `profiles: vgpio:leds` and
@@ -5808,3 +5918,45 @@ pub use config::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tmpfs_devpts_message {
+    use super::is_dev_pts_path;
+
+    /// `/dev/pts` is refused with its OWN sentence, and every other hardened path keeps the generic one.
+    ///
+    /// The refusal is not in question: a tmpfs over `/dev/pts` covers the private devpts the box
+    /// mounts and reintroduces the `forkpty(3)` failure of issue #8. What this pins is that the
+    /// message SAYS the mount is already there. The workaround `tmpfs: /dev/pts` is written in a
+    /// public issue thread, so a reader who copies it onto a fixed binary must learn that their
+    /// problem is solved, not that kern refuses them.
+    ///
+    /// BOTH DIRECTIONS, because a message that fires on the wrong path is worse than the one it
+    /// replaced: `/dev/shm`, `/dev/ptsx` and `/proc/x` must keep the generic wording.
+    #[test]
+    fn only_dev_pts_gets_the_already_mounted_sentence() {
+        for p in [
+            "/dev/pts",
+            "//dev/pts",
+            "/dev//pts",
+            "/dev/pts/",
+            "/dev/pts//",
+        ] {
+            assert!(
+                is_dev_pts_path(p),
+                "{p} must reach the devpts-specific message"
+            );
+        }
+        for p in [
+            "/dev",
+            "/dev/shm",
+            "/dev/ptsx",
+            "/dev/pts/x",
+            "/proc/x",
+            "/sys/x",
+            "/devpts",
+        ] {
+            assert!(!is_dev_pts_path(p), "{p} must keep the generic refusal");
+        }
+    }
+}
