@@ -1541,6 +1541,77 @@ const SWEEP_LIMIT: usize = 128;
 /// and therefore only ever touches kern.slice, while a scope / managed / best-effort box is created in
 /// the CALLER'S cgroup and is never swept by a later start. That is why this walks both directories
 /// rather than the slice alone.
+/// Boxes the KERNEL still has, as `(tag, supervisor pid)`, whatever the registry says.
+///
+/// WHY THIS IS NEEDED AT ALL, measured: `kern`'s registry lives in `$XDG_RUNTIME_DIR/kern/instances`,
+/// and `/run/user` is swept by `systemd-tmpfiles`, cleared on logout, and deleted by any operator who
+/// reads it as scratch. When that happens to a RUNNING box the process does not care: it keeps
+/// running, its supervisor is alive, its cgroup is intact. Only kern forgets. Reproduced on this
+/// machine:
+///
+/// ```text
+/// box r1 -d -- sleep 120     ps: r1
+/// rm -rf $XDG_RUNTIME_DIR/kern/instances
+/// ps                         r1 GONE
+/// stop r1                    error: no running box named 'r1'
+/// /proc/<pid of r1>          still there
+/// kern.slice/kern-box-r1-…   still there
+/// ```
+///
+/// So the box became invisible and unstoppable through kern, while every fact needed to find it was
+/// sitting in the cgroup tree: the directory name carries the TAG and the SUPERVISOR PID. That is the
+/// channel this codebase says to trust - written by the kernel, not by the thing being described -
+/// and `ps` was reading only the one that had been erased.
+///
+/// The sweep next door uses the same names for the opposite purpose: it reaps the ones whose
+/// supervisor is DEAD. This returns the ones whose supervisor is ALIVE, which is exactly the set the
+/// sweep must never touch and the set an operator needs to be told about.
+#[must_use]
+pub fn live_box_cgroups() -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut done: Vec<PathBuf> = Vec::new();
+    for dir in [kern_slice_path(), current_v2_cgroup()]
+        .into_iter()
+        .flatten()
+    {
+        if !dir.is_dir() || done.contains(&dir) {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            done.push(dir);
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix("kern-box-") else {
+                continue;
+            };
+            // The supervisor's sibling leaf is `…-sup` and names the SAME box, so counting it would
+            // report every box twice.
+            if rest.ends_with("-sup") {
+                continue;
+            }
+            // `kern-box-<tag>-<pid>`, and a tag may itself contain '-', so the pid is the LAST field
+            // and the tag is everything before it.
+            let Some((tag, pid)) = rest.rsplit_once('-') else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if tag.is_empty() || !PathBuf::from(format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            out.push((tag.to_string(), pid));
+        }
+        done.push(dir);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn gc_orphan_box_cgroups() -> usize {
     // Boxes are not all created in one place, so sweeping one place cannot find them all. `apply_limits`
     // puts a DIRECT-path box under kern.slice and EVERY other box (scope, managed, best-effort) under the

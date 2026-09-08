@@ -266,6 +266,17 @@ fn compose_config_and_up_agree_on_what_the_file_may_say() {
         };
         let (config_ok, config_out) = run("config");
         let (_, up_out) = run("up");
+        // TEAR THE STACK DOWN, even though the `up` FAILED, because it does not fail early enough to
+        // leave nothing behind: it creates the pod and only then dies on the unreachable registry.
+        // Without this the pod and its holder survive the test, and the holder is a live process
+        // holding a network namespace that nothing will ever reap.
+        //
+        // MEASURED, and it is why this line exists rather than being tidiness: after a day of
+        // running this suite the machine carried 477 orphaned kern processes and 378 pods with zero
+        // boxes, 1.6 GB of RSS, the oldest from the morning. This one test accounts for 5 pods and
+        // ~7 processes PER RUN, which multiplied out is nearly all of it. `kern gc` does not collect
+        // them - it reaps box cgroups and scratch dirs, not pods - so nothing else would have.
+        let _ = run("down");
 
         assert_eq!(
             config_ok, !refused,
@@ -6404,6 +6415,113 @@ fn cgroup_num(p: PathBuf) -> Option<u64> {
 /// cgroup to its ceiling and be reclaimed instead of killed, which would make this test depend on
 /// how much the host felt like reclaiming. Concatenating into a shell variable cannot be reclaimed.
 const MEMORY_HOG: &str = r#"A=""; while :; do A="$A$(/bin/busybox dd if=/dev/zero bs=1M count=4 2>/dev/null | /bin/busybox tr "\0" "x")"; done"#;
+
+/// A box the kernel still has must not vanish from `ps` because its registry record did.
+///
+/// MEASURED DEFECT this pins. kern's registry lives in `$XDG_RUNTIME_DIR/kern/instances`, and
+/// `/run/user` is swept by `systemd-tmpfiles`, cleared on logout, and deleted by any operator who
+/// reads it as scratch. The box does not care: its supervisor keeps running and its cgroup stays.
+/// Only kern forgets, and it forgets completely:
+///
+///     box r1 -d -- sleep 120      ps: r1
+///     rm -rf $XDG_RUNTIME_DIR/kern/instances
+///     ps                          r1 GONE
+///     stop r1                     error: no running box named 'r1'
+///     /proc/<pid>                 still there
+///     kern.slice/kern-box-r1-…    still there
+///
+/// Invisible AND unstoppable, while the cgroup directory name carried the tag and the supervisor
+/// pid the whole time. `ps` now reads that too and says the two disagree.
+///
+/// DELETES ONE ENTRY, NOT THE DIRECTORY, and that is not cosmetic: `cargo test` runs several test
+/// binaries at once against this same shared runtime directory, so wiping it would orphan every box
+/// the other tests have running and turn this test into the very defect it describes. One file
+/// reproduces the condition exactly.
+#[test]
+fn a_box_whose_registry_record_vanished_is_still_reported_by_ps() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let tag = "psghost";
+    let _ = kern().args(["stop", tag]).output();
+    let root = build_rootfs(&busybox, tag);
+    let started = kern()
+        .args([
+            "box",
+            tag,
+            "--rootfs",
+            root.to_str().unwrap_or("."),
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("start detached box")
+        .status
+        .success();
+
+    // PROBED TO THE END, not one step short: the box must exist AND have a `kern-box-*` cgroup of
+    // its own, because that directory is the entire evidence this feature reads. A host that gives
+    // the box no cgroup (no delegation) can neither produce the defect nor detect it.
+    let cg = started.then(|| box_cgroup_dir(tag)).flatten();
+    let entry = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .map(|x| x.join("kern/instances"))
+        .and_then(|d| {
+            fs::read_dir(d).ok()?.flatten().find_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with(&format!("{tag}-")).then(|| e.path())
+            })
+        });
+
+    let (Some(_cg), Some(entry)) = (cg, entry) else {
+        let _ = kern().args(["stop", tag]).output();
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: this host gave the box no cgroup or no registry entry to remove");
+        return;
+    };
+
+    // The sweep, in miniature: the record goes, the box stays.
+    let _ = fs::remove_file(&entry);
+    let out = kern().args(["ps"]).output().expect("run kern ps");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // Stop by name cannot work any more - that is the defect, not a bug in this test - so the
+    // supervisor is killed through the pid `ps` just reported. Cleaning up BEFORE asserting, so a
+    // failure never leaves a box nobody can reach.
+    let _ = kern().args(["stop", tag]).output();
+    // ONLY THIS TEST'S BOX, and the filter is not caution, it is a defect this test HAD. The warning
+    // lists every running box with no registry record, and in a full `cargo test` that set can hold
+    // boxes belonging to OTHER test binaries running at the same moment. Killing every pid it
+    // mentions SIGKILLed them, and two unrelated tests went red - reproducibly, twice on a clean
+    // machine, while the previous commit was green twice. A test that reaches outside its own
+    // subject does not measure that subject; it breaks the suite and blames the code.
+    for line in err.lines() {
+        let mine = line.split_whitespace().any(|w| w == tag);
+        if !mine {
+            continue;
+        }
+        if let Some(p) = line.split("supervisor pid ").nth(1) {
+            if let Ok(pid) = p.trim_end_matches(')').trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        err.contains(tag) && err.contains("no registry record"),
+        "a running box with no registry record must be named on stderr, or it is invisible AND \
+         unstoppable; got {err:?}"
+    );
+}
 
 /// A `kern exec` that dies because the BOX blew its memory ceiling must say so.
 ///

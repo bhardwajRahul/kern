@@ -46,6 +46,45 @@ pub fn ps(
         .into_iter()
         .filter(|b| ps_matches(b, filters))
         .collect();
+    // ASK THE KERNEL TOO, because the registry is the one source that can be erased while the boxes it
+    // describes keep running. `$XDG_RUNTIME_DIR/kern/instances` is swept by `systemd-tmpfiles`, cleared
+    // on logout, and deleted by any operator who reads `/run/user` as scratch. Reproduced here:
+    //
+    //     box r1 -d -- sleep 120      ps: r1
+    //     rm -rf $XDG_RUNTIME_DIR/kern/instances
+    //     ps                          r1 GONE
+    //     stop r1                     error: no running box named 'r1'
+    //     /proc/<pid>                 still there
+    //     kern.slice/kern-box-r1-…    still there
+    //
+    // The box was invisible and unstoppable through kern while every fact needed to find it sat in the
+    // cgroup tree, whose directory name carries the tag and the supervisor pid. This does NOT invent a
+    // row for it: the two sources disagree, and a table that quietly merged them would be claiming an
+    // instance record it does not have (no uptime, no ports, no health). It says the disagreement out
+    // loud, with the pid, which is the difference between a leak nobody can see and one an operator can
+    // act on with a single `kill`.
+    //
+    // Silent when the two agree, which is every ordinary run, and silent under `--quiet`/`--format`,
+    // whose callers are parsing.
+    if !quiet && format.is_none() && filters.is_empty() {
+        let known: std::collections::HashSet<&str> =
+            boxes.iter().map(|b| b.name.as_str()).collect();
+        let lost: Vec<(String, u32)> = kern_isolation::live_box_cgroups()
+            .into_iter()
+            .filter(|(tag, _)| !known.contains(tag.as_str()))
+            .collect();
+        if !lost.is_empty() {
+            eprintln!(
+                "kern: warning: {} box(es) are RUNNING with no registry record, so `kern stop` cannot \
+                 reach them (the runtime dir was cleared under them). Kill by pid, or `kern gc` once \
+                 they exit:",
+                lost.len()
+            );
+            for (tag, pid) in &lost {
+                eprintln!("kern:   {tag} (supervisor pid {pid})");
+            }
+        }
+    }
     // `-a`/`--all` (or an explicit `status=exited`) also surfaces boxes that have exited but whose
     // `waitexit` breadcrumb `gc` has not yet reaped - Docker's `ps -a`. A `status=running` query never
     // wants them, and `exited_matches` (which honours the same status filter) excludes anything the

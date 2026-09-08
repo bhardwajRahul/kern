@@ -99,6 +99,8 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// See [`cgroup::oom_kill_count`].
 /// Put the calling process into the box's capped cgroup. See [`cgroup::join_box_cgroup`].
 pub use cgroup::join_box_cgroup;
+/// Boxes the kernel still has, whatever the registry says. See [`cgroup::live_box_cgroups`].
+pub use cgroup::live_box_cgroups;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
