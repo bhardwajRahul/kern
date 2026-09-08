@@ -8531,6 +8531,43 @@ fn from_an_earlier_stage_builds_an_image_that_runs_and_hides_deleted_files() {
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
+    // CAN A BOX START HERE AT ALL? Asked with a box that exercises nothing this test measures, and
+    // asked BEFORE the assertion, because the skip below used to be a guessed list of words
+    // (`registry`, `overlay`, `network`) and the failure that actually happened was in none of them.
+    // On GitHub's runners this test went red with:
+    //
+    //     unshare: write failed /proc/self/uid_map: Operation not permitted
+    //     kern: sandbox setup failed: unshare(CLONE_NEWNS) failed: Operation not permitted
+    //
+    // which is the AppArmor `apparmor_restrict_unprivileged_userns` shape: the namespace is ALLOWED
+    // and the step after it is refused, so `userns_plausible()` says yes and nothing runs. Probing
+    // one step short of the end is what produced the red, and matching on error text would only have
+    // moved the guess. A probe that does not touch `FROM <stage>` cannot hide a defect in it.
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox to probe whether a box can start here");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let probe_root = build_rootfs(&busybox, "msprobe");
+    let probe = kern()
+        .args([
+            "box",
+            &format!("msprobe{}", std::process::id()),
+            "--rootfs",
+            probe_root.to_str().unwrap_or("."),
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output();
+    let can_box = probe.map(|p| p.status.success()).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&probe_root);
+    if !can_box {
+        eprintln!("skip: no box starts on this host, so no build that runs one can be measured");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
     let tag = format!("kern-ms-test:{}", std::process::id());
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
         .args(["build", "-t", &tag, "."])
