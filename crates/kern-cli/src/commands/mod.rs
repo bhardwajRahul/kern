@@ -1530,20 +1530,128 @@ fn validate_hostname(h: Option<&str>) -> Result<Option<String>, Error> {
 /// Empty components are dropped exactly as the mount resolves them, so `//dev/pts`, `/dev//pts` and a
 /// trailing slash all fold onto the same answer, while `/dev/ptsx` and `/dev/pts/x` do not.
 fn is_dev_pts_path(path: &str) -> bool {
-    let mut parts = path.split('/').filter(|c| !c.is_empty());
-    parts.next() == Some("dev") && parts.next() == Some("pts") && parts.next().is_none()
+    is_dev_leaf(path, "pts")
 }
 
-/// Parse `--tmpfs PATH[:size]` specs into `(path, size)` - `size` a tmpfs `size=` token (`"64m"`),
+/// Is this path exactly `/dev/<leaf>`, however it is spelled?
+///
+/// One predicate for the two places that need it (`/dev/pts` and `/dev/shm`), because they are the
+/// same rule with a different word and two copies of it would drift on the next spelling anyone
+/// thinks of.
+fn is_dev_leaf(path: &str, leaf: &str) -> bool {
+    let mut parts = path.split('/').filter(|c| !c.is_empty());
+    parts.next() == Some("dev") && parts.next() == Some(leaf) && parts.next().is_none()
+}
+
+/// Mount option names kern RECOGNISES in a `--tmpfs` suffix but does not act on.
+///
+/// Recognised and not honoured are different things, and the caller says which: kern mounts every
+/// `--tmpfs` with `MS_NOSUID | MS_NODEV` and `mode=1777`, read-write, so `rw`/`nosuid`/`nodev` are
+/// already true and `ro`/`noexec`/`suid`/`dev`/`mode=` are not. Listing them here means a compose
+/// file written for Docker parses instead of dying, and the warning below means nobody believes the
+/// flag took effect. An option NOT in this list is refused by name rather than dropped, because a
+/// typo silently ignored is how `--tmpfs /run:sze=64m` becomes an unsized tmpfs.
+const TMPFS_KNOWN_OPTS: [&str; 22] = [
+    "rw",
+    "ro",
+    "exec",
+    "noexec",
+    "suid",
+    "nosuid",
+    "dev",
+    "nodev",
+    "sync",
+    "async",
+    "atime",
+    "noatime",
+    "diratime",
+    "nodiratime",
+    "relatime",
+    "norelatime",
+    "strictatime",
+    "lazytime",
+    "nolazytime",
+    "mand",
+    "nomand",
+    "remount",
+];
+
+/// Key=value tmpfs options kern recognises and does not forward. `size` is handled separately: it is
+/// the one kern implements.
+const TMPFS_KNOWN_KEYS: [&str; 5] = ["mode", "uid", "gid", "nr_blocks", "nr_inodes"];
+
+/// Is `t` a bare tmpfs size, kern's own `PATH:64m` spelling?
+fn is_bare_tmpfs_size(t: &str) -> bool {
+    let core = t
+        .strip_suffix(['k', 'm', 'g', 't', 'K', 'M', 'G', 'T'])
+        .unwrap_or(t);
+    !core.is_empty() && core.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse `--tmpfs PATH[:opts]` specs into `(path, size)` - `size` a tmpfs `size=` token (`"64m"`),
 /// empty for the kernel default. The path must be absolute, `.`/`..`/NUL-free, and not shadow a
-/// hardened mount (`/proc`, `/sys`, `/dev`). A bad size (not digits + optional k/m/g/t) is rejected.
+/// hardened mount (`/proc`, `/sys`, `/dev`).
+///
+/// THE SUFFIX IS A COMMA-SEPARATED OPTION LIST, WHICH IS DOCKER'S GRAMMAR, and it is parsed here
+/// because parsing it in two places is what broke. kern's own spelling is `PATH:64m`; Docker's is
+/// `PATH:size=64m,mode=1770,uid=1000`. `kern-compose` used to pre-chew the second into the first and
+/// decided which it had by asking whether the suffix contained an `=` at all, so an option list with
+/// no `=` in it was read as a size:
+///
+///     compose  tmpfs /run:size=64m                  accepted
+///     compose  tmpfs /run:rw,noexec,nosuid,size=64m accepted
+///     compose  tmpfs /run:rw                        REFUSED, "bad size 'rw'"
+///     compose  tmpfs /run:exec                       REFUSED, "bad size 'exec'"
+///     box --tmpfs /run:size=64m                      REFUSED, "bad size 'size=64m'"
+///     box --tmpfs /run:64m                           accepted
+///
+/// The last two are the same binary disagreeing with itself: the CLI refused the spelling compose
+/// accepted, and accepted the one compose could not produce. Two grammars, one of them reachable
+/// only through the other. Now there is one, here, and `tmpfs_value` forwards the entry untouched.
+///
+/// Found by running 245 real `docker-compose.yml` files from public repositories through
+/// `compose config`; `scripts/compose-corpus-gate.py` keeps it found.
 fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
-        let (path, size) = match s.split_once(':') {
+        let (path, suffix) = match s.split_once(':') {
             Some((p, sz)) => (p, sz),
             None => (s.as_str(), ""),
         };
+        // Split the suffix into (the size kern implements, the options it only recognises). An
+        // unknown token is an error rather than a drop: dropping a typo is how a cap goes missing.
+        let mut size = String::new();
+        let mut recognised: Vec<&str> = Vec::new();
+        for tok in suffix.split(',').filter(|t| !t.is_empty()) {
+            match tok.split_once('=') {
+                Some(("size", v)) => size = v.to_string(),
+                Some((k, _)) if TMPFS_KNOWN_KEYS.contains(&k) => recognised.push(tok),
+                Some(_) => {
+                    return Err(Error::Sandbox(format!(
+                        "--tmpfs '{s}': unknown option '{tok}' (kern implements size=, and \
+                         recognises the usual mount flags)"
+                    )))
+                }
+                None if TMPFS_KNOWN_OPTS.contains(&tok) => recognised.push(tok),
+                None if is_bare_tmpfs_size(tok) => size = tok.to_string(),
+                None => {
+                    return Err(Error::Sandbox(format!(
+                        "--tmpfs '{s}': bad size or unknown option '{tok}' (a size is digits + \
+                         optional k/m/g/t, e.g. 64m)"
+                    )))
+                }
+            }
+        }
+        if !recognised.is_empty() {
+            // Say it once per entry, and say what kern DOES rather than only what it ignores: the
+            // reader's next question after "ignored" is always "so what did I get".
+            eprintln!(
+                "kern: --tmpfs '{path}': option(s) {} recognised but not applied - kern mounts every \
+                 --tmpfs nosuid, nodev, mode=1777 and read-write, and caps it with size= only",
+                recognised.join(",")
+            );
+        }
+        let size = size.as_str();
         if !path.starts_with('/')
             || path.contains('\0')
             || path.split('/').any(|c| c == "." || c == "..")
@@ -1577,19 +1685,44 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
                         .to_string(),
                 ));
             }
+            // `/dev/shm` GETS ITS OWN SENTENCE for the same reason `/dev/pts` does, and it is the
+            // single most common `tmpfs:` entry in real compose files: `tmpfs: - /dev/shm` is the
+            // standard workaround for Docker's 64 MB `/dev/shm`, which breaks Postgres and Chrome
+            // under load. Someone carrying that idiom to kern reads the generic refusal and concludes
+            // the shared-memory problem is unsolved here, when it never existed.
+            //
+            // ⛔ THE MESSAGE MUST NOT POINT AT `shm_size:`. kern-compose RECOGNISES that key and
+            // ignores it on purpose, with its reason written beside it, so naming it would send the
+            // reader to write a line that does nothing.
+            //
+            // WHAT IT SAYS INSTEAD IS MEASURED, because the first draft of this sentence claimed
+            // `/dev/shm` is mounted UNSIZED and that is false. `df -h /dev/shm` inside a box:
+            //
+            //     --memory 32M     32.0M          --memory 256M    256.0M
+            //     no flags        512.0M          --shm-size 8m      8.0M
+            //
+            // It IS sized, and the size TRACKS the memory cap unless `--shm-size` overrides it. That
+            // is the fact worth telling someone carrying Docker's idiom over, and it is a different
+            // fact from "there is no limit".
+            if is_dev_leaf(path, "shm") {
+                return Err(Error::Sandbox(
+                    "--tmpfs '/dev/shm' is refused, and the entry is not needed: kern already sizes \
+                     /dev/shm to the box's memory cap, so there is no 64 MB default to work around. \
+                     Remove the entry; set it explicitly with --shm-size, or raise --memory \
+                     (compose: `mem_limit`)."
+                        .to_string(),
+                ));
+            }
             return Err(Error::Sandbox(format!(
                 "--tmpfs '{path}' is refused (it would shadow the sandbox's hardened /proc, /sys or /dev)"
             )));
         }
-        if !size.is_empty() {
-            let core = size
-                .strip_suffix(['k', 'm', 'g', 't', 'K', 'M', 'G', 'T'])
-                .unwrap_or(size);
-            if core.is_empty() || !core.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::Sandbox(format!(
-                    "--tmpfs '{s}': bad size '{size}' (digits + optional k/m/g/t, e.g. 64m)"
-                )));
-            }
+        // A `size=` VALUE still has to be a size: `size=wat` reached here as a recognised key with a
+        // value nobody checked, and an unchecked cap is no cap.
+        if !size.is_empty() && !is_bare_tmpfs_size(size) {
+            return Err(Error::Sandbox(format!(
+                "--tmpfs '{s}': bad size '{size}' (digits + optional k/m/g/t, e.g. 64m)"
+            )));
         }
         out.push((path.to_string(), size.to_ascii_lowercase()));
     }

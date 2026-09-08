@@ -2413,7 +2413,8 @@ fn service_to_box(
             // Postgres under load. Say why, so a reader does not think a feature is missing.
             "shm_size" => warn(&format!(
                 "service '{name}': 'shm_size:' ignored on purpose - kern bounds /dev/shm by the memory \
-                 cgroup (mem_limit / --memory), not a fixed size, so there is no 64 MB shm footgun"
+                 cgroup (mem_limit / --memory) instead of a fixed default, so there is no 64 MB \
+                 shm footgun; --shm-size overrides it"
             )),
             // `tty:` IS SILENT, and `stdin_open:` speaks only when it is true. Both used to fall
             // into the generic "ignored (unsupported)" bucket below, which was wrong twice: it
@@ -3153,41 +3154,20 @@ fn reconstruct_port_item(item: &str, svc: &str) -> String {
     spec
 }
 
-/// `tmpfs`: kern's `--tmpfs` grammar is `PATH[:size]`, but Docker allows a comma-separated option list
-/// `PATH:size=10M,mode=1770,uid=1000`. We keep the `size=` option (kern supports a size cap) and
-/// DROP the rest with a warning, rather than forwarding the whole option string to `--tmpfs` (which
-/// rejected it → the whole service failed to start). A plain `PATH` or `PATH:64m` passes through.
-fn tmpfs_value(node: &Node, svc: &str) -> Vec<String> {
+/// `tmpfs`: FORWARDED UNTOUCHED, and that is the fix rather than laziness.
+///
+/// This used to pre-chew Docker's option list (`PATH:size=10M,mode=1770,uid=1000`) into kern's own
+/// `PATH:size` spelling, which meant kern had TWO tmpfs grammars and this one had to guess which it
+/// was looking at. It guessed by asking whether the suffix contained an `=` at all, so an option
+/// list with none in it (`/run:rw`, `/run:exec`, `/run:noexec,nosuid`, all valid Docker) was handed
+/// on as a SIZE and the service died with "bad size 'rw'". The same guess made `kern box --tmpfs
+/// /run:size=64m` fail while the identical compose entry worked: one binary, two grammars,
+/// disagreeing with itself.
+///
+/// `parse_tmpfs` now parses the option list itself, so there is one grammar and nothing to keep in
+/// step. Found on 245 real compose files; `scripts/compose-corpus-gate.py` keeps it found.
+fn tmpfs_value(node: &Node, _svc: &str) -> Vec<String> {
     list_value(node)
-        .into_iter()
-        .map(|entry| {
-            let Some((path, opts)) = entry.split_once(':') else {
-                return entry; // bare `PATH`
-            };
-            // If `opts` isn't Docker option syntax (no `=`, e.g. a bare `64m`), keep it as the size.
-            if !opts.contains('=') {
-                return entry;
-            }
-            let mut size = None;
-            let mut dropped = Vec::new();
-            for opt in opts.split(',') {
-                match opt.split_once('=') {
-                    Some(("size", v)) => size = Some(v.to_string()),
-                    _ => dropped.push(opt.to_string()),
-                }
-            }
-            if !dropped.is_empty() {
-                warn(&format!(
-                    "service '{svc}': tmpfs '{path}' options {} not supported by kern --tmpfs (size only) - dropped",
-                    dropped.join(",")
-                ));
-            }
-            match size {
-                Some(s) => format!("{path}:{s}"),
-                None => path.to_string(),
-            }
-        })
-        .collect()
 }
 
 /// `volumes`: a short-form `src:dst[:ro]` entry passes through (kern's `-v` grammar matches compose's
@@ -4350,27 +4330,43 @@ mod tests {
         assert!(boxes(y4)[0].volumes.is_empty());
     }
 
+    /// `tmpfs:` entries reach the box VERBATIM, and that is the contract now.
+    ///
+    /// This test used to assert the opposite: that this layer rewrote Docker's option list into
+    /// kern's `PATH:size` spelling. That rewriting is gone, and its removal is the fix. It decided
+    /// which of the two grammars it was holding by asking whether the suffix contained an `=` at
+    /// all, so a list with none in it (`/run:rw`, `/run:exec`, `/run:noexec,nosuid`, every one of
+    /// them valid Docker) was forwarded as a SIZE and the service died with "bad size 'rw'". The
+    /// same guess made `kern box --tmpfs /run:size=64m` fail while the identical compose entry
+    /// worked, which is one binary disagreeing with itself.
+    ///
+    /// `parse_tmpfs` in kern-cli parses the option list, once, for both. The only thing left to
+    /// assert here is that nothing is touched on the way, because anything this layer "helpfully"
+    /// normalises is a second grammar growing back.
     #[test]
-    fn tmpfs_options_keep_size_drop_the_rest() {
-        // Extreme vs-Docker regression: Docker's `- /scratch:size=10M,mode=1770,uid=1000` option list
-        // was passed whole to `--tmpfs`, which took the entire `size=10M,mode=...` as the size and
-        // aborted the box. Now we keep `size=` and drop the rest with a warning.
-        let y = "services:\n  a:\n    image: x\n    tmpfs:\n      - /scratch:size=10M,mode=1770,uid=1000\n";
-        assert_eq!(boxes(y)[0].tmpfs, ["/scratch:10M"]);
-        // A bare path passes through.
+    fn tmpfs_entries_are_forwarded_verbatim() {
+        let t = |y: &str| boxes(y)[0].tmpfs.clone();
+        for entry in [
+            "/scratch:size=10M,mode=1770,uid=1000",
+            "/run",
+            "/t:64m",
+            "/t:mode=1777",
+            "/run:rw,noexec,nosuid,size=64m",
+            "/run:exec",
+            "/run:ro",
+        ] {
+            let y = format!("services:\n  a:\n    image: x\n    tmpfs:\n      - {entry}\n");
+            assert_eq!(
+                t(&y),
+                [entry],
+                "tmpfs entries must reach --tmpfs unmodified; rewriting one here recreates the \
+                 second grammar this removed"
+            );
+        }
+        // The scalar (non-list) spelling reaches it the same way.
         assert_eq!(
-            boxes("services:\n  a:\n    image: x\n    tmpfs: /run\n")[0].tmpfs,
+            t("services:\n  a:\n    image: x\n    tmpfs: /run\n"),
             ["/run"]
-        );
-        // The kern-native `PATH:64m` (size without `key=`) is untouched.
-        assert_eq!(
-            boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:64m\n")[0].tmpfs,
-            ["/t:64m"]
-        );
-        // Options with NO size → just the path.
-        assert_eq!(
-            boxes("services:\n  a:\n    image: x\n    tmpfs:\n      - /t:mode=1777\n")[0].tmpfs,
-            ["/t"]
         );
     }
 
