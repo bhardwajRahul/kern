@@ -6,7 +6,12 @@ on:
     # name says something untrue about what is being built. Add the branch back, in the same push
     # that creates it, whenever work leaves `main` again. It is back for the SDK scratch work
     # (a writable /tmp and the tmpfs knob); remove it again when that lands on main.
-    branches: [main, dev]
+    #
+    # `perf-bench_2026-09-09_0737` carries the `kern run` direct-cap path and the box-terminal fix.
+    # REMOVE IT IN THE PUSH THAT MERGES IT, on the same rule as `dev` above: a dated name outliving
+    # its branch is the exact thing this comment warns about, and this one carries a date, so it
+    # will read as stale the moment the work lands.
+    branches: [main, dev, perf-bench_2026-09-09_0737]
   pull_request:
   workflow_dispatch: {}
 
