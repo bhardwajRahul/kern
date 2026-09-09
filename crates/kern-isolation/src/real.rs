@@ -4401,182 +4401,6 @@ fn exec_fail_closed(reason: &str) -> ! {
     unsafe { libc::_exit(126) }
 }
 
-/// `kern exec`: run `command` inside the namespaces of an already-running box (its PID 1 is
-/// `pid1`, in the host pid namespace). Joins the box's user namespace first (to gain capabilities
-/// in it), then its mount/ipc/uts/(net)/pid namespaces, then forks so the child lands in the
-/// box's pid namespace, applies the env/workdir + the same seccomp filter, and execs. Returns the
-/// command's exit code.
-///
-/// Not a descendant of PID 1, so the box's own seccomp filter doesn't block the `setns` calls
-/// here; the new process gets its own copy of the filter for parity. Requires that the caller is
-/// the same user that created the box (its user namespace owner).
-/// The live end of the pipe that tells the OOM reporter this process is gone. Closing it, whether by
-/// `Drop` on a normal return or by the kernel on a `SIGKILL`, is the only signal the reporter waits
-/// on, so this must stay owned for as long as the exec runs.
-struct OomReporter {
-    write_fd: libc::c_int,
-}
-
-impl Drop for OomReporter {
-    fn drop(&mut self) {
-        if self.write_fd >= 0 {
-            // ONE BYTE THAT MEANS "I LEFT ON MY OWN FEET", and it is the whole reason the reporter
-            // can afford to wait. A `SIGKILL` cannot run this, so the reporter tells a clean exit
-            // from a killed one by whether the byte arrived before the EOF: on a clean exit it stops
-            // immediately and costs the caller nothing, and only in the killed case does it wait for
-            // the counter to catch up.
-            let b = *b".";
-            unsafe { libc::write(self.write_fd, b.as_ptr().cast(), 1) };
-            unsafe { libc::close(self.write_fd) };
-        }
-    }
-}
-
-/// Fork a process that OUTLIVES a whole-box OOM and reports it, because nothing inside the box's
-/// cgroup can.
-///
-/// `kern exec` migrates the launcher into the box's cgroup so the command it forks inherits the
-/// caps. With `memory.oom.group = 1` that means a box that blows its memory ceiling takes the
-/// launcher with it, and it goes by `SIGKILL`, which cannot be caught. Measured on a `--memory 32m`
-/// box before this existed: the `kern exec` process itself returned `-9`, with empty stdout and
-/// empty stderr, while `memory.events` recorded `oom_group_kill 1`. The person who typed the command
-/// saw it die and got no reason.
-///
-/// So the reporter is forked BEFORE the migration and stays in the caller's cgroup and namespaces.
-/// It holds the read end of a pipe whose only writer is the launcher; when the launcher dies, for
-/// any reason, the write end closes and the read returns EOF. The reporter then compares
-/// `oom_group_kill` against the value it captured before anything ran, and speaks only if it grew.
-///
-/// FAILURE MODES, all of them deliberately silent, because this is a diagnostic and must never be
-/// the reason an exec does not happen:
-///
-/// * the box has no real `memory.max`, so a group OOM is not possible here -> no reporter,
-///   and no process spent on a box that cannot produce the event;
-/// * `memory.events` unreadable NOW -> no reporter, because without a baseline an increase cannot
-///   be told from a count that was already there, and announcing an OOM that did not happen is the
-///   same defect as the silence, pointed the other way;
-/// * `pipe2` or `fork` fails -> no reporter, and the exec proceeds untouched.
-///
-/// The pipe is `O_CLOEXEC` on both ends: the exec'd program must not inherit the write end and hold
-/// the reporter open for its whole life, and the reporter never execs.
-fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef, pid1: i32) -> Option<OomReporter> {
-    if !cg.has_real_memory_cap() {
-        return None;
-    }
-    // NOT THE BOX'S OWN CGROUP, an ANCESTOR of it. The first version read the box's own
-    // `memory.events` after the launcher died and it was a coin toss, because `memory.oom.group`
-    // takes the directory down with the processes: sampling every 2 ms from the host, the box's
-    // cgroup was gone 10.7 ms in and `oom_group_kill` was never seen non-zero there, since the
-    // counter increments at the instant the directory is torn down. The same command reported the
-    // OOM under one harness and stayed silent under another, which is worse than never reporting:
-    // the one run that matters is the one nobody repeats.
-    //
-    // The counters are hierarchical and the ancestor outlives the box, so the event lands somewhere
-    // that is still readable afterwards. Measured across one group kill: `kern.slice` went
-    // `oom_group_kill 228 -> 229`. This is the mechanism `oom_kill_dir_for_pid` already existed for
-    // on the `kern run` path, and reusing it is the point: the rule for which directory outlives a
-    // box is not one to hold two opinions about.
-    let anc = crate::cgroup::oom_kill_dir_for_pid(pid1)?;
-    let events_fd = crate::cgroup::open_oom_events_fd(&anc)?;
-    let Some(baseline) = crate::cgroup::oom_group_kill_from_fd(events_fd) else {
-        unsafe { libc::close(events_fd) };
-        return None;
-    };
-
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return None;
-    }
-    let (r, w) = (fds[0], fds[1]);
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe { libc::close(r) };
-        unsafe { libc::close(w) };
-        return None;
-    }
-    if pid == 0 {
-        // THE REPORTER. NOTHING BELOW MAY ALLOCATE: this is a forked child, and the allocator's lock
-        // can have been copied held from a thread that does not exist here, which would make a
-        // single allocation a permanent hang. `oom_group_kill_from_fd` reads into a stack buffer for
-        // exactly this reason, and the message is a literal.
-        unsafe { libc::close(w) };
-        let mut byte = [0u8; 1];
-        // One byte means the launcher ran its `Drop`, so it was not killed and there is nothing to
-        // explain. EOF or an error means it went without one.
-        let clean = loop {
-            let n = unsafe { libc::read(r, byte.as_mut_ptr().cast(), 1) };
-            if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                continue;
-            }
-            break n == 1;
-        };
-        if clean {
-            unsafe { libc::_exit(0) };
-        }
-
-        // KILLED, so wait for the counter instead of sampling it once. Reading after the death is
-        // safe here and was not in the first version - this descriptor is on an ancestor that
-        // outlives the box - but "safe to read" is not "already updated": measured, one sample taken
-        // the instant the pipe closed reported the OOM in only 3 runs out of 10, because the process
-        // dies before the count that explains it lands. Retrying turns a race into a bounded wait.
-        //
-        // The wait costs NOTHING on a healthy exec: that path exited above on the byte. It is only
-        // ever paid by a command that has already been killed, where a few hundred milliseconds are
-        // invisible next to the fact that the caller is about to be told why.
-        //
-        // WHY A BARE CONSTANT IS ALLOWED TO STAND HERE, which is the part worth reading and not the
-        // number. This is the longest this process will spend EXPLAINING A FAILURE THAT HAS ALREADY
-        // HAPPENED, and both directions of getting it wrong are harmless:
-        //
-        //   too short  the reporter gives up before the counter lands and the caller sees `-9` with
-        //              no reason. That is the state before this reporter existed, on a path that had
-        //              already failed. No cap is lost, no process escapes, nothing regresses.
-        //   too long   someone who has just been killed waits a fraction of a second longer to read
-        //              why. Nobody perceives it after a `-9`.
-        //
-        // A constant whose two failure directions are both innocuous does not need a distribution to
-        // justify it, and measuring one would be an activity rather than an answer. This is NOT the
-        // class of a timeout on a live path, where being short is a wrong result and the number has
-        // to be earned. Raise it or lower it freely; the only thing lowering it too far costs is the
-        // sentence, never the enforcement.
-        //
-        // The margin IS measured, because it is one timestamp inside the ten runs that were needed
-        // anyway: over ten group kills the counter landed after ONE 2 ms step every time (median 2 ms,
-        // max 2 ms, one run at 0). The ceiling is 200x the slowest observed, which is what makes it
-        // generous rather than lucky.
-        let deadline = 400; // ms, in 2 ms steps
-        let mut waited = 0;
-        let mut fired =
-            crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
-        while !fired && waited < deadline {
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2_000_000,
-            };
-            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
-            waited += 2;
-            fired =
-                crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
-        }
-        if fired {
-            // WHAT THIS CLAIMS, AND WHAT IT DOES NOT. A group kill happened in the slice this box
-            // lives in while this command was running, and this command died. The slice is shared
-            // with kern's other boxes, so the counter does not name THIS box the way the `kern run`
-            // path's does; the sentence says "its box", which is what the caller can act on, and
-            // stops short of naming the process. Overclaiming here would be the same defect as the
-            // silence it replaces, pointed the other way.
-            const MSG: &[u8] = b"kern: exec: this command was killed with its box by the kernel's \
-                OOM killer, against the box's memory cap (memory.oom.group kills the whole box, the \
-                exec'd command included). Raise it with `--memory <size>`.\n";
-            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
-        }
-        unsafe { libc::_exit(0) };
-    }
-    unsafe { libc::close(r) };
-    Some(OomReporter { write_fd: w })
-}
-
 #[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
 pub fn exec_in_box(
     pid1: i32,
@@ -4643,6 +4467,11 @@ pub fn exec_in_box(
         ("pid", libc::CLONE_NEWPID),
     ];
     let mut fds: Vec<(libc::c_int, libc::c_int)> = Vec::with_capacity(ns_order.len());
+    // THE CGROUP NAMESPACE IS HELD BACK FOR THE CHILD. Joining it here would make
+    // `clone3(CLONE_INTO_CGROUP)` below answer ENOENT, because inside it the box's cgroup is the
+    // root and the ancestor it shares with ours cannot be named. The child enters it after it has
+    // been born in the right cgroup, which is the same place it ends up either way.
+    let mut cgroup_ns_fd: libc::c_int = -1;
     for (name, flag) in ns_order {
         // A namespace the box SHARES with us is not one to join, and joining it fails. `--net` is the
         // case that made this visible: `/proc/<pid1>/ns/net` is not missing there, it EXISTS and
@@ -4658,7 +4487,11 @@ pub fn exec_in_box(
         let p = cstr(&format!("/proc/{pid1}/ns/{name}"))?;
         let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd >= 0 {
-            fds.push((fd, flag));
+            if flag == libc::CLONE_NEWCGROUP {
+                cgroup_ns_fd = fd;
+            } else {
+                fds.push((fd, flag));
+            }
         }
         // A missing ns file means the box is gone; the required-namespace check below catches that.
     }
@@ -4729,10 +4562,10 @@ pub fn exec_in_box(
     // period and IS used, but only on the box START path, which places its child before entering any
     // namespace and where the saving is real. Buying those milliseconds here costs the cap.
     //
-    // KNOWN PROPERTY, not a new one: this puts the launcher inside the box's memory cap for the rest
-    // of its life, where a whole-box OOM can take it down. Recovering that without losing the cap needs
-    // the child to be created in the cgroup before the namespaces are joined and then to enter the PID
-    // namespace itself, which takes a second fork - a restructure, not an ordering change.
+    // AND THE LAUNCHER IS OUT OF THE BLAST RADIUS. While it migrated, `memory.oom.group` killed it with
+    // the box, so the process that would have explained the kill was the one being killed, and a third
+    // process outside the group had to exist to say so. That watcher is gone: the launcher survives,
+    // reports the OOM itself after `waitpid`, and returns 137 instead of dying of SIGKILL.
     //
     // WHAT THE CALLER USED TO SEE WHEN THAT HAPPENED, measured rather than guessed. A `--memory 32m`
     // box, an exec'd command that allocates past it:
@@ -4762,9 +4595,20 @@ pub fn exec_in_box(
     // BEFORE the migration below, because a reporter forked after it would be inside the group and
     // would die with everything else. `_reporter` keeps the pipe's write end alive for exactly as
     // long as this process is alive; that is the whole signal.
-    let _reporter = box_cg.as_ref().and_then(|c| spawn_oom_reporter(c, pid1));
+    // NESSUN GUARDIANO, e la ragione e' che il lanciatore adesso SOPRAVVIVE. Finche' migrava dentro il
+    // cgroup, `memory.oom.group` lo uccideva col box e il processo che avrebbe potuto spiegare l'evento
+    // era quello ucciso: serviva un terzo processo fuori dal gruppo. Ora `clone3(CLONE_INTO_CGROUP)`
+    // colloca il FIGLIO e il lanciatore resta fuori, quindi puo' riportare da se'. Un processo in meno
+    // per ogni `kern exec`, e una macchina a stati in meno.
+    //
+    // La linea di base si legge QUI, prima che parta qualsiasi cosa, su un ANTENATO che sopravvive al
+    // box: il cgroup del box viene smontato insieme ai suoi processi, misurato sparito 10,7 ms dopo.
+    let oom_events_fd = crate::cgroup::oom_kill_dir_for_pid(pid1)
+        .and_then(|d| crate::cgroup::open_oom_events_fd(&d));
+    let oom_baseline = oom_events_fd.and_then(crate::cgroup::oom_group_kill_from_fd);
 
-    let placed = box_cg.as_ref().is_some_and(crate::cgroup::join_box_cgroup);
+    // Nothing migrates: `fork_into_cgroup` below places the child, and refuses if it cannot.
+    let placed = true;
     if !placed && box_has_explicit_caps {
         if let Some(cg) = box_cg.as_ref() {
             if let crate::cgroup::ExecCgroupJoin::Unbounded =
@@ -4780,7 +4624,7 @@ pub fn exec_in_box(
             }
         }
     }
-    drop(box_cg);
+    // `box_cg` is kept alive for the `clone3` below, which needs its descriptor.
 
     for (fd, flag) in &fds {
         if unsafe { libc::setns(*fd, *flag) } != 0 {
@@ -4804,11 +4648,26 @@ pub fn exec_in_box(
     // the cgroup this process was migrated into above. NOTHING IS PLACED HERE - a second placement
     // after the `setns` is not a safety net, it is a copy of the same decision that always fails, and
     // reading its failure is what produced the silent uncapped exec.
-    let pid = unsafe { libc::fork() };
+    let (pid, born) = crate::cgroup::fork_into_cgroup(box_cg.as_ref());
     if pid < 0 {
         return Err(Error::last("fork"));
     }
     if pid == 0 {
+        if cgroup_ns_fd >= 0 {
+            unsafe { libc::setns(cgroup_ns_fd, libc::CLONE_NEWCGROUP) };
+        }
+        // FAIL-CLOSED, e questa e' la meta' che l'esperimento ha mostrato mancante. `clone3` rifiuta
+        // con EAGAIN quando il box ha gia' raggiunto `pids.max`, e il ripiego di `fork_into_cgroup` e'
+        // una `fork` normale che RIESCE e lascia il figlio fuori dal cgroup: misurato, un box a 2/2 ha
+        // accettato l'exec con exit 0 e il comando e' girato senza tetto. E' la stessa fuga
+        // silenziosa che la migrazione pre-`setns` era stata rimessa per chiudere.
+        if !born {
+            const MSG: &[u8] =
+                b"kern: exec: refusing: the command could not be placed in the box's \
+                cgroup, so it would run outside its --memory/--pids caps\n";
+            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+            unsafe { libc::_exit(126) };
+        }
         // For a `--health-timeout` probe: become a **session leader** (`setsid`) so this grandchild is
         // a new process-group/session leader inside the box's pid namespace whose host-visible id is
         // `pid` - the probe and everything it forks then live in that group, so the parent can
@@ -4941,7 +4800,45 @@ pub fn exec_in_box(
             if reap_retry_eintr(pid, &mut status) < 0 {
                 return Err(Error::last("waitpid"));
             }
-            Ok(wait_code(status))
+            let code = wait_code(status);
+            // SIGKILL E IL CONTATORE SALITO: il comando e' stato ucciso col box. Da solo `128 + SIGKILL`
+            // non dice niente, perche' SIGKILL ha molti mittenti; l'incremento di `oom_group_kill` sul
+            // cgroup ANTENATO e' cio' che lo attribuisce.
+            //
+            // ⛔ L'attesa e' necessaria e non e' cautela: il contatore atterra DOPO che il processo e'
+            // morto. Misurato, un solo campione preso all'istante della morte riportava l'OOM in 3 corse
+            // su 10. A passi di 2 ms fino a 400: sono 200x il massimo osservato (2 ms), e questo tempo lo
+            // paga solo un comando GIA' ucciso, mai uno sano.
+            if code == 128 + libc::SIGKILL {
+                if let (Some(fd), Some(base)) = (oom_events_fd, oom_baseline) {
+                    let mut fired = false;
+                    let mut waited = 0;
+                    while !fired && waited <= 400 {
+                        fired =
+                            crate::cgroup::oom_group_kill_from_fd(fd).is_some_and(|now| now > base);
+                        if fired {
+                            break;
+                        }
+                        let ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 2_000_000,
+                        };
+                        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                        waited += 2;
+                    }
+                    if fired {
+                        eprintln!(
+                            "kern: exec: this command was killed with its box by the kernel's OOM \
+                             killer, against the box's memory cap (memory.oom.group kills the whole \
+                             box, the exec'd command included). Raise it with `--memory <size>`."
+                        );
+                    }
+                }
+            }
+            if let Some(fd) = oom_events_fd {
+                unsafe { libc::close(fd) };
+            }
+            Ok(code)
         }
     }
 }
