@@ -4408,13 +4408,23 @@ mod tests {
             "a target whose common ancestor with our own cgroup is the ROOT must be refused for an \
              ordinary user and allowed for root"
         );
-        // The positive control for the same call: our own cgroup is trivially reachable from itself,
-        // so a build that refused everything would fail here instead of passing the line above.
+        // The positive control for the same call, ON THE PRECONDITION IT ACTUALLY NEEDS. Our own
+        // cgroup is its own ancestor, so placement into it is permitted exactly when we may write its
+        // `cgroup.procs`. That is a host property, not a law: GitHub's runner puts the job in a
+        // root-owned `system.slice/...` where the answer is legitimately no, and asserting the
+        // opposite made this fail there twice.
+        //
+        // Conditioning on the measured precondition keeps the control real where it runs and honest
+        // where it cannot. A build that refuses everything is still caught: on any host that owns its
+        // own cgroup it fails here, and on one that does not, the hermetic `cgroup_procs_writable`
+        // control above fails instead, because that is the call this composition is built out of.
         if let Some(m) = current_v2_cgroup() {
-            assert!(
-                placement_into_is_permitted(&m),
-                "placement into our OWN cgroup must be permitted, or the probe refuses everything: {m:?}"
-            );
+            if cgroup_procs_writable(&m) {
+                assert!(
+                    placement_into_is_permitted(&m),
+                    "our own cgroup.procs is writable, so placement into it must be permitted: {m:?}"
+                );
+            }
         }
     }
 
