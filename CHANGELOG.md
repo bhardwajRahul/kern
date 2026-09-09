@@ -44,6 +44,14 @@ stop a file being rendered without the value, and it is what a compose file writ
 a token: a stack came up with `MYSQL_PASSWORD=`. Every variable with no value is named, not just the
 first one found.
 
+**`target:`, `uid:` and `gid:` under a service's `secrets:` were read and dropped in silence.** Each
+changes where the file lands or who may read it, and kern honours none of them: every secret is
+delivered at `/run/secrets/<source>`, owned by the box's root, with the mode from `mode:`. Measured:
+a service declaring all three produced nothing on stderr and the file appeared at `/run/secrets/pw`
+owned by root rather than at `/etc/mypw` owned by 1500. Named rather than implemented, for the reason
+that put the mode on the box: none of the three appears once in 259 real compose files nor in
+Docker's own samples.
+
 **A service secret was written `0400` into a `0700` directory, so no image running as a non-root
 user could read it.** The Compose Specification says a service secret has "world-readable permissions
 (mode `0444`)". Measured on Docker's own `nginx-golang-postgres` sample, whose `db` declares

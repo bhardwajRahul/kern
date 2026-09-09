@@ -2559,9 +2559,16 @@ fn list_value(node: &Node) -> Vec<String> {
 /// form is a list of maps each with a `source:` (`[{source: db_pw, target: …}]`) - we take `source`
 /// (the target is always `/run/secrets/<source>` in kern). Returns the referenced secret names.
 /// Also returns the `mode:` the long form declares, when it declares one; see [`secret_mode_of`].
-fn secret_refs(node: &Node) -> (Vec<String>, Result<Option<String>, String>) {
+fn secret_refs(
+    node: &Node,
+) -> (
+    Vec<String>,
+    Result<Option<String>, String>,
+    Vec<&'static str>,
+) {
     let mut out = Vec::new();
     let mut modes: Vec<String> = Vec::new();
+    let mut unhonoured: Vec<&'static str> = Vec::new();
     for it in list_value(node) {
         let it = it.trim();
         if it.starts_with('{') {
@@ -2573,6 +2580,13 @@ fn secret_refs(node: &Node) -> (Vec<String>, Result<Option<String>, String>) {
             if let Some(m) = n.child("mode").and_then(|m| m.scalar.as_deref()) {
                 modes.push(scalar_str(m));
             }
+            // The long-syntax keys kern does NOT honour. Collected in the specification's own order
+            // so a file declaring several reads back the way it was written.
+            for k in UNHONOURED_SECRET_KEYS {
+                if n.child(k).is_some() && !unhonoured.contains(k) {
+                    unhonoured.push(k);
+                }
+            }
         } else if !it.is_empty() {
             out.push(scalar_str(it));
         }
@@ -2580,7 +2594,38 @@ fn secret_refs(node: &Node) -> (Vec<String>, Result<Option<String>, String>) {
     // Block long-form (`- source: name` on its own lines) is handled too: `build_tree` folds each
     // block list item's `key: value` children into an inline `{source: name, …}` scalar, so it arrives
     // at the `{`-prefixed branch above. No separate code path needed.
-    (out, secret_mode_of(&modes))
+    (out, secret_mode_of(&modes), unhonoured)
+}
+
+/// The service-`secrets:` long-syntax keys kern reads and does not apply, in the specification's
+/// order.
+///
+/// NAMED RATHER THAN IMPLEMENTED, and the reason is the same one that put the mode on the BOX: none
+/// of the three appears once in 259 real compose files, nor in any of Docker's own samples that use
+/// secrets. Building a per-secret channel for them would be machinery with no reader; leaving them
+/// silent would be the exact defect this branch exists to remove, because each one changes where the
+/// file lands or who may read it, and a service that cannot find its secret fails inside its own
+/// code with an error that points nowhere near the mount.
+pub const UNHONOURED_SECRET_KEYS: &[&str] = &["target", "uid", "gid"];
+
+/// The sentence a service is owed for the secret keys kern did not apply, or `None`.
+///
+/// A FUNCTION so the decision is assertable: printed inline at a `warn`, nothing can ask whether the
+/// right keys were named, which is how the `internal:` note came to need one too.
+pub fn unhonoured_secret_note(keys: &[&str]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "under `secrets:` the key(s) {} are NOT applied: kern delivers every secret at \
+         `/run/secrets/<source>`, owned by the box's root, with the mode from `mode:` (default \
+         0444). A service that opens the path `target:` names, or that expects the file to belong \
+         to `uid:`/`gid:`, will not find it where it looks",
+        keys.iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// The ONE mode a service's secrets share, or a refusal when it declares more than one.
@@ -2903,10 +2948,13 @@ fn service_to_box(
                 //
                 // The MODE travels with them: the specification's default is world-readable, and a
                 // long-form `mode:` overrides it. See `secret_mode_of` for why it is one per box.
-                let (refs, mode) = secret_refs(node);
+                let (refs, mode, unhonoured) = secret_refs(node);
                 match mode {
                     Ok(m) => b.secret_mode = m,
                     Err(why) => return Err(format!("service '{name}': {why}")),
+                }
+                if let Some(note) = unhonoured_secret_note(&unhonoured) {
+                    warn(&format!("service '{name}': {note}"));
                 }
                 for entry in refs {
                     match secret_files.get(&entry) {
@@ -4944,6 +4992,62 @@ mod tests {
     /// `/run/secrets/db-password: Permission denied` on every start, the database never came up, and
     /// the `service_healthy` gate its backend waits on timed out after 120 s. With the mode fixed the
     /// same file comes up and the proxy answers 200 with rows from the database.
+    /// A KEY KERN READS AND DOES NOT APPLY MUST BE NAMED.
+    ///
+    /// `target:`, `uid:` and `gid:` each change where the secret lands or who may read it, and kern
+    /// honours none of them: it delivers every secret at `/run/secrets/<source>` owned by box root.
+    /// Left silent, a service that opens the path `target:` names fails inside its own code with an
+    /// error pointing nowhere near the mount - the exact shape this branch exists to remove.
+    ///
+    /// NAMED RATHER THAN IMPLEMENTED because none of the three appears once in 259 real compose
+    /// files nor in Docker's own samples; see `UNHONOURED_SECRET_KEYS`.
+    #[test]
+    fn the_secret_keys_kern_does_not_apply_are_named_and_the_rest_stay_quiet() {
+        let note = |y: &str| {
+            let (_, _, un) = secret_refs(
+                super::build_tree(&super::lex(y).unwrap())
+                    .unwrap()
+                    .child("x")
+                    .unwrap(),
+            );
+            unhonoured_secret_note(&un)
+        };
+        // Short form and a long form using only what kern honours: nothing to say.
+        assert_eq!(note("x:\n  - pw\n"), None);
+        assert_eq!(note("x:\n  - source: pw\n    mode: 0400\n"), None);
+
+        // Each unhonoured key on its own is named, and only itself.
+        for (yaml, key, quiet) in [
+            (
+                "x:\n  - source: pw\n    target: /etc/pw\n",
+                "`target`",
+                "`uid`",
+            ),
+            (
+                "x:\n  - source: pw\n    uid: \"1500\"\n",
+                "`uid`",
+                "`target`",
+            ),
+            (
+                "x:\n  - source: pw\n    gid: \"1500\"\n",
+                "`gid`",
+                "`target`",
+            ),
+        ] {
+            let n = note(yaml).unwrap_or_else(|| panic!("must be named: {yaml}"));
+            assert!(n.contains(key), "must name {key}: {n}");
+            assert!(!n.contains(quiet), "must NOT name {quiet}: {n}");
+        }
+
+        // All three at once: named in the specification's order, once each even across entries.
+        let n = note("x:\n  - source: pw\n    target: /etc/pw\n    uid: \"1\"\n    gid: \"2\"\n  - source: other\n    uid: \"3\"\n")
+            .expect("three keys must be named");
+        assert!(
+            n.contains("`target`, `uid`, `gid`"),
+            "the specification's order, no repeats: {n}"
+        );
+    }
+
     #[test]
     fn a_service_secret_carries_the_specifications_mode_and_a_declared_one_wins() {
         let mode = |y: &str| parse(y).unwrap().into_iter().next().unwrap().secret_mode;
