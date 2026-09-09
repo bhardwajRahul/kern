@@ -9058,23 +9058,19 @@ fn a_kern_run_does_not_inherit_its_parents_direct_path_decision() {
 /// kernel, and a pid above it can never exist, which would make the test pass for the wrong reason.
 #[test]
 fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
-    let Some(slice) = find_kern_slice() else {
-        eprintln!("skip: no kern.slice under this user's cgroup, so this host caps another way");
-        return;
-    };
-    // THE DIRECTORY EXISTING IS NOT THE SAME AS KERN USING IT, and reading it as the same is what
-    // made this test fail on GitHub's runner while passing on two developer machines. The sweep runs
-    // in the process `kern run` leaves behind to reap its workload, and that process is only forked
-    // when a cap was actually BUILT. A host where the slice is on disk but placement into it is
-    // refused (cgroup v2 delegation containment, from a caller outside the delegated tree) builds no
-    // cap, forks nothing, and sweeps nothing - correctly. `find_kern_slice` reads the filesystem and
-    // cannot see that refusal.
+    // ASK THE VERB WHERE IT CAPS, because every cheaper way of guessing has now been wrong once.
     //
-    // So the precondition is measured through the channel the behaviour needs: run the verb with a
-    // cap and have the WORKLOAD read its own `memory.max` back. A number means the direct path is
-    // live here and a leaf will be swept; anything else means this host caps another way and the
-    // assertion below would be about the host rather than about the sweep.
-    let capped = kern()
+    // First this looked for `kern.slice` on the filesystem and planted there. That is not the
+    // question: `apply_limits` uses `kern.slice` only when placement into it is PERMITTED, and falls
+    // back to the caller's own cgroup when cgroup v2 delegation containment refuses the migration.
+    // On GitHub's runner the directory exists, the cap binds in the caller's cgroup instead, the
+    // sweep correctly scans that one, and a leaf planted in `kern.slice` is never looked at. The
+    // second version measured that a cap is built at all: necessary, and still not enough, because
+    // it proved the sweep RUNS without proving WHERE.
+    //
+    // So the workload reports its own cgroup, and the parent of that leaf is by construction the
+    // directory this verb caps and sweeps in. One reading, no inference.
+    let reported = kern()
         .args([
             "run",
             "-m",
@@ -9082,19 +9078,25 @@ fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
             "--",
             "/bin/sh",
             "-c",
-            "cat /sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/memory.max",
+            "sed -n 's/^0:://p' /proc/self/cgroup",
         ])
         .output();
-    let reads_back = capped
+    let leaf = reported
         .as_ref()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "67108864")
-        .unwrap_or(false);
-    if !reads_back {
-        eprintln!(
-            "skip: `kern run` does not build a cap of its own here, so it forks no reaper and sweeps nothing (the slice on disk is not the slice it uses)"
-        );
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    // It must be a leaf THIS VERB named. Without a `kern-run-` component the caller's own cgroup was
+    // echoed back, meaning no capped leaf was built and there is nothing here to sweep.
+    let Some(slice) = leaf
+        .rsplit_once('/')
+        .filter(|(_, n)| n.starts_with("kern-run-"))
+        .map(|(parent, _)| std::path::PathBuf::from(format!("/sys/fs/cgroup{parent}")))
+        .filter(|p| p.is_dir())
+    else {
+        eprintln!("skip: `kern run` built no capped leaf of its own here ({leaf:?}), so it forks no reaper and sweeps nothing");
         return;
-    }
+    };
     let dead = (2u32..2_000_000)
         .rev()
         .find(|pid| !Path::new(&format!("/proc/{pid}")).exists())
