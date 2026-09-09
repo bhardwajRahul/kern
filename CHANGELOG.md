@@ -291,8 +291,328 @@ already (measured: the box holds only `lo`, the same connect is refused), so the
 the services that asked and for the ones that did not. The over-application is stated rather than
 left to be discovered by a stack that calls an external API.
 
-**CLI surface: five flags added, none changed or removed.** `--dns`, `--dns-search`, `--dns-option`,
-`--log-max-size`, `--log-max-file`. Additive, so nothing that runs today stops running.
+**CLI surface: six flags added, none changed or removed.** `--dns`, `--dns-search`, `--dns-option`,
+`--log-max-size`, `--log-max-file` and `--secret-mode`. Additive, so nothing that runs today stops
+running.
+
+**`tty` said "not a tty" inside every alpine box, and the terminal now has a name.**
+
+`kern box -it` and `kern exec -it` allocated the PTY pair on the HOST and handed the slave to the
+box as its stdio. The box mounts its own private devpts at `/dev/pts`, which does not contain that
+node, so inside the box:
+
+```
+isatty(0)                 1              the fd IS a terminal
+readlink /proc/self/fd/0  /dev/pts/2     the HOST's path
+stat /dev/pts/2           ENOENT         that path does not exist in the box
+```
+
+musl's `ttyname_r` is exactly that readlink, a `stat` and a device comparison, with no second
+strategy, so it returned ENOENT. glibc's falls back to scanning `/dev`, where it found the
+`/dev/console` bind kern already installed, and reported `/dev/console`. So the same box looked
+correct on a Debian image and broken on an alpine one, which is the image most people run. podman
+does not have it: `podman exec -it c sh -c tty` prints `/dev/pts/0`, because its slave comes from
+the container's devpts.
+
+The pair is now opened from the BOX's `/dev/ptmx` in the process that holds the box's mount
+namespace, and the master is passed back to the CLI over a socketpair with `SCM_RIGHTS` (a pipe
+cannot carry a descriptor). Both libraries then read `/dev/pts/0` and the node is there. Measured,
+same probe, before and after:
+
+```
+box -it, musl     ttyname_r FAILED rc=2      ->   /dev/pts/0
+box -it, glibc    ttyname_r = /dev/console   ->   /dev/pts/0
+exec -it, musl    ttyname_r FAILED rc=2      ->   /dev/pts/0
+```
+
+The host pair is still opened and is still the fallback: a box that cannot produce a terminal of its
+own (no devpts, a `--rootfs` kern did not populate, a kernel that refused the mount) behaves exactly
+as it did before. A terminal is a convenience, and failing a box over one would be a worse defect
+than the one being fixed. `/dev/console` is kept for that case, and the comment that used to call it
+the fix now says which library it was ever the fix for.
+
+`scripts/certify-ttyname.sh` is the certificate. It builds its own static probe, so it runs from a
+fresh clone with no fixture, and it is RED on the previous binary rather than merely green on this
+one. Measured on six distributions, three of them SELinux Enforcing, all passing both `box -it` and
+`exec -it`: Fedora 44 (6.19), CentOS Stream 10 (6.12), Rocky Linux 10.2 (6.12), Debian 13 (6.12),
+openSUSE Leap 15.6 (6.4) and Ubuntu 24.04 (6.8).
+
+Those VMs found a second defect this developer's host could not: `libc::ioctl` takes a `c_ulong`
+request against glibc and a `c_int` against musl, so the first version of the new code compiled
+cleanly here and failed to build for `x86_64-unknown-linux-musl`, which is the target kern ships.
+
+**A `kern doctor` row that denies a memory cap now names the cgroup it probed, and `kern inspect`
+reports the cap the kernel actually holds.**
+
+An outside reviewer held a review on this. doctor said a `--memory` write is "accepted and silently
+never bites", and on the same host a box started with `--memory 64m` reported `memory_max` 67108864
+and an `exec` that overran it exited 137. Two statements, no way to tell whether they were even about
+the same cgroup, because neither named one.
+
+Both halves are now checkable rather than asserted:
+
+- Every doctor row that says a cap does not bind names the directories the write-probe used, taken
+  from the same call the probe resolves its targets with, so the row can never name a directory the
+  probe did not touch. Its remedy also says how to check it against a running box.
+- `kern inspect --json` gains `memory_max_enforced`, read back from the box's own cgroup. The
+  existing `memory_max` is the value the box was STARTED with, echoed from the registry, which is
+  what the reviewer read as a cap in force. `null` means nothing is holding it. The human row says
+  `(requested, NOT enforced here)` in that case. `--json` is additive by contract.
+
+What the two observations do NOT establish, and the code no longer claims: the cgroup v2 root has no
+`memory.max` file at all, so a box whose PID 1 is in `0::/` has nothing capping it, and exit 137 is
+SIGKILL, which a system OOM kill delivers identically. A kill by kern's own cap always prints kern's
+own OOM message. The comment that had recorded "the cap bound; the probe said it would not" as a
+settled fact records the measurement instead.
+
+Separately, the probe already asked BOTH directories a box can be capped in; previously it asked
+`kern.slice` and stopped, and on that reviewer's host reported on a directory no box went near.
+
+The `mem-cap` row's four cases moved out of `inspect`'s 245-line body into a pure `mem_cap_row`,
+because the branch that matters most is the one this developer's host cannot produce: `enforced ==
+None` needs a box outside every kern leaf. Buried in an I/O function it was unreachable by any test,
+which is why an outside reviewer had to find it by hand. It is now pinned by four tests, each verified
+to go red under mutation of its own arm.
+
+`docs/RESOURCES.md` promised its way past the same host class: it said both verbs "carry a default
+memory cap of 512 MiB whether or not you ask for one", and named the two mechanisms that deliver it
+without naming the host where NEITHER exists. It now says so, and shows the two `inspect` fields and
+the 137 caveat.
+
+**`kern run` no longer pays for a systemd scope it does not need: 4.70 ms to 0.87 ms.**
+
+`kern run` bought its resource caps with a transient `systemd-run --user --scope`, one per
+invocation. `kern box` stopped doing that long ago and caps directly under kern's delegated
+`kern.slice`; `run` was excluded by a single flag, and the scope was the entire difference between the
+two verbs. Measured on one desktop, the shipped extreme binary, 200 samples per column, medians:
+
+```
+kern run -- /bin/true                    4.700 ms
+KERN_NO_SCOPE=1 kern run -- /bin/true    0.577 ms   (the same work, no scope, no caps)
+systemd-run --user --scope -- /bin/true  3.867 ms
+```
+
+The scope was 4.12 ms of the 4.70. Paired and alternating sample by sample against the previous
+binary, `kern run` is **-3.3 to -4.0 ms** depending on how busy the user manager is (two runs, 300
+pairs each: -4.004 ms, 95% interval [-4.074, -3.940], and -3.335 ms, [-3.384, -3.256]); `kern box` is
+unchanged, its interval containing zero. The whole surface on that host, same binary and recipe as a
+release, 400 samples each: `exec` 0.79 ms, `run` 0.87 ms, `box --rootfs` 2.39 ms, `box --image alpine`
+3.38 ms, against bubblewrap 0.9.0 at 2.72 ms for the same namespaces and rootfs.
+
+**The tail moved more than the median, and it is the better half of the result.** Over 400 samples,
+`kern run`'s p99 goes from 5.735 ms to 1.267 ms and its worst sample from 15.304 ms to 1.487 ms. A
+D-Bus round trip to a shared, single-threaded user manager is a queue, and a queue is what a tail is
+made of.
+
+**It also scales now, where it did not before.** `kern run -- /bin/true` in parallel, amortised
+runs per second:
+
+```
+concurrency      1      8     32    100    200
+before         214    496    288    151     86
+this branch   1053   4734   4891   4601   4052
+```
+
+The old path got SLOWER as concurrency rose, because every run serialised on the same manager. Zero
+failures on either column, and under a 200-way burst 400 out of 400 runs read exactly `67108864` from
+their own `memory.max`, so nothing about the cap is traded for the throughput.
+
+The reason recorded for excluding `run` was that it `exec()`s the workload in place, leaving no
+process behind to remove the cgroup the way the scope's `--collect` does. That had stopped being true:
+the scope path itself forks a proxy, so a `kern run` was already `caller -> kern -> workload`. The
+fork is now performed on the direct path too, and the parent is what removes the leaf. **The process
+topology is unchanged**, and so is everything a caller can observe: the command's exit code, a
+forwarded Ctrl-C (130), the OOM message on a 137, stdin and stdout, and `--landlock-rw` applied to the
+command and not to kern.
+
+Two behaviours that are new and worth knowing:
+
+- `kern run`'s cgroup is now `kern-run-<pid>`, not `kern-box-run-<pid>`. With the box prefix, a live
+  `kern run` was reported by `kern ps` as a box with no registry record that `kern stop` could not
+  reach. A box may legitimately be named `run`, so a reserved tag could not have separated them.
+- The orphan sweep reaps a `kern run` leaf but **never kills what is still inside it**. A box's
+  processes are the box's; `kern run` governs processes the caller started, and a backgrounded child
+  outliving the launcher is an ordinary use. Under the scope it kept the scope alive and was collected
+  when it exited; the sweep now leaves it alone and removes the directory once it is empty. Verified
+  against a real cgroup: a survivor of a SIGKILL'd launcher is still running after a `kern box`, a
+  `kern gc` and a `kern run`, and its directory goes only once it exits.
+- `kern run` now runs that sweep itself, in the parent, WHILE the workload runs. Nothing on this
+  verb's path ever called it, so a machine that only ever ran `kern run` accumulated one directory per
+  killed launcher until a `kern box` or a `kern gc` came along. It is free: with 130 entries planted to
+  be stat'd and skipped, the paired difference against the same binary without the call is -7.9 us.
+
+Where kern's `kern.slice` is not usable - no systemd user manager, `KERN_NO_SCOPE=1`, inside a box, a
+`kern build` RUN step, a `--restart` unit - `kern run` takes exactly the path it took before.
+
+**The fork is not gated on the systemd path, and the first version of this change got that wrong.**
+An outside reviewer measured the shipped v0.9.31 on two hosts, 200 sequential `kern run` each:
+
+```
+Ubuntu, systemd user manager present    0 leftover cgroup dirs -> 200 runs -> 0
+WSL2 Alpine, no user manager            2                      -> 200 runs -> 201
+```
+
+The host that leaks is the one WITHOUT a manager, because there the leaf is a plain directory kern
+made and `exec()` in place leaves nothing to remove it. The host that does not leak is the one with a
+manager, where the leaf lives inside the transient scope and systemd reaps the whole unit. Gating the
+fork on the direct path therefore fixed the case that was already fine and left the broken one alone,
+and the broken one is the configuration of the WSL rootfs this project publishes. The fork is now
+decided by `run_should_fork`, a pure function of two facts: a capped leaf exists, and nothing outside
+already supervises the workload. On a host with an outer enforcer - kern's own scope proxy, a
+`--restart` unit, a build step - it still `exec()`s in place, because that proxy already waits,
+forwards signals, reports the OOM and propagates the code.
+
+The same host also lost its OOM diagnostic: with no process outliving the workload, a run killed by
+the 512 MiB default nobody typed printed the shell's bare `Killed`. A supervisor restores the message
+there for free.
+
+**Two notices were wrong and are fixed with it.** The check behind "this command runs with no RAM
+ceiling" read `/proc/self/cgroup`, which is the SUPERVISOR's cgroup once `kern run` forks, and that
+one is uncapped by construction: every plain `kern run` would have printed the notice over a workload
+holding exactly 536870912. And the notice named `KERN_NO_SCOPE` as the cause whatever the cause was,
+so a host with no user manager was told to unset a variable it never set. It now names the reason it
+can actually name.
+
+**`kern run` also sweeps the cgroup it can actually reach.** The per-start sweep only ever looked in
+`kern.slice`, the one directory a host without a user manager does not have, so nothing on that path
+ever swept anything. It now sweeps the caller's own cgroup as well, deduplicated where they coincide,
+and it runs in the parent while the workload does, so it costs nothing measurable: paired against the
+same binary without it, `kern run` differs by -2.9 us and `kern box` by -0.0 us, both intervals
+containing zero.
+
+**`/dev/tty` stays out of a box, and it can no longer be created by accident.** The device is excluded
+because a controlling terminal enables TIOCSTI-style injection on unhardened kernels, and that reason
+was re-measured rather than trusted: under a real pty, a box started WITHOUT `-it` inherits the
+launcher's controlling terminal, `tty_nr=34816` for both, so the device inside the box would be the
+operator's own terminal. What was wrong is that `/dev` is a tmpfs the box's root owns, so a redirect
+CREATED a regular file there and a program writing a prompt got no error and wrote into nothing. The
+path is now a directory: `open` for writing is EISDIR whether or not `O_CREAT` is passed, so the write
+fails loudly and nothing that worked before changes.
+
+**A box that could not be BUILT now says what to check, from either process that reports it.** The
+message is printed twice in kern, and one of the two could never carry a hint: `report_exec_failure`
+runs in the forked child and `_exit`s, so the error never reaches the CLI's hint function. A reviewer
+measured `kern: sandbox setup failed: mount(overlay) failed: Invalid argument (os error 22)` arriving
+bare while every neighbouring branch carried advice. The remedy is one constant used by both, naming
+the four things a setup failure is (the mount, the uid map, the seccomp filter, the AppArmor profile)
+and pointing at `kern doctor`, which reports all four. The older wording named two of the four.
+
+**A box whose kern binary was replaced is visible again to the channel that exists to find it.** The
+kernel appends `" (deleted)"` to `/proc/<pid>/exe` once the file behind a running process is gone,
+which is the state of every already-running kern the moment an upgrade overwrites the binary.
+`live_box_supervisors_via_proc` compared against the bare name, so those processes read as not-kern
+and their boxes disappeared from the fallback channel that exists precisely to find boxes the registry
+has lost, on the one event most likely to lose them. Found on this desktop as a disagreement between
+the two channels in the same second: the cgroup channel reported a box the `/proc` channel did not.
+
+**`kern doctor` asks about both directories a box can be capped in.** `apply_limits` caps under
+`kern.slice` on the direct path and under the caller's own cgroup otherwise; the probe used
+`or_else`, which reaches the second only when the first is absent, so on a host where the slice exists
+but boxes do not use it the probe reported on a directory no box goes near. An outside reviewer
+measured the consequence: doctor said a `--memory` write "silently never bites" while a box on the
+same host held `memory_max = 67108864` and an exec that overran it was killed with 137. Both
+directories are asked now, and the better answer wins.
+
+**The cap probe's leftovers are reaped.** Its throwaway child is removed on every path the probe
+returns from, so one survives only when the process died in between; nothing collected those, because
+the sweep knew only the two box prefixes. Measured: one `kern-capprobe-*` in `kern.slice` from a pid
+long gone, which four consecutive `kern doctor` runs did not add to and `kern gc` did not remove. The
+sweep knows the family now, and never kills anything in it, because it is empty by construction.
+
+**`kern exec` no longer refuses when there is no cap to escape.** The fail-closed asked "was the
+command placed in the box's cgroup" and never "is there a cgroup, carrying a real limit, to be outside
+of". On a host with no delegation `apply_limits` returns `None`, the box sits in the caller's own
+cgroup, the placement has nothing to place, and `kern exec` refused with 126 while telling the operator
+the command would run outside `--memory`/`--pids` caps the box did not have. Reported by an outside
+reviewer on a box that was NOT at its pids limit.
+
+The function that answers the real question was already there and its result was thrown away: the block
+that called it read `let placed = true; if !placed`, dead since the migration was replaced by
+`clone3`. It is consulted now, before the `setns`, because it reads `memory.max` and `pids.max` through
+the cgroup's descriptor and the same read through a path afterwards reports a capped box as uncapped.
+A box at its `--pids-limit` still refuses, because a pids ceiling is a real limit.
+
+**`kern doctor` names the way through, and the health probe stopped writing into a hole.** The
+refusal points at `kern doctor` to tell its two causes apart; the row it points at did not name
+`KERN_ALLOW_UNCAPPED`, so a reader who followed the pointer learned which cause they had and not what
+to do about it. It names it now, along with the verb that refuses and the probe that does not.
+
+The probe's own notice is gone rather than kept, and the reason is measured: a marker written to
+stderr from inside the probe's child appears in a foreground `kern exec` and does NOT appear in
+`kern logs` or in the box's log file, which stays 0 bytes. A detached supervisor's stdout and stderr
+are one pipe that nothing reads. A notice nobody can read is the silent-success shape this codebase
+refuses, and keeping it would have been worse than not having it, because it would have looked like
+the condition was reported. It is reported, in the one place an operator looks when a host behaves
+this way.
+
+**`kern exec` no longer loses a whole class of host to its own fail-closed, and the health check no
+longer reports a healthy box as unhealthy there.** The refusal is right: a command that steps around
+the box's `--memory`/`--pids-limit` while the operator believes it is capped is the escape it exists
+to stop. But it fires for two causes, and only one of them is the box's fault. The other is cgroup v2
+delegation containment, which needs write access to the `cgroup.procs` of the COMMON ANCESTOR of the
+source and destination cgroups: from a shell in `/init.scope` that ancestor is the root cgroup, so on
+WSL2 with `systemd=true` every `kern exec` refused, on hosts where nothing was wrong. No
+implementation fixes that one, because a process there cannot reach the user's delegated tree and
+cannot move itself into it either.
+
+So the default stays REFUSE and `KERN_ALLOW_UNCAPPED` is the way through, which is the meaning that
+variable already carries in `SECURITY.md`, `INSTALL.md` and `RESOURCES.md`: explicitly accept running
+uncapped where a cgroup cap cannot be applied. It adds no CLI surface, which matters because that
+surface is frozen. The command then runs and says what it gave up; the box's namespaces, seccomp
+filter and AppArmor profile still apply to it, and only the resource ceiling does not.
+
+`exec_in_box` has a second caller that nobody had looked at: kern's own `--health-cmd` probe. Refusing
+there turned the same host property into a permanent false "unhealthy" for every box with a health
+check, with nothing in the health output naming the cause. The probe now proceeds, warning once per
+process rather than once per interval. What that costs is stated rather than glossed: on those hosts
+the probe runs outside the box's caps, which is the same tradeoff already documented for its baseline
+capabilities and its unconfined AppArmor, and on the same narrow set of hosts.
+
+**`kern exec`'s fail-closed refusal now names what to do about it.** It states that the command could
+not be placed in the box's cgroup, which is the consequence; it did not say which of the two causes it
+was, and they need opposite actions. A reviewer hit it on every `kern exec` on WSL2 with
+`systemd=true`, where the previous release ran the command uncapped and warned, and had no way to tell
+a box at its `--pids-limit` from a host layout on which no exec can ever join. Both are named now, and
+`kern doctor`, which reports which cap path a host takes in its first two lines, is pointed at.
+
+**A fork failure is no longer blamed on user namespaces or the rootfs, for any errno.** That hint has
+now been wrong twice, to two reviewers, under two different errnos: EAGAIN from a tightened
+`RLIMIT_NPROC`, which got a branch of its own last release, and ENOMEM on WSL2, measured
+deterministically. Both times the reader was sent to two places that were already fine, because by
+the time any fork on this path runs the user namespace exists and the rootfs has been validated. The
+rule is now the CLASS rather than one errno at a time, which is how the third one would otherwise have
+been found by a user. It states what the errno is, names the two limits a fork can actually hit, and
+does not guess at a cause: `clone3(CLONE_INTO_CGROUP)` into a cgroup it may not write answers EACCES
+on the developer's host and EBUSY into a populated one, neither of which is the ENOMEM measured in the
+field, and a hint that guessed would be the defect it replaces.
+
+**Finding the delegated slice is not the same as being allowed to enter it, and the difference is a
+class of host.** cgroup v2's delegation containment rule needs write access to the `cgroup.procs` of
+the COMMON ANCESTOR of the source and destination cgroups, not just of the destination. From a shell
+in `/init.scope` that ancestor is the root cgroup, owned by root, so a `kern.slice` that is delegated,
+writable and correctly capped is still unreachable. Measured on WSL2 with `systemd=true`: the leaf was
+created, both caps were written and read back, and then `clone3(CLONE_INTO_CGROUP)` and the
+`cgroup.procs` write both failed. `kern run` warned and ran UNCAPPED where the previous release had
+capped it; `kern box`, which is fail-closed on the same placement, would have refused to start at all.
+The decision site now asks the kernel's own question with one `access(2)` on that ancestor, so a host
+that cannot place takes the systemd scope exactly as it did before.
+
+**And a whole class of hosts could not reach the fast path at all, for a reason that had nothing to
+do with the fork.** kern derived its delegated `kern.slice` by walking UP from its own cgroup looking
+for a `user@<uid>.service`. On WSL2 with `systemd=true` a user manager is running and the login shell
+sits in `0::/init.scope`, whose only ancestors are itself and the root: the search answered "no
+delegated slice on this host" while the tree sat one directory away. Measured there, same binary:
+`kern run` 11.5 ms with the per-invocation scope against 1.0 ms with the scope skipped. When the
+ancestor search finds nothing, kern now tries the canonical `user.slice/user-<uid>.slice/
+user@<uid>.service` built from the real uid, and uses it only if the directory is really there. A host
+laid out some other way answers exactly what it answered before.
+
+**The numbers above are warm, and the FIRST invocation on an idle machine is not.** Measured on the
+same host by removing `kern.slice` before each sample, three samples each: the new binary reads 19.2,
+1.6 and 27.9 ms and the previous one 16.2, 23.4 and 22.4. That cost is systemd's, not kern's - a
+standalone `systemd-run --user -p Delegate=yes --slice=kern.slice --scope -- true` on the same idle
+manager is 19.5 ms on its own - and both binaries pay it. The change moves the warm case and leaves the
+cold one where it was.
 
 ## v0.9.31 - 2026-09-09
 

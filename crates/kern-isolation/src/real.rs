@@ -177,6 +177,14 @@ pub struct SandboxSpec {
     /// it onto stdin/out/err. `None` → the box inherits kern's stdio. The parent pumps the matching
     /// master (see `run_in_sandbox_with`'s `tty_master`).
     pub tty_slave: Option<i32>,
+    /// `-it`: the CHILD end of a `socketpair` on which the box hands its own PTY master back to the
+    /// CLI. `None` keeps the pre-existing behaviour, where the box uses the host slave in
+    /// `tty_slave` and its terminal has no name inside the box. See [`crate::ptybox`].
+    pub pty_sock: Option<i32>,
+    /// `-it`: the PARENT end of that same `socketpair`, which the CLI reads the box's master from
+    /// inside `on_started`. Held here rather than passed separately so the two ends cannot drift
+    /// apart: one of them is useless without the other.
+    pub pty_sock_parent: Option<i32>,
     /// vGPIO device nodes (host `/dev/*` paths) to expose in the box's `/dev` - from a `vgpio:`
     /// profile. Bound before pivot like the base device allowlist.
     pub vgpio_devs: Vec<String>,
@@ -1050,13 +1058,31 @@ fn child_setup_and_exec(
     // a caller must not be able to shadow the hardened `/dev`, so kern owns this mount rather than
     // leaving users to improvise one.
     let needs_pts = true;
-    setup_dev(
+    // THE BOX'S OWN SLAVE WINS WHEN THERE IS ONE. `spec.tty_slave` is the host pty the CLI opened
+    // before the fork; it works, but its device does not exist under the box's `/dev`, so
+    // `ttyname()` cannot name it and `tty(1)` prints "not a tty" on every musl image. When
+    // `setup_dev` managed to build a pair from the box's own devpts and hand the master back, that
+    // one is used instead and the terminal has a name. See [`crate::ptybox`].
+    let box_slave = setup_dev(
         &spec.root,
         spec.tun,
         needs_pts,
         spec.tty_slave,
         shm_size_for(spec.shm_max, spec.memory_max),
+        spec.pty_sock,
     )?;
+    // The host slave is now dead weight in this process: the workload is about to get the box's
+    // one. Closing it here rather than leaking it into the exec keeps the box from holding an fd on
+    // a terminal it does not use, which `/proc/1/fd` would otherwise show.
+    if box_slave.is_some() {
+        if let Some(host) = spec.tty_slave {
+            unsafe { libc::close(host) };
+        }
+    }
+    // Whichever way it went, this process is done with the channel.
+    if let Some(sock) = spec.pty_sock {
+        unsafe { libc::close(sock) };
+    }
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -1175,7 +1201,7 @@ fn child_setup_and_exec(
     // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp - these are setup
     // syscalls, not the workload's). The slave fd was opened on the host and inherited across the
     // unshare/pivot (it's just an fd).
-    if let Some(slave) = spec.tty_slave {
+    if let Some(slave) = box_slave.or(spec.tty_slave) {
         adopt_controlling_tty(slave);
     }
 
@@ -1467,7 +1493,18 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
             );
         }
     } else {
-        eprintln!("kern: sandbox setup failed: {e}");
+        // AND IT CARRIES ITS OWN REMEDY, because nothing downstream can add one. This branch runs in
+        // the FORKED CHILD, which `_exit`s on the next line, so the error never reaches the CLI's hint
+        // function and no match arm there can ever help it. An outside reviewer measured exactly that:
+        // `kern: sandbox setup failed: mount(overlay) failed: Invalid argument (os error 22)`, with no
+        // hint line under it, while every neighbouring branch in this function carries one.
+        //
+        // The text is [`crate::SETUP_FAILURE_HINT`] and not a copy: the CLI prints the same class of
+        // failure for everything that fails BEFORE the fork, and two wordings for one condition drift.
+        eprintln!(
+            "kern: sandbox setup failed: {e}\nhint: {}",
+            crate::SETUP_FAILURE_HINT
+        );
     }
 }
 
@@ -1991,13 +2028,21 @@ fn mount_or_leave_nothing(path: &str, fstype: &str) -> bool {
 /// device binds all resolve to a directory we own *inside* the new root - never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
+/// Returns the PTY slave allocated from the BOX's own devpts, when `pty_sock` asked for one and the
+/// box could produce it. `None` means the caller keeps whatever terminal it already had, which is
+/// the pre-existing HOST pty: the terminal is a convenience and must never fail a box over it.
+///
+/// See [`crate::ptybox`] for why a box-owned slave is the difference between `tty(1)` working and
+/// printing "not a tty" on every musl image.
 fn setup_dev(
     root: &str,
     tun: bool,
     needs_pts: bool,
     tty_slave: Option<i32>,
     shm_size: Option<u64>,
-) -> Result<(), Error> {
+    pty_sock: Option<i32>,
+) -> Result<Option<i32>, Error> {
+    let mut box_slave: Option<i32> = None;
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -2029,6 +2074,32 @@ fn setup_dev(
     } != 0
     {
         return Err(Error::last("mount(/dev tmpfs)"));
+    }
+    // `/dev/tty` IS ABSENT ON PURPOSE, AND ABSENT IS NOT THE SAME AS CREATABLE.
+    //
+    // The device stays out for the reason on `DEV_NODES`, and that reason was re-measured rather than
+    // taken on trust before this line was written. A box started WITHOUT `-it` from a shell that has a
+    // terminal INHERITS the launcher's controlling terminal: measured under a real pty, the launcher
+    // reads `tty_nr=34816` (`/dev/pts/0`) and the box's workload reads the SAME 34816. So a `/dev/tty`
+    // inside the box would open the operator's own terminal, and `TIOCSTI` on it injects into the
+    // shell the operator is typing at. The exclusion is load-bearing and is not being relaxed.
+    //
+    // What IS wrong is what happens next. `/dev` is a tmpfs the box's root owns, so `> /dev/tty`
+    // CREATES a regular file: a program that writes a prompt there gets no error and the operator sees
+    // nothing, and a later reader opens the file instead of failing. Reported by an outside reviewer
+    // and reproduced here, `-rw-rw-r-- 2 bytes` where the host has `crw-rw-rw- 5, 0`. That is the
+    // silent-success shape this codebase refuses everywhere else.
+    //
+    // A DIRECTORY is the answer that needs no device. `open(O_WRONLY)` on it is `EISDIR` whether or not
+    // `O_CREAT` is passed, so a redirect fails loudly, `open(O_RDONLY)` succeeds but every `read` is
+    // `EISDIR`, and `stat` reports something that is honestly not a character device. Nothing that
+    // works today breaks: today the path does not exist, so the only behaviours are "silently created"
+    // and `ENOENT`, and both become a hard error naming the path.
+    //
+    // Best-effort like the binds below: on a host where the `mkdir` fails, the box keeps exactly the
+    // behaviour it had before this line.
+    if let Ok(t) = cstr(&format!("{root}/dev/tty")) {
+        unsafe { libc::mkdir(t.as_ptr(), 0o000) };
     }
     // Bind each node best-effort: a host that lacks one (or refuses the bind) just leaves that
     // node absent rather than failing the whole box. The tmpfs above is the load-bearing step.
@@ -2094,13 +2165,22 @@ fn setup_dev(
             }
         }
     }
-    // `-it`: bind the controlling-PTY SLAVE onto `/dev/console` (like runc/Docker). kern's `-it` slave
-    // is a HOST devpts node; the box's own `/dev/pts` is a private `newinstance` that doesn't contain
-    // it, so fd 0's device isn't found under the box's `/dev` and `ttyname()` fails - bash prints
-    // "ttyname error: No such device" and the `tty` command errors. The slave's host path is still
-    // resolvable here (pre-pivot), so read it off `/proc/self/fd/<slave>` and bind the device onto a
-    // fresh `/dev/console` node; `ttyname()` then resolves fd 0 to `/dev/console`. Best-effort: a
-    // failure just leaves the (cosmetic) warning, never breaks the box.
+    // `-it`: bind the controlling-PTY SLAVE onto `/dev/console` (like runc/Docker), for the case
+    // where the box could NOT build its own terminal and kept the host one.
+    //
+    // THIS USED TO BE THE WHOLE FIX, AND IT ONLY EVER WORKED UNDER ONE C LIBRARY. The host slave's
+    // device is absent from the box's private devpts, so `ttyname()` has to find it some other way.
+    // glibc's falls back to SCANNING `/dev` and finds this bind; musl's is a `readlink` of
+    // `/proc/self/fd/0` plus a `stat`, with no fallback, so it returned ENOENT and `tty(1)` printed
+    // "not a tty" on every alpine box while a Debian one looked correct. Measured on kern
+    // 0.9.32-review.14, same box, two probes:
+    //
+    //     musl    ttyname_r FAILED rc=2      /proc/self/fd/0 -> /dev/pts/2, absent in the box
+    //     glibc   ttyname_r = /dev/console   found by the scan
+    //
+    // The pair now comes from the box's OWN devpts (see [`crate::ptybox`]), which both libraries
+    // resolve, and this bind is what is left for a box that could not make one. Kept rather than
+    // removed for exactly that case. Best-effort: a failure never breaks the box.
     if let Some(slave) = tty_slave {
         let mut buf = [0u8; 256];
         if let Ok(link) = cstr(&format!("/proc/self/fd/{slave}")) {
@@ -2200,6 +2280,17 @@ fn setup_dev(
                     {
                         unsafe { libc::symlink(tgt.as_ptr(), px.as_ptr()) };
                     }
+                    // THE BOX'S OWN TERMINAL, and this is the earliest moment one can exist: the
+                    // mount above is what makes `/dev/ptmx` mean anything here. Allocated now,
+                    // pre-pivot, so the slave's path is `<root>/dev/pts/N` and becomes `/dev/pts/N`
+                    // the moment the box takes that root - a path that RESOLVES inside the box.
+                    //
+                    // The host pair the CLI opened stays exactly where it is until the master
+                    // reaches it. Only when both halves of the handover succeed does the caller
+                    // switch, so a failure anywhere here is the old behaviour and not a broken box.
+                    if let Some(sock) = pty_sock {
+                        box_slave = crate::ptybox::hand_over_pair(&format!("{root}/dev"), sock);
+                    }
                 }
             }
         }
@@ -2236,7 +2327,7 @@ fn setup_dev(
             };
         }
     }
-    Ok(())
+    Ok(box_slave)
 }
 
 /// Expose a `vgpio:` profile's host devices in the box. Device nodes are bound into the box's own
@@ -3607,7 +3698,7 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
 /// Run `spec.command` inside a fresh user + PID + mount namespace sandbox. Returns the child's
 /// exit code. Requires unprivileged user namespaces.
 pub fn run_in_sandbox(spec: &SandboxSpec) -> Result<i32, Error> {
-    run_in_sandbox_with(spec, None, |_| {}, None, &[], false)
+    run_in_sandbox_with(spec, None, |_| None, None, &[], false)
 }
 
 /// Owns the readiness-pipe write end and *fails closed*: if dropped while still armed (i.e. before
@@ -3653,7 +3744,13 @@ impl Drop for ReadyGuard {
 /// cleanup can run) cascades launcher → supervisor → pidns-init instead of orphaning the box until
 /// the `--timeout` backstop fires. It MUST stay false for a detached box, whose launcher exits right
 /// after forking the supervisor (arming would kill the box instantly).
-pub fn run_in_sandbox_with<F: FnOnce(i32)>(
+/// `on_started` is called with PID 1 as soon as the box exists, and MAY RETURN A REPLACEMENT PTY
+/// MASTER. That return is the seam between the two crates: the box allocates its own terminal from
+/// its own devpts (so `ttyname()` can name it), sends the master back over `spec.pty_sock`, and only
+/// the CLI knows what to do with it - retarget `SIGWINCH`, copy the window size. So the CLI receives
+/// it inside this callback and hands it back here, where the pump lives. `None` keeps `tty_master`,
+/// which is the host pty and the behaviour before [`crate::ptybox`] existed.
+pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     spec: &SandboxSpec,
     ready_fd: Option<i32>,
     on_started: F,
@@ -3732,7 +3829,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // fast path (no systemd `--collect`) would leak one cgroup dir per box.
     let cg = crate::cgroup::apply_limits(
         true, // allow_direct: `kern box` has a supervisor to hold the RAII guard and vacate on the direct path
-        &spec.hostname,
+        crate::cgroup::Leaf::Box(&spec.hostname),
         spec.memory_max,
         spec.memory_swap_max,
         spec.cpuset.as_deref(),
@@ -4135,7 +4232,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         unsafe { libc::close(fd) };
     }
     // Report PID 1 (for `kern exec`) and start the `-p` forwarders now that the box's net ns exists.
-    on_started(pid);
+    let box_master = on_started(pid);
     forwarders.activate(pid);
     // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
     // the box exits, then pump host stdio <-> master until then. Single-threaded by design - the
@@ -4145,6 +4242,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         if let Some(slave) = spec.tty_slave {
             unsafe { libc::close(slave) };
         }
+        // PUMP THE BOX'S OWN MASTER WHEN THERE IS ONE. The host pair still exists and is still
+        // valid; it is simply not the terminal the box took. Pumping the host master here would
+        // move bytes to nobody, so the choice has to be made on the same fact the box made it on.
+        let master = box_master.unwrap_or(master);
         let code = pty_pump_and_wait(master, pid);
         hint_missing_uid_range(range_unmet, code);
         return Ok(code); // `forwarders` drops here and stops them
@@ -4973,183 +5074,72 @@ fn exec_fail_closed(reason: &str) -> ! {
     unsafe { libc::_exit(126) }
 }
 
-/// `kern exec`: run `command` inside the namespaces of an already-running box (its PID 1 is
-/// `pid1`, in the host pid namespace). Joins the box's user namespace first (to gain capabilities
-/// in it), then its mount/ipc/uts/(net)/pid namespaces, then forks so the child lands in the
-/// box's pid namespace, applies the env/workdir + the same seccomp filter, and execs. Returns the
-/// command's exit code.
-///
-/// Not a descendant of PID 1, so the box's own seccomp filter doesn't block the `setns` calls
-/// here; the new process gets its own copy of the filter for parity. Requires that the caller is
-/// the same user that created the box (its user namespace owner).
-/// The live end of the pipe that tells the OOM reporter this process is gone. Closing it, whether by
-/// `Drop` on a normal return or by the kernel on a `SIGKILL`, is the only signal the reporter waits
-/// on, so this must stay owned for as long as the exec runs.
-struct OomReporter {
-    write_fd: libc::c_int,
-}
-
-impl Drop for OomReporter {
-    fn drop(&mut self) {
-        if self.write_fd >= 0 {
-            // ONE BYTE THAT MEANS "I LEFT ON MY OWN FEET", and it is the whole reason the reporter
-            // can afford to wait. A `SIGKILL` cannot run this, so the reporter tells a clean exit
-            // from a killed one by whether the byte arrived before the EOF: on a clean exit it stops
-            // immediately and costs the caller nothing, and only in the killed case does it wait for
-            // the counter to catch up.
-            let b = *b".";
-            unsafe { libc::write(self.write_fd, b.as_ptr().cast(), 1) };
-            unsafe { libc::close(self.write_fd) };
-        }
-    }
-}
-
-/// Fork a process that OUTLIVES a whole-box OOM and reports it, because nothing inside the box's
-/// cgroup can.
-///
-/// `kern exec` migrates the launcher into the box's cgroup so the command it forks inherits the
-/// caps. With `memory.oom.group = 1` that means a box that blows its memory ceiling takes the
-/// launcher with it, and it goes by `SIGKILL`, which cannot be caught. Measured on a `--memory 32m`
-/// box before this existed: the `kern exec` process itself returned `-9`, with empty stdout and
-/// empty stderr, while `memory.events` recorded `oom_group_kill 1`. The person who typed the command
-/// saw it die and got no reason.
-///
-/// So the reporter is forked BEFORE the migration and stays in the caller's cgroup and namespaces.
-/// It holds the read end of a pipe whose only writer is the launcher; when the launcher dies, for
-/// any reason, the write end closes and the read returns EOF. The reporter then compares
-/// `oom_group_kill` against the value it captured before anything ran, and speaks only if it grew.
-///
-/// FAILURE MODES, all of them deliberately silent, because this is a diagnostic and must never be
-/// the reason an exec does not happen:
-///
-/// * the box has no real `memory.max`, so a group OOM is not possible here -> no reporter,
-///   and no process spent on a box that cannot produce the event;
-/// * `memory.events` unreadable NOW -> no reporter, because without a baseline an increase cannot
-///   be told from a count that was already there, and announcing an OOM that did not happen is the
-///   same defect as the silence, pointed the other way;
-/// * `pipe2` or `fork` fails -> no reporter, and the exec proceeds untouched.
-///
-/// The pipe is `O_CLOEXEC` on both ends: the exec'd program must not inherit the write end and hold
-/// the reporter open for its whole life, and the reporter never execs.
-fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef, pid1: i32) -> Option<OomReporter> {
-    if !cg.has_real_memory_cap() {
-        return None;
-    }
-    // NOT THE BOX'S OWN CGROUP, an ANCESTOR of it. The first version read the box's own
-    // `memory.events` after the launcher died and it was a coin toss, because `memory.oom.group`
-    // takes the directory down with the processes: sampling every 2 ms from the host, the box's
-    // cgroup was gone 10.7 ms in and `oom_group_kill` was never seen non-zero there, since the
-    // counter increments at the instant the directory is torn down. The same command reported the
-    // OOM under one harness and stayed silent under another, which is worse than never reporting:
-    // the one run that matters is the one nobody repeats.
-    //
-    // The counters are hierarchical and the ancestor outlives the box, so the event lands somewhere
-    // that is still readable afterwards. Measured across one group kill: `kern.slice` went
-    // `oom_group_kill 228 -> 229`. This is the mechanism `oom_kill_dir_for_pid` already existed for
-    // on the `kern run` path, and reusing it is the point: the rule for which directory outlives a
-    // box is not one to hold two opinions about.
-    let anc = crate::cgroup::oom_kill_dir_for_pid(pid1)?;
-    let events_fd = crate::cgroup::open_oom_events_fd(&anc)?;
-    let Some(baseline) = crate::cgroup::oom_group_kill_from_fd(events_fd) else {
-        unsafe { libc::close(events_fd) };
-        return None;
-    };
-
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return None;
-    }
-    let (r, w) = (fds[0], fds[1]);
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe { libc::close(r) };
-        unsafe { libc::close(w) };
-        return None;
-    }
-    if pid == 0 {
-        // THE REPORTER. NOTHING BELOW MAY ALLOCATE: this is a forked child, and the allocator's lock
-        // can have been copied held from a thread that does not exist here, which would make a
-        // single allocation a permanent hang. `oom_group_kill_from_fd` reads into a stack buffer for
-        // exactly this reason, and the message is a literal.
-        unsafe { libc::close(w) };
-        let mut byte = [0u8; 1];
-        // One byte means the launcher ran its `Drop`, so it was not killed and there is nothing to
-        // explain. EOF or an error means it went without one.
-        let clean = loop {
-            let n = unsafe { libc::read(r, byte.as_mut_ptr().cast(), 1) };
-            if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                continue;
-            }
-            break n == 1;
-        };
-        if clean {
-            unsafe { libc::_exit(0) };
-        }
-
-        // KILLED, so wait for the counter instead of sampling it once. Reading after the death is
-        // safe here and was not in the first version - this descriptor is on an ancestor that
-        // outlives the box - but "safe to read" is not "already updated": measured, one sample taken
-        // the instant the pipe closed reported the OOM in only 3 runs out of 10, because the process
-        // dies before the count that explains it lands. Retrying turns a race into a bounded wait.
-        //
-        // The wait costs NOTHING on a healthy exec: that path exited above on the byte. It is only
-        // ever paid by a command that has already been killed, where a few hundred milliseconds are
-        // invisible next to the fact that the caller is about to be told why.
-        //
-        // WHY A BARE CONSTANT IS ALLOWED TO STAND HERE, which is the part worth reading and not the
-        // number. This is the longest this process will spend EXPLAINING A FAILURE THAT HAS ALREADY
-        // HAPPENED, and both directions of getting it wrong are harmless:
-        //
-        //   too short  the reporter gives up before the counter lands and the caller sees `-9` with
-        //              no reason. That is the state before this reporter existed, on a path that had
-        //              already failed. No cap is lost, no process escapes, nothing regresses.
-        //   too long   someone who has just been killed waits a fraction of a second longer to read
-        //              why. Nobody perceives it after a `-9`.
-        //
-        // A constant whose two failure directions are both innocuous does not need a distribution to
-        // justify it, and measuring one would be an activity rather than an answer. This is NOT the
-        // class of a timeout on a live path, where being short is a wrong result and the number has
-        // to be earned. Raise it or lower it freely; the only thing lowering it too far costs is the
-        // sentence, never the enforcement.
-        //
-        // The margin IS measured, because it is one timestamp inside the ten runs that were needed
-        // anyway: over ten group kills the counter landed after ONE 2 ms step every time (median 2 ms,
-        // max 2 ms, one run at 0). The ceiling is 200x the slowest observed, which is what makes it
-        // generous rather than lucky.
-        let deadline = 400; // ms, in 2 ms steps
-        let mut waited = 0;
-        let mut fired =
-            crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
-        while !fired && waited < deadline {
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2_000_000,
-            };
-            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
-            waited += 2;
-            fired =
-                crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
-        }
-        if fired {
-            // WHAT THIS CLAIMS, AND WHAT IT DOES NOT. A group kill happened in the slice this box
-            // lives in while this command was running, and this command died. The slice is shared
-            // with kern's other boxes, so the counter does not name THIS box the way the `kern run`
-            // path's does; the sentence says "its box", which is what the caller can act on, and
-            // stops short of naming the process. Overclaiming here would be the same defect as the
-            // silence it replaces, pointed the other way.
-            const MSG: &[u8] = b"kern: exec: this command was killed with its box by the kernel's \
-                OOM killer, against the box's memory cap (memory.oom.group kills the whole box, the \
-                exec'd command included). Raise it with `--memory <size>`.\n";
-            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
-        }
-        unsafe { libc::_exit(0) };
-    }
-    unsafe { libc::close(r) };
-    Some(OomReporter { write_fd: w })
-}
-
 #[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
+/// What `exec_in_box` must do when the child cannot be PLACED in the box's capped cgroup.
+///
+/// The placement fails for two causes that need opposite answers, and a third caller needs a third
+/// answer, so the decision cannot live inside the function: it is the caller's policy and it is the
+/// one input that cannot be re-derived after the fork.
+///
+/// CAUSE ONE, the box is at its `pids.max`: `clone3` refuses with EAGAIN and the fallback `fork`
+/// SUCCEEDS outside the cgroup. The cap is real, in force, and the command would step around it.
+///
+/// CAUSE TWO, the host layout forbids the migration: cgroup v2 delegation containment needs write
+/// access to the `cgroup.procs` of the COMMON ANCESTOR of the source and destination, and from a
+/// shell in `/init.scope` that ancestor is the root cgroup. MEASURED on WSL2 with `systemd=true` by
+/// an outside reviewer: `kern exec` refused every single time, on a host where nothing was wrong
+/// with the box. No implementation fixes that one. A process in `/init.scope` cannot reach the
+/// user's delegated tree, and it cannot move itself there either, because that migration needs the
+/// same permission on the same root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unplaceable {
+    /// Refuse with 126 and say why. The default for `kern exec`, because a command that steps around
+    /// the box's `--memory`/`--pids-limit` while the operator believes it is capped is the silent
+    /// escape the fail-closed exists to stop.
+    Refuse,
+    /// Run it, and say so. `KERN_ALLOW_UNCAPPED`, whose documented meaning across `SECURITY.md`,
+    /// `INSTALL.md` and `RESOURCES.md` is already "explicitly accept running UNCAPPED where a cgroup
+    /// cap cannot be applied". Reusing it adds no CLI surface, which matters because that surface is
+    /// frozen, and it keeps ONE name for one concept. kern never sets it itself, so it cannot be
+    /// inherited from an outer kern; it is only ever the operator saying it.
+    ProceedWithWarning,
+    /// Run it, quietly. ONLY for kern's own `--health-cmd` probe, and only after the first one has
+    /// warned. A probe is an instrument, not the workload: refusing it turns a host cgroup layout
+    /// into a permanent false "unhealthy" for every box that has a health check, which is a broken
+    /// feature reported as a broken box. Warning on every interval instead would be a line every few
+    /// seconds, which trains the reader to ignore the stream that carries it.
+    ProceedQuietly,
+}
+
+// One parameter per thing the exec must REPRODUCE from the box it enters: its namespaces, workdir,
+// terminal, timeout, caps, seccomp filter, AppArmor profile and cgroup policy. Grouping them into a
+// struct would hide exactly the list a reader has to check when asking "does an exec match its box",
+// which is the question this function exists to answer correctly. The same reasoning, and the same
+// allow, is on `apply_limits`.
+#[allow(clippy::too_many_arguments)]
+/// The three things an `exec -it` needs to give the command a terminal the box can NAME: the two
+/// ends of the handover socket, and the CLI's hook for re-pointing `SIGWINCH` once the master
+/// changes. Grouped because they are useless individually and because `exec_in_box`'s signature is
+/// already at the limit clippy warns about.
+///
+/// `retarget` is a plain `fn` pointer on purpose: it crosses a crate boundary into the CLI, which
+/// owns the host terminal's state, and a bare pointer carries no lifetime to thread through a
+/// function that forks.
+pub struct PtyHandover {
+    /// Child end of the socketpair, inherited across the fork; the child sends the master on it.
+    pub sock_child: i32,
+    /// Parent end, which this function reads the master from after the fork.
+    pub sock_parent: i32,
+    /// Called in the PARENT with the new master, before the pump starts.
+    pub retarget: fn(i32),
+}
+
+// THIRTEEN ARGUMENTS, and each one is a decision the CHILD cannot make for itself. Everything here
+// is resolved before the fork on purpose: after it, the child may not allocate, may not read the
+// environment, and may not consult the registry. Collapsing them into a struct would move the same
+// values behind one name without changing what has to be decided when, so the lint is silenced
+// rather than satisfied. `PtyHandover` groups the three that DO belong together.
+#[allow(clippy::too_many_arguments)]
 pub fn exec_in_box(
     pid1: i32,
     command: &[String],
@@ -5167,6 +5157,13 @@ pub fn exec_in_box(
     // exec UNCONFINED into a confined box. Re-entered here so `kern exec` matches the box's confinement,
     // like caps + seccomp - otherwise an exec would run OUTSIDE the box's AppArmor profile.
     apparmor: Option<&str>,
+    // What to do if the child cannot be placed in the box's capped cgroup. Resolved by the CALLER,
+    // before the fork, because the child may not read the environment or allocate. See [`Unplaceable`].
+    unplaceable: Unplaceable,
+    // `-it`: let the exec'd command take its terminal from the BOX's devpts rather than the host's,
+    // so `ttyname()` can resolve it inside the box. `None` keeps the host pty in `tty_slave`, which
+    // works but has no name there. See [`crate::ptybox`].
+    pty: Option<PtyHandover>,
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -5215,6 +5212,11 @@ pub fn exec_in_box(
         ("pid", libc::CLONE_NEWPID),
     ];
     let mut fds: Vec<(libc::c_int, libc::c_int)> = Vec::with_capacity(ns_order.len());
+    // THE CGROUP NAMESPACE IS HELD BACK FOR THE CHILD. Joining it here would make
+    // `clone3(CLONE_INTO_CGROUP)` below answer ENOENT, because inside it the box's cgroup is the
+    // root and the ancestor it shares with ours cannot be named. The child enters it after it has
+    // been born in the right cgroup, which is the same place it ends up either way.
+    let mut cgroup_ns_fd: libc::c_int = -1;
     for (name, flag) in ns_order {
         // A namespace the box SHARES with us is not one to join, and joining it fails. `--net` is the
         // case that made this visible: `/proc/<pid1>/ns/net` is not missing there, it EXISTS and
@@ -5230,7 +5232,11 @@ pub fn exec_in_box(
         let p = cstr(&format!("/proc/{pid1}/ns/{name}"))?;
         let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd >= 0 {
-            fds.push((fd, flag));
+            if flag == libc::CLONE_NEWCGROUP {
+                cgroup_ns_fd = fd;
+            } else {
+                fds.push((fd, flag));
+            }
         }
         // A missing ns file means the box is gone; the required-namespace check below catches that.
     }
@@ -5301,10 +5307,10 @@ pub fn exec_in_box(
     // period and IS used, but only on the box START path, which places its child before entering any
     // namespace and where the saving is real. Buying those milliseconds here costs the cap.
     //
-    // KNOWN PROPERTY, not a new one: this puts the launcher inside the box's memory cap for the rest
-    // of its life, where a whole-box OOM can take it down. Recovering that without losing the cap needs
-    // the child to be created in the cgroup before the namespaces are joined and then to enter the PID
-    // namespace itself, which takes a second fork - a restructure, not an ordering change.
+    // AND THE LAUNCHER IS OUT OF THE BLAST RADIUS. While it migrated, `memory.oom.group` killed it with
+    // the box, so the process that would have explained the kill was the one being killed, and a third
+    // process outside the group had to exist to say so. That watcher is gone: the launcher survives,
+    // reports the OOM itself after `waitpid`, and returns 137 instead of dying of SIGKILL.
     //
     // WHAT THE CALLER USED TO SEE WHEN THAT HAPPENED, measured rather than guessed. A `--memory 32m`
     // box, an exec'd command that allocates past it:
@@ -5334,25 +5340,51 @@ pub fn exec_in_box(
     // BEFORE the migration below, because a reporter forked after it would be inside the group and
     // would die with everything else. `_reporter` keeps the pipe's write end alive for exactly as
     // long as this process is alive; that is the whole signal.
-    let _reporter = box_cg.as_ref().and_then(|c| spawn_oom_reporter(c, pid1));
+    // NESSUN GUARDIANO, e la ragione e' che il lanciatore adesso SOPRAVVIVE. Finche' migrava dentro il
+    // cgroup, `memory.oom.group` lo uccideva col box e il processo che avrebbe potuto spiegare l'evento
+    // era quello ucciso: serviva un terzo processo fuori dal gruppo. Ora `clone3(CLONE_INTO_CGROUP)`
+    // colloca il FIGLIO e il lanciatore resta fuori, quindi puo' riportare da se'. Un processo in meno
+    // per ogni `kern exec`, e una macchina a stati in meno.
+    //
+    // La linea di base si legge QUI, prima che parta qualsiasi cosa, su un ANTENATO che sopravvive al
+    // box: il cgroup del box viene smontato insieme ai suoi processi, misurato sparito 10,7 ms dopo.
+    let oom_events_fd = crate::cgroup::oom_kill_dir_for_pid(pid1)
+        .and_then(|d| crate::cgroup::open_oom_events_fd(&d));
+    let oom_baseline = oom_events_fd.and_then(crate::cgroup::oom_group_kill_from_fd);
 
-    let placed = box_cg.as_ref().is_some_and(crate::cgroup::join_box_cgroup);
-    if !placed && box_has_explicit_caps {
-        if let Some(cg) = box_cg.as_ref() {
-            if let crate::cgroup::ExecCgroupJoin::Unbounded =
-                crate::cgroup::exec_join_outcome_after_failure(cg)
-            {
-                eprintln!(
-                    "kern: exec: warning: this host runs the box in a per-box systemd scope that \
-                     the kernel won't let `kern exec` join, so the command runs OUTSIDE the box's \
-                     --memory/--pids caps (its namespaces + seccomp still isolate it). A host with \
-                     kern's delegated kern.slice (e.g. running kern as root) caps exec'd commands \
-                     too."
-                );
-            }
-        }
-    }
-    drop(box_cg);
+    // IS THERE A CAP TO ESCAPE AT ALL? Computed HERE, before the `setns` below, and this is the
+    // input the refusal was missing.
+    //
+    // The block that used to stand here was dead: `let placed = true;` followed by `if !placed`,
+    // left behind when the migration was replaced by `clone3`. It called
+    // `exec_join_outcome_after_failure`, which is the function that answers exactly this question,
+    // and nothing consulted the answer.
+    //
+    // WHAT THAT COST, reported by an outside reviewer on a host with no delegation: `kern exec`
+    // refused with 126 on a box that was NOT at its pids limit, saying the command "would run
+    // outside its --memory/--pids caps" on a box that HAD no caps. `apply_limits` returns `None`
+    // where nothing can be delegated, so the box sits in the caller's own cgroup,
+    // `box_cgroup_dir_for_exec` answers `None`, `fork_into_cgroup(None)` reports `born = false`, and
+    // the refusal fired on a placement that had nothing to place. A refusal for a loss that did not
+    // happen, with a message naming caps that did not exist.
+    //
+    // BEFORE THE `setns`, and that is not a preference: `exec_join_outcome_after_failure` reads
+    // `memory.max` and `pids.max` through the cgroup's DESCRIPTOR, and the comment on that function
+    // records what happened when the same read was done afterwards through a path - inside the box's
+    // namespaces the host path names nothing, both reads failed, and a box capped at
+    // `--pids-limit 2 --memory 64M` was reported as having no cap worth mentioning.
+    //
+    // `None` means the box has no cgroup of its own, so there is nothing to be outside of.
+    let escaping_a_real_cap = crate::cgroup::placement_failure_costs_a_cap(
+        box_cg.is_some(),
+        box_cg.as_ref().is_some_and(|cg| {
+            matches!(
+                crate::cgroup::exec_join_outcome_after_failure(cg),
+                crate::cgroup::ExecCgroupJoin::Unbounded
+            )
+        }),
+    );
+    // `box_cg` is kept alive for the `clone3` below, which needs its descriptor.
 
     for (fd, flag) in &fds {
         if unsafe { libc::setns(*fd, *flag) } != 0 {
@@ -5376,11 +5408,53 @@ pub fn exec_in_box(
     // the cgroup this process was migrated into above. NOTHING IS PLACED HERE - a second placement
     // after the `setns` is not a safety net, it is a copy of the same decision that always fails, and
     // reading its failure is what produced the silent uncapped exec.
-    let pid = unsafe { libc::fork() };
+    let (pid, born) = crate::cgroup::fork_into_cgroup(box_cg.as_ref());
     if pid < 0 {
         return Err(Error::last("fork"));
     }
     if pid == 0 {
+        if cgroup_ns_fd >= 0 {
+            unsafe { libc::setns(cgroup_ns_fd, libc::CLONE_NEWCGROUP) };
+        }
+        // FAIL-CLOSED, and this is the half the experiment showed was missing. `clone3` refuses with
+        // EAGAIN once the box is at its `pids.max`, and `fork_into_cgroup`'s fallback is a plain
+        // `fork` that SUCCEEDS and leaves the child outside the cgroup: measured, a box at 2/2
+        // accepted the exec with exit 0 and the command ran with no ceiling. That is the same silent
+        // escape the pre-`setns` migration was put back to close.
+        if !born && escaping_a_real_cap {
+            // AND IT NAMES THE TWO CAUSES, because a refusal that states only the consequence leaves
+            // the reader with nothing to do. An outside reviewer hit this on WSL2 with `systemd=true`:
+            // `kern exec` refused every time, on a host where the previous release ran the command
+            // uncapped and said so, and the message gave no way to tell a full box from a host layout
+            // that can never work. The two causes need opposite actions and only the reader can tell
+            // them apart, so both are named and `kern doctor` is pointed at, which reports which cap
+            // path this host takes in its first two lines.
+            //
+            // ONE `const` LITERAL, written with `write(2)`: this is between a fork and an exec, where
+            // nothing may allocate or format. The `\`-continuations are stripped by the compiler
+            // along with the indentation that follows them, so the reader sees one sentence. That is
+            // worth stating because `cargo fmt` will join such a literal back onto one line if it is
+            // ever edited, and the indentation then becomes runs of spaces INSIDE the message.
+            //
+            // AND THE DEFAULT IS STILL REFUSE. What changed is that a host where the placement can
+            // NEVER succeed no longer loses the verb outright: `KERN_ALLOW_UNCAPPED` is the operator
+            // saying the uncapped run is intended, which is the meaning that variable already carries
+            // for `kern box` and `kern run`, and kern's own health probe proceeds because refusing it
+            // reports a healthy box as unhealthy. Both alternatives are the CALLER's decision, taken
+            // before this fork; nothing here reads the environment.
+            match unplaceable {
+                Unplaceable::Refuse => {
+                    const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and no exec can join a box here; `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs it anyway.\n";
+                    unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+                    unsafe { libc::_exit(126) };
+                }
+                Unplaceable::ProceedWithWarning => {
+                    const MSG: &[u8] = b"kern: exec: KERN_ALLOW_UNCAPPED is set, so the command runs OUTSIDE the box's --memory/--pids caps. The box's namespaces, seccomp filter and AppArmor profile still apply to it; only the resource ceiling does not.\n";
+                    unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+                }
+                Unplaceable::ProceedQuietly => {}
+            }
+        }
         // For a `--health-timeout` probe: become a **session leader** (`setsid`) so this grandchild is
         // a new process-group/session leader inside the box's pid namespace whose host-visible id is
         // `pid` - the probe and everything it forks then live in that group, so the parent can
@@ -5405,7 +5479,20 @@ pub fn exec_in_box(
             exec_fail_closed("could not sanitise the environment");
         }
         // `-it`: adopt the PTY slave as the controlling terminal (before seccomp - a setup syscall).
-        if let Some(slave) = tty_slave {
+        //
+        // THE BOX'S OWN DEVPTS IS ALREADY OURS HERE: `setns` put this child in the box's mount
+        // namespace, so `/dev/ptmx` is the box's multiplexer and a pair opened from it lands at
+        // `/dev/pts/N` - a path that RESOLVES for the command about to run. The host slave in
+        // `tty_slave` is the fallback and stays exactly as it was if any of this fails.
+        // `/dev` and not `<root>/dev`: `setns` already put this child in the box's mount namespace,
+        // so the box's devpts IS `/dev/pts` here. Same handover as the box start path, same code.
+        let box_slave = pty
+            .as_ref()
+            .and_then(|h| crate::ptybox::hand_over_pair("/dev", h.sock_child));
+        if let Some(h) = pty.as_ref() {
+            unsafe { libc::close(h.sock_child) };
+        }
+        if let Some(slave) = box_slave.or(tty_slave) {
             adopt_controlling_tty(slave);
         }
         // Honor `--workdir` - fatal if it can't be entered (consistent with `kern box -w`, so a
@@ -5479,7 +5566,32 @@ pub fn exec_in_box(
         if let Some(slave) = tty_slave {
             unsafe { libc::close(slave) };
         }
-        return Ok(pty_pump_and_wait(master, pid));
+        // THE BOX'S MASTER, IF THE CHILD BUILT ONE. `recv_fd` answers `None` on EOF, so a child that
+        // never reached the allocation (or could not) costs one read and leaves the host pty pumping,
+        // which is exactly what happened before this existed.
+        let mut master = master;
+        if let Some(h) = pty.as_ref() {
+            unsafe { libc::close(h.sock_child) };
+            if let Some(m) = crate::ptybox::recv_fd(h.sock_parent) {
+                // Size and SIGWINCH follow the terminal actually in use; the CLI owns that state.
+                (h.retarget)(m);
+                unsafe { libc::close(master) };
+                master = m;
+            }
+        }
+        let code = pty_pump_and_wait(master, pid);
+        if let Some(h) = pty.as_ref() {
+            unsafe { libc::close(h.sock_parent) };
+        }
+        return Ok(code);
+    }
+    // No terminal on this call, so the handover channel is pure cost: close both ends rather than
+    // let a `--health-cmd` probe accumulate two descriptors per interval.
+    if let Some(h) = pty.as_ref() {
+        unsafe {
+            libc::close(h.sock_child);
+            libc::close(h.sock_parent);
+        }
     }
     let mut status = 0i32;
     match timeout_secs {
@@ -5514,7 +5626,45 @@ pub fn exec_in_box(
             if reap_retry_eintr(pid, &mut status) < 0 {
                 return Err(Error::last("waitpid"));
             }
-            Ok(wait_code(status))
+            let code = wait_code(status);
+            // SIGKILL E IL CONTATORE SALITO: il comando e' stato ucciso col box. Da solo `128 + SIGKILL`
+            // non dice niente, perche' SIGKILL ha molti mittenti; l'incremento di `oom_group_kill` sul
+            // cgroup ANTENATO e' cio' che lo attribuisce.
+            //
+            // ⛔ L'attesa e' necessaria e non e' cautela: il contatore atterra DOPO che il processo e'
+            // morto. Misurato, un solo campione preso all'istante della morte riportava l'OOM in 3 corse
+            // su 10. A passi di 2 ms fino a 400: sono 200x il massimo osservato (2 ms), e questo tempo lo
+            // paga solo un comando GIA' ucciso, mai uno sano.
+            if code == 128 + libc::SIGKILL {
+                if let (Some(fd), Some(base)) = (oom_events_fd, oom_baseline) {
+                    let mut fired = false;
+                    let mut waited = 0;
+                    while !fired && waited <= 400 {
+                        fired =
+                            crate::cgroup::oom_group_kill_from_fd(fd).is_some_and(|now| now > base);
+                        if fired {
+                            break;
+                        }
+                        let ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 2_000_000,
+                        };
+                        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                        waited += 2;
+                    }
+                    if fired {
+                        eprintln!(
+                            "kern: exec: this command was killed with its box by the kernel's OOM \
+                             killer, against the box's memory cap (memory.oom.group kills the whole \
+                             box, the exec'd command included). Raise it with `--memory <size>`."
+                        );
+                    }
+                }
+            }
+            if let Some(fd) = oom_events_fd {
+                unsafe { libc::close(fd) };
+            }
+            Ok(code)
         }
     }
 }

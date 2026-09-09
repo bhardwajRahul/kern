@@ -988,6 +988,39 @@ pub(crate) fn run_probe(
             // tradeoff, the same one taken for the probe's baseline caps; applying the profile here is
             // the separately-tracked follow-up.
             None,
+            // A PROBE THAT REFUSES REPORTS A HEALTHY BOX AS UNHEALTHY, and that is what `Refuse`
+            // would do here. The placement fails for a cause the box has no part in: cgroup v2
+            // delegation containment forbids the migration from a caller sitting outside the tree
+            // kern's cgroups live in, measured on WSL2 with `systemd=true`. Refusing there marks
+            // EVERY box with a `--health-cmd` permanently unhealthy, for a host property, with
+            // nothing in the health output naming the cause. That is a broken feature reported as a
+            // broken box, which is strictly worse than what the refusal protects against.
+            //
+            // WHAT IT COSTS, stated rather than glossed: on such a host the probe runs outside the
+            // box's `--memory`/`--pids-limit`. The probe command is kern's own, from the registry, so
+            // a workload cannot choose it, but the BINARY it names lives in the workload-writable
+            // rootfs. This is the identical tradeoff already taken and documented four lines above
+            // for the probe's baseline caps and its unconfined AppArmor, and it applies on the same
+            // narrow set of hosts.
+            //
+            // AND IT PROCEEDS SILENTLY, because the only stream it could speak on goes nowhere.
+            //
+            // The first version of this used `ProceedWithWarning` on the first probe and quiet after,
+            // on the reasoning that a line every interval trains the reader to skip it. MEASURED
+            // before shipping that reasoning: a marker written to fd 2 from inside the probe's child
+            // appears in a foreground `kern exec` (the positive control) and does NOT appear in
+            // `kern logs`, nor in the box's log file, which stays 0 bytes. The detached supervisor's
+            // stdout and stderr are the same pipe and nothing reads it, so a warning there is written
+            // into a hole. A notice nobody can read is the silent-success shape this codebase
+            // refuses, and keeping it would have been worse than not having it: it would have looked
+            // like the condition was reported.
+            //
+            // The condition IS reported, in the one place an operator looks when a host behaves like
+            // this: `kern doctor`'s scope-toll row names it, alongside the `kern exec` consequence
+            // that has the same cause. See `check_scope_toll`.
+            kern_isolation::Unplaceable::ProceedQuietly,
+            // A health probe has no terminal, so there is no handover: `-it` never applies to it.
+            None,
         )
         .unwrap_or(1);
         unsafe { libc::_exit(code) };

@@ -118,7 +118,19 @@ fn check_scope_toll() -> R {
         format!(
             "this session is outside the systemd user manager, so every box pays a transient scope to enforce its caps: at least {ms:.1} ms here, on top of the box itself{caveat}"
         ),
-        "pay it ONCE: `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5)".into(),
+        // AND THE TWO CONSEQUENCES THAT ARE NOT ABOUT SPEED, because this row is the only place they
+        // are reachable. The same boundary that costs a transient scope per box also stops `kern
+        // exec` joining a box's cgroup: cgroup v2 delegation containment needs write access to the
+        // `cgroup.procs` of the COMMON ANCESTOR, and from outside the user manager's tree that is the
+        // root cgroup. So `kern exec` refuses, and the refusal points HERE to tell the two causes
+        // apart. An outside reviewer, on WSL2 with `systemd=true`, reported that the pointer resolved
+        // to a row which did not name the way through; this is that gap.
+        //
+        // The health probe is named for the opposite reason: it does NOT refuse, it runs outside the
+        // box's caps, and its own stderr is unreadable (measured: the detached supervisor's stdout
+        // and stderr are one pipe nobody reads, and the box log stays 0 bytes). A consequence that
+        // cannot announce itself where it happens has to be announced where it can be read.
+        "pay it ONCE: `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5). The same boundary stops `kern exec` joining a box's cgroup here, so it refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the uncapped command is intended (its namespaces, seccomp filter and AppArmor profile still apply); a `--health-cmd` probe is never refused and runs outside the box's caps on this host".into(),
     )
 }
 
@@ -890,7 +902,15 @@ fn check_max_userns() -> R {
 /// than none, because the reader spends the attempt and concludes kern is broken rather than
 /// undelegated.
 fn delegation_hint() -> String {
-    let common = "boxes still run and the isolation holds";
+    // Every branch ends with the same CHECK, because a reviewer who saw this warning and a 137 from a
+    // `--memory` box on the same host had no way to tell which of the two was describing kern's cap.
+    // `memory_max_enforced` is read back from the box's own cgroup, so `null` there agrees with this
+    // row and a number contradicts it; and a kill by kern's OWN cap always prints kern's OOM line,
+    // which a system OOM kill (also SIGKILL, also exit 137) does not.
+    let common = "boxes still run and the isolation holds; to check this row against a running box, \
+                  read `memory_max_enforced` in `kern inspect --json` (null = nothing in force, and \
+                  an exit 137 without kern's own OOM message on stderr is the SYSTEM's OOM killer, \
+                  not a cap)";
     match kern_isolation::delegation_blocker() {
         kern_isolation::DelegationBlocker::ControllerNotEnabled => format!(
             "{common}; add `memory` to this tree's `cgroup.subtree_control`, or run kern under a \
@@ -946,11 +966,11 @@ fn check_cgroup() -> R {
                     .into(),
             ),
             MemoryCapState::PresentNotDelegated => R::Warn(
-                "cgroup v2 present, no systemd --user manager, and the `memory` controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and silently never bites".into(),
+                format!("cgroup v2 present, no systemd --user manager, and the `memory` controller is listed but NOT delegated to a child cgroup ({}) - a `--memory` write is accepted and silently never bites", memory_probe_sites_phrase()),
                 delegation_hint(),
             ),
             MemoryCapState::Absent => R::Warn(
-                "cgroup v2 present, no systemd --user manager, and the `memory` controller is not in this cgroup's tree - `--memory`/`--pids-limit` will not bind".into(),
+                format!("cgroup v2 present, no systemd --user manager, and the `memory` controller is not in this cgroup's tree ({}) - `--memory`/`--pids-limit` will not bind", memory_probe_sites_phrase()),
                 "boxes still run and the isolation holds; enable `cgroup_enable=memory` (stock Raspberry Pi OS) or use a kernel that delegates it (Microsoft's default WSL2 kernel does not)".into(),
             ),
             MemoryCapState::Unknown => R::Warn(
@@ -1008,11 +1028,38 @@ fn check_cgroup() -> R {
             };
             R::Warn(
                 format!(
-                    "systemd --user scope present but a `--memory` write does not bind in the box's cap target (user manager delegates: {listed}) - `--memory` won't be enforced (`--cpus`/`--pids-limit` may still work)"
+                    "systemd --user scope present but a `--memory` write does not bind in the box's cap target ({}; user manager delegates: {listed}) - `--memory` won't be enforced (`--cpus`/`--pids-limit` may still work)",
+                    memory_probe_sites_phrase()
                 ),
                 "enable it: /etc/systemd/system/user@.service.d/delegate.conf → [Service] Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)".into(),
             )
         }
+    }
+}
+
+/// The directories the `--memory` probe actually wrote into, formatted for a report row.
+///
+/// An outside reviewer held a release on this row: doctor said a `--memory` write "silently never
+/// bites" while a box on the same host exited 137 under `--memory`, and the sentence named no
+/// directory, so neither of us could tell whether the two statements were even about the same cgroup.
+/// Their box's PID 1 sat in `0::/`. A verdict about a cgroup that does not say WHICH cgroup cannot be
+/// checked against `/proc/<pid>/cgroup`, so every negative memory row now carries these paths.
+///
+/// The paths come from [`kern_isolation::memory_cap_probe_sites`], the same call the probe resolves
+/// its targets with, so this can never name a directory the probe did not use.
+fn memory_probe_sites_phrase() -> String {
+    let (slice, own) = kern_isolation::memory_cap_probe_sites();
+    let mut sites: Vec<String> = Vec::new();
+    for s in [slice, own].into_iter().flatten() {
+        let d = s.display().to_string();
+        if !sites.contains(&d) {
+            sites.push(d);
+        }
+    }
+    if sites.is_empty() {
+        "no cap target could be resolved".to_string()
+    } else {
+        format!("probed a child of: {}", sites.join(", "))
     }
 }
 
@@ -1375,6 +1422,84 @@ fn which(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// EVERY NEGATIVE MEMORY-CAP ROW MUST NAME THE DIRECTORY IT PROBED.
+    ///
+    /// An outside reviewer refused a release on this. doctor printed that a `--memory` write
+    /// "silently never bites", and on the same host a `--memory 64m` box exited 137 through `exec`.
+    /// The sentence named no cgroup and their box's PID 1 sat in `0::/`, so nothing in the output
+    /// said whether the two statements were even about the same directory - and the verdict could
+    /// not be checked against `/proc/<pid1>/cgroup`, the one file that settles it.
+    ///
+    /// This host answers `Enforced`, so none of the three negative arms RUN here and a behavioural
+    /// test would pass while asserting nothing (the mistake that let the previous version of this
+    /// row ship). The rows are built inline inside `check_cgroups`, so the check is made against the
+    /// SOURCE: each arm that reports a cap not binding must interpolate
+    /// [`memory_probe_sites_phrase`], and the assertion below fails on a new arm that forgets it.
+    #[test]
+    fn a_row_that_denies_a_memory_cap_names_the_cgroup_it_probed() {
+        let src = include_str!("doctor.rs");
+        // The arms that say a cap does not bind. Each is matched by its distinctive verdict text so
+        // that renaming the enum cannot silently empty this list.
+        let denials = [
+            "listed but NOT delegated to a child cgroup",
+            "is not in this cgroup's tree",
+            "does not bind in the box's cap target",
+        ];
+        for d in denials {
+            // The row's own `format!` call, from the verdict text back to the nearest `format!`.
+            let at = src.find(d).unwrap_or_else(|| {
+                panic!("no memory-cap row says {d:?} any more - update this test")
+            });
+            let head = &src[..at];
+            let start = head
+                .rfind("format!")
+                .expect("a denial row must be a format!");
+            // BOUNDED BY THE NEXT `format!`, not by a byte count. The first version took a fixed
+            // 400-byte window after the verdict text, which reached PAST the end of the first arm and
+            // into the second - so deleting the phrase from arm one left the test green on arm two's
+            // copy. A mutation put that in front of me: the window has to end where the row does.
+            let end = src[at..]
+                .find("format!")
+                .map(|o| at + o)
+                .unwrap_or(src.len());
+            let row = &src[start..end];
+            assert!(
+                row.contains("memory_probe_sites_phrase()"),
+                "the row saying {d:?} states a cap does not bind without naming the cgroup it \
+                 probed; a reviewer cannot check that against /proc/<pid1>/cgroup"
+            );
+        }
+        // POSITIVE CONTROL: the search above must be capable of failing. A verdict that is NOT a
+        // denial has no reason to carry the phrase, and if it did the assertion would be vacuous.
+        let ok_at = src
+            .find("no systemd --user manager needed: caps enforced")
+            .expect("the enforced row must still exist");
+        assert!(
+            !src[ok_at..ok_at + 200].contains("memory_probe_sites_phrase()"),
+            "the ENFORCED row carries the phrase too, so the assertion above proves nothing"
+        );
+    }
+
+    /// The phrase must name REAL, absolute cgroup paths - not an empty parenthesis.
+    ///
+    /// [`memory_probe_sites_phrase`] resolves its paths through
+    /// `kern_isolation::memory_cap_probe_sites`, the same call the probe uses, so this also pins that
+    /// the two cannot drift apart into naming a directory no cap is ever written to.
+    #[test]
+    fn the_probed_sites_are_named_as_absolute_cgroup_paths() {
+        let phrase = super::memory_probe_sites_phrase();
+        if phrase == "no cap target could be resolved" {
+            return; // Honest on a host with no v2 cgroup at all; nothing to name.
+        }
+        assert!(phrase.starts_with("probed a child of: "), "got {phrase:?}");
+        for p in phrase.trim_start_matches("probed a child of: ").split(", ") {
+            assert!(
+                p.starts_with("/sys/fs/cgroup"),
+                "a named site must be a cgroupfs path, got {p:?}"
+            );
+        }
+    }
+
     /// THE ROW MUST NOT SAY `available` FOR A MOUNT THAT WAS REFUSED.
     ///
     /// Every non-zero exit collapsed into one `None`, which `check_overlay` matched with `_ =>` and

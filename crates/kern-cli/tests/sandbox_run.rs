@@ -32,6 +32,75 @@ fn kern_out(args: &[&str]) -> std::process::Output {
     out
 }
 
+/// Kern's delegated `kern.slice`, WHERE KERN PUTS IT, or `None` on a host that caps another way.
+///
+/// A bounded search under this user's own `user@<uid>.service`, and not a read of
+/// `/proc/self/cgroup`. The first version of the orphan-sweep test derived the slice from the latter,
+/// which is the TEST BINARY's cgroup: run from a terminal inside a systemd scope, that path has no
+/// `kern.slice` and never will, so the test skipped on every run and proved nothing.
+///
+/// One definition for the four tests that need it. It was two copies of the same closure, and a
+/// search that answers "this host caps another way" is exactly the kind of helper whose copies drift
+/// into disagreeing about when to skip.
+fn find_kern_slice() -> Option<std::path::PathBuf> {
+    let uid = unsafe { libc::getuid() };
+    let base = std::path::PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+    ));
+    let mut stack = vec![(base, 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 4 {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if e.file_name() == "kern.slice" {
+                return Some(p);
+            }
+            stack.push((p, depth + 1));
+        }
+    }
+    None
+}
+
+/// The name of the capped leaf `slice` holds for the kern process `pid`, waiting up to two seconds
+/// for it to appear, or `None` if none does.
+///
+/// ASKED BY NAME AND NOT BY READING `/proc/<pid>/cgroup`, and the difference is the whole point: on
+/// the direct path the kern process stays OUTSIDE the leaf it creates (that is what keeps a whole-box
+/// OOM from taking the process that has to report it), so its own cgroup line names the caller's
+/// cgroup and never the leaf. The leaf carries `<pid>` in its NAME, which is the handle every reader
+/// of these directories uses. The first version of this helper read the proc line and skipped on a
+/// host where the property under test held perfectly.
+///
+/// It WAITS rather than sleeps a fixed time: the leaf is what the assertions are about, so landing
+/// before it exists would assert nothing and pass.
+fn wait_for_leaf_of(slice: &Path, pid: u32) -> Option<String> {
+    for _ in 0..100 {
+        if let Ok(rd) = fs::read_dir(slice) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.ends_with(&format!("-{pid}")) {
+                    return Some(n);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    None
+}
+
+/// Does `pid` have at least one child yet? The portable "the fork has happened" signal, true on both
+/// the direct path (where kern forks the workload) and the scope path (where it forks a proxy).
+fn has_forked(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .is_ok_and(|c| !c.trim().is_empty())
+}
+
 /// A statically-linked busybox we can drop into an otherwise-empty rootfs, or `None`.
 fn static_busybox() -> Option<PathBuf> {
     ["/bin/busybox", "/usr/bin/busybox"]
@@ -6127,30 +6196,7 @@ fn a_box_start_still_reaps_an_orphan_cgroup() {
     // a terminal inside a systemd scope, that path has no `kern.slice` and never will, so the test
     // skipped on every run and proved nothing. A bounded search under the user's own cgroup finds
     // whichever one this host actually caps through.
-    let find_slice = || -> Option<std::path::PathBuf> {
-        let uid = unsafe { libc::getuid() };
-        let base = std::path::PathBuf::from(format!(
-            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-        ));
-        let mut stack = vec![(base, 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > 4 {
-                continue;
-            }
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                if !p.is_dir() {
-                    continue;
-                }
-                if e.file_name() == "kern.slice" {
-                    return Some(p);
-                }
-                stack.push((p, depth + 1));
-            }
-        }
-        None
-    };
+    let find_slice = find_kern_slice;
 
     let root = build_rootfs(&busybox, "sweep");
     let run_one = |name: &str| -> std::process::Output {
@@ -6262,30 +6308,7 @@ fn the_supervisor_leaf_is_reaped_and_does_not_accumulate() {
     // The SAME bounded search the orphan test uses, and for the reason its comment records: deriving the
     // slice from `/proc/self/cgroup` finds the TEST binary's cgroup, which has no `kern.slice` under a
     // terminal's scope, so the test would skip on every run and prove nothing.
-    let find_slice = || -> Option<std::path::PathBuf> {
-        let uid = unsafe { libc::getuid() };
-        let base = std::path::PathBuf::from(format!(
-            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-        ));
-        let mut stack = vec![(base, 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > 4 {
-                continue;
-            }
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                if !p.is_dir() {
-                    continue;
-                }
-                if e.file_name() == "kern.slice" {
-                    return Some(p);
-                }
-                stack.push((p, depth + 1));
-            }
-        }
-        None
-    };
+    let find_slice = find_kern_slice;
     let count_sup = |slice: &std::path::Path| -> usize {
         let Ok(rd) = fs::read_dir(slice) else {
             return 0;
@@ -8900,5 +8923,883 @@ fn from_an_earlier_stage_builds_an_image_that_runs_and_hides_deleted_files() {
     assert!(
         leaked.contains("clean"),
         "a file deleted behind an opaque directory must not reappear in the squashed image, got {leaked:?}"
+    );
+}
+
+/// **`kern run` is capped by a leaf it creates AND removes, without a systemd scope.**
+///
+/// `kern run` used to buy its cap with a transient `systemd-run --user --scope`, which cleaned up
+/// from outside and cost 4.12 ms of a 4.70 ms run (measured, 200 samples, the shipped extreme
+/// binary). It now caps directly under `kern.slice` and reaps the leaf itself. That trade is only
+/// sound if BOTH halves hold, so both are asserted here on one run:
+///
+///   1. the cap is REAL and is the requested value, read from the workload's own cgroup;
+///   2. nothing is left behind, read from the slice after the process is gone.
+///
+/// Half 2 alone would pass on a build that applies no cap at all, and half 1 alone would pass on a
+/// build that leaks a directory per invocation, which is what the systemd `--collect` used to
+/// prevent. Skipped where this host caps another way (no `kern.slice`), which is a host property.
+#[test]
+fn a_kern_run_is_capped_by_a_leaf_it_removes_afterwards() {
+    let Some(slice) = find_kern_slice() else {
+        eprintln!("skip: no kern.slice under this user's cgroup, so this host caps another way");
+        return;
+    };
+    // The workload reads its OWN `memory.max`, through its own `/proc/self/cgroup`. Asking the
+    // cgroup and not kern is the rule this project keeps for cap questions: a value kern prints is
+    // kern's claim, and a value the kernel exposes to the capped process is the cap.
+    let out = kern()
+        .args([
+            "run",
+            "--memory",
+            "64m",
+            "--",
+            "sh",
+            "-c",
+            "c=$(cut -d: -f3 /proc/self/cgroup); echo \"$c\"; cat /sys/fs/cgroup$c/memory.max",
+        ])
+        .output()
+        .expect("run kern");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let (Some(cg), Some(max)) = (lines.next(), lines.next()) else {
+        eprintln!("skip: `kern run` produced no cgroup reading here: {text:?}");
+        return;
+    };
+    let leaf = cg.rsplit('/').next().unwrap_or("");
+    if !leaf.starts_with("kern-run-") {
+        eprintln!(
+            "skip: this host did not take the direct path ({cg}), so there is no leaf of ours"
+        );
+        return;
+    }
+    assert_eq!(
+        max.trim(),
+        "67108864",
+        "`--memory 64m` must be the workload's own `memory.max`, not a larger ancestor's: {text:?}"
+    );
+    // AND THE DIRECTORY IS GONE. The `rmdir` is the parent's, in `Drop`, after the `waitpid` - the
+    // job systemd's `--collect` did on the path this replaced. A leak here is invisible to the user
+    // and accumulates one directory per `kern run`.
+    assert!(
+        !slice.join(leaf).exists(),
+        "the `kern run` leaf {leaf} must be removed when the command exits, or every run leaks a cgroup dir"
+    );
+}
+
+/// **A live `kern run` is not a box, and `kern ps` must not report it as one.**
+///
+/// `kern ps` lists every live `kern-box-*` directory it finds and WARNS that those with no registry
+/// record cannot be stopped. `kern run`'s leaf now lives in the same slice as the boxes', so the
+/// name is the only thing keeping the two apart.
+///
+/// MEASURED before the prefixes were split, with a `kern-box-run-<live pid>` placed in `kern.slice`
+/// by hand:
+///
+/// ```text
+/// kern: warning: 1 box(es) are RUNNING with no registry record, so `kern stop` cannot reach them
+/// kern:   run (supervisor pid 149338)
+/// ```
+///
+/// The assertion is on OUR pid rather than on the warning's presence, because this suite runs in
+/// parallel and another test's box may legitimately produce that line at the same moment.
+#[test]
+fn a_live_kern_run_is_not_reported_as_a_box_by_ps() {
+    let Some(slice) = find_kern_slice() else {
+        eprintln!("skip: no kern.slice under this user's cgroup, so this host caps another way");
+        return;
+    };
+    let mut child = kern()
+        .args(["run", "--", "sleep", "5"])
+        .spawn()
+        .expect("spawn kern run");
+    let pid = child.id();
+    let leaf = wait_for_leaf_of(&slice, pid);
+    let Some(name) = leaf else {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!(
+            "skip: `kern run` created no leaf of its own here, so this host caps another way"
+        );
+        return;
+    };
+    let ps = kern().arg("ps").output().expect("run kern ps");
+    let _ = child.kill();
+    let _ = child.wait();
+    let seen = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ps.stdout),
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    // THE CONSEQUENCE FIRST, then the mechanism. What a user sees is the warning; the prefix is only
+    // how it is prevented. Asserting the prefix first would fail this test one line before it ever
+    // exercised `kern ps`, and the report would name a naming convention rather than the defect.
+    assert!(
+        !seen.contains(&format!("supervisor pid {pid}")),
+        "`kern ps` must not report a running `kern run` as an unreachable box, got:\n{seen}"
+    );
+    assert!(
+        name.starts_with("kern-run-"),
+        "a `kern run` must not land in a leaf that carries the BOX prefix, got {name}"
+    );
+}
+
+/// **A `kern run` killed by its own cap says so, and the code that says it is the one holding the
+/// leaf.**
+///
+/// The OOM message used to be printed by the scope proxy, which could only read a shared ANCESTOR's
+/// counter because `--collect` had already removed the box's own cgroup. The direct path's parent
+/// reads the leaf itself, before dropping the guard that removes it. That ordering is the whole
+/// test: read the counter one line later and it finds nothing, which is the silent 137 this message
+/// exists to end.
+///
+/// Skipped where no memory cap can bind (WSL2's default kernel, a stock Raspberry Pi OS) - there the
+/// workload is not killed at all, and that is the host, not kern.
+#[test]
+fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
+    if find_kern_slice().is_none() {
+        eprintln!("skip: no kern.slice under this user's cgroup, so this host caps another way");
+        return;
+    }
+    // A HEAP HOG WITH NO INTERPRETER, so the test does not depend on python being installed: `sh`
+    // grows a shell variable, which is an ordinary heap allocation charged to the cgroup.
+    let out = kern()
+        .args([
+            "run",
+            "--memory",
+            "16m",
+            "--",
+            "sh",
+            "-c",
+            "s=xxxxxxxxxxxxxxxx; while :; do s=$s$s; done",
+        ])
+        .output()
+        .expect("run kern");
+    let code = out.status.code();
+    if code != Some(137) {
+        eprintln!("skip: no memory cap bound here (exit {code:?}), so nothing could be OOM-killed");
+        return;
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("OOM killer"),
+        "a 137 from kern's own cap must be explained, not left as a bare signal: {err:?}"
+    );
+}
+
+/// **`kern run` propagates its command's exit code and forwards a fatal signal to it.**
+///
+/// Both were free while `kern run` `exec()`d in place: the workload WAS the process. The direct path
+/// forks, so the parent now has to translate the child's wait status and relay Ctrl-C, and a proxy
+/// that gets either wrong is invisible until a script depends on it. The SIGINT half asserts 130
+/// (`128 + SIGINT`) reaches the caller, which can only happen if the parent forwarded the signal and
+/// then reported the child's death rather than dying first.
+#[test]
+fn a_kern_run_reports_its_commands_exit_code_and_relays_a_signal() {
+    let out = kern()
+        .args(["run", "--", "sh", "-c", "exit 42"])
+        .output()
+        .expect("run kern");
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "`kern run` must exit with the command's own code, got {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut child = kern()
+        .args(["run", "--", "sleep", "30"])
+        .spawn()
+        .expect("spawn kern run");
+    // Wait until the command is really running: signalling before the fork would test the parent's
+    // startup, not the relay. `has_forked` is the one signal true on BOTH paths - the direct path
+    // forks the workload, the scope path forks a proxy - so this test does not quietly become
+    // path-specific.
+    for _ in 0..200 {
+        if has_forked(child.id()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let st = child.wait().expect("wait kern run");
+    assert_eq!(
+        st.code(),
+        Some(128 + libc::SIGINT),
+        "a SIGINT to `kern run` must reach the command and come back as 130, got {st:?}"
+    );
+}
+
+/// **An inherited `KERN_DIRECT_CAPS` is the PARENT's decision, and `kern run` must not act on it.**
+///
+/// The direct-path decision is recorded in an env var, so it survives into everything kern execs -
+/// the workload included, and so into a `kern` that workload runs. `kern run` now READS that value
+/// to decide whether to fork and which leaf to build, which is exactly what makes an inherited one
+/// harmful.
+///
+/// The discriminant is `KERN_NO_SCOPE=1`, whose documented meaning is that no scope and no
+/// delegated slice are used. It returns from the decision site BEFORE the marker is ever written, so
+/// an inherited `1` is the only thing that can be read there. MEASURED with the scrub removed:
+///
+/// ```text
+/// 0::/user.slice/user-1000.slice/user@1000.service/kern.slice/kern-run-255890
+/// ```
+///
+/// where the command should have stayed in the caller's own cgroup. `kern box` has scrubbed at its
+/// entry since the marker existed; `run` did not need to until it started reading the value.
+#[test]
+fn a_kern_run_does_not_inherit_its_parents_direct_path_decision() {
+    if find_kern_slice().is_none() {
+        eprintln!(
+            "skip: no kern.slice under this user's cgroup, so there is nothing to be lured into"
+        );
+        return;
+    }
+    let out = kern()
+        .args(["run", "--", "cat", "/proc/self/cgroup"])
+        .env("KERN_NO_SCOPE", "1")
+        .env("KERN_DIRECT_CAPS", "1") // the poison: a decision this invocation never made
+        .env("KERN_ALLOW_UNCAPPED", "1") // KERN_NO_SCOPE is deliberate here; silence its warning
+        .output()
+        .expect("run kern");
+    let cg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !cg.is_empty(),
+        "the command must have run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !cg.contains("kern.slice"),
+        "`KERN_NO_SCOPE=1` must not cap through kern.slice on an INHERITED marker, got {cg}"
+    );
+    // AND NOTHING IS ASSERTED ABOUT THE SLICE'S CONTENTS, deliberately. The first version of this
+    // test also required `kern.slice` to hold zero `kern-run-*` leaves, which is a property of a
+    // SHARED directory and not of this invocation: under the suite's parallelism the other `kern run`
+    // tests have their own leaves in it at that instant, and the assertion read 2 where it demanded 0.
+    // A test that fails because a sibling test is running is worse than no test - the cgroup line
+    // above is this invocation's own evidence, and it is what goes red when the scrub is removed.
+}
+
+/// **A `kern run` cleans up after a `kern run` that was killed before it could clean up itself.**
+///
+/// The leaf is removed by the parent's `Drop` on every ordinary exit, so the only way one survives is
+/// a parent that never ran it: a SIGKILL, an OOM, a power cut. `kern box` self-heals that through
+/// `sweep_orphans_off_hot_path`, called by its launcher AFTER the box is spawned. Nothing on the
+/// `run` path called it at all, so on a machine that only ever runs `kern run` those leaves
+/// accumulated until a `kern box` or a `kern gc` came along.
+///
+/// The sweep now runs in `run`'s own parent while it waits on the workload, which is why this test
+/// asserts a dead-owner leaf disappears across an ORDINARY `kern run` and not across a `gc`.
+///
+/// The owner pid is one verified absent from `/proc`, not merely a large number: `pid_max` varies by
+/// kernel, and a pid above it can never exist, which would make the test pass for the wrong reason.
+#[test]
+fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
+    // ASK THE VERB WHERE IT CAPS, because every cheaper way of guessing has now been wrong once.
+    //
+    // First this looked for `kern.slice` on the filesystem and planted there. That is not the
+    // question: `apply_limits` uses `kern.slice` only when placement into it is PERMITTED, and falls
+    // back to the caller's own cgroup when cgroup v2 delegation containment refuses the migration.
+    // On GitHub's runner the directory exists, the cap binds in the caller's cgroup instead, the
+    // sweep correctly scans that one, and a leaf planted in `kern.slice` is never looked at. The
+    // second version measured that a cap is built at all: necessary, and still not enough, because
+    // it proved the sweep RUNS without proving WHERE.
+    //
+    // So the workload reports its own cgroup, and the parent of that leaf is by construction the
+    // directory this verb caps and sweeps in. One reading, no inference.
+    let reported = kern()
+        .args([
+            "run",
+            "-m",
+            "64m",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sed -n 's/^0:://p' /proc/self/cgroup",
+        ])
+        .output();
+    let leaf = reported
+        .as_ref()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    // It must be a leaf THIS VERB named. Without a `kern-run-` component the caller's own cgroup was
+    // echoed back, meaning no capped leaf was built and there is nothing here to sweep.
+    let Some(slice) = leaf
+        .rsplit_once('/')
+        .filter(|(_, n)| n.starts_with("kern-run-"))
+        .map(|(parent, _)| std::path::PathBuf::from(format!("/sys/fs/cgroup{parent}")))
+        .filter(|p| p.is_dir())
+    else {
+        eprintln!("skip: `kern run` built no capped leaf of its own here ({leaf:?}), so it forks no reaper and sweeps nothing");
+        return;
+    };
+    let dead = (2u32..2_000_000)
+        .rev()
+        .find(|pid| !Path::new(&format!("/proc/{pid}")).exists())
+        .expect("a pid that is not in use");
+    let orphan = slice.join(format!("kern-run-{dead}"));
+    if fs::create_dir(&orphan).is_err() {
+        eprintln!("skip: cannot create a cgroup dir under {slice:?} on this host");
+        return;
+    }
+    // UP TO TEN RUNS, because the per-start sweep examines at most `SWEEP_LIMIT` entries so that its
+    // cost stays O(1): under this suite's parallelism the slice can hold more than that at the
+    // instant of any one run, and the planted dir is then simply not among the ones looked at. Ten
+    // bounded attempts is still a statement about the sweep - with the call removed, no number of
+    // runs clears it - and it is not a statement about which entry a single readdir happened to
+    // reach.
+    let mut gone = false;
+    for _ in 0..10 {
+        let _ = kern().args(["run", "--", "/bin/true"]).output();
+        if !orphan.exists() {
+            gone = true;
+            break;
+        }
+    }
+    // COUNTED BEFORE THE CLEANUP, because the other way this can fail is the bounded sweep never
+    // reaching the planted entry: it examines at most `SWEEP_LIMIT` per run, and under this suite's
+    // parallelism the slice can hold more. A bare "was not reaped" cannot tell that apart from "the
+    // sweep never ran", which is exactly the ambiguity that cost a CI round to resolve by hand.
+    let crowd = fs::read_dir(&slice).map(|d| d.count()).unwrap_or(0);
+    let _ = fs::remove_dir(&orphan);
+    assert!(
+        gone,
+        "a dead-owner `kern run` leaf must be reaped by a later `kern run`, or a host that only ever \
+         runs this verb accumulates one directory per killed launcher. The slice held {crowd} \
+         entries at the end; the sweep examines at most 128 per run, so a number near or above that \
+         means the planted dir was never looked at rather than never swept"
+    );
+}
+
+/// **A plain `kern run` under its DEFAULT cap must say nothing, and the check that decides it must
+/// read the WORKLOAD's cgroup rather than its own.**
+///
+/// `kern run` keeps this process OUTSIDE the capped leaf whenever it forks, so that a whole-box OOM
+/// cannot take the process that has to report it. The "no RAM ceiling" notice therefore cannot be
+/// answered from `/proc/self/cgroup`: that names a cgroup which is uncapped BY CONSTRUCTION.
+///
+/// MEASURED against a build with the directory argument replaced by `None`, which is the whole of
+/// the defect this pins: every plain `kern run` printed
+///
+/// ```text
+/// kern: warning: KERN_NO_SCOPE skipped the systemd scope, and with it kern's DEFAULT memory cap -
+/// this command runs with no RAM ceiling and no OOM backstop ...
+/// ```
+///
+/// over a workload whose own `memory.max` read 536870912, and named a variable that was not set.
+///
+/// The assertion is paired: the notice must be absent AND the cap must really be there. Absence
+/// alone would pass on a build that stopped applying the default altogether, which is the failure
+/// the notice exists to report.
+#[test]
+fn a_default_capped_kern_run_is_silent_and_the_cap_is_really_there() {
+    let out = kern()
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "c=$(cut -d: -f3 /proc/self/cgroup); cat /sys/fs/cgroup$c/memory.max",
+        ])
+        .env_remove("KERN_QUIET")
+        .env_remove("KERN_ALLOW_UNCAPPED")
+        .env_remove("KERN_NO_SCOPE")
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let cap = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cap.is_empty() || cap == "max" {
+        eprintln!(
+            "skip: no memory cap binds on this host, so there is nothing to stay quiet about"
+        );
+        return;
+    }
+    assert_eq!(
+        cap, "536870912",
+        "a plain `kern run` must carry kern's 512 MiB default in the WORKLOAD's own cgroup: {err}"
+    );
+    assert!(
+        !err.contains("no RAM ceiling"),
+        "the default cap is in force, so nothing may claim otherwise. This fires when the check \
+         reads the supervisor's cgroup instead of the workload's: {err}"
+    );
+}
+
+/// **The uncapped notice must name the reason it can actually name.**
+///
+/// One message used to serve every way of reaching this branch, and it said "unset KERN_NO_SCOPE to
+/// get the default back". `KERN_NO_SCOPE` is only one of them: a host with no systemd user manager
+/// whose own cgroup cannot hold a capped child gets here too, and there that sentence names a
+/// variable the user never set and a remedy that changes nothing. An instruction that cannot work
+/// is worse than none, because it ends the reader's search at the wrong place.
+///
+/// Both halves are asserted in the same test, because either alone is satisfiable by a build that
+/// prints one message unconditionally.
+#[test]
+fn the_uncapped_notice_names_the_cause_it_can_name_and_not_the_other_one() {
+    // WITH the opt-out: the variable is the cause, so the message must name it.
+    let opted_out = kern()
+        .args(["run", "--", "/bin/true"])
+        .env("KERN_NO_SCOPE", "1")
+        .env_remove("KERN_QUIET")
+        .env_remove("KERN_ALLOW_UNCAPPED")
+        .output()
+        .expect("run kern");
+    let a = String::from_utf8_lossy(&opted_out.stderr).into_owned();
+    if !a.contains("no RAM ceiling") {
+        eprintln!("skip: a cap still binds under KERN_NO_SCOPE here, so the notice is correct to stay quiet");
+        return;
+    }
+    assert!(
+        a.contains("KERN_NO_SCOPE"),
+        "with the opt-out set, the notice must name it as the cause: {a}"
+    );
+    // WITHOUT it, and with no user manager reachable. `XDG_RUNTIME_DIR` pointing at a directory with
+    // no `systemd` socket in it is what makes `user_systemd_present()` false, so this is a controlled
+    // input rather than a host property: it reproduces on any host, including one that does have a
+    // manager.
+    let nomgr = std::env::temp_dir().join(format!("kern-nomgr-{}", std::process::id()));
+    let _ = fs::create_dir_all(&nomgr);
+    let out = kern()
+        .args(["run", "--", "/bin/true"])
+        .env("XDG_RUNTIME_DIR", &nomgr)
+        .env("DBUS_SESSION_BUS_ADDRESS", "")
+        .env_remove("KERN_NO_SCOPE")
+        .env_remove("KERN_QUIET")
+        .env_remove("KERN_ALLOW_UNCAPPED")
+        .output()
+        .expect("run kern");
+    let b = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = fs::remove_dir_all(&nomgr);
+    if !b.contains("no RAM ceiling") {
+        eprintln!("skip: this host still capped the run with no user manager, so the branch was not reached");
+        return;
+    }
+    assert!(
+        !b.contains("KERN_NO_SCOPE"),
+        "with the opt-out UNSET, the notice must not blame it, or it sends the reader after a \
+         variable they never set: {b}"
+    );
+}
+
+/// **A refusal must name what to do, and this one names two causes because only the reader can tell
+/// them apart.**
+///
+/// `kern exec` fails closed when the command cannot be placed in the box's cgroup, because the
+/// alternative is a command that runs outside the box's `--memory`/`--pids-limit` and says nothing.
+/// That is right. What was missing is the next step: an outside reviewer hit the refusal on every
+/// `kern exec` on WSL2 with `systemd=true`, where the previous release ran the command uncapped and
+/// warned, and the message gave no way to tell a FULL box from a host layout on which no exec can
+/// ever join.
+///
+/// The two causes need opposite actions, so both are named. This test pins the message rather than
+/// the refusal: the refusal itself is covered by `exec_joins_the_box_cgroup_so_resource_caps_apply`.
+///
+/// It also pins the shape of the literal. It is a `const` written between a fork and an exec, where
+/// nothing may allocate, and its `\`-continuations are stripped by the compiler along with the
+/// indentation that follows. `cargo fmt` will join such a literal back onto one line if it is edited,
+/// and the indentation then becomes runs of spaces the user sees. That happened to another message in
+/// this codebase the same day.
+#[test]
+fn the_exec_refusal_names_both_causes_and_reads_as_one_sentence() {
+    let src = fs::read_to_string("../kern-isolation/src/real.rs")
+        .or_else(|_| fs::read_to_string("crates/kern-isolation/src/real.rs"))
+        .expect("the isolation source is next to this test");
+    let anchor = "kern: exec: refusing: the command could not be placed";
+    let start = src.find(anchor).expect("the refusal message must exist");
+    let end = src[start..].find("\\n\";").expect("the literal must end") + start;
+    // Reproduce what the compiler does with a `\`-continuation: drop the backslash, the newline and
+    // the indentation behind it. Asserting on the SOURCE would pass with the spaces still in.
+    let mut rendered = String::new();
+    let mut skipping = false;
+    for ch in src[start..end].chars() {
+        match ch {
+            '\\' => skipping = true,
+            c if skipping && c.is_whitespace() => {}
+            c => {
+                skipping = false;
+                rendered.push(c);
+            }
+        }
+    }
+    assert!(
+        !rendered.contains("  "),
+        "the message carries collapsed indentation as double spaces: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("--pids-limit"),
+        "the FULL-BOX cause must be named, or a user at their pids cap has nothing to raise: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("cgroup tree it delegates"),
+        "the HOST-LAYOUT cause must be named, or a user on a host where no exec can ever join reads \
+         it as a transient failure and retries forever: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("kern doctor"),
+        "and it must point at the one command that reports WHICH of the two it is: {rendered:?}"
+    );
+}
+
+/// **`/dev/tty` is absent from a box on purpose, and absent must not mean CREATABLE.**
+///
+/// The device is deliberately not in the box's set: a controlling terminal enables TIOCSTI-style
+/// injection on unhardened kernels. That reason was re-measured before this test was written rather
+/// than taken on trust, and it is stronger than the comment says. A box started WITHOUT `-it` from a
+/// shell that has a terminal INHERITS the launcher's controlling terminal:
+///
+/// ```text
+/// launcher under a real pty   tty_nr=34816  (/dev/pts/0)
+/// the box's workload          tty_nr=34816  (the SAME device)
+/// ```
+///
+/// So a `/dev/tty` inside the box would open the operator's own terminal. The exclusion stays.
+///
+/// What was wrong is what happened next: `/dev` is a tmpfs the box's root owns, so `> /dev/tty`
+/// CREATED a regular file. An outside reviewer measured `-rw-rw-r--` with 2 bytes where the host has
+/// `crw-rw-rw- 5, 0`. A program writing a prompt there got no error and the operator saw nothing.
+///
+/// Both halves are asserted, because either alone is satisfiable by the wrong build: a test that only
+/// checked "not a character device" would pass against the silent-file behaviour, and one that only
+/// checked the write fails would pass against a build that added the device and made it read-only.
+#[test]
+fn dev_tty_is_absent_as_a_device_and_refuses_to_become_a_file() {
+    let out = kern()
+        .args([
+            "box",
+            "devtty",
+            "--image",
+            "alpine",
+            "--",
+            "sh",
+            "-c",
+            // The redirect FIRST, then the type, so the check is of what the write left behind.
+            "echo x > /dev/tty 2>&1; printf 'TYPE='; [ -c /dev/tty ] && printf chardev; \
+             [ -d /dev/tty ] && printf dir; [ -f /dev/tty ] && printf file; \
+             [ -e /dev/tty ] || printf absent; echo",
+        ])
+        .output()
+        .expect("run kern");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !text.contains("TYPE=") {
+        eprintln!("skip: the box did not run here: {err}");
+        return;
+    }
+    assert!(
+        !text.contains("TYPE=file"),
+        "a write to /dev/tty must not silently create a regular file: {text}"
+    );
+    assert!(
+        !text.contains("TYPE=chardev"),
+        "the controlling-terminal device must stay OUT of the box: a box without -it inherits the \
+         launcher's terminal, so this would be the operator's own tty: {text}"
+    );
+    assert!(
+        text.contains("Is a directory") || text.contains("TYPE=dir"),
+        "and the write must FAIL loudly rather than appear to succeed: {text}"
+    );
+}
+
+/// **A setup failure carries its own remedy, because nothing downstream can add one.**
+///
+/// `report_exec_failure` runs in the FORKED CHILD and `_exit`s immediately after printing, so the
+/// error never reaches the CLI's hint function and no match arm there can help it. An outside
+/// reviewer measured the consequence: `kern: sandbox setup failed: mount(overlay) failed: Invalid
+/// argument (os error 22)` arriving with no hint at all, while every neighbouring branch in the same
+/// function carries one.
+///
+/// Driven through the reviewer's EXACT failure, reproduced deterministically: `--rootfs /proc` is a
+/// directory that exists and cannot be an overlay lowerdir, so the mount fails with EINVAL every
+/// time. The first version of this test used `RLIMIT_AS` and SKIPPED on this host, which is the
+/// third time in this session a test asserted a guard it never reached.
+///
+/// It also asserts the rendering, not the source. A `\`-continued literal is joined back onto one
+/// line by `cargo fmt`, leaving the indentation as runs of spaces inside the message. That has
+/// happened three times here in one day, and this hint shipped
+/// `command: the mount,      the uid map` before this assertion existed.
+#[test]
+fn a_setup_failure_printed_from_the_forked_child_still_carries_a_hint() {
+    let out = kern()
+        .args(["box", "sfhint", "--rootfs", "/proc", "--", "/bin/true"])
+        .output()
+        .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !err.contains("sandbox setup failed") {
+        eprintln!("skip: `--rootfs /proc` did not fail in box SETUP on this host: {err}");
+        return;
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a box that could not be BUILT exits 125, not a command-not-found code: {err}"
+    );
+    assert!(
+        err.contains("hint:"),
+        "a setup failure must not arrive bare: it is printed from the forked child, which exits \
+         before anything can add a hint to it: {err}"
+    );
+    assert!(
+        err.contains("kern doctor"),
+        "and the hint must point at the one command that reports all four causes: {err}"
+    );
+    // ONE SENTENCE, not a literal with the source's indentation baked into it.
+    let hint = err
+        .lines()
+        .find(|l| l.starts_with("hint:"))
+        .unwrap_or_default();
+    assert!(
+        !hint.contains("  "),
+        "the hint carries collapsed indentation as double spaces: {hint:?}"
+    );
+}
+
+/// **`kern exec` refuses an unplaceable command by default, and `KERN_ALLOW_UNCAPPED` is the way
+/// through.**
+///
+/// The placement fails for two causes. One is a box at its `pids.max`, where the cap is real and in
+/// force and the command would step around it. The other is cgroup v2 delegation containment: from a
+/// caller outside the tree kern's cgroups live in, the migration needs write access to the
+/// `cgroup.procs` of the COMMON ANCESTOR, which is the root cgroup. An outside reviewer measured that
+/// second one on WSL2 with `systemd=true`, where `kern exec` then refused every single time and the
+/// verb was lost on the whole host class. No implementation fixes it: a process in `/init.scope`
+/// cannot reach the user's delegated tree and cannot move itself there either.
+///
+/// So the default stays REFUSE, and the escape is the variable that already means this. Across
+/// `SECURITY.md`, `INSTALL.md` and `RESOURCES.md`, `KERN_ALLOW_UNCAPPED` is documented as "explicitly
+/// accept running UNCAPPED where a cgroup cap cannot be applied". Reusing it adds no CLI surface,
+/// which matters because that surface is frozen and `kern exec` takes none of the cap flags.
+///
+/// DRIVEN THROUGH CAUSE ONE, which is reproducible on any host: a box whose `--pids-limit` is
+/// saturated makes `clone3` refuse with EAGAIN while the fallback `fork` succeeds outside the cgroup,
+/// which is the same `!born` the host-layout cause produces. Both branches are asserted in one test
+/// because either alone is satisfiable by the wrong build: only-refuse passes against a build that
+/// ignores the variable, and only-proceed passes against one that never refuses.
+#[test]
+fn exec_refuses_an_unplaceable_command_and_the_documented_variable_is_the_way_through() {
+    let name = format!("plx{}", std::process::id());
+    let started = kern()
+        .args([
+            "box",
+            &name,
+            "--image",
+            "alpine",
+            "--pids-limit",
+            "4",
+            "-d",
+            "--",
+            "sh",
+            "-c",
+            "sleep 300 & sleep 300 & sleep 300 & sleep 300",
+        ])
+        .output()
+        .expect("run kern");
+    if !started.status.success() {
+        eprintln!(
+            "skip: this host cannot start a pids-limited box: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    let refused = kern()
+        .args(["exec", &name, "--", "/bin/true"])
+        .env_remove("KERN_ALLOW_UNCAPPED")
+        .output()
+        .expect("run kern");
+    let allowed = kern()
+        .args(["exec", &name, "--", "/bin/echo", "RAN"])
+        .env("KERN_ALLOW_UNCAPPED", "1")
+        .output()
+        .expect("run kern");
+    let _ = kern().args(["stop", &name]).output();
+
+    let rerr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    if !rerr.contains("could not be placed") {
+        eprintln!("skip: this host placed the exec even at the pids limit, so neither branch was reached: {rerr}");
+        return;
+    }
+    assert_eq!(
+        refused.status.code(),
+        Some(126),
+        "the default must refuse with 126: {rerr}"
+    );
+    assert!(
+        rerr.contains("KERN_ALLOW_UNCAPPED"),
+        "and the refusal must name the way through, or a host where the placement can NEVER succeed \
+         simply loses the verb: {rerr}"
+    );
+    assert!(
+        !rerr.contains("  "),
+        "the refusal carries collapsed indentation as double spaces: {rerr:?}"
+    );
+
+    let aerr = String::from_utf8_lossy(&allowed.stderr).into_owned();
+    let aout = String::from_utf8_lossy(&allowed.stdout).into_owned();
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "with the variable set the command must RUN: {aerr}"
+    );
+    assert!(
+        aout.contains("RAN"),
+        "and produce its output: {aout:?} {aerr}"
+    );
+    assert!(
+        aerr.contains("OUTSIDE the box"),
+        "and say what it gave up, because running uncapped in silence is the defect the refusal \
+         exists to prevent: {aerr:?}"
+    );
+    assert!(
+        !aerr.contains("  "),
+        "the warning carries collapsed indentation as double spaces: {aerr:?}"
+    );
+}
+
+/// **A health probe is never refused for a placement failure, because that reports a healthy box as
+/// unhealthy.**
+///
+/// `exec_in_box` has two callers and only one of them is an operator's command. The other is kern's
+/// own `--health-cmd` probe, and refusing it there turns a host cgroup layout into a permanent false
+/// "unhealthy" for every box that has a health check, with nothing in the health output naming the
+/// cause. That is a broken feature reported as a broken box.
+///
+/// The same `--pids-limit` saturation that makes `kern exec` refuse is used to reach the branch, so
+/// this asserts the two callers behave DIFFERENTLY under one condition. A test on the probe alone
+/// would pass against a build that never refuses anything.
+#[test]
+fn a_health_probe_is_not_refused_where_kern_exec_would_be() {
+    let name = format!("hpx{}", std::process::id());
+    let started = kern()
+        // THE SAME SATURATION THE SIBLING TEST USES, and it has to be: at `--pids-limit 6` the box
+        // was not full at the moment of the exec, the branch under test was never reached, and the
+        // test SKIPPED while reporting a pass. Four slots and four sleeps is the shape measured to
+        // fail the placement every time.
+        .args([
+            "box",
+            &name,
+            "--image",
+            "alpine",
+            "--pids-limit",
+            "4",
+            "-d",
+            "--health-cmd",
+            "/bin/true",
+            "--health-interval",
+            "1",
+            "--",
+            "sh",
+            "-c",
+            "sleep 300 & sleep 300 & sleep 300 & sleep 300",
+        ])
+        .output()
+        .expect("run kern");
+    if !started.status.success() {
+        eprintln!(
+            "skip: this host cannot start a pids-limited box with a health check: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        return;
+    }
+    // Long enough for at least two intervals, so the once-per-process warning is exercised as well
+    // as the quiet path behind it.
+    std::thread::sleep(std::time::Duration::from_millis(2600));
+    let ps = kern().args(["ps"]).output().expect("run kern ps");
+    let refused = kern()
+        .args(["exec", &name, "--", "/bin/true"])
+        .env_remove("KERN_ALLOW_UNCAPPED")
+        .output()
+        .expect("run kern");
+    let _ = kern().args(["stop", &name]).output();
+
+    let rerr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    if !rerr.contains("could not be placed") {
+        eprintln!("skip: this host placed the exec at the pids limit, so the branch under test was never reached");
+        return;
+    }
+    let seen = String::from_utf8_lossy(&ps.stdout).into_owned();
+    assert!(seen.contains(&name), "the box must still be listed: {seen}");
+    assert!(
+        !seen.contains("unhealthy"),
+        "kern exec is refused on this box, and the health probe must NOT be, or a host cgroup layout \
+         becomes a permanent false unhealthy: {seen}"
+    );
+}
+
+/// **`kern doctor` names the way through, on the host class where `kern exec` refuses.**
+///
+/// The refusal points at `kern doctor` to tell its two causes apart. An outside reviewer checked
+/// whether that pointer resolves and found the row did not name `KERN_ALLOW_UNCAPPED`, so a reader
+/// who followed it learned which cause they had and not what to do about it. That is a pointer to
+/// half an answer, and it is the last thing they asked for.
+///
+/// The same row also has to name the health probe, and for a reason that is not symmetry: the probe
+/// does NOT refuse, it runs outside the box's caps, and its own stderr is unreadable. Measured before
+/// this row was written: a marker written to fd 2 from inside the probe's child appears in a
+/// foreground `kern exec` and does NOT appear in `kern logs` or in the box's log file, which stays
+/// 0 bytes. A consequence that cannot announce itself where it happens must be announced where it
+/// can be read, and this is the only such place.
+///
+/// Skipped where this session IS inside the user manager's tree, because the row that carries the
+/// text is then correctly absent: that is a host property, and asserting it here would be asserting
+/// the host rather than kern.
+#[test]
+fn doctor_names_the_escape_on_the_host_class_where_exec_refuses() {
+    let out = kern().arg("doctor").output().expect("run kern doctor");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !text.is_empty(),
+        "doctor must produce output: {:?}",
+        out.status
+    );
+    // THE SOURCE-LEVEL HALF, WHICH RUNS EVERYWHERE, and it is here because the half below cannot.
+    // Reaching the `Warn` branch needs a session that has a user manager and sits OUTSIDE its tree,
+    // and a process inside that tree cannot move itself out: the migration needs write access to the
+    // `cgroup.procs` of the common ancestor, which is the same wall this whole row is about. So on a
+    // developer desktop the runtime half always skips, and a test that only had it would report a
+    // pass while asserting nothing. This reads the literal that row prints.
+    let src = fs::read_to_string("../kern-cli/src/doctor.rs")
+        .or_else(|_| fs::read_to_string("crates/kern-cli/src/doctor.rs"))
+        .expect("the doctor source is next to this test");
+    let anchor = "pay it ONCE: `systemd-run --user --scope bash`";
+    let start = src.find(anchor).expect("the scope-toll remedy must exist");
+    let end = src[start..]
+        .find("\".into(),")
+        .expect("the literal must end")
+        + start;
+    let literal = &src[start..end];
+    for token in ["KERN_ALLOW_UNCAPPED", "kern exec", "health"] {
+        assert!(
+            literal.contains(token),
+            "the scope-toll remedy must name {token:?}: `kern exec` points readers at this row to \
+             tell its two causes apart, and the probe cannot announce itself anywhere else. Got: \
+             {literal}"
+        );
+    }
+
+    if !text.contains("outside the systemd user manager") {
+        eprintln!(
+            "skip: the RUNTIME half only: this session is inside the user manager's tree, so the row \
+             that carries the text is correctly absent. The source half above ran."
+        );
+        return;
+    }
+    assert!(
+        text.contains("KERN_ALLOW_UNCAPPED"),
+        "the row must name the way through, or `kern exec`'s refusal points at half an answer: {text}"
+    );
+    assert!(
+        text.contains("exec"),
+        "and it must say WHICH verb refuses, or the variable arrives without its condition: {text}"
+    );
+    assert!(
+        text.contains("health"),
+        "and name the probe, whose own stderr is unreadable, so this row is the only place that \
+         consequence can be stated: {text}"
     );
 }

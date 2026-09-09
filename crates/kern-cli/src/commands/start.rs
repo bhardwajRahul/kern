@@ -1693,6 +1693,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     }
                 }
             }
+            // No terminal on this path, so nothing to swap: see `run_in_sandbox_with`'s `on_started`.
+            None
         },
         None,
         ports,
@@ -1803,6 +1805,16 @@ pub fn run(
     landlock_rw: &[String],
 ) -> Result<(), Error> {
     use std::os::unix::process::CommandExt;
+    // AN INHERITED DIRECT-CAP-PATH MARKER IS THIS PROCESS'S PARENT'S DECISION, NOT ITS OWN.
+    //
+    // The marker is an env var, so it survives into everything kern execs - including the workload,
+    // and so into a `kern` the workload runs. This verb now READS it (`took_direct_cap_path()` below
+    // decides whether to fork and which leaf to build), which is what makes an inherited one harmful:
+    // `KERN_NO_SCOPE=1 kern run` returns from the decision site before the marker is ever written, so
+    // an inherited `1` would make this claim a direct path it never chose and cap through `kern.slice`
+    // in the one mode whose documented meaning is that it does not. `kern box` scrubs at its own entry
+    // for the same reason; `run` did not need to until it started reading the value.
+    kern_isolation::scrub_direct_marker();
     // A FAST-FAIL on the write-allowlist, so a typo costs a message instead of a systemd scope and a
     // re-exec. This check is a convenience and is deliberately NOT the security decision: it stats a
     // path here, and the rule is bound to an fd opened later, so the two could in principle be
@@ -1933,21 +1945,78 @@ pub fn run(
     // no-op and the best-effort in-process cgroup below applies the same caps.
     let cpus = clamp_cpus(cpus);
     let cpuset = clamp_cpuset(cpuset)?;
-    // `kern run` exec()s in place (no supervisor to reap the cgroup) → `false`: it must use the systemd
-    // `--scope --collect` path (which auto-removes the cgroup on exit), never the direct kern.slice path.
+    // THE SCOPE IS 88% OF `kern run`, AND IT IS NOT BUYING WHAT ITS COMMENT SAID IT WAS.
+    //
+    // MEASURED on this desktop, the shipped extreme binary, 200 samples each, medians:
+    //
+    //     kern run -- /bin/true                    4.700 ms
+    //     KERN_NO_SCOPE=1 kern run -- /bin/true    0.577 ms
+    //     systemd-run --user --scope -- /bin/true  3.867 ms
+    //     kern box --rootfs … -- true              2.354 ms   (direct kern.slice path)
+    //
+    // so the transient scope costs 4.12 ms of a 4.70 ms `kern run` and is the entire reason the
+    // GOVERNOR verb is twice as slow as the verb that builds a whole container. `kern box` skips it
+    // through `kern.slice` and this verb was excluded from that by one `false`.
+    //
+    // The reason recorded for the `false` was that `kern run` "exec()s in place, so there is no
+    // supervisor to drop the RAII guard and `rmdir` the leaf". That was true of the code it was
+    // written against and has not been true since the scope re-exec grew its fork+proxy: measured by
+    // walking `/proc/<pid>/stat` from inside the workload, a `kern run` today is `bash -> kern -> sh`,
+    // with the original kern resident for the whole run as a signal-forwarding proxy. The process the
+    // comment said did not exist is the one waiting on the workload.
+    //
+    // So the direct path is granted, and the fork that makes it legitimate is performed HERE rather
+    // than assumed: see `run_forked_under_direct_caps` below. It is granted ONLY together with that
+    // fork - on any path that still `exec()`s in place, `took_direct_cap_path()` is false and the
+    // scope stays exactly as it was.
     reexec_in_scope_if_possible(ScopeReexec {
         memory,
         memory_swap_max,
         cpuset: cpuset.as_deref(),
         cpus,
         pids_max: None,
-        allow_direct: false, // `kern run` execs the workload in place - no box to tie to the launcher
+        allow_direct: true, // `kern run` forks its workload below, so it can hold the guard and clean up
         die_with_parent: false,
         allow_uncapped: kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
     });
+    // TWO INDEPENDENT DECISIONS, AND CONFLATING THEM IS WHAT LEFT A LEAK ON THE HOSTS THAT HAD IT.
+    //
+    // `direct` answers "may this relocate into kern's delegated `kern.slice`", which needs a systemd
+    // user manager. `run_should_fork` answers "must this process leave a supervisor behind to reap the
+    // workload and remove its leaf", which does NOT. The first version of this change used `direct`
+    // for both, so it forked on exactly the hosts that never leaked (there the leaf lives inside the
+    // transient scope and systemd reaps the whole unit) and left the leaking hosts untouched.
+    //
+    // MEASURED by an outside reviewer, 2026-09-09, same binary, two hosts, 200 sequential `kern run`:
+    //
+    //     Ubuntu, systemd user manager present    0 leaves -> 200 runs -> 0 leaves
+    //     WSL2 Alpine, no user manager            2 leaves -> 200 runs -> 201 leaves
+    //
+    // and the second is the configuration of the WSL rootfs this project publishes, so it was the
+    // documented Windows install path that accumulated one directory per invocation. The same host
+    // also lost the OOM diagnostic: with no process outliving the workload, a run killed by its own
+    // 512 MiB default printed the shell's bare `Killed`.
+    let direct = kern_isolation::took_direct_cap_path();
+    // NOT `!direct`. Under `KERN_SCOPE` the outer scope proxy is already the surviving process: it
+    // waits, forwards signals, reports the OOM and propagates the code, and `--collect` removes the
+    // cgroup. Under `KERN_MANAGED` / `KERN_BUILD_STEP` an ancestor owns the workload for the same
+    // reason. Forking under any of them adds a third process to the chain and buys none of it, which
+    // is exactly the question `outer_enforcer_present` already answers for the cap path.
+    let outer_enforcer = kern_isolation::outer_enforcer_present();
+    // BOUND ONCE, USED THREE TIMES, because it is one decision and not three that happen to agree.
+    // `cap_built` is `true` here because the two later uses are both inside `cg.is_some()`, and the
+    // first one is what MAKES the cgroup: if none is built, the fork re-asks with the real value and
+    // stays a single process. Writing the expression out at each site is the duplicated-derived-
+    // condition shape that has already cost this project a divergence.
+    let forking = run_should_fork(outer_enforcer, true);
     let cg = kern_isolation::apply_cgroup_limits(
-        false, // allow_direct: `kern run` exec()s in place (no supervisor) → never relocate into kern.slice
-        "run",
+        direct, // allow_direct: the kern.slice relocation, and nothing else
+        // `kern run`'s leaf is NOT a box leaf, on ANY path, and the name is what keeps it out of
+        // `kern ps` and out of reach of the sweep's `cgroup.kill`. See `kern_isolation::CgroupLeaf`.
+        // It was `kern-box-run-<pid>` before, which mattered most on the no-manager path: there the
+        // leaf is built in the CALLER's own cgroup, which `kern ps` scans, and a live `kern run` was
+        // reported as a box with no registry record that `kern stop` could not reach.
+        kern_isolation::CgroupLeaf::Run,
         memory,
         memory_swap_max,
         cpuset.as_deref(),
@@ -1958,7 +2027,12 @@ pub fn run(
         None, // no --memory-reservation in `kern run`: the soft knobs are box-shaped (compose sets them)
         None, // no --cpu-weight in `kern run`, same reason
         false, // `kern run` is a cooperative governor, never fail-closed (best-effort gate)
-        false, // supervisor_forks_workload: `kern run` exec()s in place, so THIS process is the workload
+        // supervisor_forks_workload: the SAME value the fork below acts on, so the two cannot drift.
+        // `true` keeps this process OUT of the capped leaf so a whole-box OOM cannot take the process
+        // that has to report it; `false` puts it IN, which is required where it `exec()`s in place.
+        // Getting it wrong is not cosmetic: `true` without the fork runs the workload in the UNCAPPED
+        // parent, which is the failure `apply_limits` documents against this very parameter.
+        forking,
     );
     // For its RESOURCE CAPS `kern run` is a cooperative governor, not an isolation boundary - so unlike
     // `kern box` it does NOT fail-closed when a cap can't be applied. But make the drop VISIBLE, not
@@ -1987,7 +2061,21 @@ pub fn run(
         && cpus.is_none()
         && !kern_common::env_flag("KERN_QUIET")
         && !kern_common::env_flag("KERN_ALLOW_UNCAPPED")
-        && !kern_isolation::memory_cap_in_force_at_or_below(SCOPE_MEMORY_MAX_BYTES)
+        && !kern_isolation::memory_cap_in_force_at_or_below(
+            // THE WORKLOAD'S CGROUP, NOT THIS PROCESS'S, WHEREVER THE TWO DIFFER.
+            //
+            // `will_fork` puts this process OUTSIDE the capped leaf on purpose, so that a whole-box
+            // OOM cannot take the process that has to report it. A self-read then answers about a
+            // cgroup that is uncapped BY CONSTRUCTION, and this branch would print "no RAM ceiling"
+            // over a workload holding the exact 512 MiB default. It is the same correction
+            // `warn_unenforced_caps` already carries one branch up, and it is why that one takes a
+            // directory at all. `None` where this process IS the workload, which is every path that
+            // still `exec()`s in place.
+            cg.as_ref()
+                .filter(|_| forking)
+                .map(kern_isolation::CgroupGuard::box_dir),
+            SCOPE_MEMORY_MAX_BYTES,
+        )
     {
         // THE DEFAULT CAP, WHICH NOBODY TYPED AND WHICH BOTH BRANCHES ABOVE ARE BLIND TO.
         //
@@ -2014,19 +2102,51 @@ pub fn run(
         // VERIFIED against the cgroup rather than inferred from `cg` or from the absence of an env
         // var, for the same reason the sandbox path does it that way: the question is whether a cap is
         // in force, and only the cgroup answers that.
-        eprintln!(
-            "kern: warning: KERN_NO_SCOPE skipped the systemd scope, and with it kern's DEFAULT \
-             memory cap - this command runs with no RAM ceiling and no OOM backstop, in the cgroup \
-             of whatever started it. Unset KERN_NO_SCOPE to get the default back, pass an explicit \
-             `--memory <size>` (applied best-effort on this path), or set KERN_ALLOW_UNCAPPED=1 to \
-             say the uncapped run is intended and silence this."
-        );
+        //
+        // THE CAUSE IS NAMED, NOT ASSUMED, and it used to be assumed. This branch is reached whenever
+        // nothing was typed and nothing binds, and `KERN_NO_SCOPE` is only ONE of the ways to get
+        // here: a host with no systemd user manager whose own cgroup cannot take a capped child
+        // reaches it too, and so does one where the controllers are not delegated. The single message
+        // told all of them "unset KERN_NO_SCOPE to get the default back", which on those hosts names
+        // a variable the user never set and a remedy that changes nothing. An instruction that cannot
+        // work is worse than no instruction, because it ends the reader's search at the wrong place.
+        if kern_common::env_flag("KERN_NO_SCOPE") {
+            eprintln!(
+                "kern: warning: KERN_NO_SCOPE skipped the systemd scope, and with it kern's DEFAULT \
+                 memory cap - this command runs with no RAM ceiling and no OOM backstop, in the \
+                 cgroup of whatever started it. Unset KERN_NO_SCOPE to get the default back, pass an \
+                 explicit `--memory <size>` (applied best-effort on this path), or set \
+                 KERN_ALLOW_UNCAPPED=1 to say the uncapped run is intended and silence this."
+            );
+        } else {
+            eprintln!(
+                "kern: warning: this host could not give the command a memory cgroup, so kern's \
+                 DEFAULT memory cap is not in force - it runs with no RAM ceiling and no OOM \
+                 backstop, in the cgroup of whatever started it. `kern doctor` reports which part is \
+                 missing; an explicit `--memory <size>` is applied best-effort on this path, and \
+                 KERN_ALLOW_UNCAPPED=1 says the uncapped run is intended and silences this."
+            );
+        }
     }
-    // `kern run` exec()s the workload IN PLACE - there is no supervisor left to reap it and drop the
-    // guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to exec into, which is
-    // non-empty (we're in it) → EBUSY → a no-op anyway. Forget it so the intent is explicit: we do NOT
-    // tear down our own live cgroup here. (Same as the pre-guard behaviour - the `run` cgroup outlives
-    // this call; it's removed when the whole systemd scope / caller lifecycle is collected.)
+    // THE FORK - and past this line, on every path, this process is the workload's.
+    //
+    // Where it forks, this call returns ONLY in the child, which is inside the capped leaf; the
+    // parent stays behind proxying signals, reaps the workload, drops the guard (which `rmdir`s the
+    // leaf) and exits with the workload's code, so it never reaches any of the code below. Where an
+    // outer enforcer already supervises the workload, or where no cap could be built at all, it is a
+    // no-op and this process is still the one that will `exec`.
+    //
+    // Everything below therefore runs exactly once, in the process that becomes the workload, which is
+    // what the affinity, the `nice`, the throughput counter and above all the Landlock ruleset require:
+    // a ruleset applied in the parent would confine the proxy and not the command.
+    let cg = fork_workload_under_caps(outer_enforcer, cg);
+    // On the scope path this process `exec()`s the workload IN PLACE, so there is no supervisor left to
+    // reap it and drop the guard afterwards. The guard's Drop would `rmdir` the cgroup we're about to
+    // exec into, which is non-empty (we're in it) → EBUSY → a no-op anyway. Forget it so the intent is
+    // explicit: we do NOT tear down our own live cgroup here. (Same as the pre-guard behaviour - the
+    // `run` cgroup outlives this call; it's removed when the systemd scope is collected.) On the direct
+    // path `cg` is already `None`: the parent kept the guard, and forgetting a guard the CHILD holds
+    // would be the leak, not the fix.
     std::mem::forget(cg);
     // Pin CPUs via affinity (works with no cgroup cpuset delegation), and apply a profile's `nice`.
     kern_isolation::set_cpu_affinity(cpuset.as_deref());
@@ -2217,6 +2337,9 @@ pub fn exec(
     } else {
         None
     };
+    // The channel the box's own master comes back on. Only for `-it`, and a failure to make one is
+    // simply the old behaviour: the host pty above is already open and already works.
+    let pty_chan = pty.as_ref().and_then(|_| kern_isolation::fd_channel());
     let saved = pty
         .as_ref()
         .and_then(|p| crate::pty::raw_with_resize(p.master));
@@ -2257,6 +2380,25 @@ pub fn exec(
         &box_caps,
         box_seccomp,
         box_aa.as_deref(),
+        // RESOLVED HERE, BEFORE THE FORK, because the child may not read the environment. The default
+        // is to refuse: a command that steps around the box's caps while the operator believes it is
+        // capped is the escape the fail-closed exists to stop. `KERN_ALLOW_UNCAPPED` is the operator
+        // saying otherwise, and it is the same variable, with the same documented meaning, that
+        // `kern box` and `kern run` already read for exactly this condition. No new flag: the CLI
+        // surface is frozen, and `kern exec` takes none of the cap flags anyway.
+        if kern_common::env_flag("KERN_ALLOW_UNCAPPED") {
+            kern_isolation::Unplaceable::ProceedWithWarning
+        } else {
+            kern_isolation::Unplaceable::Refuse
+        },
+        // `-it`: let the command take its terminal from the BOX's devpts, so `ttyname()` resolves it
+        // inside the box. Built only when there IS a terminal; without it the host pty still works,
+        // it just has no name in there.
+        pty_chan.map(|(parent, child)| kern_isolation::PtyHandover {
+            sock_child: child,
+            sock_parent: parent,
+            retarget: crate::pty::retarget_resize,
+        }),
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -2498,6 +2640,8 @@ fn supervise_box(
                             "kern: warning: could not record the box's PID 1 in the registry: {e} -                              `kern exec` on this box will not find it"
                         );
                     }
+                    // A detached box has no terminal at all, so there is never a master to swap.
+                    None
                 },
                 None,  // detached boxes have no terminal to attach
                 ports, // the runtime forks `-p` forwarders before unshare, kills them on box exit
@@ -2900,6 +3044,123 @@ fn install_persistent_box(
         name = name.as_str(),
     );
     Ok(())
+}
+
+/// Should `kern run` fork a supervisor for its workload, rather than `exec()` in place?
+///
+/// A pure function of the two facts that decide it, so all four combinations are asserted without a
+/// cgroup filesystem. It is the single definition: the SAME value is passed to `apply_limits` as
+/// `supervisor_forks_workload`, and the two disagreeing is a cap escape in one direction (this
+/// process outside the leaf, and the workload exec'd in place there too) or a leak in the other.
+///
+/// `outer_enforcer` means kern's own scope proxy, a `--restart` unit or a build step already owns
+/// this workload: it waits, reports and cleans up, so a second supervisor buys nothing.
+/// `cap_built` means a capped leaf actually exists; with none there is nothing to be inside, nothing
+/// to reap and nothing to remove.
+pub(super) const fn run_should_fork(outer_enforcer: bool, cap_built: bool) -> bool {
+    cap_built && !outer_enforcer
+}
+
+/// Fork the workload into the capped leaf and stay behind as its supervisor.
+///
+/// WHY A FORK IS REQUIRED AT ALL. A cgroup leaf kern created is a plain directory: the only thing
+/// that can `rmdir` it is a kern process that outlives the workload, and `exec()`ing in place leaves
+/// none. Where an outer enforcer exists that process already exists too (the scope proxy, and
+/// `systemd-run --collect` on top of it), and this is a no-op. Where it does not - a host with no
+/// systemd user manager, which is the configuration of the WSL rootfs this project publishes - there
+/// was nothing, and a reviewer measured 200 sequential `kern run` leaving 201 directories behind.
+///
+/// The fork buys three things on that host, not one: the leaf is removed, the workload's exit code
+/// and signals are still propagated by a process that survives it, and an OOM kill is EXPLAINED
+/// instead of surfacing as the shell's bare `Killed`.
+///
+/// WHERE IT FORKS, this returns in the CHILD only, with `None`: the guard belongs to the parent,
+/// which is the process that removes the directory, and the parent never returns - it proxies, reaps,
+/// drops the guard and exits with the workload's code. Where it does not fork it hands `cg` straight
+/// back untouched, so those paths are byte-for-byte what they were, and a failed fork returns `None`
+/// after saying so, because the command still runs and it will run uncapped.
+///
+/// COST: one `clone3` and one `waitpid`. The process TOPOLOGY does not change on the scope path -
+/// `kern run` was already `caller -> kern -> workload` there, because that path's own fork+proxy put
+/// a resident kern between them (verified by walking `/proc/<pid>/stat` from inside the workload).
+fn fork_workload_under_caps(
+    outer_enforcer: bool,
+    cg: Option<kern_isolation::CgroupGuard>,
+) -> Option<kern_isolation::CgroupGuard> {
+    // NOT FORKING: stay a single process, and hand the guard BACK rather than drop it. The difference
+    // is a cap escape. On those paths this process IS the workload and sits INSIDE the capped cgroup
+    // (`supervisor_forks_workload` was false), so `CgroupGuard::drop` would move it back to `origin` -
+    // out of its own memory ceiling, one line before the `execve`. The caller `mem::forget`s it for
+    // exactly that reason.
+    if !run_should_fork(outer_enforcer, cg.is_some()) {
+        return cg;
+    }
+    let Some(guard) = cg else {
+        // UNREACHABLE BY CONSTRUCTION: `run_should_fork` returned true, and its `cap_built` input was
+        // `cg.is_some()`. Written as a branch rather than an `expect`, because this codebase does not
+        // put a panic on a path it can express as a value, and `None` is the correct value anyway:
+        // with no cap there is nothing to reap and nothing to remove.
+        return None;
+    };
+    // The same invariant the scope path's fork asserts, for the same reason: the child runs Rust that
+    // allocates (the `Command` argv, the Landlock ruleset) after the fork, which is safe only while
+    // this process is single-threaded, since a lock held by another thread at fork time is copied
+    // HELD into a child that will never see it released.
+    debug_assert!(
+        single_threaded(),
+        "kern run's fork must stay single-threaded (no thread spawned before it)"
+    );
+    let (pid, placed) = kern_isolation::fork_workload_into_leaf(&guard);
+    if pid < 0 {
+        // The fork failed. Keeping the guard and exiting would be worse than continuing: `exec()` in
+        // place still runs the command, and this process is NOT in the capped leaf (the supervisor
+        // stays outside on this path), so the command would run uncapped. Say so, drop the guard so
+        // the empty leaf does not survive us, and let the caller exec.
+        eprintln!(
+            "kern: warning: could not fork to place the command under its resource caps ({}) - the \
+             command runs UNCAPPED.",
+            std::io::Error::last_os_error()
+        );
+        drop(guard);
+        return None;
+    }
+    if pid == 0 {
+        // CHILD: this process becomes the workload.
+        if !placed {
+            // `kern run` is a cooperative GOVERNOR, not an isolation boundary, so this warns where
+            // `kern box` refuses - the same split the `cg.is_none()` branch above already applies.
+            // Written with one `write(2)` on a `const` slice rather than `eprintln!`: this is between
+            // a fork and an exec, and the rule this codebase keeps there is that nothing allocates,
+            // takes a lock or formats a string.
+            const MSG: &[u8] = b"kern: warning: the command could not be placed in its cgroup, so \
+                it runs outside the requested resource caps\n";
+            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+        }
+        // The PARENT owns the guard. Leaking it here (rather than dropping it) is the point: `Drop`
+        // would `rmdir` the leaf this very process is running in.
+        std::mem::forget(guard);
+        return None;
+    }
+    // PARENT: proxy the workload, then remove the leaf. `box_dir` is the workload's OWN cgroup, so the
+    // OOM counter this reads is the workload's and not a shared ancestor's.
+    //
+    // AND THE SWEEP, HERE, BECAUSE THIS VERB HAD NOWHERE ELSE TO PUT IT. `kern run`'s leaf is removed
+    // by the `drop` below on every ordinary exit, so the only way one is left behind is a parent that
+    // died without running it - a SIGKILL, an OOM, a power cut. `kern box` self-heals that through
+    // `sweep_orphans_off_hot_path`, called by its launcher AFTER the box is spawned; until now nothing
+    // on the `run` path called it at all, so on a machine that only ever runs `kern run` those leaves
+    // accumulated until a `kern box` or a `kern gc` came along. This process is about to block in
+    // `waitpid` for the whole workload, so the work is free: it overlaps the run instead of preceding
+    // it, which is the same reason the box path moved it off ITS start path (193 us with 61 entries,
+    // measured). Passed as the overlap closure so it lands after the signal handlers are armed.
+    let code = proxy_child_to_exit(pid, Some(guard.box_dir()), || {
+        kern_isolation::sweep_orphans_off_hot_path();
+    });
+    // EXPLICIT, and it has to be, because `std::process::exit` does NOT run destructors: an implicit
+    // drop at the end of this function would never happen. This is the `rmdir` that the systemd
+    // `--collect` used to perform, and it is the whole justification for the direct path.
+    drop(guard);
+    std::process::exit(code);
 }
 
 fn reexec_in_scope_if_possible(p: ScopeReexec) {

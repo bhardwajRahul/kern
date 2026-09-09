@@ -489,3 +489,63 @@ fn a_box_sigkilled_by_itself_is_not_blamed_on_the_cap() {
         "a self-inflicted SIGKILL was blamed on the cap: {err:?}"
     );
 }
+
+/// **A fork failure must never be answered with the user-namespace and rootfs hint, whatever the
+/// errno.**
+///
+/// That hint has now been wrong twice, for two different errnos, to two different reviewers. The
+/// first time it was EAGAIN under `RLIMIT_NPROC` and it got its own branch. The second was ENOMEM on
+/// WSL2, deterministic, and the reader was again sent to two places that were both fine.
+///
+/// The argument was never about a particular errno: by the time any fork on this path runs, the user
+/// namespace exists and the rootfs has been validated, or control would not have reached the fork.
+/// So the rule is the CLASS, and this test is on the class. Enumerating errnos one reviewer at a
+/// time is how the third one gets found by a user instead.
+///
+/// Driven through the SAME real failure the EAGAIN test uses, an `RLIMIT_NPROC` of 1, because a hint
+/// asserted against a constructed `Error` value proves the match arm and not the rendering: an errno
+/// that reaches the formatter through something other than an `io::Error` loses the `(os error N)`
+/// suffix and would revert the specific branch in silence. This one matches on the word `fork`,
+/// which comes from kern's own message rather than from libc, so it survives that.
+#[test]
+fn no_fork_failure_is_ever_blamed_on_user_namespaces_or_the_rootfs() {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = kern();
+    cmd.args(["box", "forkhint", "--rootfs", "/tmp", "--", "/bin/true"]);
+    // SAFETY: async-signal-safe between fork and exec. `setrlimit` is on the permitted list and
+    // nothing here allocates or takes a lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            let r = libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: 1,
+            };
+            if libc::setrlimit(libc::RLIMIT_NPROC, &r) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("skip: could not even spawn kern under RLIMIT_NPROC=1: {e}");
+            return;
+        }
+    };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !err.contains("fork") {
+        eprintln!("skip: this host did not fail at a fork under RLIMIT_NPROC=1, so the branch under test was never reached: {err}");
+        return;
+    }
+    assert!(
+        !err.contains("unprivileged user namespaces"),
+        "a fork failure must not be blamed on user namespaces or the rootfs, which are both already \
+         established by the time kern forks: {err}"
+    );
+    assert!(
+        err.contains("hint:"),
+        "and it must still carry SOME hint: removing the wrong one and leaving nothing would trade a \
+         misleading pointer for no pointer at all: {err}"
+    );
+}

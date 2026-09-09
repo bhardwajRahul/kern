@@ -5763,3 +5763,36 @@ mod scratch_placement_tests {
         );
     }
 }
+
+/// **`kern run`'s fork decision, all four inputs, because the two ways to get it wrong are not
+/// symmetric and neither is visible in a passing box.**
+///
+/// The same value feeds `apply_limits` as `supervisor_forks_workload` and the fork itself. If they
+/// ever disagree the failure is silent in both directions:
+///
+///   forked but told `apply_limits` false  -> this process is written INTO the leaf and then forks;
+///                                            the child inherits it, so the cap holds, but the
+///                                            parent is inside a cgroup carrying `oom.group=1` and
+///                                            dies with the workload it was meant to report on.
+///   not forked but told `apply_limits` true -> the supervisor is kept OUTSIDE the leaf and then
+///                                            `exec()`s in place, so THE WORKLOAD RUNS IN THE
+///                                            UNCAPPED PARENT. That is the cap escape `apply_limits`
+///                                            documents against that very parameter.
+///
+/// A pure function of two bools, so the four combinations are asserted here rather than inferred
+/// from a box that happened to start.
+#[test]
+fn run_forks_only_when_it_has_both_a_cgroup_to_enter_and_nobody_else_supervising() {
+    use crate::commands::start::run_should_fork;
+    // A capped leaf exists and nothing outside owns the workload: fork, because otherwise the leaf
+    // outlives every process that knows its name. This is the case an outside reviewer measured on
+    // WSL2 with no systemd user manager: 200 sequential `kern run` left 201 directories behind.
+    assert!(run_should_fork(false, true));
+    // An outer enforcer already waits, reports and cleans up (kern's own scope proxy, a `--restart`
+    // unit, a build step). A second supervisor would be a third process in the chain buying nothing.
+    assert!(!run_should_fork(true, true));
+    // No cap was built, so there is nothing to be inside, nothing to reap and nothing to remove.
+    // `kern run` is a cooperative governor and does not refuse; it warns and runs.
+    assert!(!run_should_fork(false, false));
+    assert!(!run_should_fork(true, false));
+}

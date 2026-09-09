@@ -8,12 +8,18 @@
 //!
 //! Two honest, zero-cost fields are tracked (a page has room for more): a monotonic **total** count
 //! and the cumulative **setup latency** (process entry → `exec`, in microseconds) so `top` can show a
-//! real average - the per-run exec-setup cost, measured not guessed. (Honest caveat: for a *scoped*
-//! run the workload is exec'd in a re-exec'd child, so this is the child's entry→exec leg, not the full
-//! outer→inner setup - an under-, never over-count.) What is NOT tracked:
-//! "active/peak CONCURRENT" - `kern run` exec()s IN PLACE (no supervisor left to decrement on exit), so
-//! a live-count would need a per-run reaper against the whole point of a ~1 ms run. `top` derives
-//! runs/sec, a session peak throughput, and a sparkline entirely reader-side from the monotonic total.
+//! real average - the per-run exec-setup cost, measured not guessed. Honest caveat, and it now applies
+//! to ONE of the two paths: on the *scoped* path the workload is exec'd in a re-exec'd child whose
+//! `START` is its own entry, so the figure is the child's entry→exec leg and not the full outer→inner
+//! setup - an under-, never over-count. On the direct path the workload is a FORK of the process that
+//! stamped `START`, which it inherits, so there the leg is the whole of it.
+//!
+//! What is NOT tracked: "active/peak CONCURRENT". A live count needs something that decrements when a
+//! run ends, and only one of the two paths has a process there to do it - the direct path's parent,
+//! which reaps its workload. The scoped path `exec()`s in place, and a host with no cap at all has
+//! neither. A gauge that is right on one path and silently wrong on the others is worse than no gauge,
+//! so `top` derives runs/sec, a session peak throughput, and a sparkline entirely reader-side from the
+//! monotonic total.
 
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, Ordering};

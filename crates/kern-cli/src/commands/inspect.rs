@@ -417,6 +417,34 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// superset of one `ps`+`stats` row for a single box. Untrusted fields (rootfs, command) are
 /// scrubbed of terminal-escape sequences before display, exactly like the status panel and tables.
 /// Errors with a `kern ps` hint if no live box has that name.
+/// The human `mem-cap` row: what was ASKED FOR, and whether that is what the kernel holds.
+///
+/// A free function rather than a `match` inside `inspect` because its most important branch is the
+/// one this developer's host cannot produce. `enforced == None` needs a box whose PID 1 is outside
+/// every kern leaf, which happens on a host with no usable cgroup delegation and not here; buried in
+/// a 245-line I/O function that branch was unreachable by any test, and it is precisely the branch an
+/// outside reviewer had to discover by hand. Pure, total over the four `(asked, enforced)` shapes,
+/// and pinned by `mem_cap_row_*` below.
+///
+/// The wording is deliberate in each arm:
+/// - no cap asked: `-`, the same dash the rest of this block uses for "nothing to report".
+/// - asked and held, equal: the number alone. The common case must stay quiet.
+/// - asked and held, DIFFERENT: both, because an outer limit (a fleet cap on `kern.slice`, or a
+///   `kern update` that has not been recorded) can bind tighter than the request, and reporting only
+///   the request would name a ceiling the box does not actually have.
+/// - asked and NOT held: say so in the row. Silence here is what let a box report `mem-cap 64M`
+///   on a host holding no such limit, which is the defect this whole field exists to close.
+fn mem_cap_row(asked: Option<u64>, enforced: Option<u64>) -> String {
+    match (asked, enforced) {
+        (None, _) => "-".into(),
+        (Some(asked), Some(live)) if live == asked => human_bytes(asked),
+        (Some(asked), Some(live)) => {
+            format!("{} (in force: {})", human_bytes(asked), human_bytes(live))
+        }
+        (Some(asked), None) => format!("{} (requested, NOT enforced here)", human_bytes(asked)),
+    }
+}
+
 pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let b = registry::find_ref(name)
         .ok_or_else(|| Error::NotRunning(format!("no running box named '{name}'")))?;
@@ -425,11 +453,31 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let cpu = registry::cpu_usec(b.cgroup_pid());
     let tasks = registry::tasks(b.cgroup_pid());
     let up = registry::now_unix().saturating_sub(b.started);
+    // WHAT IS ACTUALLY IN FORCE, read from the box's own cgroup, next to what was ASKED FOR.
+    //
+    // `memory_max` is the value the box was STARTED with: kern writes it into the registry entry and
+    // this echoes it. It is not a read-back, and on a host that cannot delegate a cgroup there is
+    // nothing behind it. An outside reviewer measured exactly that: `--memory 64m` reported
+    // `"memory_max": 67108864` while the box's PID 1 sat in `0::/`, the cgroup-v2 ROOT, which has no
+    // `memory.max` file at all. A cap reported as a fact where the kernel holds none.
+    //
+    // The number is NOT changed, because a consumer may legitimately read it as "what was asked" and
+    // `--json` is additive by contract. A second field answers the other question, and the two
+    // together are the honest report: `memory_max` what you asked for, `memory_max_enforced` what the
+    // kernel will hold you to. `null` there means nothing is enforcing it.
+    //
+    // Resolved from `/proc/<pid1>/cgroup` rather than from a recorded path: the registry's `cgroup`
+    // field is empty for a box with no dedicated cgroup, which is precisely the case being reported
+    // on, and `box_cgroup_dir` refuses anything that is not one of kern's own leaves, so the ROOT
+    // cgroup answers `None` instead of being read as though it were the box's.
+    let enforced_mem = kern_isolation::box_cgroup_dir(b.pid1_recorded)
+        .and_then(|d| std::fs::read_to_string(d.join("memory.max")).ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     if json {
         // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
         let num = json_num;
         println!(
-            "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             b.pid,
             b.pid1_recorded,
@@ -446,6 +494,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&b.egress),
             json_str(&b.landlock_rw),
             num(b.memory_max),
+            num(enforced_mem),
             num(b.pids_max),
         );
     } else {
@@ -480,7 +529,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         row("tasks", &tasks.map_or("-".into(), |t| t.to_string()));
         // Configured caps (the REQUESTED limits, distinct from the live usage above, which reads `-`
         // when the box has no dedicated cgroup) and the 0.6.7 isolation policies, shown when set.
-        row("mem-cap", &b.memory_max.map_or("-".into(), human_bytes));
+        row("mem-cap", &mem_cap_row(b.memory_max, enforced_mem));
         row(
             "pids-cap",
             &b.pids_max.map_or("-".into(), |v| v.to_string()),
@@ -1156,4 +1205,58 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mem_cap_row;
+
+    /// THE BRANCH THIS HOST CANNOT PRODUCE, which is the only reason the row exists.
+    ///
+    /// `enforced == None` means `box_cgroup_dir` found no kern leaf for the box's PID 1 - a host with
+    /// no usable cgroup delegation, where the box sits in the cgroup-v2 ROOT and nothing caps it. An
+    /// outside reviewer measured exactly that and read the requested value as a cap in force, because
+    /// the row said `64M` and stopped. On a delegated developer machine this state cannot be created,
+    /// so a runtime test would silently skip; the logic is pure, so it is pinned directly.
+    #[test]
+    fn an_asked_for_cap_that_nothing_enforces_says_so_in_the_row() {
+        assert_eq!(
+            mem_cap_row(Some(64 * 1024 * 1024), None),
+            "64M (requested, NOT enforced here)"
+        );
+    }
+
+    /// And the common case stays QUIET: a cap that is held exactly as asked prints the number alone.
+    /// If this ever gained a qualifier, every capped box on every host would carry noise, and the
+    /// warning above would stop standing out - which is the only thing that makes it useful.
+    #[test]
+    fn a_cap_held_exactly_as_asked_prints_the_number_alone() {
+        let row = mem_cap_row(Some(64 * 1024 * 1024), Some(64 * 1024 * 1024));
+        assert_eq!(row, "64M");
+        assert!(
+            !row.contains("force") && !row.contains("NOT"),
+            "the quiet case must carry no qualifier, got {row:?}"
+        );
+    }
+
+    /// A DIFFERENT ceiling in force is named, not swallowed. Reachable in production through a fleet
+    /// cap on `kern.slice` binding tighter than the request, or a `kern update` whose new value the
+    /// registry entry has not recorded. Reporting only the request would name a ceiling the box does
+    /// not have, which is the same class of defect as the arm above with the sign flipped.
+    #[test]
+    fn a_ceiling_that_differs_from_the_request_names_both() {
+        assert_eq!(
+            mem_cap_row(Some(64 * 1024 * 1024), Some(32 * 1024 * 1024)),
+            "64M (in force: 32M)"
+        );
+    }
+
+    /// No cap asked: the same dash the rest of the block uses for "nothing to report", and it must not
+    /// depend on what the kernel happens to hold. A box started with no `--memory` inside a slice that
+    /// has one would otherwise report a limit the operator never asked for as though it were theirs.
+    #[test]
+    fn no_requested_cap_is_a_dash_whatever_the_kernel_holds() {
+        assert_eq!(mem_cap_row(None, None), "-");
+        assert_eq!(mem_cap_row(None, Some(64 * 1024 * 1024)), "-");
+    }
 }
