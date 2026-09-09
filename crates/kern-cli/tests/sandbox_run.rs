@@ -9062,6 +9062,39 @@ fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
         eprintln!("skip: no kern.slice under this user's cgroup, so this host caps another way");
         return;
     };
+    // THE DIRECTORY EXISTING IS NOT THE SAME AS KERN USING IT, and reading it as the same is what
+    // made this test fail on GitHub's runner while passing on two developer machines. The sweep runs
+    // in the process `kern run` leaves behind to reap its workload, and that process is only forked
+    // when a cap was actually BUILT. A host where the slice is on disk but placement into it is
+    // refused (cgroup v2 delegation containment, from a caller outside the delegated tree) builds no
+    // cap, forks nothing, and sweeps nothing - correctly. `find_kern_slice` reads the filesystem and
+    // cannot see that refusal.
+    //
+    // So the precondition is measured through the channel the behaviour needs: run the verb with a
+    // cap and have the WORKLOAD read its own `memory.max` back. A number means the direct path is
+    // live here and a leaf will be swept; anything else means this host caps another way and the
+    // assertion below would be about the host rather than about the sweep.
+    let capped = kern()
+        .args([
+            "run",
+            "-m",
+            "64m",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/memory.max",
+        ])
+        .output();
+    let reads_back = capped
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "67108864")
+        .unwrap_or(false);
+    if !reads_back {
+        eprintln!(
+            "skip: `kern run` does not build a cap of its own here, so it forks no reaper and sweeps nothing (the slice on disk is not the slice it uses)"
+        );
+        return;
+    }
     let dead = (2u32..2_000_000)
         .rev()
         .find(|pid| !Path::new(&format!("/proc/{pid}")).exists())
@@ -9085,11 +9118,18 @@ fn a_kern_run_sweeps_a_leaf_left_by_a_kern_run_that_was_killed() {
             break;
         }
     }
+    // COUNTED BEFORE THE CLEANUP, because the other way this can fail is the bounded sweep never
+    // reaching the planted entry: it examines at most `SWEEP_LIMIT` per run, and under this suite's
+    // parallelism the slice can hold more. A bare "was not reaped" cannot tell that apart from "the
+    // sweep never ran", which is exactly the ambiguity that cost a CI round to resolve by hand.
+    let crowd = fs::read_dir(&slice).map(|d| d.count()).unwrap_or(0);
     let _ = fs::remove_dir(&orphan);
     assert!(
         gone,
         "a dead-owner `kern run` leaf must be reaped by a later `kern run`, or a host that only ever \
-         runs this verb accumulates one directory per killed launcher"
+         runs this verb accumulates one directory per killed launcher. The slice held {crowd} \
+         entries at the end; the sweep examines at most 128 per run, so a number near or above that \
+         means the planted dir was never looked at rather than never swept"
     );
 }
 
