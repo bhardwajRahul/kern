@@ -82,6 +82,8 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 
 ## Install
 
+### The binary
+
 A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
 boards** (Raspberry Pi · Jetson · Arduino UNO Q) directly, **Windows through WSL2** with a pre-baked
 rootfs and an installer that sets WSL2 up for you, and **a Mac inside a Linux VM** (colima, Lima,
@@ -107,22 +109,28 @@ those, in real VMs and on the boards, before it ships.
 [docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
 the Windows and Mac guests step by step, and what the resource caps do on a default VM.
 
-**`pip install kern-sandbox` does not install this binary, and the two are versioned separately.**
-`kern-sandbox` ([PyPI](https://pypi.org/project/kern-sandbox/),
-[npm](https://www.npmjs.com/package/kern-sandbox)) is the Python and Node wrapper that drives `kern`
-from your own program, described [below](#run-an-agents-code-python-node-langchain-mcp-pi). It is
-a pure-Python wheel: it needs a `kern` on your PATH, or a path in `$KERN_BIN`, and installing it
-gives you neither.
+### The SDK, to call kern from Python or Node
 
-They also move on different clocks: `kern` is versioned by its git tag, the SDK by its package
-version, so an SDK newer than the binary can ask for behaviour that binary does not have.
+`kern-sandbox` ([PyPI](https://pypi.org/project/kern-sandbox/),
+[npm](https://www.npmjs.com/package/kern-sandbox)) drives the binary above from your own program.
+Install the binary first, then:
+
+```sh
+pip install kern-sandbox
+npm  install kern-sandbox
+```
+
+Both packages are the wrapper alone: they find `kern` on your PATH, or wherever `$KERN_BIN` points.
+The two are released on their own clocks, so check what you have when a call does something the
+changelog says it should not:
 
 ```sh
 kern --version
 python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
 ```
 
-The [changelog](CHANGELOG.md) names the release each fix landed in.
+What the SDK does with it is [further down](#run-an-agents-code-python-node-langchain-mcp-pi), and
+the [changelog](CHANGELOG.md) names the release each fix landed in.
 
 ## Quickstart
 
@@ -146,14 +154,9 @@ different `--image`, and so does anything else that ships one.
 
 
 An agent needs somewhere to run what the model just wrote. **`kern-sandbox`** is that place: a thin,
-dependency-free wrapper over the `kern` binary, called from your own program. On
-[PyPI](https://pypi.org/project/kern-sandbox/) and [npm](https://www.npmjs.com/package/kern-sandbox);
-the API is in [bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md).
-
-```sh
-pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
-npm  install kern-sandbox       # npm  · same
-```
+dependency-free wrapper over the `kern` binary, called from your own program.
+[Installed above](#the-sdk-to-call-kern-from-python-or-node); the API is in
+[bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md).
 
 ```python
 from kern_sandbox import run_code
