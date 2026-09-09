@@ -107,11 +107,22 @@ those, in real VMs and on the boards, before it ships.
 [docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
 the Windows and Mac guests step by step, and what the resource caps do on a default VM.
 
-**The binary and the SDK move separately.** `kern` is versioned by its git tag, `kern-sandbox` by its
-own release, and the SDK drives the binary as a subprocess, so an SDK newer than the binary can ask
-for behaviour the binary does not have. `kern --version` and
-`python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"` tell you what you have, and the
-[changelog](CHANGELOG.md) names the release each fix landed in.
+**`pip install kern-sandbox` does not install this binary, and the two are versioned separately.**
+`kern-sandbox` ([PyPI](https://pypi.org/project/kern-sandbox/),
+[npm](https://www.npmjs.com/package/kern-sandbox)) is the Python and Node wrapper that drives `kern`
+from your own program, described [below](#run-an-agents-code-python-node-langchain-mcp-pi). It is
+a pure-Python wheel: it needs a `kern` on your PATH, or a path in `$KERN_BIN`, and installing it
+gives you neither.
+
+They also move on different clocks: `kern` is versioned by its git tag, the SDK by its package
+version, so an SDK newer than the binary can ask for behaviour that binary does not have.
+
+```sh
+kern --version
+python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
+```
+
+The [changelog](CHANGELOG.md) names the release each fix landed in.
 
 ## Quickstart
 
