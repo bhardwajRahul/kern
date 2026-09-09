@@ -458,7 +458,12 @@ pub fn gc(images: bool) -> Result<(), Error> {
         let freed = dir_size(&cache);
         if freed == 0 {
             println!("{}no cached images{}", p.d, p.z);
-        } else if let Err(e) = remove_tree_forced(&cache) {
+        // `remove_tree_mapped`, not `remove_tree_forced`: the cache now holds layers unpacked with the
+        // image's own ownership, so it contains directories this process does not own and cannot
+        // chmod. MEASURED before this line changed: `kern gc --images` failed with "Permission
+        // denied ... is owned by uid 100041, not you" and cleared nothing. `rmi` and `volume rm` take
+        // the same path, for the same reason.
+        } else if let Err(e) = crate::commands::remove_tree_mapped(&cache) {
             // A FAILURE, not a note. This printed to stderr and returned Ok, so `kern gc --images &&
             // echo cleaned` printed "cleaned" over an untouched cache: the caller had no way to tell.
             return Err(Error::Sandbox(format!(

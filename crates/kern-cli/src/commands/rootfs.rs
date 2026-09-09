@@ -1173,7 +1173,14 @@ pub(crate) fn remove_build_tree(path: &std::path::Path) {
         }
     }
     chmod_dirs(path);
-    let _ = std::fs::remove_dir_all(path);
+    if std::fs::remove_dir_all(path).is_err() {
+        // A BUILD TREE HOLDS AN UNPACKED IMAGE, so it holds whatever ownership that image carries:
+        // a `RUN` step's overlay upper contains files the image gave to a non-root user, and
+        // `chmod_dirs` above cannot touch a directory this process does not own. MEASURED as the
+        // same failure `kern gc --images` hit: "owned by uid 100041, not you". Retried as root of the
+        // mapped namespace, where those ids are ours.
+        let _ = crate::commands::remove_tree_mapped(path);
+    }
 }
 
 /// Probe whether an unprivileged overlay with a persistent upper actually mounts on this kernel (a
