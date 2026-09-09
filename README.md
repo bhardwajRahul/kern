@@ -112,8 +112,7 @@ the Windows and Mac guests step by step, and what the resource caps do on a defa
 ### The SDK, to call kern from Python or Node
 
 `kern-sandbox` ([PyPI](https://pypi.org/project/kern-sandbox/),
-[npm](https://www.npmjs.com/package/kern-sandbox)) drives the binary above from your own program.
-Install the binary first, then:
+[npm](https://www.npmjs.com/package/kern-sandbox)) needs the binary above, so install that first:
 
 ```sh
 pip install kern-sandbox
@@ -129,8 +128,8 @@ kern --version
 python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
 ```
 
-What the SDK does with it is [further down](#run-an-agents-code-python-node-langchain-mcp-pi), and
-the [changelog](CHANGELOG.md) names the release each fix landed in.
+What it is for is [further down](#run-an-agents-code-python-node-langchain-mcp-pi); the
+[changelog](CHANGELOG.md) names the release each fix landed in.
 
 ## Quickstart
 
