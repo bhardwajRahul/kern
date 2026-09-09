@@ -62,6 +62,34 @@ fn is_relative_path(source: &str) -> bool {
     source == "." || source == ".." || source.starts_with("./") || source.starts_with("../")
 }
 
+/// The volume NAME behind a resolved data directory, or `None` when the path is not one.
+///
+/// The inverse of [`resolve_named`], and it exists so the two cannot disagree. A caller that has
+/// already resolved a `-v` spec holds `<volumes_dir>/<name>/data` and no longer knows the name or
+/// even that the mount is a named volume at all; deriving that with an ad-hoc `starts_with` at the
+/// call site would be a second, drifting definition of the same layout.
+pub fn name_of_data_dir(path: &std::path::Path) -> Option<String> {
+    let rest = path.strip_prefix(volumes_dir()).ok()?;
+    let mut it = rest.components();
+    let name = it.next()?.as_os_str().to_str()?.to_string();
+    // Exactly `<name>/data`: a deeper path is a bind into a volume's contents, not the volume.
+    if it.next()?.as_os_str() != "data" || it.next().is_some() {
+        return None;
+    }
+    kern_common::valid_resource_name(&name).then_some(name)
+}
+
+/// Is a volume's data directory EMPTY, i.e. has nothing ever been written to it?
+///
+/// The question Docker asks before it seeds a named volume from the image, and it must be asked of
+/// the DIRECTORY rather than of a `meta.json` or a first-use marker: a volume can be created ahead
+/// of time (`kern volume create`) and still be empty, and one whose data was deleted by hand is
+/// empty again. An unreadable directory answers `false` - refusing to seed is the safe answer, since
+/// the alternative is writing image content over data that might be there.
+pub fn data_dir_is_empty(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_none())
+}
+
 /// Is this `-v` source a *named* volume (a bare name) rather than a host path or a `scheme://` URL?
 pub fn is_named(source: &str) -> bool {
     classify(source) == SourceKind::Named
@@ -846,7 +874,11 @@ fn remove(names: &[String]) -> Result<(), Error> {
             fails.push(format!(
                 "volume '{name}' is in use by box '{box_name}' - stop it first"
             ));
-        } else if let Err(e) = std::fs::remove_dir_all(dir.join(name)) {
+        // `remove_tree_mapped`, not `remove_dir_all`: a volume SEEDED FROM AN IMAGE carries the
+        // image's ownership on its root and its contents (that is what lets a service running as a
+        // non-root user write there), and an unprivileged caller cannot unlink inside a directory a
+        // subuid owns. The same reason `kern rmi` needs it.
+        } else if let Err(e) = crate::commands::remove_tree_mapped(&dir.join(name)) {
             // EACCES here has exactly one cause worth naming, and it is the common one: a box that
             // used the uid RANGE (every OCI image box by default, so every database image) wrote
             // files owned by a uid that exists only inside that box's user namespace. The host user
@@ -1009,6 +1041,70 @@ fn human_bytes(b: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// THE INVERSE OF `resolve_named` MUST AGREE WITH IT, and nothing else may claim to be a volume.
+    ///
+    /// The seeding path holds a RESOLVED `-v` source - `<volumes_dir>/<name>/data` - and has to
+    /// decide from that alone whether the mount is a named volume it may write into. Getting this
+    /// wrong in the permissive direction means copying image content into somebody's BIND MOUNT,
+    /// which is their own directory and never kern's to fill.
+    #[test]
+    fn only_a_volumes_own_data_dir_is_recognised_as_one() {
+        let base = super::volumes_dir();
+        assert_eq!(
+            super::name_of_data_dir(&base.join("pgdata/data")),
+            Some("pgdata".to_string())
+        );
+        // A path INSIDE a volume is a bind into its contents, not the volume itself: seeding it
+        // would write image content into a subdirectory of live data.
+        assert_eq!(super::name_of_data_dir(&base.join("pgdata/data/sub")), None);
+        // The volume directory without its `data` child is the metadata dir, not the mount source.
+        assert_eq!(super::name_of_data_dir(&base.join("pgdata")), None);
+        // Anywhere else on the filesystem is a bind mount and must never be touched.
+        assert_eq!(
+            super::name_of_data_dir(std::path::Path::new("/etc/data")),
+            None
+        );
+        assert_eq!(super::name_of_data_dir(std::path::Path::new("/")), None);
+        // A traversal never reaches the name check at all: `../escape/data` has `escape` where
+        // `data` must be. Kept because it is the shape an attacker writes.
+        assert_eq!(super::name_of_data_dir(&base.join("../escape/data")), None);
+        // THE NAME RULE ITSELF, reached only by a path of the RIGHT SHAPE carrying a name the volume
+        // layer would refuse. Without these the rule could be deleted and every assertion above would
+        // still pass, because they are all stopped by the shape check one line earlier.
+        for bad in ["-lead", ".lead", "has space", "has!bang", ".."] {
+            assert_eq!(
+                super::name_of_data_dir(&base.join(bad).join("data")),
+                None,
+                "'{bad}' is not a name `resolve_named` would accept, so it is not one here either"
+            );
+        }
+    }
+
+    /// EMPTY IS THE ONLY CONDITION UNDER WHICH SEEDING MAY HAPPEN, so this predicate is the guard
+    /// standing between image content and somebody's data. An unreadable directory answers `false`:
+    /// refusing to seed leaves the volume exactly as it was, which is the safe wrong answer.
+    #[test]
+    fn a_volume_counts_as_empty_only_when_it_really_holds_nothing() {
+        let dir = std::env::temp_dir().join(format!("kern-vol-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(super::data_dir_is_empty(&dir));
+        // One file is enough to stop it: Docker seeds only a volume that has never been written to.
+        std::fs::write(dir.join("x"), b"1").expect("write");
+        assert!(!super::data_dir_is_empty(&dir));
+        // A directory (not just a file) also counts as content.
+        std::fs::remove_file(dir.join("x")).expect("rm");
+        std::fs::create_dir(dir.join("d")).expect("mkdir d");
+        assert!(!super::data_dir_is_empty(&dir));
+        // A path that does not exist, or is not a directory, is NOT empty: it is unreadable, and
+        // reading that as "empty, go ahead and copy" is the permissive direction.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!super::data_dir_is_empty(&dir));
+        assert!(!super::data_dir_is_empty(std::path::Path::new(
+            "/etc/hostname"
+        )));
+    }
+
     /// The three read paths must agree that a volume with no quota has NO CEILING.
     ///
     /// They did not. `volume ls` printed `∞`, `volume inspect` printed `none`, and an outside

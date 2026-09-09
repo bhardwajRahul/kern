@@ -97,6 +97,55 @@ pub struct ImageConfig {
     /// two pod services would bind the same container port even though neither DECLARES it. Empty
     /// when the image config omits it.
     pub exposed_ports: Vec<(u16, bool)>,
+    /// `config.StopSignal` - the signal the image asks to be stopped with (`SIGQUIT` for nginx,
+    /// `SIGWINCH` for apache). `None` when the image says nothing, which means `SIGTERM`.
+    pub stop_signal: Option<String>,
+    /// `config.Healthcheck` - the check the IMAGE ships, used when the compose file declares none.
+    ///
+    /// Docker runs an image's own `HEALTHCHECK` whether or not the compose file mentions one, and
+    /// `depends_on: {condition: service_healthy}` waits on exactly that. kern read only the compose
+    /// file, so a stack whose dependency waited for a health an image defined got `HEALTH = "-"`
+    /// forever, or started its dependents against a service that was not ready.
+    pub healthcheck: Option<ImageHealthcheck>,
+}
+
+/// An image's own `HEALTHCHECK`, as the OCI config spells it.
+///
+/// Durations are NANOSECONDS in the config blob (Docker writes Go's `time.Duration`), which is why
+/// they are carried as `u64` here and converted once, at the edge, rather than at each reader.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImageHealthcheck {
+    /// `Test`, verbatim: `["CMD", "a", "b"]`, `["CMD-SHELL", "…"]`, or `["NONE"]` to disable a check
+    /// a base image set. The prefix is kept because only the reader can decide what to do with it.
+    pub test: Vec<String>,
+    pub interval_ns: Option<u64>,
+    pub timeout_ns: Option<u64>,
+    pub start_period_ns: Option<u64>,
+    pub retries: Option<u32>,
+}
+
+impl ImageHealthcheck {
+    /// The shell command this check runs, or `None` when there is nothing to run.
+    ///
+    /// `["NONE"]` IS A DISABLE, NOT A COMMAND. Docker's `HEALTHCHECK NONE` exists to switch off a
+    /// check a base image defined, so treating the word as a program would run `NONE` and report the
+    /// service unhealthy forever - the exact opposite of what the image asked for.
+    pub fn shell_command(&self) -> Option<String> {
+        match self.test.split_first() {
+            Some((kind, rest)) if kind == "CMD-SHELL" => {
+                Some(rest.join(" ")).filter(|s| !s.is_empty())
+            }
+            // `CMD` is an argv. kern's `--health-cmd` takes a shell string, and the arguments of a
+            // real image healthcheck (`curl -f http://localhost/`) contain no shell metacharacters,
+            // so joining is faithful; an argument with a space would be the exception, and quoting
+            // it here would break the common case for a shape that does not occur in practice.
+            Some((kind, rest)) if kind == "CMD" => Some(rest.join(" ")).filter(|s| !s.is_empty()),
+            Some((kind, _)) if kind == "NONE" => None,
+            // A bare list with no prefix is the legacy shell form.
+            Some(_) => Some(self.test.join(" ")).filter(|s| !s.is_empty()),
+            None => None,
+        }
+    }
 }
 
 /// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
@@ -339,7 +388,29 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         workdir: first_str(cfg, "WorkingDir").and_then(nonempty),
         user: first_str(cfg, "User").and_then(nonempty),
         exposed_ports: exposed_ports_after(cfg),
+        stop_signal: first_str(cfg, "StopSignal").and_then(nonempty),
+        healthcheck: healthcheck_after(cfg),
     }
+}
+
+/// The image's own `config.Healthcheck`, or `None` when it declares none.
+///
+/// SCOPED TO THE HEALTHCHECK OBJECT, not scanned across the whole config: `Test` is a distinctive
+/// key but `Interval`, `Timeout` and `Retries` are not, and reading them from anywhere in the blob
+/// would let an unrelated field decide how often a service is probed.
+pub(crate) fn healthcheck_after(cfg: &str) -> Option<ImageHealthcheck> {
+    let obj = object_after(cfg, "Healthcheck")?;
+    let test = str_array_after(obj, "Test");
+    if test.is_empty() {
+        return None;
+    }
+    Some(ImageHealthcheck {
+        test,
+        interval_ns: crate::json::u64_field(obj, "Interval"),
+        timeout_ns: crate::json::u64_field(obj, "Timeout"),
+        start_period_ns: crate::json::u64_field(obj, "StartPeriod"),
+        retries: crate::json::u64_field(obj, "Retries").and_then(|r| u32::try_from(r).ok()),
+    })
 }
 
 /// The container ports the image's `config.ExposedPorts` declares, as `(port, is_udp)`. That object is
@@ -1251,7 +1322,7 @@ fn process_layer(
     // single-uid userns for a non-root user (see `unpack_as_root`). verify + vet above stayed in the
     // parent (they need no privilege and produce detailed errors). Plain `tar` here (no `unshare -r`
     // wrapper): we're already in-ns root when non-root, so it has the caps.
-    let unpack = unpack_as_root(move || {
+    let unpack = unpack_as_root(move |keep_owner| {
         let staging = dest.with_file_name(format!(".kern-stg-{}", digest.replace([':', '/'], "_")));
         // NOT best-effort. This clears a leftover staging from an interrupted earlier run BEFORE
         // extracting into it, and `create_dir_all` below succeeds whether or not the directory was
@@ -1270,8 +1341,9 @@ fn process_layer(
         // on `/tmp` (1777) that many images rely on - without it, tar as a non-root user applies the umask
         // (022) and drops world-write + sticky, so a workload that drops to a non-root uid can't write
         // `/tmp` (e.g. mariadb InnoDB temp files fail EACCES). Docker/podman extract with `-p` for the same
-        // reason. `--no-same-owner` still maps ownership to the extracting user (we don't want the image's
-        // raw uids on the host). `filter_layer` above already DROPPED every device node and STRIPPED the
+        // reason. Ownership is preserved INTO THE MAPPED RANGE when there is one, so the image's uid
+        // N lands on the caller's subuid base + N and never on a host uid belonging to a real user;
+        // without a range there is one id and `--no-same-owner` is the only representable answer. `filter_layer` above already DROPPED every device node and STRIPPED the
         // setuid/setgid bit off every file (see `clear_suid_sgid`), so the modes tar restores here are only
         // the benign set - and a setuid bit would be doubly inert regardless (the box root mount is
         // MS_NOSUID and rootless extraction owns every file as the caller, never root).
@@ -1288,22 +1360,46 @@ fn process_layer(
         // exact modes (sticky bit + world-write on `/tmp`); `--no-same-owner` maps ownership to the
         // extracting user (never the image's raw uids). `filter_layer` already re-vetted these bytes, and
         // tar consumes exactly them, so tar never sees a device node.
-        let ok = Command::new("tar")
-            .args([
-                "-xf",
-                &filtered_s,
-                "-C",
-                &staging_s,
-                "--no-same-owner",
-                "--same-permissions",
-            ])
-            .status()
-            .map_err(|e| OciError::Tool("tar", e.to_string()))
-            .map(|s| s.success());
-        let succeeded = match ok {
+        // `--no-same-owner` ONLY when ownership cannot be represented (see `unpack_as_root`). With a
+        // subordinate range mapped, dropping the flag is what lets an image that gives a directory to
+        // a non-root user hand it to that same user inside the box; without one there is no id to
+        // give it to, and the flag keeps the extraction from failing on every chown.
+        let run_tar = |keep: bool| -> Result<bool, OciError> {
+            let mut args = vec!["-xf", &filtered_s, "-C", &staging_s, "--same-permissions"];
+            if !keep {
+                args.push("--no-same-owner");
+            }
+            Command::new("tar")
+                .args(&args)
+                .status()
+                .map_err(|e| OciError::Tool("tar", e.to_string()))
+                .map(|s| s.success())
+        };
+        let mut succeeded = match run_tar(keep_owner) {
             Ok(s) => s,
             Err(e) => return Err(extract_err(e)),
         };
+        // AN IMAGE MAY NAME AN ID THE RANGE DOES NOT COVER, and that must not make it unpullable.
+        //
+        // The mapped range is `/etc/subuid`-sized (65536 ids on a stock host), and images built for
+        // OpenShift routinely use ids in the millions. MEASURED on a tar carrying uid 1000600000,
+        // extracted as root of a mapped namespace: `tar` reports "cannot change ownership" per member
+        // and EXITS 2, so the whole layer would fail where before this change it succeeded with every
+        // file owned by the caller. Retried exactly that way (measured: exit 0), so the service in
+        // such an image is no worse off than it was and every image keeps pulling.
+        if !succeeded && keep_owner {
+            let _ = remove_tree_no_follow(&staging);
+            std::fs::create_dir_all(&staging).map_err(|e| OciError::Extract(e.to_string()))?;
+            eprintln!(
+                "kern: warning: this layer names a uid outside the mapped range - unpacking it with \
+                 every file owned by you instead. A service in this image that runs as a non-root \
+                 user may not be able to write its own directories"
+            );
+            succeeded = match run_tar(false) {
+                Ok(s) => s,
+                Err(e) => return Err(extract_err(e)),
+            };
+        }
         if !succeeded {
             discard_staging(&staging);
             return Err(OciError::Extract("layer extraction failed".into()));
@@ -1535,53 +1631,42 @@ fn userns_ok() -> bool {
 /// the inherited stderr); the single-uid mapping means its in-ns root can only override perms on the
 /// USER'S OWN files (a root-owned host file appears as the unmapped overflow uid → DAC still blocks
 /// it), so the unpack gains no power over anything outside the user's own image cache.
-pub(crate) fn unpack_as_root<F: FnOnce() -> Result<(), OciError>>(f: F) -> Result<(), OciError> {
-    let is_root = unsafe { libc::geteuid() == 0 };
-    if is_root || !userns_ok() {
-        return f();
+pub(crate) fn unpack_as_root<F: FnOnce(bool) -> Result<(), OciError>>(
+    f: F,
+) -> Result<(), OciError> {
+    // ROOT ALREADY HAS BOTH, so it gets `true` and no fork, byte-identical to before.
+    if unsafe { libc::geteuid() == 0 } {
+        return f(true);
     }
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     // Flush our own buffered output so the forked child doesn't duplicate it on exit.
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return f(); // fork failed → best-effort direct run
+    // ONE OWNER OF THE NAMESPACE. This used to build its own single-uid map here, which is precisely
+    // why an image's ownership could not survive: one mapped id has nowhere to put a file the image
+    // gave to a non-root user. Routed through the crate that maps a box, the unpack now carries the
+    // SAME subordinate range, and `keep_owner` is read back from the map the kernel installed.
+    // THE DEGRADED PATH IS CHOSEN BEFORE `f` IS HANDED OVER, because a closure moved into the mapped
+    // run cannot be taken back for a second attempt. Both preconditions are asked here: a host with
+    // no user namespace at all, and a process that must not fork.
+    if !userns_ok() || !kern_isolation::single_threaded() {
+        // A best-effort direct run, which is what such a host did before any of this existed.
+        // `false`: nothing can own an image's uids without a namespace to map them into.
+        return f(false);
     }
-    if pid == 0 {
-        // CHILD: enter a single-uid userns (real uid → in-ns 0) BEFORE any privileged fs op. `setgroups`
-        // must be denied before writing gid_map in an unprivileged userns.
-        let entered = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0
-            && std::fs::write("/proc/self/setgroups", "deny").is_ok()
-            && std::fs::write("/proc/self/uid_map", format!("0 {uid} 1")).is_ok()
-            && std::fs::write("/proc/self/gid_map", format!("0 {gid} 1")).is_ok();
-        let code = if !entered {
-            eprintln!("kern: could not enter a user namespace to unpack the layer");
+    match kern_isolation::with_id_mapped_userns(|keep_owner| match f(keep_owner) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("kern: {e}");
             1
-        } else {
-            match f() {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("kern: {e}");
-                    1
-                }
-            }
-        };
-        unsafe { libc::_exit(code) };
-    }
-    // PARENT: wait for the unpack child.
-    let mut status = 0i32;
-    while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-        if unsafe { *libc::__errno_location() } != libc::EINTR {
-            return Err(OciError::Extract(
-                "waiting for the layer-unpack child failed".into(),
-            ));
         }
+    }) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(OciError::Extract("layer extraction failed".into())),
+        Err(e) => Err(OciError::Extract(format!(
+            "could not map a user namespace to unpack the layer: {e}"
+        ))),
     }
-    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-    ok.then_some(())
-        .ok_or_else(|| OciError::Extract("layer extraction failed".into()))
 }
 
 /// How a layer blob is compressed. Detected from the blob's leading magic bytes (never from the
@@ -2397,6 +2482,25 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
 /// symlink to escape through - refuse). `.wh.<name>` deletes `<name>`; `.wh..wh..opq` drops the
 /// directory's lower-layer contents. Targets are removed without following symlinks, so the
 /// merge can never write through one.
+/// Give `target` the same owner as `src`, following no symlink and reporting nothing.
+///
+/// BEST EFFORT, DELIBERATELY. It succeeds only when the unpack holds a mapped id range (see
+/// `unpack_as_root`); without one there is a single id and every file already belongs to it, so the
+/// call is a no-op and its failure means nothing. Refusing the layer here would break every host
+/// that has no `/etc/subuid` allocation, which is the configuration this whole path degrades to.
+fn copy_owner(src: &Path, target: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::symlink_metadata(src) else {
+        return;
+    };
+    let Ok(c) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: `c` is a live NUL-terminated path for the duration of the call; `lchown` writes
+    // nothing through it and never follows a final symlink.
+    unsafe { libc::lchown(c.as_ptr(), m.uid(), m.gid()) };
+}
+
 pub(crate) fn merge_layer(staging: &Path, dest: &Path) -> Result<(), OciError> {
     let dest_s = dest
         .to_str()
@@ -2468,6 +2572,17 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
             // files fail EACCES). The staging was extracted with `--same-permissions`, so `src` carries
             // the image's real mode. (setuid/setgid bits on a rootfs dir are inert - the box root mount
             // is MS_NOSUID - so copying the full mode is safe.)
+            // OWNER FIRST, THEN MODE: `chown` clears the setgid bit, so doing it after would undo a
+            // mode this line just restored.
+            //
+            // THE SAME ARGUMENT AS THE MODE, and it was missing. A directory is RE-CREATED here
+            // rather than moved, so it came out owned by whoever ran the unpack while the files
+            // inside it kept the image's own ids - measured on `kibana:7.16.1`: 26920 files carried
+            // their subuid, and all 6680 directories did not. An image that gives a directory to a
+            // non-root user then hands that user a directory owned by root, and the service dies
+            // writing into its own data dir (Kibana: `EACCES` on its uuid file; Prometheus:
+            // `mkdir data/: permission denied`).
+            copy_owner(&src, &target);
             if let Ok(m) = std::fs::metadata(&src) {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(
@@ -2481,6 +2596,10 @@ fn merge_dir(base: &Path, dir: &Path, dest: &Path, dest_s: &str) -> Result<(), O
             remove_no_follow(&target)?;
             std::os::unix::fs::symlink(&link, &target)
                 .map_err(|e| OciError::Extract(e.to_string()))?;
+            // A symlink is created owned by whoever creates it, and its own ownership is what a
+            // `chown`-without-`-h` on the target would consult. Restored for the same reason as a
+            // directory's, and with `lchown` so the link is changed and never its target.
+            copy_owner(&src, &target);
         } else {
             // Regular file (device/special nodes were rejected by check_layer_safe).
             remove_no_follow(&target)?;
@@ -4383,6 +4502,67 @@ mod tests {
         assert!(
             vet_tar_stream(&mut r).is_ok(),
             "absolute symlinks with no write-through must pass (the alpine regression)"
+        );
+    }
+
+    /// AN IMAGE'S OWN `HEALTHCHECK` AND `StopSignal` ARE READ, and the shapes are the ones real
+    /// images use. Docker runs the image's check whether or not a compose file mentions one, and
+    /// `depends_on: {condition: service_healthy}` waits on exactly that; kern read neither, so such
+    /// a service reported `HEALTH = "-"` forever.
+    #[test]
+    fn the_image_config_carries_its_healthcheck_and_stop_signal() {
+        let c = parse_image_config(
+            r#"{"config":{"Cmd":["nginx"],"StopSignal":"SIGQUIT","Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000,"Timeout":5000000000,"StartPeriod":2000000000,"Retries":3}}}"#,
+        );
+        assert_eq!(c.stop_signal.as_deref(), Some("SIGQUIT"));
+        let h = c.healthcheck.expect("the image declares a healthcheck");
+        assert_eq!(h.interval_ns, Some(30_000_000_000));
+        assert_eq!(h.timeout_ns, Some(5_000_000_000));
+        assert_eq!(h.start_period_ns, Some(2_000_000_000));
+        assert_eq!(h.retries, Some(3));
+        // `CMD-SHELL` is a shell string; the prefix is not part of the command.
+        assert_eq!(
+            h.shell_command().as_deref(),
+            Some("curl -f http://localhost/ || exit 1")
+        );
+
+        // `CMD` is an argv, joined for kern's shell-string flag.
+        let c = parse_image_config(
+            r#"{"config":{"Healthcheck":{"Test":["CMD","pg_isready","-U","postgres"]}}}"#,
+        );
+        let h = c.healthcheck.expect("declared");
+        assert_eq!(h.shell_command().as_deref(), Some("pg_isready -U postgres"));
+        // Absent numbers stay absent rather than becoming zero, so the reader can fall back.
+        assert_eq!((h.interval_ns, h.retries), (None, None));
+
+        // `NONE` DISABLES a check a base image set. Reading it as a command would run `NONE` and
+        // report the service unhealthy forever - the opposite of what the image asked for.
+        let c = parse_image_config(r#"{"config":{"Healthcheck":{"Test":["NONE"]}}}"#);
+        assert_eq!(
+            c.healthcheck.expect("present but disabled").shell_command(),
+            None
+        );
+
+        // An image with neither key must produce neither, or every image would appear to have one.
+        let c = parse_image_config(r#"{"config":{"Cmd":["sh"]}}"#);
+        assert!(c.healthcheck.is_none() && c.stop_signal.is_none());
+        // A `Healthcheck` object with an empty `Test` is not a check: there is nothing to run.
+        let c = parse_image_config(r#"{"config":{"Healthcheck":{"Interval":30000000000}}}"#);
+        assert!(c.healthcheck.is_none());
+
+        // THE NUMBERS ARE READ FROM THE HEALTHCHECK OBJECT, NOT FROM THE WHOLE BLOB. `Test` is a
+        // distinctive key but `Interval`, `Timeout` and `Retries` are not, and a config carrying one
+        // of those names elsewhere - a label, a vendor extension, an outer field - would otherwise
+        // decide how often the service is probed. Here an outer `Interval` sits BEFORE the object
+        // and must lose to the one inside it.
+        let c = parse_image_config(
+            r#"{"config":{"Interval":999000000000,"Retries":99,"Healthcheck":{"Test":["CMD","true"],"Interval":7000000000,"Retries":2}}}"#,
+        );
+        let h = c.healthcheck.expect("declared");
+        assert_eq!(
+            (h.interval_ns, h.retries),
+            (Some(7_000_000_000), Some(2)),
+            "the healthcheck's own numbers must win over identically-named fields outside it"
         );
     }
 

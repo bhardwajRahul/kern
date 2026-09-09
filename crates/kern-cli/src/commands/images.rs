@@ -526,6 +526,10 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         workdir: None,
         user: None,
         exposed_ports: Vec::new(),
+        // Same reason as the fields above: a filesystem snapshot cannot recover OCI metadata, so a
+        // commit carries none. `docker commit` without `--change` behaves identically.
+        stop_signal: None,
+        healthcheck: None,
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;

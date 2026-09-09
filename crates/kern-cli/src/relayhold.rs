@@ -452,31 +452,43 @@ fn live_pid1_in(
     })
 }
 
-/// Wait, bounded, for every box the plan names to have a live PID 1.
+/// Wait, bounded, for every box the plan names to have a live PID 1, and return the ones that never
+/// appeared.
 ///
-/// Returns the name of the box it gave up on. Bounded rather than indefinite: a holder that waits
-/// forever for a box that will never start is indistinguishable from one that is working.
-fn wait_for_pid1s(plan: &[crate::nopod::RelayPlan]) -> Result<(), String> {
+/// ONE BOX WITHOUT A PID 1 USED TO FAIL THE WHOLE STACK, and that is too blunt for a case that is
+/// ordinary rather than exceptional: a service with `restart:` is installed as a SYSTEMD unit, so
+/// `up` never holds it and the manager starts it on its own schedule. MEASURED on a real repository
+/// (`AP0827/Multi-Threaded-Web-Server`): every other service was up, and the stack was failed by the
+/// one the manager had not started yet.
+///
+/// The rest of the mesh does not depend on that box, so the edges that touch it are dropped and the
+/// others are built. That is the same answer this holder already gives for a pair it cannot serve
+/// because of a wildcard listener: name it, serve what can be served. A stack whose every edge is
+/// dropped is a different thing and is still an error, because then there is nothing to hold.
+///
+/// Bounded rather than indefinite: a holder that waits forever for a box that will never start is
+/// indistinguishable from one that is working.
+fn wait_for_pid1s(plan: &[crate::nopod::RelayPlan]) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PID1_WAIT_MS);
-    loop {
-        let mut missing: Option<&str> = None;
-        for r in plan {
-            for name in [r.in_box.as_str(), r.to_box.as_str()] {
-                if live_pid1(name).is_none() {
-                    missing = Some(name);
-                    break;
-                }
-            }
-            if missing.is_some() {
-                break;
+    let mut names: Vec<&str> = Vec::new();
+    for r in plan {
+        for n in [r.in_box.as_str(), r.to_box.as_str()] {
+            if !names.contains(&n) {
+                names.push(n);
             }
         }
-        let Some(name) = missing else { return Ok(()) };
+    }
+    loop {
+        let missing: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| live_pid1(n).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Vec::new();
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "box '{name}' has no live PID 1 after {PID1_WAIT_MS} ms, so nothing can be relayed \
-                 into or out of it"
-            ));
+            return missing.into_iter().map(str::to_string).collect();
         }
         std::thread::sleep(std::time::Duration::from_millis(PID1_POLL_MS));
     }
@@ -503,10 +515,34 @@ pub(crate) fn run_holder(dir: &str) -> ! {
             std::process::exit(1);
         }
     };
-    if let Err(e) = wait_for_pid1s(&plan) {
-        println!("relay-error {e}");
-        std::process::exit(1);
-    }
+    // A box that never got a PID 1 costs its OWN edges, not the stack's. `restart:` services are
+    // systemd's to start, and the manager's schedule is not this holder's to wait on.
+    let absent = wait_for_pid1s(&plan);
+    let plan: Vec<crate::nopod::RelayPlan> = if absent.is_empty() {
+        plan
+    } else {
+        let kept: Vec<crate::nopod::RelayPlan> = plan
+            .into_iter()
+            .filter(|r| !absent.contains(&r.in_box) && !absent.contains(&r.to_box))
+            .collect();
+        if kept.is_empty() {
+            println!(
+                "relay-error no box in this stack has a live PID 1 after {PID1_WAIT_MS} ms ({}), so \
+                 there is nothing to relay",
+                absent.join(", ")
+            );
+            std::process::exit(1);
+        }
+        // Reported on the holder's own log rather than the ready line, which the caller reads as ONE
+        // line and stops: the count of relays it does bring up is what that line is for.
+        eprintln!(
+            "kern: relay holder: no live PID 1 for {} after {PID1_WAIT_MS} ms (a `restart:` service \
+             is started by systemd, which this holder does not wait on), so its edges are not \
+             relayed; the rest of the stack is",
+            absent.join(", ")
+        );
+        kept
+    };
     let pump_cap = kern_isolation::peer::pump_cap_for(plan.len());
 
     // WAIT FOR THE HOLDERS TO BIND BEFORE DECIDING ANYTHING, because the decision is a measurement of
@@ -737,6 +773,20 @@ impl Slot {
 }
 
 /// Why a pair cannot be served right now.
+/// Does this relay error say the address was already taken?
+///
+/// MATCHED ON THE ERRNO THE MESSAGE CARRIES, not on prose: `peer::spawn` returns a formatted string
+/// ending in `errno <n>`, and 98 is `EADDRINUSE` on Linux. Parsing a number out of a message is not
+/// pretty, and the alternative - a typed error across the isolation boundary - is a wider change than
+/// this fix should be; the number is stable ABI, unlike the sentence around it, so this reads the
+/// stable half.
+#[must_use]
+fn is_addr_in_use(err: &str) -> bool {
+    err.rsplit_once("errno ")
+        .and_then(|(_, n)| n.trim().parse::<i32>().ok())
+        .is_some_and(|n| n == libc::EADDRINUSE)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockReason {
     /// The holder binds this wildcard address, so it owns every address on that port. Carries the
@@ -745,6 +795,18 @@ pub(crate) enum BlockReason {
     Wildcard(&'static str),
     /// The holder declares the port and has not bound it yet.
     NotListeningYet,
+    /// The alias could not be bound because the holder already owns that port on every address, and
+    /// it was discovered by the BIND rather than by the probe.
+    ///
+    /// A service that declares no port in the file is not probed - there is nothing to measure and
+    /// probing every pair would read "nothing is listening" for the whole stack. But a service can
+    /// bind a port it never declared, and then the alias bind fails with `EADDRINUSE`. MEASURED on a
+    /// real repository (`AP0827/Multi-Threaded-Web-Server`): `backend` declares no port, binds 8080
+    /// as a wildcard anyway, and the relay's `errno 98` FAILED the whole stack - a file Docker runs.
+    ///
+    /// It is the same fact as [`Self::Wildcard`], learned one step later, so it gets the same
+    /// treatment: the edge is dropped and named, and every other edge is served.
+    AliasInUse,
 }
 
 impl BlockReason {
@@ -769,6 +831,11 @@ impl std::fmt::Display for BlockReason {
                 f,
                 "it declares that port and is not listening on it yet, so binding the peer's alias \
                  now would make its own later bind fail"
+            ),
+            Self::AliasInUse => write!(
+                f,
+                "it already owns that port on every address (it binds a port it does not declare in \
+                 the file), so the peer's alias cannot be bound there"
             ),
         }
     }
@@ -830,6 +897,18 @@ impl std::fmt::Display for BlockReport<'_> {
                 ". The edge comes up on its own once '{}' binds that port",
                 self.holder
             ),
+            // SAME REMEDY AS THE WILDCARD, because it is the same situation: the holder owns the
+            // whole port. The one thing worth adding is WHY kern did not say so before starting -
+            // the file declares no port for that service, so there was nothing to check against, and
+            // a reader who looks at their own compose will not find the number that is in the way.
+            BlockReason::AliasInUse => write!(
+                f,
+                ". '{}' declares no port for this in the file, so the collision could only be found \
+                 by binding. Give one of them a different internal port, which keeps the file \
+                 working under Docker too, or declare the port it really binds so kern can say this \
+                 before starting anything",
+                self.holder
+            ),
         }
     }
 }
@@ -882,6 +961,10 @@ fn try_spawn_in(
     if !r.holder_declares {
         return match kern_isolation::peer::spawn(a, r.alias, b, r.port, r.from_alias, pump_cap) {
             Ok(relay) => Attempt::Up((relay, a, b)),
+            // `EADDRINUSE` HERE IS THE WILDCARD CASE, LEARNED LATE. The holder declares no port, so
+            // it was not probed; it binds one anyway. Failing the stack for it would take down every
+            // other edge over a pair this holder already knows how to report.
+            Err(e) if is_addr_in_use(&e) => Attempt::Blocked(BlockReason::AliasInUse),
             Err(e) => Attempt::Failed(e),
         };
     }
@@ -891,6 +974,9 @@ fn try_spawn_in(
         PortState::SpecificOnly => {
             match kern_isolation::peer::spawn(a, r.alias, b, r.port, r.from_alias, pump_cap) {
                 Ok(relay) => Attempt::Up((relay, a, b)),
+                // Same as above: the probe said the holder binds a specific address, and between
+                // that measurement and this bind it took the whole port. A race, not a stack failure.
+                Err(e) if is_addr_in_use(&e) => Attempt::Blocked(BlockReason::AliasInUse),
                 Err(e) => Attempt::Failed(e),
             }
         }
@@ -1196,6 +1282,16 @@ pub(crate) fn kill_holder(dir: &Path) {
     ] {
         let _ = std::fs::remove_file(f);
     }
+    // THE PER-SERVICE NAT STATE, which is a directory TREE rather than a file: `outbound/<service>/`
+    // holds each box's `pasta.pid` and its identity record. `remove_dir_all` and not the guarded
+    // `remove_dir` below, because this subtree is created and written entirely by kern for this
+    // stack and its shape is known; the guard on the PARENT stays exactly as it was, so anything
+    // unexpected at the top level still keeps the directory rather than being deleted blindly.
+    //
+    // MEASURED as the failure the comment above predicts: adding this subtree without naming it here
+    // left `down` unable to remove the stack directory (`remove_dir` refuses a non-empty one), and
+    // `compose_down_removes_the_relay_directory_it_created` went red on the first run.
+    let _ = std::fs::remove_dir_all(dir.join("outbound"));
     // And the directory itself, so `relays/` does not accumulate one empty entry per stack that ever
     // ran. `remove_dir` refuses a non-empty directory, which is the guard: anything left there is a
     // file this function did not expect and must not delete blindly.

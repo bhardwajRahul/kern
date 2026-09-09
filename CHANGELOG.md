@@ -5,6 +5,244 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**Five silent differences from Docker were named, and one of them was a refusal.** The compatibility
+rate for `kern compose` had been measured from kern's own warnings, which makes it blind by
+construction to any difference kern does not know it has: a file kern says nothing about counts as
+perfect. Five such differences are now stated at `up` and at `config`, and the measured rate fell
+when they were, because the differences were always there and the measurement was not.
+
+A service with no `mem_limit:` runs under kern's 512 MiB ceiling while a Docker container with none
+runs uncapped, so a service that needs more is OOM-killed at a number written nowhere in the file.
+243 of the 259 files in the neutral corpus have at least one service in that position; kern names
+them once per stack, quoting the constant the cgroup actually enforces rather than a copy of it.
+
+In one shared namespace the services share `127.0.0.1`, so a port a service binds on the loopback is
+reachable from every other service in the stack. That is an exposure rather than a failure, which is
+why nothing had ever reported it, and it now gets a line on any multi-service pod. A single-service
+stack is told nothing: there is no peer to be reached from.
+
+A service mounting `/var/run/docker.sock` (or `/run/docker.sock`) is told that kern is daemonless and
+that there is nothing behind the path. That difference cannot be closed, and naming it is the whole
+remedy available.
+
+`RUN --mount=type=secret` and `--mount=type=ssh` are now REFUSED instead of silently stripped. The
+command was written because the credential would be there, so dropping the flag runs it
+unauthenticated: either a 401 whose message points at the registry rather than at the discarded flag,
+or a build that succeeds against a public mirror and ships something other than what was asked for.
+`type=cache` and `type=bind` stay dropped, since those cost a rebuild rather than a wrong answer.
+
+`external: true` on a volume that does not exist is refused, as Docker refuses it. The top-level
+`volumes:` block was previously not read at all, so kern auto-created the volume and the service
+started on empty storage where somebody else's data was supposed to be. An `external:` declaration
+carrying `name:` is honoured, and that name is validated as a volume name: a first version let it
+name a host path, which kern's `-v` classifier then bind-mounted.
+
+**`${VAR:?message}` refuses the file instead of substituting an empty string.** That form exists to
+stop a file being rendered without the value, and it is what a compose file writes for a password or
+a token: a stack came up with `MYSQL_PASSWORD=`. Every variable with no value is named, not just the
+first one found.
+
+**An image's file OWNERSHIP survives the unpack, so a service that runs as a non-root user can write
+its own directories.** Layers were extracted with `--no-same-owner`, which gave every file to the
+caller: inside a box that is uid 0, so an image that `chown`s a directory to a non-root user and then
+runs as that user could not write to it. Measured on three real stacks, all of which died on it:
+Prometheus (`mkdir data/: permission denied`), Kibana (`EACCES` on its uuid file) and Logstash. All
+three now come up, and Kibana answers 200.
+
+The box already maps a full subordinate range, so the ownership those images want was always
+representable on disk; it was lost because `tar` ran outside the namespace where the range exists.
+The unpack now runs as root of a namespace carrying that same range, which also let the hand-rolled
+single-uid map inside the OCI crate be deleted in favour of the one owner of that primitive. An image
+that names a uid the range cannot cover (OpenShift-style ids in the millions) is retried the old way,
+because `tar` exits 2 on such a chown and the image must stay pullable; measured on a crafted layer.
+
+Directory ownership needed a second fix: the layer merge RE-CREATES directories and only moved the
+files, so on `kibana:7.16.1` all 26920 files carried their ids and all 6680 directories did not. The
+merge now restores owner and mode on directories and symlinks, for the reason the code already gave
+for restoring the mode.
+
+**A named volume inherits the image directory's owner and mode, not just its contents.** `cp` fills a
+directory and leaves the directory alone, so a volume mounted where the image put an EMPTY directory
+owned by a non-root user copied nothing and stayed owned by in-box root. That is the Prometheus case
+exactly, and it survived the ownership fix above until the volume root was given the same treatment.
+
+**`kern rmi` no longer reports a removal it did not perform.** With ownership preserved, an image
+leaves directories this process does not own, and unlinking inside one needs write permission on it:
+measured, `kern rmi kibana:7.16.1` printed "freed 1.1G" and left 85 entries behind. The removal now
+retries as root of the mapped namespace, the result is returned instead of discarded, and the freed
+figure is reduced by whatever survived. `kern volume rm` takes the same path, for the same reason.
+
+**A string `command:` is an argv, not a shell line.** kern wrapped it as `sh -c "<string>"`, so
+Docker's own `awesome-compose` WordPress sample - `command: '--default-authentication-plugin=…'` on
+`mariadb` - started `sh` with that string as an OPTION and the database died on every start with
+`sh: 0: Illegal option --`. The Compose Specification is explicit that the shell-form syntax "does
+not implicitly run in the context of the SHELL instruction" and tells the author to write
+`/bin/sh -c` when they want one. Measured on the neutral corpus: of 83 string commands, 13 use shell
+syntax and all but two of those already write their own `sh -c`, which splitting preserves verbatim.
+Two more files carried the same broken shape (a command beginning with `-`).
+
+A string `entrypoint:` no longer DROPS `command`. That rule belongs to Dockerfiles, where
+`ENTRYPOINT some string` becomes `/bin/sh -c "…"` and has nowhere to put arguments; the specification
+says the Compose string form does not run in a shell, so the premise is absent. kern cleared the
+command and warned, silently discarding arguments the file asked for.
+
+**A block scalar carrying a tag was not folded at all.** `command: !!str |` with a body left the
+literal `|` in the value, so the service tried to execute a program called `|`. The fold scan
+required the value to BEGIN with the indicator and did not look past a tag it otherwise accepts. It
+was invisible while a string command was wrapped in a shell, where it became a run-time syntax error
+instead of a start failure, and the test that covered it asserted only that some argument contained
+the body.
+
+**An empty named volume is seeded from the image, as Docker does.** Docker copies the image's content
+at the mount point into a named volume the first time it is used while still empty; kern mounted an
+empty directory over the top, so a service found nothing where its image had put a default
+configuration or an initial database, and then failed with an error of its own making. Measured on
+`nginx:alpine` with an empty volume at `/etc/nginx`: 0 files before, 8 after. Only when the volume is
+EMPTY, and only for a NAMED volume; a bind mount of a host path is never touched. A multi-layer image
+is read through the kernel-merged overlay view, so a file a higher layer deleted does not come back.
+`merged_view_extract` gained an `Extract` enum for this: a first version placed the directory itself
+inside the volume, one level too deep, and `Option<&str>` could not say which of the two was meant.
+
+**The image's own `HEALTHCHECK` and `STOPSIGNAL` are read.** Docker runs an image's check whether or
+not the compose file mentions one, and `depends_on: {condition: service_healthy}` waits on exactly
+that; kern read neither, so such a service reported `HEALTH = "-"` forever. Measured on a box whose
+image declares a check: `healthy` when it passes, `unhealthy` when it fails, `-` on `main` in both
+cases. A `healthcheck:` in the file replaces the image's entirely, numbers included, which is
+Compose's rule. `--stop-signal` became optional at the flag boundary so an explicit `SIGTERM` can be
+told apart from the default and still win over an image that asks for something else.
+
+**A double close in the log-rotation test was corrupting unrelated tests.** `CappedLog` closes its
+descriptor in `Drop`, and the test added with `logging:` closed it by hand as well. The second close
+succeeds, having destroyed whatever the operating system handed that number to in the meantime, so
+the suite failed intermittently in a different unrelated test each run with `remove_dir_all`
+panicking `closedir: Bad file descriptor`. Measured at 3 failures in 14 runs before, 0 in 14 after,
+0 in 11 on `main`. A source-scan test now fails the build if any holder closes that field again.
+
+**Six Docker Compose keys stopped being warnings and started being behaviour.** Each was chosen from
+what real files ask for: 240 compose files from 221 public repositories were parsed and their values
+counted, so the work follows the distribution rather than Docker's vocabulary.
+
+`devices:` is applied. It is a bind mount, which is what it always was: measured before any of this,
+`kern box -v /dev/kvm:/dev/kvm` already gave a workload a working `crw-rw---- 10, 232 /dev/kvm`, so
+refusing the key whose only purpose is to say that was withholding a spelling, not a privilege. The
+node arrives with the host's own owner and mode, so a caller who cannot open it on the host cannot
+open it in the box. `/dev/net/tun`, which is 37 of the 83 `devices:` values in that corpus, maps to
+`--tun` instead of a plain bind, because the node alone is useless without the `CAP_NET_ADMIN` that
+creating a tunnel interface needs. Docker's third field is honoured where kern has it: a spec with no
+`w` becomes a read-only bind.
+
+`dns:`, `dns_search:` and `dns_opt:` are applied, through three new flags: `--dns`, `--dns-search`
+and `--dns-option`. A box that names none is byte-identical to every box kern has started so far:
+the image's own `/etc/resolv.conf` is left alone, including the empty one the debian family ships. A
+`--dns` that is not an IP literal is refused at the flag, because glibc silently skips a `nameserver`
+line it cannot parse and the box would otherwise run with no DNS and no message.
+
+`logging:`'s `max-size` and `max-file` are applied, through `--log-max-size` and `--log-max-file`.
+kern's capture has always been a size-capped rotating log; the options now set its cap and its
+generation count, with Docker's counting (`max-file: 3` means the active file plus `.1` and `.2`).
+
+`links:` is applied. The alias lands in the source service's `/etc/hosts` in both stack modes, and
+the ordering edge Docker implies is added to `depends_on`.
+
+`ipc:` and `pid:` are answered with measurements instead of a blanket "unsupported": every box
+already has a private IPC and PID namespace, so `private` is reported as ALREADY ENFORCED, and two
+members of one stack were measured to share only their network namespace, which is what makes
+`pid: service:X` unsatisfiable here rather than merely unimplemented.
+
+`tmpfs:` options are applied. `size=`, `mode=`, `noexec` and `ro` now reach the mount; `nosuid` and
+`nodev` are kern's floor and a `suid` or `dev` token is named as recognised-and-never-applied rather
+than acted on. A long-form `{type: tmpfs}` volume entry, which used to be dropped with a pointer to
+`--tmpfs`, is now translated into one.
+
+`kern docker run` follows: `--device`, `--dns`, `--dns-search`, `--dns-option`, `--dns-opt` and
+`--log-opt max-size/max-file` are translated instead of refused, `--device` through the same
+normaliser the compose parser uses so the two surfaces cannot disagree. Any other `--log-opt` is
+still refused rather than dropped.
+
+**`networks:` is now enforced by default, and `internal: true` is a real boundary for the first
+time.** A compose file whose networks leave two services with nothing in common gets one network
+namespace PER SERVICE, so the separation it asked for is enforced by the absence of a relay rather
+than dropped. kern says so at bring-up, names the pairs it separated, and `--pod` keeps the old
+single-namespace wiring for anyone who prefers the speed. A file whose networks separate nothing
+keeps the pod and is told nothing, because nothing is lost.
+
+Making that usable needed egress per service, which did not exist: outside a pod a box held only
+`lo` and could not reach the internet at all. kern now attaches a rootless NAT to each service's own
+namespace, through the same `pasta` machinery the pod has always used, at the one instant it is safe
+to: the service is held at its pre-exec gate with every namespace built and no instruction run, so a
+workload never observes a namespace that has no route one moment and a route the next.
+
+`internal: true` then means what Compose says it means. A service confined to internal networks gets
+NO NAT, so there is no route out of its namespace rather than a filter that has to stay correct.
+Measured on one stack, one run: the service on a public network reported two routes and reached
+`1.1.1.1:443`, the confined one reported zero and could not. A service with `restart:` gets no NAT
+either way and is named at bring-up: it is installed as a systemd unit, so `up` never holds it.
+
+**Docker Compose compatibility, measured before and after on the same neutral corpus** of 259 files,
+one per repository, sampled across 733 repositories: the share of files kern runs with NO behavioural
+difference from what the file says went from **14% to 94%**. What remains is dominated by keys that
+ask kern to be less confining than it is (`privileged: true`, `security_opt`) and by
+`network_mode: host`, which one namespace per stack cannot express.
+
+**A PUBLISHED PORT NOW BINDS `0.0.0.0`, NOT `127.0.0.1`. Read this one.** `-p 8080:80` and a compose
+`ports: "8080:80"` bind every interface, which is what Docker does and what a file written for Docker
+means. Until now kern bound loopback and warned; a stack that looked published was reachable only
+from the machine it ran on.
+
+This is a deliberate change of a security-relevant default, and the reason is measured. On a neutral
+corpus of 259 compose files, one per repository, sampled across 733 repositories, **203 files (78%)**
+published a port and therefore behaved differently under kern than their own text says. It was by a
+wide margin the largest source of difference: the next cause was worth 75 files, and every key kern
+refuses on purpose (`privileged`, `security_opt`) was worth 8 together. Closing it moved the share of
+files with zero behavioural difference from **14% to 63%** on that corpus.
+
+The previous posture is one line, and it is stronger than the old default was:
+
+```toml
+[kern]
+publish_bind = "127.0.0.1"
+```
+
+That key is a CEILING, not a default: it overrides even a spec that explicitly writes
+`0.0.0.0:8080:80`, so a compose file obtained from anywhere cannot decide where the host listens. It
+is read only from the default config, never from a `--config` a compose file named. The box reports
+how many specs it narrowed, so the policy is never silent. If `kern.toml` cannot be parsed, kern
+publishes on loopback and says so rather than assuming the wide answer.
+
+**Four more compose keys are applied.** `mem_reservation` becomes cgroup `memory.low` through a new
+`--memory-reservation` (a soft floor, never a cap and never an OOM kill); `cpu_shares` becomes
+`cpu.weight` through a new `--cpu-weight`, CONVERTED between the two scales so Docker's normal (1024)
+lands on cgroup v2's normal (100) rather than on 39; `cpu_quota` + `cpu_period` are divided into
+`--cpus`, which is the same `cpu.max` line written the short way; `pull_policy` becomes `--pull`.
+
+**`networks:` became a boundary instead of a warning, under `--no-pod`.** A stack in a pod is one
+network namespace and cannot segregate anything, so there the key is still reported as dropped.
+Without a pod each service has its own namespace and reachability is built edge by edge out of
+relays, so the memberships now decide which edges exist: two services with no network in common get
+no relay AND no entry in each other's `/etc/hosts`, so the peer's name does not resolve. Measured on
+a three-service stack, the plan drops from six relays to four and the two cut directions answer
+`nc: bad address` while every shared-network pair still delivers its payload. The boundary is the
+absence of a relay rather than a filter, so there is no rule that can be misconfigured open.
+
+A service with no `networks:` key is on the implicit `default` network and is therefore separated
+from the services that name one. That is the Compose Specification's rule, and measured over 240 real
+compose files it is the dominant case: 52 files have at least one pair that loses its edge, 40 of
+them through exactly this. `up` names every cut pair with both memberships before starting anything,
+because a removed edge otherwise appears minutes later as `bad address '<peer>'` in a service log,
+indistinguishable from a typo or a dead peer.
+
+**`internal: true` now says something different in each wiring, and both are measured.** In a pod it
+is all-or-nothing and becomes `--no-outbound` only when every service qualifies; outbound otherwise
+stays open (measured: a pod member reaches `1.1.1.1:443`). Without a pod every service is confined
+already (measured: the box holds only `lo`, the same connect is refused), so the key is satisfied for
+the services that asked and for the ones that did not. The over-application is stated rather than
+left to be discovered by a stack that calls an external API.
+
+**CLI surface: five flags added, none changed or removed.** `--dns`, `--dns-search`, `--dns-option`,
+`--log-max-size`, `--log-max-file`. Additive, so nothing that runs today stops running.
+
 ## v0.9.31 - 2026-09-09
 
 **If you use `kern exec`, this release is the one that makes it obey the box's limits.** It did not.

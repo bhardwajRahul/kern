@@ -220,6 +220,27 @@ fn warn_if_ssh_lacks_a_uid_range(ssh_port: Option<u16>) {
     }
 }
 
+/// The `nameserver` addresses in a pod's shared `resolv.conf`, in file order.
+///
+/// Read rather than re-derived: the pod's file is written once by `pod create` from whatever the host
+/// resolver was at that moment, and deriving it a second time here could disagree with what the other
+/// members are actually using. A line that is not a `nameserver` (a `search`, a comment) is skipped,
+/// because this exists only to keep a box's resolvers when it asked to change something else.
+fn pod_nameservers(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .next()
+                .filter(|h| *h == "nameserver")
+                .and(l.split_whitespace().nth(1))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// `--pod <name>`: join the pod's shared user+net namespace (created by `kern pod create`). Resolves
 /// its live holder PID, registers this box in the pod's shared `/etc/hosts` (so peers resolve it by
 /// name), and binds that hosts file over the box's `/etc/hosts`. Returns the holder PID, or `None`
@@ -228,6 +249,8 @@ fn join_pod_and_bind_its_files(
     pod: Option<&str>,
     name: &str,
     volumes: &mut Vec<kern_isolation::Volume>,
+    dns_requested: bool,
+    inherit_nameservers: &mut Vec<String>,
 ) -> Result<Option<i32>, Error> {
     let Some(pod) = pod else { return Ok(None) };
     let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
@@ -254,13 +277,31 @@ fn join_pod_and_bind_its_files(
         read_only: false,
     });
     // If the pod has outbound (a pasta NAT → a pod resolv.conf exists), bind it so DNS works.
+    //
+    // NOT WHEN THIS BOX ASKED FOR ITS OWN DNS. The bind is the pod's SHARED file, writable, and the
+    // box writes `/etc/resolv.conf` from `--dns` later in its own setup - so with the bind in place
+    // that write lands on the file every other member is reading. MEASURED before this branch
+    // existed: a two-service stack where only service `a` declared `dns:` gave service `b`, which
+    // declared none, `nameserver 1.1.1.1` and `nameserver 9.9.9.9`. One service's configuration
+    // silently became the whole stack's, and the pod's own resolvers were destroyed for everyone.
+    // Discriminated: no leak under `--no-pod` and none between standalone boxes, so the shared bind
+    // was the whole mechanism.
+    //
+    // Skipping the bind leaves the write on the box's own root, which is private per box. What the
+    // box must not lose is the pod's RESOLVERS when it only asked to add a `search` or an `options`
+    // line: those are carried out through `inherit_nameservers` and re-emitted into the private
+    // file, so "add a search domain" cannot silently mean "and drop DNS".
     let rp = crate::pod::resolv_path(pod);
     if rp.exists() {
-        volumes.push(kern_isolation::Volume {
-            source: symlink_free(rp),
-            target: "/etc/resolv.conf".to_string(),
-            read_only: false,
-        });
+        if dns_requested {
+            inherit_nameservers.extend(pod_nameservers(&rp));
+        } else {
+            volumes.push(kern_isolation::Volume {
+                source: symlink_free(rp),
+                target: "/etc/resolv.conf".to_string(),
+                read_only: false,
+            });
+        }
     }
     Ok(Some(holder))
 }
@@ -320,6 +361,187 @@ fn point_the_box_at_the_egress_proxy(
         env.push((k.to_string(), proxy.clone()));
     }
     Ok(())
+}
+
+/// Copy the image's content at each mount point into any NAMED volume that is still empty.
+///
+/// BEST EFFORT BY DESIGN, and every failure is silent on purpose: a volume that could not be seeded
+/// behaves exactly as every kern volume behaved before this existed, so nothing that worked stops
+/// working. Refusing to start a box because an optional copy failed would trade a subtle difference
+/// for an outage.
+///
+/// THE MERGED VIEW IS THE ONLY CORRECT READER of a multi-layer image, for [`merged_view_extract`]'s
+/// reason: a hand-rolled walk of the raw layer directories re-includes files a higher layer DELETED,
+/// through per-file whiteouts and through opaque directories that carry no `.wh.` file at all. A
+/// single-layer image cannot hold a cross-layer opaque and is copied directly, which is the same
+/// split the push path makes.
+fn seed_empty_named_volumes(lower: &str, volumes: &[Volume]) {
+    // NOTHING TO SEED: the common case, and it must cost nothing. Checked before the fork, because a
+    // fork per box start would be a real cost on the hot path for a job that is almost always empty.
+    let seedable: Vec<&Volume> = volumes.iter().filter(|v| is_seedable(v)).collect();
+    if seedable.is_empty() {
+        return;
+    }
+    // INSIDE THE MAPPED NAMESPACE, so the copy can carry the image's OWNERSHIP onto the volume and
+    // the volume's own root can be given the image directory's owner and mode.
+    //
+    // Docker does both. A named volume mounted where the image put a directory owned by a non-root
+    // user must arrive owned by that user, or the service cannot write it: MEASURED on
+    // `prom/prometheus`, whose `/prometheus` is `nobody:nobody` and whose volume came back owned by
+    // in-box root, so it died with `mkdir data/: permission denied` even after the image's own
+    // ownership was fixed. The contents are only half of what a volume inherits.
+    let lower = lower.to_string();
+    let owned: Vec<(String, String)> = seedable
+        .iter()
+        .map(|v| (v.source.clone(), v.target.clone()))
+        .collect();
+    let seed = move |_ranged: bool| {
+        seed_now(&lower, &owned);
+        0
+    };
+    if kern_isolation::with_id_mapped_userns(seed).is_err() {
+        // No namespace to map: the volume stays empty, which is where it started and what every kern
+        // volume did before this existed.
+    }
+}
+
+/// May this mount be seeded from the image? Three conditions, each excluding a different mistake.
+///
+/// NAMED: a bind mount of a host path is the caller's own directory, and writing image content into
+/// it would be kern filling a directory nobody asked it to touch. EMPTY: Docker's rule, and the only
+/// thing standing between this and overwriting live data. A TARGET THAT IS NOT THE ROOT: a volume
+/// over `/` has no meaningful "the image's content at the mount point" to copy.
+fn is_seedable(v: &Volume) -> bool {
+    let src = std::path::Path::new(&v.source);
+    crate::volume::name_of_data_dir(src).is_some()
+        && crate::volume::data_dir_is_empty(src)
+        && !v.target.trim_matches('/').is_empty()
+}
+
+/// The seeding itself, running as root of the mapped namespace (see [`seed_empty_named_volumes`]).
+fn seed_now(lower: &str, volumes: &[(String, String)]) {
+    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
+    for (source, target) in volumes {
+        let src = std::path::Path::new(source);
+        let rel = target.trim_start_matches('/');
+        if chain.len() >= 2 {
+            let _ = crate::commands::merged_view_extract(
+                &chain,
+                crate::commands::Extract::Contents(rel),
+                src,
+            );
+        } else {
+            let from = std::path::Path::new(&chain[0]).join(rel);
+            if from.is_dir() {
+                let _ = std::process::Command::new("cp")
+                    .arg("-a")
+                    .arg("--reflink=auto")
+                    .arg("--")
+                    .arg(format!("{}/.", from.display()))
+                    .arg(src)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        // THE VOLUME'S OWN ROOT, which no content copy can set: `cp -a` fills the directory and
+        // leaves the directory itself alone. An image whose mount point is an EMPTY directory owned
+        // by a non-root user copies nothing at all, and that is exactly the Prometheus case.
+        let from = std::path::Path::new(&chain[0]).join(rel);
+        if let Ok(m) = std::fs::metadata(&from) {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(c) = std::ffi::CString::new(source.as_bytes()) {
+                // SAFETY: `c` is a live NUL-terminated path for the duration of the call.
+                unsafe { libc::chown(c.as_ptr(), m.uid(), m.gid()) };
+            }
+            // AFTER the chown, which clears setgid.
+            let _ = std::fs::set_permissions(
+                src,
+                std::fs::Permissions::from_mode(m.permissions().mode()),
+            );
+        }
+    }
+}
+
+/// The signal that stops this box: the flag, else the image's `STOPSIGNAL`, else `SIGTERM`.
+///
+/// AN EXPLICIT FLAG WINS EVEN WHEN IT NAMES `SIGTERM`, which is why the flag arrives as an `Option`:
+/// with kern's default folded in as a value, honouring the image would have meant overriding
+/// somebody's deliberate choice, and keeping the flag would have meant never honouring the image.
+///
+/// A NAME THE IMAGE WROTE THAT KERN'S TABLE LACKS FALLS BACK rather than refusing. nextcloud ships
+/// `SIGWINCH` (MEASURED), which kern has no mapping for; refusing there would stop a box from
+/// running over a field it used to ignore entirely.
+///
+/// A FUNCTION so the precedence can be asserted. Written inline as an `.or_else` chain it was only
+/// ever checked end to end, which needs a box, an image with a `STOPSIGNAL`, and a workload that
+/// reports which signal it caught.
+pub(crate) fn resolve_stop_signal(flag: Option<i32>, image: Option<&str>) -> i32 {
+    flag.or_else(|| image.and_then(crate::cli::parse_signal_name))
+        .unwrap_or(libc::SIGTERM)
+}
+
+/// What an image's own `HEALTHCHECK` contributes, once the caller's flags have had their say.
+///
+/// EVERY FIELD `None` MEANS "THE IMAGE SAYS NOTHING HERE", so each falls back independently at the
+/// call site to the flag's value (which already carries kern's default).
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct ImageHealthDefaults {
+    pub(crate) cmd: Option<String>,
+    pub(crate) interval: Option<u64>,
+    pub(crate) retries: Option<u32>,
+    pub(crate) start_period: Option<u64>,
+    pub(crate) timeout: Option<u64>,
+}
+
+/// ALL OR NOTHING, which is what Docker does and what the flags allow us to know.
+///
+/// A caller who passes `--health-cmd` owns the whole check: their command with their (or kern's
+/// default) numbers, and the image's is ignored - Compose's `healthcheck.test` REPLACES the image's
+/// rather than merging with it. A caller who passes none gets the image's check entire.
+///
+/// FIELD-BY-FIELD FALLBACK IS NOT EXPRESSIBLE and pretending otherwise would be a guess: the numeric
+/// flags carry kern's defaults already baked in (`--health-interval` is 30 whether or not anyone
+/// typed it), so "did the caller choose this?" has no answer here. An all-or-nothing rule needs only
+/// a question that can be answered.
+///
+/// A FUNCTION so the rule can be asserted: taken inline at the struct literal, a mutation swapping
+/// which side wins leaves every test green.
+pub(crate) fn image_health_defaults(
+    img: Option<&kern_oci::ImageHealthcheck>,
+    flag_cmd: Option<&str>,
+) -> ImageHealthDefaults {
+    // The caller named a command: the image contributes nothing at all, numbers included.
+    let Some(h) = img.filter(|_| flag_cmd.is_none()) else {
+        return ImageHealthDefaults::default();
+    };
+    // `HEALTHCHECK NONE` disables a check a base image set, so it contributes nothing either - and
+    // must not leave its INTERVALS behind to be applied to a check that does not exist.
+    let Some(cmd) = h.shell_command() else {
+        return ImageHealthDefaults::default();
+    };
+    ImageHealthDefaults {
+        cmd: Some(cmd),
+        interval: secs_from_nanos(h.interval_ns),
+        retries: h.retries,
+        start_period: secs_from_nanos(h.start_period_ns),
+        timeout: secs_from_nanos(h.timeout_ns),
+    }
+}
+
+/// An OCI config duration (NANOSECONDS, Go's `time.Duration`) as whole SECONDS, which is the unit
+/// every kern health flag speaks.
+///
+/// A ZERO IS "UNSET", not "every zero seconds": the OCI spec writes 0 for a field the image left
+/// out, and a zero interval would spin the checker in a loop. A sub-second value rounds UP to one
+/// second rather than down to zero, for the same reason - the coarser unit must never turn a real
+/// interval into no interval at all.
+fn secs_from_nanos(ns: Option<u64>) -> Option<u64> {
+    match ns? {
+        0 => None,
+        n => Some(n.div_ceil(1_000_000_000)),
+    }
 }
 
 /// Attach the named volumes that carry a recorded quota, each on its own ext4 loop image so the limit
@@ -584,7 +806,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::volume::is_named(src) && crate::volume::size_limit(src).is_some()
         });
     let mut volumes = parse_volumes(&plain_specs)?;
-    let pod_holder = join_pod_and_bind_its_files(args.pod, name.as_str(), &mut volumes)?;
+    // A box "asked for DNS" if it named ANY of the three: a `search` line alone is still a request
+    // to own the file, and owning it in a pod means not sharing the pod's.
+    let dns_requested =
+        !args.dns.is_empty() || !args.dns_search.is_empty() || !args.dns_options.is_empty();
+    let mut inherited_nameservers: Vec<String> = Vec::new();
+    let pod_holder = join_pod_and_bind_its_files(
+        args.pod,
+        name.as_str(),
+        &mut volumes,
+        dns_requested,
+        &mut inherited_nameservers,
+    )?;
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
     env.extend(parse_envs(args.env)?);
@@ -746,6 +979,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         (None, None, Some(img)) => resolve_image_depth(img, 0, args.pull)?,
         (None, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
     };
+    // AN EMPTY NAMED VOLUME IS SEEDED FROM THE IMAGE, WHICH IS WHAT DOCKER DOES.
+    //
+    // Docker copies the image's content at the mount point into a named volume the first time that
+    // volume is used while it is still empty; kern mounted an empty directory over the top, so the
+    // service came up and found NOTHING where its image had put a default configuration, an initial
+    // database, or a web root. It then failed with an error of its own making, which points at the
+    // application and never at the mount: `postgres` re-initialises, `nginx` serves 403, and the
+    // person debugging it has no reason to suspect kern.
+    //
+    // ONLY WHEN THE VOLUME IS EMPTY, so this costs nothing after first use and can never write over
+    // data that is already there. That is Docker's rule too, and it is the whole reason the check is
+    // on the directory rather than on a first-use marker: a volume created ahead of time is empty,
+    // and one emptied by hand is empty again.
+    seed_empty_named_volumes(&lower, &volumes);
     // Resolve the effective command from the image config (docker semantics: Entrypoint + the user's
     // command, else the image's Cmd; a shell if nothing is set). `--ssh` with no command keeps the
     // box alive instead. Explicit `-- CMD` always wins over the image's Cmd.
@@ -852,7 +1099,46 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--ssh`: authorize a key (generate a throwaway keypair, or use `--ssh-key`) and publish the
     // in-box sshd on the host port (→ box `:22`) via the ordinary rootless forwarder. `eff_ports`
     // is the user's `-p` maps plus that SSH mapping.
-    let (ssh, eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
+    let (ssh, mut eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
+    // THE HOST'S PUBLISH POLICY, APPLIED AT THE ONE CHOKE POINT. Everything downstream - the
+    // preflight, the forwarders, the registry entry, `kern ps` - reads this list, so narrowing it
+    // here means there is no second place where a port could still be bound wider than the operator
+    // allowed. Named rather than silent: a spec that asked for something else is reported, because a
+    // published port that answers somewhere other than where the file said is precisely the class of
+    // difference this project refuses to ship.
+    // NOT CONSULTED WHEN THERE IS NOTHING TO PUBLISH, and this is a measured cost rather than a
+    // tidiness argument. `publish_policy` reads `kern.toml`, and it used to run on every box start
+    // including the overwhelming majority that publish no port at all. Alternated against `main`,
+    // 250 pairs per repeat, three repeats: +13, +33, +17 us on box start p50 - all three positive,
+    // so unlike ordinary run-to-run spread this was real. A box with no `-p` cannot be affected by a
+    // publish policy, so the read is skipped and the cost is paid only by the boxes the setting is
+    // about.
+    let policy = if eff_ports.is_empty() {
+        None
+    } else {
+        match crate::commands::publish_policy() {
+            Ok(p) => p,
+            // FAIL CLOSED, AND SAY SO. kern cannot know what the operator meant, and the two wrong
+            // answers are not symmetric: guessing "every interface" publishes ports the operator may
+            // have spent a config file preventing, while guessing "loopback" costs reachability that a
+            // single readable line restores. The box still starts, because refusing every box over an
+            // unrelated typo elsewhere in `kern.toml` would be a bigger change than this setting owns.
+            Err(e) => {
+                eprintln!(
+                "kern: warning: kern.toml could not be read ({e}); publishing on 127.0.0.1 until it \
+                 parses, rather than assuming every interface"
+            );
+                Some(crate::ports::LOOPBACK_IP)
+            }
+        }
+    };
+    let moved = crate::commands::apply_publish_policy(&mut eff_ports, policy);
+    if moved > 0 {
+        eprintln!(
+            "kern: note: {moved} published port(s) bound to 127.0.0.1 by the host's \
+             `[kern] publish_bind` policy, overriding what the spec asked for"
+        );
+    }
     let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
@@ -1076,6 +1362,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         io_max: vdisk_io_max,
         io_weight: args.io_weight,
         extra_hosts: resolve_add_hosts(args.add_hosts, args.share_net),
+        // The box's own servers win; the pod's are the FALLBACK for a box that only added a search
+        // domain or an option. An empty result means neither existed, and the box then gets no
+        // nameserver line at all, which is the same as it had before it asked.
+        memory_low: args.memory_reservation,
+        cpu_weight: args.cpu_weight,
+        dns: if args.dns.is_empty() {
+            inherited_nameservers
+        } else {
+            args.dns.to_vec()
+        },
+        dns_search: args.dns_search.to_vec(),
+        dns_options: args.dns_options.to_vec(),
         ulimits: args.ulimits.to_vec(),
         sysctls: args.sysctls.to_vec(),
     })?;
@@ -1136,13 +1434,52 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // be constructed inline for `run_detached` and field-by-field again for the foreground checker,
     // which is exactly how the same flag comes to mean two things depending on how the box was
     // started - the defect this branch exists to fix, in miniature.
+    // THE IMAGE'S OWN `HEALTHCHECK` IS A DEFAULT, exactly as its `ENTRYPOINT` and `Cmd` are.
+    //
+    // Docker runs the check an image ships whether or not the compose file mentions one, and
+    // `depends_on: {condition: service_healthy}` waits on precisely that. kern read only what the
+    // caller passed, so a service built on an image with a `HEALTHCHECK` reported `HEALTH = "-"`
+    // forever and a dependency waiting on it either hung or was let through against a service that
+    // was not ready. `nginx`, `postgres`, `redis` and `traefik` images all ship one.
+    //
+    // A TYPED FLAG ALWAYS WINS, and every field falls back independently: a file that sets only
+    // `interval:` keeps the image's command, which is what a partial override means.
+    // ALL OR NOTHING, which is what Docker does and what the flags allow us to know.
+    //
+    // A caller who passes `--health-cmd` owns the whole check: their command with their (or kern's
+    // default) numbers, and the image's is ignored - Compose's `healthcheck.test` REPLACES the
+    // image's rather than merging with it. A caller who passes none gets the image's check entire.
+    //
+    // FIELD-BY-FIELD FALLBACK IS NOT EXPRESSIBLE HERE and pretending otherwise would be a guess: the
+    // numeric flags carry kern's defaults already baked in (`--health-interval` is 30 whether or not
+    // anyone typed it), so "did the caller choose this?" has no answer at this point. An all-or-
+    // nothing rule needs only a question that can be answered.
+    // THE IMAGE'S `STOPSIGNAL` IS A DEFAULT TOO, and for the same reason as its healthcheck: Docker
+    // stops a container with the signal its image asked for. nginx wants `SIGQUIT` (a graceful
+    // drain), apache wants `SIGWINCH`; sent `SIGTERM`, both cut live connections instead of
+    // finishing them, which looks like a flaky proxy and never like a missing signal.
+    //
+    // AN EXPLICIT FLAG WINS EVEN WHEN IT NAMES `SIGTERM`, which is why the flag is an `Option`: with
+    // the default folded in as a value, honouring the image would have meant overriding somebody's
+    // deliberate choice, and keeping the flag would have meant never honouring the image.
+    let stop_signal = resolve_stop_signal(args.stop_signal, image_config.stop_signal.as_deref());
+    let img_health = image_health_defaults(image_config.healthcheck.as_ref(), args.health_cmd);
     let health_cfg = HealthConfig {
-        cmd: args.health_cmd,
-        interval: args.health_interval,
-        retries: args.health_retries,
-        start_period: args.health_start_period,
-        timeout: args.health_timeout,
+        cmd: args.health_cmd.or(img_health.cmd.as_deref()),
+        interval: img_health.interval.unwrap_or(args.health_interval),
+        retries: img_health.retries.unwrap_or(args.health_retries),
+        start_period: img_health.start_period.unwrap_or(args.health_start_period),
+        timeout: img_health.timeout.unwrap_or(args.health_timeout),
         action: health_action,
+    };
+    // ONE POLICY OBJECT, BUILT ONCE, and computed BEFORE the branch so the detached path and the
+    // systemd-managed path cannot bound their logs differently. `LogCap::default()` is what every
+    // box had before the flags existed, so an unset flag changes nothing.
+    let log_cap = crate::commands::boxlog::LogCap {
+        max_bytes: args
+            .log_max_size
+            .unwrap_or(crate::commands::boxlog::BOX_LOG_MAX_BYTES),
+        files: args.log_max_file.unwrap_or(2),
     };
     if args.detached {
         return run_detached(
@@ -1157,10 +1494,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             health_cfg,
             args.timeout,
             &args.labels.join(","),
-            args.stop_signal,
+            stop_signal,
             args.stop_grace,
             args.restart_max,
             args.def_hash,
+            log_cap,
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -1197,7 +1535,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             let log = registry::logs_dir()
                 .ok()
                 .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
-            detach_stdio(log.as_deref());
+            detach_stdio(log.as_deref(), log_cap);
         }
         let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
         let inst = registry::Instance {
@@ -1216,7 +1554,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             egress: args.egress_allow.join(","),
             landlock_rw: spec.landlock_rw.join(","),
             labels: args.labels.join(","),
-            stop_signal: args.stop_signal,
+            stop_signal,
             stop_grace: args.stop_grace,
             def_hash: args.def_hash.to_string(),
             memory_max: spec.memory_max,
@@ -1612,6 +1950,8 @@ pub fn run(
         None,  // `kern run` has no --pids-limit; box's pids cap is applied in the sandbox
         &[],   // no vdisk io limits in `kern run`
         None,  // no --io-weight in `kern run`
+        None, // no --memory-reservation in `kern run`: the soft knobs are box-shaped (compose sets them)
+        None, // no --cpu-weight in `kern run`, same reason
         false, // `kern run` is a cooperative governor, never fail-closed (best-effort gate)
         false, // supervisor_forks_workload: `kern run` exec()s in place, so THIS process is the workload
     );
@@ -1945,6 +2285,21 @@ fn await_box_started(
             break r;
         };
         unsafe { libc::close(rd) };
+        // PREPARED IS A SUCCESS, AND IT IS THE ONLY BYTE THAT IS.
+        //
+        // The pipe carries three states, one per shape: EOF means the workload exec'd, the byte
+        // `b'x'` means setup failed, and `b'P'` means the box is fully set up and waiting on its
+        // pre-exec gate. The third exists because a gated box CANNOT reach EOF on its own: under
+        // `compose --no-pod` the workload waits for the gate, the gate is written by `up`, and `up`
+        // waits for this launcher - a four-way wait that hung two runs in three before this byte
+        // existed.
+        //
+        // Read as "any byte means failure" - which is what this did - a prepared box was reported as
+        // a box that died before starting, complete with a log tail that did not exist. So the value
+        // is checked, not just the count.
+        if n > 0 && byte[0] == kern_isolation::READY_PREPARED {
+            return Ok(());
+        }
         if n > 0 && supervised {
             // Docker returns immediately for `-d --restart` on a box that trips its first start; the
             // supervisor keeps retrying in the background. Hand back so the caller (and `compose up`)
@@ -2261,6 +2616,8 @@ fn run_detached(
     restart_max: u32,
     // `--def-hash`: fingerprint of the compose definition, recorded for drift detection.
     def_hash: &str,
+    // `--log-max-size` / `--log-max-file`, resolved by the caller so both detach paths share one.
+    log_cap: crate::commands::boxlog::LogCap,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -2297,7 +2654,7 @@ fn run_detached(
     let log = registry::logs_dir()
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), pid)));
-    detach_stdio(log.as_deref());
+    detach_stdio(log.as_deref(), log_cap);
     let (cap_drop_all, cap_drops, cap_adds) = registry::cap_fields(&spec.caps);
     let mut inst = registry::Instance {
         name: name.as_str().to_string(),
@@ -2837,5 +3194,186 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
             unsafe { libc::close(write_fd) };
             scope_reexec_proxy(child, read_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod pod_dns_tests {
+    use super::pod_nameservers;
+
+    /// ONLY `nameserver` LINES, AND IN FILE ORDER.
+    ///
+    /// This is the fallback a pod member gets when it asked to change its `search` or `options` and
+    /// nothing else: it must inherit the resolvers the rest of the stack is using, and nothing else
+    /// from that file. Folding in a `search` line would emit it as an address, and `resolv.conf`
+    /// silently skips a `nameserver` it cannot parse - so the box would end up with fewer working
+    /// resolvers than the pod has, with nothing said anywhere.
+    ///
+    /// Order matters because glibc honours at most `MAXNS` (3) servers, top down: a reordering is a
+    /// different resolver for anyone past the third line.
+    #[test]
+    fn pod_nameservers_reads_only_nameserver_lines_in_order() {
+        let dir = std::env::temp_dir().join(format!("kern-resolv-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("resolv.conf");
+        std::fs::write(
+            &p,
+            "# a comment\nsearch example.com\nnameserver 1.1.1.1\noptions ndots:2\nnameserver 9.9.9.9\n",
+        )
+        .expect("write");
+        assert_eq!(
+            pod_nameservers(&p),
+            vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]
+        );
+
+        // A file that names no resolver yields none, rather than something that looks like one.
+        std::fs::write(&p, "search example.com\noptions ndots:2\n").expect("write");
+        assert!(pod_nameservers(&p).is_empty());
+
+        // A missing file is not an error here: a pod without outbound has no resolv.conf at all.
+        assert!(pod_nameservers(&dir.join("nope")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod image_defaults_tests {
+    use super::*;
+
+    fn hc(test: &[&str]) -> kern_oci::ImageHealthcheck {
+        kern_oci::ImageHealthcheck {
+            test: test.iter().map(|s| (*s).to_string()).collect(),
+            interval_ns: Some(30_000_000_000),
+            timeout_ns: Some(5_000_000_000),
+            start_period_ns: Some(2_000_000_000),
+            retries: Some(4),
+        }
+    }
+
+    /// ALL OR NOTHING, and each arm is a different reason. MEASURED end to end on a real box before
+    /// this was extracted: with no flag the image's check runs (`healthy` when its file exists,
+    /// `unhealthy` when it does not), and the same image on `main` reports `-`.
+    #[test]
+    fn the_image_health_is_a_default_the_flag_replaces_whole() {
+        // No image check at all: nothing to contribute.
+        assert_eq!(
+            image_health_defaults(None, None),
+            ImageHealthDefaults::default()
+        );
+        assert_eq!(
+            image_health_defaults(None, Some("curl -f /")),
+            ImageHealthDefaults::default()
+        );
+
+        // The image alone: its command AND its numbers.
+        let d = image_health_defaults(Some(&hc(&["CMD-SHELL", "test -f /ready"])), None);
+        assert_eq!(d.cmd.as_deref(), Some("test -f /ready"));
+        assert_eq!(
+            (d.interval, d.timeout, d.start_period, d.retries),
+            (Some(30), Some(5), Some(2), Some(4))
+        );
+
+        // THE FLAG REPLACES THE WHOLE CHECK, numbers included: Compose's `healthcheck.test` does not
+        // merge with the image's, and half of each would be a check nobody wrote.
+        assert_eq!(
+            image_health_defaults(Some(&hc(&["CMD-SHELL", "test -f /ready"])), Some("mine")),
+            ImageHealthDefaults::default()
+        );
+
+        // `NONE` DISABLES, and must not leave its intervals behind to be applied to a check that
+        // does not exist. A version that returned only `cmd: None` would set an interval on nothing.
+        assert_eq!(
+            image_health_defaults(Some(&hc(&["NONE"])), None),
+            ImageHealthDefaults::default()
+        );
+    }
+
+    /// A ZERO IS "UNSET", NOT "EVERY ZERO SECONDS". The OCI config writes 0 for a field the image
+    /// omitted, and a zero interval would spin the checker in a loop.
+    #[test]
+    fn an_oci_duration_becomes_whole_seconds_and_a_zero_stays_absent() {
+        assert_eq!(secs_from_nanos(None), None);
+        assert_eq!(secs_from_nanos(Some(0)), None);
+        assert_eq!(secs_from_nanos(Some(30_000_000_000)), Some(30));
+        // ROUNDS UP: the coarser unit must never turn a real interval into no interval at all, which
+        // is what truncating a sub-second value to 0 would do.
+        assert_eq!(secs_from_nanos(Some(500_000_000)), Some(1));
+        assert_eq!(secs_from_nanos(Some(1)), Some(1));
+        assert_eq!(secs_from_nanos(Some(1_500_000_000)), Some(2));
+    }
+
+    /// THREE CONDITIONS, AND EACH EXCLUDES A DIFFERENT MISTAKE.
+    ///
+    /// Seeding writes image content, and its owner and mode, onto a directory: getting this
+    /// predicate wrong once means filling somebody's bind mount, or overwriting live data.
+    #[test]
+    fn only_an_empty_named_volume_at_a_real_path_is_seeded() {
+        let dir = std::env::temp_dir().join(format!("kern-seedable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty_named = crate::volume::volumes_dir()
+            .join("kern-seed-probe")
+            .join("data");
+        let _ = std::fs::create_dir_all(&empty_named);
+        let v = |src: &std::path::Path, target: &str| Volume {
+            source: src.to_string_lossy().into_owned(),
+            target: target.to_string(),
+            read_only: false,
+        };
+
+        assert!(is_seedable(&v(&empty_named, "/etc/nginx")));
+        // A BIND MOUNT of a host path: the caller's own directory, never kern's to fill.
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(!is_seedable(&v(&dir, "/etc/nginx")));
+        // A volume that already holds something: Docker seeds only an empty one, and this is the
+        // only thing standing between seeding and overwriting live data.
+        std::fs::write(empty_named.join("x"), b"1").expect("write");
+        assert!(!is_seedable(&v(&empty_named, "/etc/nginx")));
+        std::fs::remove_file(empty_named.join("x")).expect("rm");
+        // A volume over the ROOT has no "the image's content at the mount point" to copy.
+        assert!(!is_seedable(&v(&empty_named, "/")));
+        assert!(!is_seedable(&v(&empty_named, "///")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(crate::volume::volumes_dir().join("kern-seed-probe"));
+    }
+
+    /// THE PRECEDENCE, asserted. MEASURED end to end before it was a function: an image declaring
+    /// `SIGQUIT` delivers QUIT, the same box with `--stop-signal TERM` delivers TERM, and `main`
+    /// delivers TERM in both cases.
+    #[test]
+    fn the_flag_beats_the_image_and_the_image_beats_the_default() {
+        let r = resolve_stop_signal;
+        // Nothing anywhere: the historic default.
+        assert_eq!(r(None, None), libc::SIGTERM);
+        // The image alone decides.
+        assert_eq!(r(None, Some("SIGQUIT")), libc::SIGQUIT);
+        // THE FLAG WINS EVEN WHEN IT NAMES THE DEFAULT. This is the arm the `Option` exists for: with
+        // `SIGTERM` folded in as a value, this case and the one above are indistinguishable.
+        assert_eq!(r(Some(libc::SIGTERM), Some("SIGQUIT")), libc::SIGTERM);
+        assert_eq!(r(Some(libc::SIGINT), Some("SIGQUIT")), libc::SIGINT);
+        // A name kern's table lacks leaves the box on the default rather than stopping it.
+        assert_eq!(r(None, Some("SIGWINCH")), libc::SIGTERM);
+        assert_eq!(r(None, Some("")), libc::SIGTERM);
+    }
+
+    /// AN IMAGE'S SIGNAL IS NOT A TYPO, so an unknown name must not stop the box.
+    ///
+    /// The flag is typed by the person running kern and an unknown name there is their mistake, to
+    /// be refused before anything starts. `STOPSIGNAL` is written by whoever built the image, is
+    /// read where there is no usage error to return, and a name kern's table lacks (nextcloud ships
+    /// `SIGWINCH`, MEASURED) must leave the box running on `SIGTERM` as it did before.
+    #[test]
+    fn an_image_signal_kern_does_not_know_falls_back_instead_of_refusing() {
+        assert_eq!(
+            crate::cli::parse_signal_name("SIGQUIT"),
+            Some(libc::SIGQUIT)
+        );
+        assert_eq!(crate::cli::parse_signal_name("QUIT"), Some(libc::SIGQUIT));
+        assert_eq!(crate::cli::parse_signal_name("15"), Some(libc::SIGTERM));
+        // Unknown to kern's table, and to any table: neither may panic or refuse.
+        assert_eq!(crate::cli::parse_signal_name("SIGWINCH"), None);
+        assert_eq!(crate::cli::parse_signal_name(""), None);
+        assert_eq!(crate::cli::parse_signal_name("999"), None);
     }
 }

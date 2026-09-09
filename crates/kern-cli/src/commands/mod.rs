@@ -300,8 +300,10 @@ pub struct BoxRunArgs<'a> {
     pub labels: &'a [String],
     /// `--restart-max <n>`: retry cap for the on-failure supervisor (0 = kern's default).
     pub restart_max: u32,
-    /// `--stop-signal <name|num>`: signal sent before the SIGKILL (default SIGTERM).
-    pub stop_signal: i32,
+    /// `--stop-signal <name|num>`: signal sent before the SIGKILL. `None` = the flag was not given,
+    /// which is NOT the same as `Some(SIGTERM)`: absent, the image's own `STOPSIGNAL` decides, and
+    /// only if the image declares none does it fall back to `SIGTERM`.
+    pub stop_signal: Option<i32>,
     /// `--stop-timeout <secs>`: grace given to the workload before the SIGKILL.
     pub stop_grace: u64,
     /// `--def-hash <hex>`: fingerprint of the compose definition this box comes from, recorded so a
@@ -348,6 +350,20 @@ pub struct BoxRunArgs<'a> {
     /// `--add-host NAME:IP` extra `/etc/hosts` entries; the IP may be the keyword `host-gateway`
     /// (resolved to the host's reachable address at build time).
     pub add_hosts: &'a [(String, String)],
+    /// `--dns IP`: the box's `nameserver` lines (already validated as IP literals by the CLI).
+    pub dns: &'a [String],
+    /// `--dns-search DOMAIN`: the `search` line of the box's `/etc/resolv.conf`.
+    pub dns_search: &'a [String],
+    /// `--dns-option OPT`: the `options` line of the box's `/etc/resolv.conf`.
+    pub dns_options: &'a [String],
+    /// `--log-max-size`: the captured log's rotation threshold in bytes; `None` = kern's default.
+    pub log_max_size: Option<u64>,
+    /// `--log-max-file`: how many log files to keep, active one included; `None` = kern's default.
+    pub log_max_file: Option<u32>,
+    /// `--memory-reservation`: cgroup `memory.low`, a soft floor.
+    pub memory_reservation: Option<u64>,
+    /// `--cpu-weight`: cgroup `cpu.weight`, a relative share.
+    pub cpu_weight: Option<u64>,
 }
 
 /// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address -
@@ -1097,7 +1113,7 @@ struct BuildSpec<'a> {
     hostname: Option<String>,
     tun: bool,
     init: bool,
-    tmpfs: Vec<(String, String)>,
+    tmpfs: Vec<kern_isolation::TmpfsMount>,
     run_as: Option<(u32, u32)>,
     pids_max: Option<u64>,
     caps: kern_isolation::CapSpec,
@@ -1105,6 +1121,11 @@ struct BuildSpec<'a> {
     io_weight: Option<u64>,
     /// `--add-host NAME:IP` entries (`host-gateway` already resolved to a concrete address).
     extra_hosts: Vec<(String, String)>,
+    memory_low: Option<u64>,
+    cpu_weight: Option<u64>,
+    dns: Vec<String>,
+    dns_search: Vec<String>,
+    dns_options: Vec<String>,
     /// `--ulimit`, pre-resolved to `(RLIMIT_*, soft, hard)`.
     ulimits: Vec<(i32, u64, u64)>,
     /// `--sysctl KEY=VALUE`, applied inside the box's namespaces.
@@ -1330,6 +1351,11 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         io_max: b.io_max,
         io_weight: b.io_weight,
         extra_hosts: b.extra_hosts,
+        memory_low: b.memory_low,
+        cpu_weight: b.cpu_weight,
+        dns: b.dns,
+        dns_search: b.dns_search,
+        dns_options: b.dns_options,
         ulimits: b.ulimits,
         sysctls: b.sysctls,
         privileged: b.privileged,
@@ -1611,27 +1637,55 @@ fn is_bare_tmpfs_size(t: &str) -> bool {
 ///
 /// Found by running 245 real `docker-compose.yml` files from public repositories through
 /// `compose config`; `scripts/compose-corpus-gate.py` keeps it found.
-fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
+fn parse_tmpfs(specs: &[String]) -> Result<Vec<kern_isolation::TmpfsMount>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
         let (path, suffix) = match s.split_once(':') {
             Some((p, sz)) => (p, sz),
             None => (s.as_str(), ""),
         };
-        // Split the suffix into (the size kern implements, the options it only recognises). An
-        // unknown token is an error rather than a drop: dropping a typo is how a cap goes missing.
+        // Split the suffix into what kern APPLIES (size, mode, noexec, ro) and what it only
+        // RECOGNISES. An unknown token is an error rather than a drop: dropping a typo is how a cap
+        // goes missing.
+        //
+        // THE RECOGNISED LIST SHRANK, and what left it is now enforced rather than announced. `mode`
+        // sets the mount's mode, `noexec` and `ro` set `MS_NOEXEC` and `MS_RDONLY`, and their
+        // opposites (`exec`, `rw`) are the defaults so they are satisfied by doing nothing. What
+        // stays in the list is what kern will not do: `suid` and `dev` ask for a weaker mount than
+        // kern's floor, and the timestamp/sync knobs have no effect on a RAM-backed filesystem this
+        // process mounts for one box.
         let mut size = String::new();
+        let mut mode = String::new();
+        let (mut noexec, mut read_only) = (false, false);
         let mut recognised: Vec<&str> = Vec::new();
         for tok in suffix.split(',').filter(|t| !t.is_empty()) {
             match tok.split_once('=') {
                 Some(("size", v)) => size = v.to_string(),
+                // AN OCTAL MODE, CHECKED HERE, because it travels to `mount(2)` as text: a value
+                // the kernel cannot parse makes the whole mount fail, and the box would then be
+                // missing a `/tmp` with nothing said about why.
+                Some(("mode", v)) => {
+                    let ok = !v.is_empty()
+                        && v.len() <= 4
+                        && v.bytes().all(|b| (b'0'..=b'7').contains(&b));
+                    if !ok {
+                        return Err(Error::Sandbox(format!(
+                            "--tmpfs '{s}': mode '{v}' is not octal (e.g. 1777, 0755)"
+                        )));
+                    }
+                    mode = v.to_string();
+                }
                 Some((k, _)) if TMPFS_KNOWN_KEYS.contains(&k) => recognised.push(tok),
                 Some(_) => {
                     return Err(Error::Sandbox(format!(
-                        "--tmpfs '{s}': unknown option '{tok}' (kern implements size=, and \
-                         recognises the usual mount flags)"
+                        "--tmpfs '{s}': unknown option '{tok}' (kern implements size=, mode=, \
+                         noexec and ro, and recognises the usual mount flags)"
                     )))
                 }
+                None if tok == "noexec" => noexec = true,
+                None if tok == "ro" => read_only = true,
+                // `exec` and `rw` are kern's defaults, so they are honoured by not acting.
+                None if tok == "exec" || tok == "rw" => {}
                 None if TMPFS_KNOWN_OPTS.contains(&tok) => recognised.push(tok),
                 None if is_bare_tmpfs_size(tok) => size = tok.to_string(),
                 None => {
@@ -1646,12 +1700,12 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
             // Say it once per entry, and say what kern DOES rather than only what it ignores: the
             // reader's next question after "ignored" is always "so what did I get".
             eprintln!(
-                "kern: --tmpfs '{path}': option(s) {} recognised but not applied - kern mounts every \
-                 --tmpfs nosuid, nodev, mode=1777 and read-write, and caps it with size= only",
+                "kern: --tmpfs '{path}': option(s) {} recognised but not applied - kern applies \
+                 size=, mode=, noexec and ro, and mounts every --tmpfs nosuid and nodev, which it \
+                 will not relax",
                 recognised.join(",")
             );
         }
-        let size = size.as_str();
         if !path.starts_with('/')
             || path.contains('\0')
             || path.split('/').any(|c| c == "." || c == "..")
@@ -1719,12 +1773,18 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
         }
         // A `size=` VALUE still has to be a size: `size=wat` reached here as a recognised key with a
         // value nobody checked, and an unchecked cap is no cap.
-        if !size.is_empty() && !is_bare_tmpfs_size(size) {
+        if !size.is_empty() && !is_bare_tmpfs_size(&size) {
             return Err(Error::Sandbox(format!(
                 "--tmpfs '{s}': bad size '{size}' (digits + optional k/m/g/t, e.g. 64m)"
             )));
         }
-        out.push((path.to_string(), size.to_ascii_lowercase()));
+        out.push(kern_isolation::TmpfsMount {
+            path: path.to_string(),
+            size: size.to_ascii_lowercase(),
+            mode,
+            noexec,
+            read_only,
+        });
     }
     Ok(out)
 }
@@ -2359,6 +2419,36 @@ pub(crate) fn remove_tree_forced(path: &std::path::Path) -> std::io::Result<()> 
     std::fs::remove_dir(path).map_err(|e| annotate(e, path))
 }
 
+/// [`remove_tree_forced`], and then the same thing again as root of an id-mapped namespace if the
+/// first attempt could not finish.
+///
+/// A SUBUID-OWNED DIRECTORY IS UNREMOVABLE FROM HERE, and now it is the normal case. Layers are
+/// unpacked with the image's own ownership preserved (that is what lets a service write its own data
+/// directory), so an image built around a non-root user leaves directories this process does not own
+/// and cannot chmod - and unlinking inside a directory needs write permission ON THAT DIRECTORY.
+/// MEASURED before this existed: `kern rmi kibana:7.16.1` printed "removed image, freed 1.1G" and
+/// left 85 entries behind, four of them subuid-owned.
+///
+/// Inside the mapped namespace those ids are ours and `CAP_DAC_OVERRIDE` applies, so the retry can
+/// finish what the first pass started. The first pass is kept, and runs first, because it needs no
+/// fork at all and handles every ordinary tree.
+pub(crate) fn remove_tree_mapped(path: &std::path::Path) -> std::io::Result<()> {
+    let first = remove_tree_forced(path);
+    if first.is_ok() {
+        return first;
+    }
+    let owned = path.to_path_buf();
+    match kern_isolation::with_id_mapped_userns(move |_| {
+        i32::from(remove_tree_forced(&owned).is_err())
+    }) {
+        Ok(0) => Ok(()),
+        // The retry ran and still could not finish, or no namespace could be mapped: report the
+        // FIRST error, which names the path and the owner that blocked it. The second attempt's
+        // failure would say the same thing with less context.
+        _ => first,
+    }
+}
+
 /// cgroup v2 CPU period (µs) for `cpu.max` (`cpu.max = "<quota> <period>"`, cores = quota/period).
 /// Matches the value the isolation layer uses at box start so a live update stays consistent.
 const CPU_PERIOD_US: u64 = 100_000;
@@ -2825,6 +2915,13 @@ pub struct BuildArgs<'a> {
     pub build_args: &'a [String],
     /// `--quiet`: suppress per-step progress.
     pub quiet: bool,
+    /// `--target <stage>`: stop at the named stage of a multi-stage Dockerfile and tag THAT.
+    ///
+    /// Compose spells it `build.target:`, and it is how a project selects between the `development`
+    /// and `production` stages of one Dockerfile. Building the last stage instead produces a working
+    /// image that is the WRONG image, with nothing said, so the name is resolved against the file's
+    /// stage names and an unknown one is refused rather than approximated.
+    pub target: Option<&'a str>,
 }
 
 /// Execute a MULTI-STAGE build. Each stage is built in order via the ordinary single-stage `build_run`
@@ -3038,7 +3135,7 @@ fn copy_from_stage_chain(
     if chain.len() >= 2 {
         // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view (which also
         // handles file AND directory sources uniformly, confining `src_rel` via `openat2(RESOLVE_IN_ROOT)`).
-        return merged_view_extract(chain, Some(src_rel), dest);
+        return merged_view_extract(chain, Extract::Entry(src_rel), dest);
     }
     // Exactly one layer: it IS its own merged rootfs (no cross-layer opaque to honour). Copy directly
     // through the shared single-rootfs confine helper (canonicalize + `starts_with`, `cp -a` no-follow).
@@ -3326,6 +3423,39 @@ fn run_build_step(
         cmd.arg("--rootfs").arg(write_dir).arg("--bind-rootfs");
     }
     cmd.arg("--net").arg("--uid-range").arg("--quiet");
+    // A BUILD STEP IS NOT A SERVICE, AND THE SERVICE DEFAULT BREAKS IT.
+    //
+    // `kern box` defaults to 512 MiB, which is a sensible ceiling for a long-running workload and is
+    // far below what an ordinary build needs. MEASURED on the first three real projects cloned from
+    // GitHub for this check: `npm install` (alitarhinisv/Notes-FE) and `bun install`
+    // (aloshai/aequi-monorepo) were both killed by the box's own OOM at 512 MiB, exit 137. Docker's
+    // builder has no memory limit at all, and NO compose key can express one - `deploy` and
+    // `mem_limit` describe the service, not the build - so a user hitting this has nothing to write
+    // in the file. It is a blocker, not a trade.
+    //
+    // BOUNDED BY THE MACHINE RATHER THAN UNCAPPED. The cap becomes the host's own RAM, which is what
+    // bounds a `docker build` in practice, and keeps the failure ATTRIBUTABLE: a build that really
+    // does exhaust memory is killed against its own cgroup, with kern's message naming the cap,
+    // instead of the host OOM killer choosing a victim somewhere else on the machine.
+    //
+    // A `/proc/meminfo` that cannot be read leaves the box default in place, which is the behaviour
+    // this replaces: a build that then fails fails the way it did before, never in a new way.
+    if let Some(total) = host_meminfo_bytes("MemTotal:") {
+        cmd.arg("--memory").arg(total.to_string());
+    }
+    // SWAP TOO, FOR THE SAME REASON AND THE SAME BOUND. A box gets `memory.swap.max = 0` by default,
+    // which is right for a service: swapping one is a service that has already failed its latency
+    // budget. A BUILD is the opposite case - it is a one-shot burst that Docker lets swap, and the
+    // heaviest ones (a `pip install` that pulls the CUDA wheels, a `cargo build` of a large tree)
+    // genuinely need the headroom. MEASURED on `abisheik687/kavach-ai`: `pip install` of the torch
+    // and NVIDIA stack was OOM-killed at the host's full 33 GiB of RAM with 21 GiB of swap sitting
+    // unused beside it.
+    //
+    // Bounded by what the machine actually has, so this grants no more than the host does, and the
+    // box's own cgroup still makes the kill attributable when even that is not enough.
+    if let Some(swap) = host_meminfo_bytes("SwapTotal:") {
+        cmd.arg("--memory-swap-max").arg(swap.to_string());
+    }
     for e in &config.env {
         cmd.arg("--env").arg(e);
     }
@@ -3696,16 +3826,34 @@ fn resolve_builds(
 
         // Guard 4 - `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
         // Either way the box RUNS the freshly built image, never a stale registry one.
+        // LOWERCASED, BECAUSE KERN GENERATES THIS NAME AND OCI REPOSITORY NAMES ARE LOWERCASE.
+        //
+        // The box name carries the project directory, and a directory with a capital letter is
+        // ordinary: MEASURED on the real repository `alitarhinisv/Notes-FE`, whose clone directory
+        // produced `kern-compose-alitarhinisvNotes-FE-…:latest`, which `kern build` then REFUSED as
+        // an invalid reference. kern was rejecting a name kern itself had just built, so a project
+        // that builds under Docker could not be brought up at all - and the advice in the refusal
+        // ("use the lowercase form") was addressed to a user who never typed the name.
+        //
+        // Only the SYNTHESIZED tag is touched. An `image:` the file wrote is passed through
+        // unchanged: if that one is invalid the refusal is about something the author can see and
+        // fix, which is the opposite situation.
         let tag = b
             .image
             .clone()
-            .unwrap_or_else(|| format!("kern-compose-{}:latest", b.name));
+            .unwrap_or_else(|| synthesized_build_tag(&b.name));
 
         kern_common::progress!("→ building '{}' from {}", b.name, bd.context);
         let mut cmd = std::process::Command::new(self_exe);
         cmd.arg("build").arg("-t").arg(&tag);
         if let Some(df) = &dfile {
             cmd.arg("-f").arg(df);
+        }
+        // `build.target:` SELECTS THE STAGE, and forwarding it is the difference between running the
+        // image the file asked for and running the last one in the Dockerfile. It used to be dropped
+        // in the parser, so a `target: development` produced the production stage with nothing said.
+        if let Some(t) = &bd.target {
+            cmd.arg("--target").arg(t);
         }
         for a in &bd.args {
             cmd.arg("--build-arg").arg(a); // already ${VAR}-interpolated by the parser (guard 2)
@@ -4103,6 +4251,193 @@ const DRY_RUN_REFUSAL_EXCEPTIONS: [&str; 1] = ["device grants (config reports, b
 ///
 /// A config that cannot be read is NOT a grant: an unreadable or malformed file answers `false`, so
 /// the gate stays closed. Failing open here would make a corrupt config a permission.
+/// The host's publish policy: which address a `-p`/`ports:` spec binds, and whether it OVERRIDES a
+/// spec that named one.
+///
+/// READ FROM THE DEFAULT CONFIG ONLY, never from a `--config` path a compose file chose, for exactly
+/// the reason `device_grants_allowed_by_config` is: a stack obtained from anywhere must not be able
+/// to decide where the host listens by shipping its own `kern.toml`.
+///
+/// A CEILING, NOT A DEFAULT, and the distinction is the whole value of the key. An operator who sets
+/// `publish_bind = "127.0.0.1"` is saying "nothing on this host is published beyond loopback"; a
+/// policy that any file could defeat by writing `0.0.0.0:8080:80` would not be a policy at all. It is
+/// never silent: the caller names how many specs it narrowed and what they had asked for.
+///
+/// `None` means the shipped behaviour, which is Docker's: bind every interface when the spec says
+/// nothing, and honour an explicit address exactly as written.
+/// `Err` carries the config's own error text; the CALLER decides what to do with it, and the only
+/// correct choice is the narrow one.
+///
+/// AN UNREADABLE CONFIG MUST NOT MEAN "PUBLISH ON EVERY INTERFACE". The first version of this
+/// function answered `None` on any error, which fell back to the shipped Docker default: a typo in
+/// `kern.toml` therefore WIDENED every published port on the host, silently. MEASURED: with a config
+/// holding `publish_bind = "1.2.3.4"`, `kern config list` refused it by line and `kern box` started
+/// and bound `0.0.0.0` without a word. An absent config is not this case and never was: `load`
+/// returns the defaults for a file that does not exist, so an `Err` here is always a file the
+/// operator wrote and kern could not read.
+pub(crate) fn publish_policy() -> Result<Option<u32>, String> {
+    let cfg = crate::config::load_cached(None)?;
+    Ok(match cfg.kern.publish_bind.as_deref() {
+        Some("127.0.0.1") => Some(crate::ports::LOOPBACK_IP),
+        Some("0.0.0.0") => Some(crate::ports::PUBLISH_DEFAULT_IP),
+        // Absent: the shipped behaviour, which is Docker's. A value the parser refuses never reaches
+        // here, because `load` fails first and this returns `Err`.
+        _ => None,
+    })
+}
+
+/// Apply [`publish_policy`] to a parsed spec list, returning how many maps it moved.
+///
+/// SEPARATED FROM THE POLICY LOOKUP so the decision can be asserted without a `kern.toml` on disk:
+/// a function that both reads the filesystem and rewrites its argument can be checked by nothing.
+pub(crate) fn apply_publish_policy(
+    ports: &mut [kern_isolation::PortMap],
+    policy: Option<u32>,
+) -> usize {
+    let Some(ip) = policy else {
+        return 0;
+    };
+    let mut moved = 0;
+    for p in ports.iter_mut() {
+        if p.bind_ip != ip {
+            p.bind_ip = ip;
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// The memory ceiling policy for a `kern compose` stack: `(operator_ceiling, host_ram)`.
+///
+/// FAIL-CLOSED ON A BROKEN CONFIG, for [`publish_policy`]'s reason and with the same asymmetry: an
+/// unreadable `kern.toml` must not silently WIDEN what a service may take, so a config that will not
+/// parse falls back to the historic `kern box` default and says so. The two wrong answers are not
+/// symmetric, and only one of them lets a downloaded file take the machine.
+pub(crate) fn compose_memory_policy() -> (Option<u64>, Option<u64>) {
+    let loaded = crate::config::load_cached(None);
+    if let Err(e) = &loaded {
+        eprintln!(
+            "kern: warning: {e}; compose services fall back to the {} MiB box default rather than \
+             the host's RAM (an unreadable config must not widen a limit)",
+            kern_isolation::DEFAULT_MEMORY_MAX / (1024 * 1024)
+        );
+    }
+    let ceiling = compose_memory_ceiling(
+        loaded
+            .as_ref()
+            .map(|c| c.kern.compose_memory_max.as_deref())
+            .map_err(|_| ()),
+    );
+    (ceiling, host_meminfo_bytes("MemTotal:"))
+}
+
+/// The ceiling itself, given what the config said: `Ok(Some(text))` the key, `Ok(None)` no key,
+/// `Err(())` a config that would not load.
+///
+/// SEPARATED FROM THE READ, exactly as `apply_publish_policy` is separated from `publish_policy`:
+/// the fail-closed arm is the one that matters most and a function that reads the filesystem can be
+/// asserted by nothing short of writing a `kern.toml` into the developer's own home.
+pub(crate) fn compose_memory_ceiling(configured: Result<Option<&str>, ()>) -> Option<u64> {
+    match configured {
+        Ok(None) => None,
+        // A VALUE THE PARSER CANNOT READ IS TREATED LIKE A CONFIG THAT WILL NOT LOAD, and that is
+        // not belt-and-braces for its own sake: `v.and_then(parse)` reads an unparseable ceiling as
+        // "no ceiling", which is the fail-OPEN shape one layer down from the arm below. The config
+        // validator refuses such a value at load today, so this arm is unreachable through the
+        // shipped path - and an unreachable arm that answers "uncapped" is one refactor away from
+        // being the bug.
+        Ok(Some(v)) => {
+            Some(kern_common::parse_binary_size(v).unwrap_or(kern_isolation::DEFAULT_MEMORY_MAX))
+        }
+        // FAIL-CLOSED. The two wrong answers are not symmetric: falling back to the historic box
+        // default costs a service that needed more an error naming a cap, while falling through to
+        // "no ceiling" would let a typo in `kern.toml` hand every stack on the machine the whole of
+        // its RAM, silently. The same asymmetry `publish_policy` is built on.
+        Err(()) => Some(kern_isolation::DEFAULT_MEMORY_MAX),
+    }
+}
+
+/// The `--memory` value one service gets, given what its file asked for and the policy.
+///
+/// A FUNCTION TAKING BOTH INPUTS, so the decision can be asserted without a `kern.toml` on disk and
+/// without a particular machine's RAM. `None` means "pass no `--memory`", which leaves the box on
+/// its own default - the answer when neither the file nor the operator nor `/proc/meminfo` said
+/// anything, and the behaviour kern shipped before, so a host that cannot be read never fails in a
+/// NEW way.
+///
+/// THE CEILING WINS OVER A LARGER `mem_limit:`, which is what makes it a policy rather than a
+/// suggestion: a compose file is frequently something downloaded, and a limit a downloaded file can
+/// raise by writing a bigger number limits nothing. It never RAISES a smaller `mem_limit:` - a
+/// service that asked for less is asking for less than the operator allows, which is allowed.
+pub(crate) fn service_memory_cap(
+    asked: Option<&str>,
+    ceiling: Option<u64>,
+    host_ram: Option<u64>,
+) -> Option<String> {
+    match asked {
+        // The file asked for nothing: the operator's ceiling, else the machine's own RAM. Docker
+        // imposes no limit on such a service and the machine is what bounds it, so this is the same
+        // bound with the failure kept attributable to the box's own cgroup.
+        None => ceiling.or(host_ram).map(|v| v.to_string()),
+        Some(a) => match (kern_common::parse_binary_size(a), ceiling) {
+            // The file asked and the operator caps it: the smaller of the two.
+            (Some(bytes), Some(c)) => Some(bytes.min(c).to_string()),
+            // Either no ceiling, or a `mem_limit:` KERN COULD NOT PARSE. Both forward the file's own
+            // text verbatim, and the second case is the reason this is not written as one `min`:
+            // substituting the ceiling for an unparseable value would swallow the typo and start the
+            // service on a limit nobody wrote. Forwarded, the box's flag parser refuses it and names
+            // it, which is a better error than anything this function could invent.
+            _ => Some(a.to_string()),
+        },
+    }
+}
+
+/// Did the ceiling actually change what this service gets? Compared by VALUE, never by text.
+///
+/// `"32m"` and `"33554432"` are the same limit written two ways, and a check on the strings reports
+/// every service in the stack as capped the moment a ceiling exists. A service the file left unset
+/// (`before == None`) DID move: it would have had the host's RAM.
+pub(crate) fn ceiling_moved(before: Option<&str>, after: &Option<String>) -> bool {
+    let Some(after) = after.as_deref().and_then(kern_common::parse_binary_size) else {
+        return false;
+    };
+    match before.and_then(kern_common::parse_binary_size) {
+        Some(b) => after < b,
+        // Nothing was written, so the ceiling decided the number: that is a move worth naming.
+        None => true,
+    }
+}
+
+/// The sentence an operator ceiling owes the reader, or `None` when it owes none.
+///
+/// NEVER SILENT WHEN IT BINDS, and silent otherwise. Without `[kern] compose_memory_max` a service
+/// gets the machine's own RAM, which is what bounds it under Docker too, so there is no difference
+/// to report and a line on every stack would be noise on 243 of 259 real files. With the key set,
+/// the ceiling can be LOWER than a `mem_limit:` the file wrote, and a limit silently replaced by a
+/// smaller one is exactly the shape that gets diagnosed as "the service is flaky" for a week.
+///
+/// The same rule `publish_bind` follows: a policy that overrides the file announces what it moved.
+pub(crate) fn memory_ceiling_note(capped: &[&str], ceiling_bytes: u64) -> Option<String> {
+    if capped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "`[kern] compose_memory_max` caps compose services at {} MiB, so {} under that rather \
+         than under what the file asks for: {}. Over it a service is OOM-killed (exit 137) against \
+         its own cgroup, not slowed down. Raise or remove the key to give a service more; a bigger \
+         `mem_limit:` cannot, by design",
+        ceiling_bytes / (1024 * 1024),
+        // The VERB comes with the noun: "so this service runs under that" / "so these services run
+        // under that". Split across the format string it read "so this service run".
+        if capped.len() == 1 {
+            "this service runs"
+        } else {
+            "these services run"
+        },
+        crate::compose::name_list(capped)
+    ))
+}
+
 fn device_grants_allowed_by_config() -> bool {
     match crate::config::load_cached(None) {
         Ok(cfg) => cfg.kern.allow_device_grants,
@@ -4174,6 +4509,80 @@ fn device_grant_refusal(service: &str, vgpio: &[crate::config::ResolvedVgpio]) -
     ))
 }
 
+/// Would ONE shared namespace refuse this stack because two services claim the same internal port?
+///
+/// THE PREDICATE THE REFUSAL IMPLIES, so the driver can act on it before deciding the wiring rather
+/// than only after it has committed to the pod. It reads the SAME source as
+/// [`check_pod_global_conflicts`] - `declared_container_ports`, which folds `port:`, `expose:` and
+/// the container side of `ports:` into one claim - so the two cannot come to disagree about which
+/// stacks collide.
+///
+/// MEASURED ON A REAL PROJECT: `AP0827/Multi-Threaded-Web-Server` puts an application and a
+/// modsecurity proxy both on container port 8080. Docker runs it, because there each container has
+/// its own namespace; kern refused it outright. That is a file Docker runs and kern would not, which
+/// is the difference this project exists to remove - and the per-service wiring expresses it
+/// exactly, so the answer is to choose that wiring rather than to refuse.
+#[must_use]
+pub(crate) fn pod_would_collide(boxes: &[crate::compose::ComposeBox]) -> bool {
+    if boxes.len() < 2 {
+        return false;
+    }
+    let mut seen: std::collections::HashMap<(u16, bool), &str> = std::collections::HashMap::new();
+    for b in boxes {
+        for slot in declared_container_ports(b) {
+            if let Some(other) = seen.insert(slot, b.service_name()) {
+                if other != b.service_name() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The image tag kern gives a service that has `build:` and no `image:`.
+///
+/// LOWERCASED, BECAUSE KERN GENERATES THIS NAME AND OCI REPOSITORY NAMES ARE LOWERCASE. The box name
+/// carries the project directory, and a directory with a capital letter is ordinary: MEASURED on the
+/// real repository `alitarhinisv/Notes-FE`, whose clone directory produced
+/// `kern-compose-alitarhinisvNotes-FE-…:latest`, which `kern build` then REFUSED as an invalid
+/// reference. kern was rejecting a name kern itself had just built, and the refusal's advice ("use
+/// the lowercase form") was addressed to a user who never typed the name.
+///
+/// A FUNCTION SO THE TWO CALLERS CANNOT DRIFT: the builder synthesises this tag and `kern compose
+/// watch` must rebuild the SAME one, or a watch rebuilds a tag nothing runs.
+#[must_use]
+pub(crate) fn synthesized_build_tag(box_name: &str) -> String {
+    format!("kern-compose-{}:latest", box_name.to_ascii_lowercase())
+}
+
+/// One `/proc/meminfo` field in BYTES, or `None` when it cannot be read.
+///
+/// The kernel reports these in kibibytes, which is the one unit conversion here and the one place to
+/// get it wrong; the value is multiplied by 1024 exactly once.
+///
+/// A FIELD PARAMETER RATHER THAN TWO NEAR-IDENTICAL FUNCTIONS, because the second reader
+/// (`SwapTotal:`) arrived a day after the first and copying the parse would have been two places to
+/// fix the day a kernel changes the format.
+///
+/// THE ORIGINAL LOOP RETURNED `None` ON THE FIRST NON-MATCHING LINE, which happened to work only
+/// because `MemTotal:` is the first line of the file; `SwapTotal:` is not, so the loop now scans.
+///
+/// `None` rather than a guess: a caller that cannot learn the machine's size must fall back to
+/// whatever it did before, not to a number invented here. A zero value (a host with no swap) is also
+/// `None`, because passing `0` would mean "swap off", which is the state this exists to change.
+#[must_use]
+fn host_meminfo_bytes(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return kib.checked_mul(1024).filter(|b| *b > 0);
+        }
+    }
+    None
+}
+
 fn check_pod_global_conflicts(
     boxes: &[crate::compose::ComposeBox],
     no_pod: bool,
@@ -4243,7 +4652,11 @@ fn check_pod_global_conflicts(
                          every address on its port. kern measures which it is once the services are \
                          running and says so per direction, so with --no-pod you may lose one \
                          direction, both, or neither. Making one of them bind 127.0.0.1:{port} \
-                         explicitly is usually a one-line change and costs no port renumber."
+                         explicitly is usually a one-line change and costs no port renumber. \
+                         Bring-up is ordered: each service is held before its first instruction \
+                         until the relays it will use exist, so it never sees a half-built network \
+                         (a service with `restart:` is started by systemd instead and is not held; \
+                         `up` names it)."
                     )));
                 }
             }
@@ -4452,9 +4865,58 @@ fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) ->
         "kern: note: --no-pod gives each service its own network namespace, and peers are reached \
          through per-service loopback aliases instead of a shared one. A service cannot host a peer's \
          alias on a port it binds itself, so two services that share an internal port are still not \
-         mutually reachable; any such pair is named with it."
+         mutually reachable; any such pair is named with it. Every other service is held before its \
+         first instruction until its relays exist, so none of them starts against a half-built \
+         network."
             .to_string(),
     )
+}
+
+/// The services that a `--no-pod` bring-up CANNOT order, named.
+///
+/// Under `--no-pod` a box is held at a pre-exec gate until every relay it will use exists, so a
+/// workload never observes a half-built network. A service that sets `restart:` does not get that:
+/// outside a pod it is installed as a systemd unit and started later by the manager, in a process
+/// that inherits no descriptor from `up`, so there is no gate to hold it with.
+///
+/// MEASURED, and the two directions differ, which is why this names the risk instead of the key.
+/// Same fixture, one variable, three runs each: with the `restart:` service as the CONSUMER,
+/// connecting at t=0, three of three got `NO-API`; with the line removed, three of three got the
+/// peer's payload. As a PRODUCER it is unaffected (three of three delivered), because starting
+/// early is not a problem for something that only has to be listening.
+///
+/// It is a note and not a refusal: `restart:` under `--no-pod` works, and the service that pays is
+/// only one that connects out before its peers are up - which is also the case a restart loop is
+/// there to survive. Returned rather than printed so the DECISION can be asserted.
+fn no_pod_restart_gate_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) -> Option<String> {
+    if !no_pod || boxes.len() < 2 {
+        return None;
+    }
+    let managed: Vec<&str> = boxes
+        .iter()
+        .filter(|b| b.restart_always)
+        .map(|b| b.service.as_str())
+        .collect();
+    if managed.is_empty() {
+        return None;
+    }
+    let one = managed.len() == 1;
+    Some(format!(
+        "kern: note: {} {} `restart:`, so under --no-pod {} started by systemd and {} NOT held \
+         until the peer relays are up like the rest of the stack. {} listens for peers, nothing \
+         changes; if {} connects out at startup, that first connection can precede the relay and \
+         needs a retry (or drop `restart:` to have kern order it).",
+        managed
+            .iter()
+            .map(|m| format!("'{m}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if one { "sets" } else { "set" },
+        if one { "it is" } else { "they are" },
+        if one { "is" } else { "are" },
+        if one { "If it only" } else { "If they only" },
+        if one { "it" } else { "one of them" },
+    ))
 }
 
 fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bool) {
@@ -4715,6 +5177,29 @@ fn run_terminal_verb(
             // that answers "what will this file be", and `--no-pod` changes the answer. Measured
             // before this: `up --no-pod` said what it cost and `config --no-pod` said nothing, so
             // the reader who checks a file first was the one who did not hear it.
+            // THE SEGREGATED PAIRS BELONG HERE TOO. They are a STATIC property of the file - the
+            // memberships decide them and nothing has to be running - so `config`, the command that
+            // answers "what will this file be", can and must state them. Measured before this: `up
+            // --no-pod` named the cut pairs and `config --no-pod` named none, which is exactly the
+            // split this file's own comment about the `--no-pod` trade was written to close.
+            //
+            // Unlike the unreachable-pair report, which is measured from RUNNING services and can
+            // therefore only exist at bring-up, nothing here needs a box.
+            if no_pod {
+                let members: Vec<(String, Vec<String>)> = boxes
+                    .iter()
+                    .map(|b| (b.service.clone(), b.networks.clone()))
+                    .collect();
+                let cut = crate::nopod::segregated_pairs(&members);
+                if !cut.is_empty() {
+                    eprintln!(
+                        "kern: note: {} service pair(s) share no network, so they get no relay and \
+                         do not resolve each other: {}",
+                        cut.len(),
+                        cut.join("; ")
+                    );
+                }
+            }
             if let Some(note) = no_pod_peer_names_note(boxes, no_pod) {
                 eprintln!("{note}");
             }
@@ -5296,6 +5781,9 @@ pub struct ComposeOpts<'a> {
     pub files: &'a [String],
     pub action: ComposeAction,
     pub no_pod: bool,
+    /// `--pod`: keep ONE namespace even when the file expresses segregation, which is the explicit
+    /// opt-out of the auto-selection. Mutually exclusive with `no_pod`; the driver refuses both.
+    pub force_pod: bool,
     /// `--allow-device-grants`: run a stack whose profiles resolve to HOST DEVICE NODES.
     ///
     /// Every other profile kind narrows: the file names a want, `kern.toml` holds a grant, and the

@@ -64,6 +64,47 @@ pub struct Assigned {
     pub alias: u32,
     /// Container ports this service declares, in file order. Empty is legal and means no relay.
     pub ports: Vec<u16>,
+    /// The networks this service joins, as written in the compose file. EMPTY means the implicit
+    /// `default` network, which is the Compose Specification's rule; [`shares_network`] resolves it
+    /// there rather than
+    /// filling it in here, so one place decides what an absent key means.
+    pub networks: Vec<String>,
+}
+
+/// Docker's implicit network: the one a service with no `networks:` key joins.
+const DEFAULT_NETWORK: &str = "default";
+
+/// Do these two services have a network in common, and therefore an edge?
+///
+/// THIS IS THE WHOLE SEGREGATION RULE, in one predicate, because it decides TWO things that must
+/// never disagree: whether a relay is built, and whether the peer's name resolves at all. If the
+/// hosts file listed a peer the relay graph does not connect, a service would resolve a name to an
+/// alias nothing binds inside its namespace and get `Connection refused` where Docker gives an
+/// unknown host - a failure that reads like the peer is down rather than like it is not on your
+/// network, which is an afternoon of looking in the wrong place.
+///
+/// AN EMPTY LIST IS `default`, NOT "every network". A service with no `networks:` key joins the
+/// project's implicit network in Docker, so two such services see each other and a service pinned to
+/// `backend` does not see them. Reading empty as "unrestricted" would make the common file (nobody
+/// writes `networks:`) behave one way and the segregated file another, with the boundary depending
+/// on whether some OTHER service in the same file happened to declare a key.
+/// ALLOCATION-FREE, because this runs once per ORDERED PAIR PER PORT: the relay plan is quadratic
+/// in the service count (33 services with one port each is 1,056 calls) and the first version built
+/// two `Vec<String>` on every one of them purely to write the implicit `default` into a list. The
+/// four arms below say the same thing by comparing against the constant directly, so the common
+/// case (both lists empty, i.e. every stack that never writes `networks:`) is one boolean test and
+/// touches no heap at all.
+pub fn shares_network(a: &[String], b: &[String]) -> bool {
+    match (a.is_empty(), b.is_empty()) {
+        // Neither declared: both are on the implicit network, so they see each other.
+        (true, true) => true,
+        // One declared: they meet only if the other one named the implicit network explicitly,
+        // which is the same statement as writing nothing.
+        (true, false) => b.iter().any(|y| y == DEFAULT_NETWORK),
+        (false, true) => a.iter().any(|x| x == DEFAULT_NETWORK),
+        // Both declared: any overlap is an edge.
+        (false, false) => a.iter().any(|x| b.iter().any(|y| x == y)),
+    }
 }
 
 /// Whether a name may appear in a hosts file without changing its meaning.
@@ -86,7 +127,9 @@ pub fn hosts_name_is_safe(name: &str) -> bool {
 ///
 /// A message naming the offending service when a name is unusable in a hosts file, when two services
 /// share a name, or when the stack has more services than there are addresses.
-pub fn assign_aliases(services: &[(String, String, Vec<u16>)]) -> Result<Vec<Assigned>, String> {
+pub fn assign_aliases(
+    services: &[(String, String, Vec<u16>, Vec<String>)],
+) -> Result<Vec<Assigned>, String> {
     if services.len() > MAX_PEER_INDEX {
         return Err(format!(
             "a --no-pod stack can address at most {MAX_PEER_INDEX} services (127.0.0.2 through \
@@ -95,7 +138,7 @@ pub fn assign_aliases(services: &[(String, String, Vec<u16>)]) -> Result<Vec<Ass
         ));
     }
     let mut out: Vec<Assigned> = Vec::with_capacity(services.len());
-    for (i, (service, box_name, ports)) in services.iter().enumerate() {
+    for (i, (service, box_name, ports, networks)) in services.iter().enumerate() {
         if !hosts_name_is_safe(service) {
             return Err(format!(
                 "service '{service}' cannot be written into a hosts file: a name may hold only \
@@ -117,6 +160,7 @@ pub fn assign_aliases(services: &[(String, String, Vec<u16>)]) -> Result<Vec<Ass
             box_name: box_name.clone(),
             alias,
             ports: ports.clone(),
+            networks: networks.clone(),
         });
     }
     Ok(out)
@@ -139,11 +183,23 @@ pub fn add_host_args(plan: &[Assigned], me: &str) -> Option<Vec<String>> {
     if !plan.iter().any(|a| a.service == me) {
         return None;
     }
+    let mine: &[String] = plan
+        .iter()
+        .find(|a| a.service == me)
+        .map_or(&[], |a| a.networks.as_slice());
     let mut out = Vec::with_capacity(plan.len());
     out.push(format!("{me}:127.0.0.1"));
     let mut buf = [0u8; 15];
     for a in plan {
         if a.service == me {
+            continue;
+        }
+        // A PEER ON NO SHARED NETWORK DOES NOT RESOLVE. That is what the Compose Specification
+        // describes (NOT verified against a Docker daemon on this host: none is installed here, and
+        // the board that has one was unreachable), and it is also the
+        // only answer consistent with the relay graph: `relay_plan` builds no edge for this pair, so
+        // an entry here would name an address nothing binds in this box.
+        if !shares_network(mine, &a.networks) {
             continue;
         }
         out.push(format!(
@@ -153,6 +209,100 @@ pub fn add_host_args(plan: &[Assigned], me: &str) -> Option<Vec<String>> {
         ));
     }
     Some(out)
+}
+
+/// The `--add-host ALIAS:IP` values a service's `links:` need, in EITHER stack mode.
+///
+/// ONE FUNCTION FOR BOTH MODES, because a link is the same statement in both and the only thing that
+/// differs is the address the target answers on: in a pod every service shares one namespace and
+/// therefore one loopback, so a link resolves to `127.0.0.1`; without a pod each service has its own
+/// stack-wide alias, which is exactly what `add_host_args` already hands out for the plain service
+/// names. Deriving the address twice, once per mode, is how the two come to disagree.
+///
+/// A LINK TO A SERVICE THAT IS NOT IN THE PLAN IS SKIPPED, not guessed. Under `--no-pod` there is no
+/// address to give it, and inventing one would produce a name that resolves to the wrong box. In a
+/// pod the plan is empty by construction, so `use_pod` short-circuits before the lookup and every
+/// link resolves to the shared loopback; a link naming a service that does not exist is reported by
+/// the parser, which is the layer that can see the whole file.
+///
+/// `me`'s own links only: a link is a statement about the SOURCE service's hosts file.
+pub fn link_host_args(links: &[String], plan: &[Assigned], use_pod: bool) -> Vec<String> {
+    let mut out = Vec::with_capacity(links.len());
+    let mut buf = [0u8; 15];
+    for l in links {
+        let Some((service, alias)) = l.split_once(':') else {
+            continue;
+        };
+        // An alias equal to the service name is already resolvable in both modes (the pod's shared
+        // hosts file, or `add_host_args`), so emitting it again would write a duplicate line.
+        if alias == service {
+            continue;
+        }
+        if use_pod {
+            out.push(format!("{alias}:127.0.0.1"));
+            continue;
+        }
+        if let Some(a) = plan.iter().find(|a| a.service == service) {
+            out.push(format!("{alias}:{}", alias_to_dotted(a.alias, &mut buf)));
+        }
+    }
+    out
+}
+
+/// The service pairs this plan does NOT connect, and the network sets that decided it.
+///
+/// SEGREGATION HAS TO BE VISIBLE OR IT IS INDISTINGUISHABLE FROM A BUG. The symptom of a removed
+/// edge is `bad address 'db'` inside a service log, minutes later, in a process the operator did not
+/// write - the same symptom as a typo in a service name, a service that failed to start, or a relay
+/// that could not bind. Naming the pairs at bring-up is what separates "kern enforced what your file
+/// asked for" from "something is broken", and it costs one line on the stacks that have it and
+/// nothing at all on the stacks that do not.
+///
+/// Each pair is reported ONCE, in file order, with both memberships spelled out: the reader's next
+/// question after "these two cannot talk" is always "according to what", and the answer is the two
+/// sets. An empty set is printed as `default`, which is the network they are actually on.
+///
+/// Returns an empty vector when every pair shares something, which is every stack that does not use
+/// `networks:` at all - so the common case pays a comparison per pair and prints nothing.
+/// TAKES NAMES AND MEMBERSHIPS, NOT AN ADDRESS PLAN, because it never used the aliases and the
+/// prerequisite mattered: `up` builds a plan and `config` does not, so a version that needed one
+/// could only be called from `up` - and `config` is the command that answers "what will this file
+/// be". MEASURED before this signature: `up --no-pod` named the cut pairs and `config --no-pod` said
+/// nothing about them, which is the same split this repository already fixed once for the `--no-pod`
+/// trade itself.
+#[must_use]
+pub fn segregated_pairs(services: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut out = Vec::new();
+    let show = |v: &[String]| -> String {
+        if v.is_empty() {
+            DEFAULT_NETWORK.to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    for (i, (a_name, a_nets)) in services.iter().enumerate() {
+        for (b_name, b_nets) in services.iter().skip(i + 1) {
+            if !shares_network(a_nets, b_nets) {
+                out.push(format!(
+                    "'{a_name}' [{}] and '{b_name}' [{}]",
+                    show(a_nets),
+                    show(b_nets)
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The `(service, networks)` pairs [`segregated_pairs`] wants, from an address plan.
+///
+/// A helper rather than an inline `map` at the call site, so the `up` path and the `config` path
+/// cannot come to build the tuple differently.
+#[must_use]
+pub fn membership_of(plan: &[Assigned]) -> Vec<(String, Vec<String>)> {
+    plan.iter()
+        .map(|a| (a.service.clone(), a.networks.clone()))
+        .collect()
 }
 
 /// One relay to spawn: inside `in_box`, bind `alias:port` and forward to `to_box`'s
@@ -205,6 +355,14 @@ pub fn relay_plan(plan: &[Assigned]) -> Vec<RelayPlan> {
                 if holder.service == target.service {
                     continue;
                 }
+                // SEGREGATION IS THE ABSENCE OF AN EDGE, not a rule applied to one. Two services
+                // with no network in common get no relay, so the connection fails in the kernel
+                // (nothing is listening on that address in this namespace) rather than at a filter
+                // that has to stay correct. Same predicate as the hosts file, so the two cannot
+                // drift into naming a peer that cannot be reached.
+                if !shares_network(&holder.networks, &target.networks) {
+                    continue;
+                }
                 out.push(RelayPlan {
                     in_box: holder.box_name.clone(),
                     to_box: target.box_name.clone(),
@@ -223,8 +381,205 @@ pub fn relay_plan(plan: &[Assigned]) -> Vec<RelayPlan> {
 mod tests {
     use super::*;
 
-    fn svc(name: &str, ports: &[u16]) -> (String, String, Vec<u16>) {
-        (name.to_string(), format!("pod-tok-{name}"), ports.to_vec())
+    /// A service on NO declared network, i.e. Docker's implicit `default` - which is what almost
+    /// every compose file in the wild writes, and therefore the case the existing tests assert.
+    fn svc(name: &str, ports: &[u16]) -> (String, String, Vec<u16>, Vec<String>) {
+        (
+            name.to_string(),
+            format!("pod-tok-{name}"),
+            ports.to_vec(),
+            Vec::new(),
+        )
+    }
+
+    /// The same, on an explicit set of networks.
+    fn svc_on(name: &str, ports: &[u16], nets: &[&str]) -> (String, String, Vec<u16>, Vec<String>) {
+        (
+            name.to_string(),
+            format!("pod-tok-{name}"),
+            ports.to_vec(),
+            nets.iter().map(|n| (*n).to_string()).collect(),
+        )
+    }
+
+    /// AN ABSENT `networks:` KEY IS THE `default` NETWORK, NOT "every network".
+    ///
+    /// This is the predicate the whole segregation rests on, and reading empty as "unrestricted"
+    /// would be the difference between the Compose Specification's behaviour and a boundary that
+    /// quietly is not one: a
+    /// service pinned to `backend` would then be reachable from every service that wrote no key,
+    /// which is most of them. It also has to be symmetric, or the relay graph and the hosts file
+    /// would disagree about the same pair depending on which side was asked first.
+    #[test]
+    fn an_absent_networks_key_means_default_and_the_rule_is_symmetric() {
+        let n = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+
+        // Two services with no key: both on `default`, so they see each other. This is the common
+        // file, and it must keep working exactly as it did before segregation existed.
+        assert!(shares_network(&[], &[]));
+
+        // One pinned, one not: DISJOINT, because the implicit network is a network.
+        assert!(!shares_network(&[], &n(&["back"])));
+        assert!(!shares_network(&n(&["back"]), &[]));
+
+        // Writing `default` explicitly is the same statement as writing nothing.
+        assert!(shares_network(&[], &n(&["default"])));
+
+        // Overlap anywhere is enough; disjoint sets are not.
+        assert!(shares_network(&n(&["front", "back"]), &n(&["back"])));
+        assert!(!shares_network(&n(&["front"]), &n(&["back"])));
+
+        // Symmetry, on every pair above: the two readers of this predicate ask it in both orders.
+        for (a, b) in [
+            (n(&["front"]), n(&["back"])),
+            (n(&["front", "back"]), n(&["back"])),
+            (Vec::new(), n(&["back"])),
+        ] {
+            assert_eq!(
+                shares_network(&a, &b),
+                shares_network(&b, &a),
+                "the rule must not depend on which service is asked first: {a:?} {b:?}"
+            );
+        }
+    }
+
+    /// SEGREGATION IS THE ABSENCE OF AN EDGE, AND IT MUST REMOVE THE NAME TOO.
+    ///
+    /// The relay graph and the per-service hosts file are two readers of one rule, and they fail
+    /// differently when they disagree: a hosts entry without a relay resolves a peer to an address
+    /// nothing binds in that namespace, so the workload gets `Connection refused` where Docker gives
+    /// an unknown host. That reads like the peer is down rather than like it is not on your network.
+    ///
+    /// MEASURED end to end on this tree with a three-service stack (`web` on front, `app` on both,
+    /// `db` on back): `web` reaches `app` and `app` reaches `db` with their payloads, while
+    /// `web -> db` and `db -> web` both answer `nc: bad address`, and the plan drops from six relays
+    /// to four.
+    #[test]
+    fn two_services_with_no_shared_network_get_neither_a_relay_nor_a_hosts_entry() {
+        let plan = assign_aliases(&[
+            svc_on("web", &[8080], &["front"]),
+            svc_on("app", &[8081], &["front", "back"]),
+            svc_on("db", &[5432], &["back"]),
+        ])
+        .expect("three services");
+
+        let relays = relay_plan(&plan);
+        let edge = |from: &str, to: &str| {
+            relays.iter().any(|r| {
+                r.in_box == format!("pod-tok-{from}") && r.to_box == format!("pod-tok-{to}")
+            })
+        };
+        assert!(edge("web", "app") && edge("app", "web"), "front is shared");
+        assert!(edge("app", "db") && edge("db", "app"), "back is shared");
+        assert!(!edge("web", "db"), "web and db share nothing");
+        assert!(!edge("db", "web"), "and the other direction too");
+        assert_eq!(
+            relays.len(),
+            4,
+            "six ordered pairs minus the two cut: {relays:?}"
+        );
+
+        // The hosts file must agree with the graph, name by name.
+        let web = add_host_args(&plan, "web").expect("web is in the plan");
+        assert!(web.iter().any(|e| e.starts_with("web:127.0.0.1")));
+        assert!(web.iter().any(|e| e.starts_with("app:")));
+        assert!(
+            !web.iter().any(|e| e.starts_with("db:")),
+            "a peer with no shared network must not resolve at all: {web:?}"
+        );
+        let app = add_host_args(&plan, "app").expect("app is in the plan");
+        assert!(
+            app.iter().any(|e| e.starts_with("db:")) && app.iter().any(|e| e.starts_with("web:"))
+        );
+    }
+
+    /// A STACK THAT DECLARES NO NETWORKS MUST BE EXACTLY THE FULL MESH IT ALWAYS WAS.
+    ///
+    /// Segregation changes the reachability of existing stacks, so the file that writes no
+    /// `networks:` key at all - which is most of them - is the one case where a regression would be
+    /// invisible until someone's service stopped answering.
+    #[test]
+    fn a_stack_without_networks_keeps_the_full_mesh() {
+        let plan = assign_aliases(&[svc("a", &[8080]), svc("b", &[8081]), svc("c", &[8082])])
+            .expect("three plain services");
+        assert_eq!(
+            relay_plan(&plan).len(),
+            6,
+            "three services, one port each, every ordered pair"
+        );
+        assert_eq!(
+            add_host_args(&plan, "a").expect("a is in the plan").len(),
+            3,
+            "itself plus both peers"
+        );
+        assert!(
+            segregated_pairs(&membership_of(&plan)).is_empty(),
+            "nothing is separated"
+        );
+    }
+
+    /// THE PAIRS THAT WERE CUT ARE NAMED, WITH BOTH MEMBERSHIPS, ONCE.
+    ///
+    /// A removed edge surfaces as `bad address '<peer>'` in a service log, which is the same symptom
+    /// as a typo or a dead peer. The report is what makes it readable as enforcement rather than as
+    /// a failure, so it has to carry the two network sets - the reader's next question after "these
+    /// two cannot talk" is "according to what".
+    #[test]
+    fn the_segregated_pairs_are_named_once_with_both_memberships() {
+        let plan = assign_aliases(&[
+            svc_on("web", &[8080], &["front"]),
+            svc_on("app", &[8081], &["front", "back"]),
+            svc_on("db", &[5432], &["back"]),
+        ])
+        .expect("three services");
+        let cut = segregated_pairs(&membership_of(&plan));
+        assert_eq!(cut.len(), 1, "exactly one pair is separated: {cut:?}");
+        let line = &cut[0];
+        assert!(line.contains("'web'") && line.contains("'db'"), "{line}");
+        assert!(line.contains("front") && line.contains("back"), "{line}");
+
+        // A service with no key is reported as being on `default`, which is where it actually is -
+        // an empty bracket would read like "on no network", which is a different (and wrong) fact.
+        let mixed = assign_aliases(&[svc("a", &[8080]), svc_on("b", &[8081], &["back"])])
+            .expect("two services");
+        let cut = segregated_pairs(&membership_of(&mixed));
+        assert_eq!(cut.len(), 1);
+        assert!(cut[0].contains("default"), "{}", cut[0]);
+    }
+
+    /// `config` AND `up` MUST NAME THE SAME PAIRS, so they read the same function from the same
+    /// shape.
+    ///
+    /// `up` has an address plan and `config` has only the parsed services, and the first version of
+    /// this report took a plan - so it could be called from one and not the other. MEASURED then:
+    /// `up --no-pod` named the cut pair and `config --no-pod` named none, which is the same split
+    /// this repository already closed once for the `--no-pod` trade itself. A dry run that omits a
+    /// boundary the real run enforces is worse than no dry run.
+    #[test]
+    fn the_cut_pairs_are_the_same_whether_asked_from_a_plan_or_from_the_parsed_services() {
+        let plan = assign_aliases(&[
+            svc_on("web", &[8080], &["front"]),
+            svc_on("app", &[8081], &["front", "back"]),
+            svc_on("db", &[5432], &["back"]),
+        ])
+        .expect("three services");
+
+        // What `up` has.
+        let from_plan = segregated_pairs(&membership_of(&plan));
+        // What `config` has: names and memberships straight off the parsed services, no aliases.
+        let from_services = segregated_pairs(&[
+            ("web".to_string(), vec!["front".to_string()]),
+            (
+                "app".to_string(),
+                vec!["front".to_string(), "back".to_string()],
+            ),
+            ("db".to_string(), vec!["back".to_string()]),
+        ]);
+        assert_eq!(
+            from_plan, from_services,
+            "the dry run and the real run must name the same pairs"
+        );
+        assert_eq!(from_plan.len(), 1, "and it is the one pair: {from_plan:?}");
     }
 
     /// Aliases are assigned in file order, starting at `127.0.0.2`, and every service keeps its own.
@@ -469,8 +824,15 @@ mod tests {
         );
 
         // The cap is where a real plan meets it: 33 services with one port each is 1,056.
-        let svcs: Vec<(String, String, Vec<u16>)> = (0..33)
-            .map(|i| (format!("s{i}"), format!("b{i}"), vec![9000 + i as u16]))
+        let svcs: Vec<(String, String, Vec<u16>, Vec<String>)> = (0..33)
+            .map(|i| {
+                (
+                    format!("s{i}"),
+                    format!("b{i}"),
+                    vec![9000 + i as u16],
+                    Vec::new(),
+                )
+            })
             .collect();
         let plan = assign_aliases(&svcs).expect("33 services fit the alias range");
         let n = relay_plan(&plan).len();
@@ -481,8 +843,15 @@ mod tests {
         );
 
         // And 32 does not, so the cap sits between two stacks a person could plausibly write.
-        let svcs: Vec<(String, String, Vec<u16>)> = (0..32)
-            .map(|i| (format!("s{i}"), format!("b{i}"), vec![9000 + i as u16]))
+        let svcs: Vec<(String, String, Vec<u16>, Vec<String>)> = (0..32)
+            .map(|i| {
+                (
+                    format!("s{i}"),
+                    format!("b{i}"),
+                    vec![9000 + i as u16],
+                    Vec::new(),
+                )
+            })
             .collect();
         let plan = assign_aliases(&svcs).expect("32 services");
         assert!(

@@ -10,4 +10,8 @@ publish = false
 
 [dependencies]
 kern-common = { path = "../kern-common" }
+# The crate that owns user namespaces. `unpack_as_root` used to build its own single-uid map here,
+# which is the reason an image's ownership could not be preserved; routing through the one owner of
+# that primitive is what lets the unpack carry the SAME subordinate range a box maps.
+kern-isolation = { path = "../kern-isolation" }
 libc = "0.2"

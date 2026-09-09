@@ -45,7 +45,7 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
     // Shed inherited fds (the detached box's readiness pipe would otherwise hang `box -d`), then
     // quiet stdio so probe output doesn't land in the box log.
     kern_isolation::shed_inherited_fds(-1);
-    detach_stdio(None);
+    detach_stdio(None, crate::commands::boxlog::LogCap::default());
     // PIN THE LAUNCHER'S PID, read here while it is provably still our parent. `pid` is this
     // checker's only handle on its box: every round resolves the box through it, and a pid is a
     // number the kernel may hand to someone else once its owner is gone. See `pid_is_still`.
@@ -200,7 +200,7 @@ pub(crate) fn fork_detached() -> Forked {
     }
     unsafe { libc::setsid() };
     kern_isolation::shed_inherited_fds(-1);
-    detach_stdio(None);
+    detach_stdio(None, crate::commands::boxlog::LogCap::default());
     Forked::Child
 }
 
@@ -269,7 +269,7 @@ pub(crate) fn spawn_foreground_timeout(secs: u64) -> Option<(i32, i32)> {
         libc::close(wr);
     }
     kern_isolation::shed_inherited_fds(rd);
-    detach_stdio(None);
+    detach_stdio(None, crate::commands::boxlog::LogCap::default());
     let mut buf = [0u8; 4];
     let mut got = 0usize;
     while got < buf.len() {

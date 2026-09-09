@@ -277,8 +277,8 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
             let rootfs_c = rootfs.clone();
             let filtered_c = filtered.clone();
             let staging_c = staging.clone();
-            unpack_as_root(move || {
-                extract_into(&filtered_c, Compression::Plain, &staging_c)?;
+            unpack_as_root(move |keep_owner| {
+                extract_into(&filtered_c, Compression::Plain, &staging_c, keep_owner)?;
                 let r = merge_layer(&staging_c, &rootfs_c);
                 let _ = std::fs::remove_dir_all(&staging_c);
                 r
@@ -297,7 +297,26 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
 /// Extract a vetted layer tar (compression `comp`) into a FRESH `staging` dir, preserving the image's
 /// exact modes and mapping ownership to the (in-ns root) extracting user - the same tar invocation
 /// pull uses for a registry layer. Caller runs this inside [`unpack_as_root`].
-fn extract_into(layer: &Path, comp: Compression, staging: &Path) -> Result<(), OciError> {
+/// The `tar` ownership flag for this unpack: NONE when the caller holds a subordinate range (so tar
+/// restores the image's own uids into it), `--no-same-owner` otherwise.
+///
+/// ONE FUNCTION, THREE EXTRACTION PATHS. The gzip, plain and zstd arms each build their own argument
+/// list, and a flag written out three times is a flag that can be dropped from two of them - which is
+/// exactly how the zstd path came to be the one that differs.
+fn owner_flag(keep_owner: bool) -> Vec<&'static str> {
+    if keep_owner {
+        Vec::new()
+    } else {
+        vec!["--no-same-owner"]
+    }
+}
+
+fn extract_into(
+    layer: &Path,
+    comp: Compression,
+    staging: &Path,
+    keep_owner: bool,
+) -> Result<(), OciError> {
     let _ = std::fs::remove_dir_all(staging);
     std::fs::create_dir_all(staging).map_err(|e| OciError::Extract(e.to_string()))?;
     let staging_s = staging.to_string_lossy().into_owned();
@@ -311,7 +330,8 @@ fn extract_into(layer: &Path, comp: Compression, staging: &Path) -> Result<(), O
             Command::new("tar")
                 .args([flag])
                 .arg(layer)
-                .args(["-C", &staging_s, "--no-same-owner", "--same-permissions"])
+                .args(["-C", &staging_s, "--same-permissions"])
+                .args(owner_flag(keep_owner))
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
@@ -321,9 +341,10 @@ fn extract_into(layer: &Path, comp: Compression, staging: &Path) -> Result<(), O
             Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "zstd -dc -- {} | tar -xf - -C {} --no-same-owner --same-permissions",
+                    "zstd -dc -- {} | tar -xf - -C {} --same-permissions {}",
                     shell_quote(&layer.to_string_lossy()),
                     shell_quote(&staging_s),
+                    owner_flag(keep_owner).join(" "),
                 ))
                 .status()
                 .map(|s| s.success())
@@ -371,6 +392,11 @@ fn parse_image_config(json: &str) -> ImageConfig {
         workdir: str_field(cfg, "WorkingDir").filter(|s| !s.is_empty()),
         user: str_field(cfg, "User").filter(|s| !s.is_empty()),
         exposed_ports: crate::pull::exposed_ports_after(cfg),
+        // A `kern load`ed archive carries the same OCI config a pulled image does, so it must yield
+        // the same fields: a `docker save`d image whose HEALTHCHECK vanished on load would be a
+        // difference between two doors into the same picture.
+        stop_signal: str_field(cfg, "StopSignal").filter(|s| !s.is_empty()),
+        healthcheck: crate::pull::healthcheck_after(cfg),
     }
 }
 
@@ -410,5 +436,46 @@ mod tests {
     fn hex_of_strips_prefix() {
         assert_eq!(hex_of("sha256:abc123"), "abc123");
         assert_eq!(hex_of("abc123"), "abc123");
+    }
+}
+
+#[cfg(test)]
+mod owner_flag_tests {
+    /// THREE EXTRACTION ARMS, ONE FLAG. The gzip, plain and zstd paths each build their own argument
+    /// list, and the flag written out three times is the flag that gets dropped from two of them -
+    /// which is how the zstd path came to be the one that differed. Asserted here so the shared
+    /// function cannot be quietly bypassed by one of them.
+    #[test]
+    fn ownership_is_kept_exactly_when_the_unpack_can_represent_it() {
+        // A mapped range: no flag, so `tar` restores the image's own ids into it.
+        assert!(super::owner_flag(true).is_empty());
+        // No range: one identity exists, so every chown would fail and the flag is the only
+        // representable answer.
+        assert_eq!(super::owner_flag(false), ["--no-same-owner"]);
+
+        // EVERY LAYER ARM GOES THROUGH IT. The flag written by hand in one of the three arms is an
+        // arm that ignores the decision, and the zstd one already drifted that way once.
+        //
+        // SCOPED TO `extract_into`, because the OUTER archive above keeps the flag on purpose: its
+        // members are the manifest and the layer tars, regular files whose ownership means nothing.
+        // The literal is assembled so this test and the comments around it are not counted.
+        let src = include_str!("archive.rs");
+        let body = {
+            let start = src.find("fn extract_into(").expect("the layer extractor");
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").expect("its end");
+            &rest[..end]
+        };
+        let literal = format!("--no-same-{}", "owner");
+        assert_eq!(
+            body.matches(&literal).count(),
+            0,
+            "no layer arm may name the flag: each asks `owner_flag` instead"
+        );
+        assert_eq!(
+            body.matches("owner_flag(").count(),
+            2,
+            "both the `tar` arm and the zstd pipe must ask it"
+        );
     }
 }

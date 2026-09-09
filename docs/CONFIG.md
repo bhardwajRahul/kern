@@ -252,6 +252,16 @@ ports      = ["127.0.0.1:8080:80"]  # --publish / -p  (repeatable)
 ssh        = "2222"               # --ssh PORT  (in-box sshd on host PORT)
 ssh_key    = "/keys/id.pub"       # --ssh-key   (authorize this pubkey instead of a throwaway)
 add_host   = ["db:10.0.0.5"]      # --add-host N:IP (IP may be `host-gateway`; repeatable)
+dns        = ["1.1.1.1"]          # --dns  (nameserver lines; without it the image's file is kept)
+dns_search = ["example.com"]      # --dns-search  (the resolver's `search` line)
+dns_opt    = ["ndots:2"]          # --dns-option  (resolv.conf options; `dns_options` also accepted)
+networks   = ["front", "back"]    # the networks this service joins. INERT in a pod (one shared
+                                  #   namespace); under --no-pod it is ENFORCED: only services with
+                                  #   a network in common get a peer relay and resolve each other.
+                                  #   No key = the implicit `default` network (Compose Spec rule)
+links      = ["db:database"]      # Docker's `links`: an /etc/hosts ALIAS for a peer, plus the
+                                  #   start-ordering edge. No CLI flag: the alias becomes an
+                                  #   --add-host whose address kern resolves per stack mode
 # Pod-scoped, and the only two keys with no CLI flag: a pod shares one network namespace, so kern
 # needs to know what each service LISTENS on to refuse a collision before it starts anything.
 port       = 3000                 # the port this service listens on inside the pod
@@ -285,6 +295,24 @@ health_start_period  = "10"       # --health-start-period
 health_timeout       = "2"        # --health-timeout
 health_action        = "restart"  # --health-action <restart|stop|none>
 
+# devices
+devices    = ["/dev/net/tun", "/dev/kvm:/dev/kvm:r"]  # HOST[:BOX[:PERMS]] - bound in, not created.
+                                  #   /dev/net/tun maps to --tun (the node alone is useless without
+                                  #   CAP_NET_ADMIN); a spec with no `w` becomes a read-only bind
+
+# logs (kern's own capture, read with `kern logs`)
+mem_reservation = "64m"           # --memory-reservation (cgroup memory.low: a SOFT floor,
+                                  #   protected under pressure, never a cap and never an OOM kill)
+cpu_weight = "100"                # --cpu-weight (cgroup cpu.weight, 1-10000, 100 = normal). A
+                                  #   compose `cpu_shares:` is CONVERTED onto this scale
+pull       = "missing"            # --pull (compose spells it `pull_policy:`)
+shm_size   = "1g"                 # --shm-size (/dev/shm cap; the memory cgroup still bounds the
+                                  #   total, so a size above the memory cap is not more memory)
+volumes_from = ["data"]           # copy another service's mounts (`data:ro` narrows the copy).
+                                  #   Resolved after the whole file; ONE level, never a chain
+log_max_size = "10m"              # --log-max-size (rotate at this size; default 16m)
+log_max_file = "3"                # --log-max-file (files kept, active one included; default 2)
+
 # host paths
 volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 ```
@@ -303,8 +331,80 @@ volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
 | `sysctls`           | `--sysctl`          |
 | `ulimits`           | `--ulimit`          |
 | `stop_grace_period` | `--stop-timeout`    |
+| `dns_opt`           | `--dns-option`      |
+| `devices`           | `--volume` / `-v` (a device is bound, not created; `/dev/net/tun` → `--tun`) |
+| `links`             | `--add-host` (the alias; the ordering edge folds into `depends_on`) |
+| `networks`          | no flag: it shapes the `--no-pod` relay graph and each box's `--add-host` set |
+| `log_max_size`      | `--log-max-size`    |
+| `log_max_file`      | `--log-max-file`    |
+| `shm_size`          | `--shm-size`        |
+| `network_mode: host` | `--net` (the service leaves the stack's network, as under Docker) |
+| `network_mode: none` | no pod and no NAT: loopback only |
+| `mem_reservation`   | `--memory-reservation` |
+| `cpu_weight`        | `--cpu-weight` (compose's `cpu_shares:` is converted onto this scale) |
+| `pull`              | `--pull` (compose spells it `pull_policy:`) |
+| `volumes_from`      | no flag: it appends the named service's entries to `--volume` |
 | `vcpu`/`vdisk`/`vgpio` | positional `vcpu:<name>` … |
 | `security_profile`  | `--security-profile` |
+
+### `[kern] publish_bind`
+
+```toml
+[kern]
+publish_bind = "127.0.0.1"   # or "0.0.0.0" (the default: Docker's, every interface)
+```
+
+A `-p`/`ports:` spec that names no address binds **`0.0.0.0`**, which is what Docker does and what a
+compose file written for Docker means. This key changes that for the whole host.
+
+It is a **CEILING, not a default**: with `publish_bind = "127.0.0.1"` even a spec that explicitly
+writes `0.0.0.0:8080:80` is bound to loopback, because a policy any downloaded compose file could
+defeat by writing an address would not be a policy. It is never silent: the box reports how many
+specs it narrowed.
+
+Read from the DEFAULT config only, never from a `--config` path a compose file chose, for the same
+reason as `allow_device_grants` below: a stack obtained from anywhere must not decide where the host
+listens. Only the two values above are accepted; a different bind address belongs in the spec, next
+to the port it applies to (`10.0.0.5:8080:80`).
+
+If `kern.toml` cannot be parsed, publishing falls back to **loopback** and says so. The two wrong
+answers are not symmetric: guessing "every interface" would publish ports an operator may have
+written a config file to prevent.
+
+### `[kern] compose_memory_max`
+
+```toml
+[kern]
+compose_memory_max = "512m"   # absent: the host's own RAM, which is Docker's bound
+```
+
+A `kern compose` **service** whose file names no `mem_limit:` gets the **host's RAM** as its
+`memory.max`. That is the bound a `docker compose` service has, because Docker imposes no memory
+limit on a container at all and the machine is the only limit. kern used to hand such a service
+`kern box`'s 512 MiB default, so a service that runs fine under Docker was OOM-killed at a number
+written **nowhere in the file**, with exit 137 and nothing to grep for. Measured on a neutral corpus
+of 259 compose files, one per repository: **243** have at least one service in that position, which
+made it the largest remaining difference from Docker after the publish default.
+
+It is **not uncapped**, and the difference matters: the box still carries a `memory.max` and still
+has `memory.oom.group = 1`, so a service that really does exhaust the machine is killed against
+**its own cgroup** with kern's message naming the cap, rather than leaving the host OOM killer to
+choose a victim elsewhere. `kern build`'s `RUN` steps already took exactly this decision, for exactly
+this measured reason; this makes the two agree.
+
+This key restores a strict ceiling, and like `publish_bind` it is a **CEILING, not a default**: a
+service asking for more through `mem_limit:` is held at this value, because a limit a downloaded
+compose file can raise by writing a bigger number limits nothing. A service asking for **less** is
+left alone. It is never silent when it binds: kern names the services it moved, and says nothing on a
+stack where the ceiling changed nothing.
+
+`kern box` and `kern run` are **not affected**. Their 512 MiB default is a sensible bound for a
+one-off sandbox typed at a prompt; a compose service is a declared long-running workload whose file
+has a way to say what it needs.
+
+If `kern.toml` cannot be parsed, compose services fall back to the historic **512 MiB** and kern says
+so. The two wrong answers are not symmetric: reading a broken config as "no ceiling" would hand every
+stack on the machine the whole of its RAM because of a typo.
 
 ### `[kern] allow_device_grants`
 

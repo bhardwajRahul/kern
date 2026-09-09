@@ -1357,7 +1357,7 @@ mod net_resource_tests {
         let size_of = |spec: &str| -> Option<String> {
             parse_tmpfs(&[spec.into()])
                 .ok()
-                .and_then(|v| v.first().map(|(_, s)| s.clone()))
+                .and_then(|v| v.first().map(|m| m.size.clone()))
         };
         // Both spellings of a size, and both reach the same value.
         assert_eq!(size_of("/run:64m").as_deref(), Some("64m"));
@@ -1932,6 +1932,14 @@ mod net_resource_tests {
             workdir: Some("/app".into()),
             user: Some("1000:1000".into()),
             exposed_ports: vec![(80, false), (53, true)],
+            stop_signal: Some("SIGQUIT".into()),
+            healthcheck: Some(kern_oci::ImageHealthcheck {
+                test: vec!["CMD-SHELL".into(), "test -f /ready".into()],
+                interval_ns: Some(30_000_000_000),
+                timeout_ns: Some(5_000_000_000),
+                start_period_ns: Some(2_000_000_000),
+                retries: Some(4),
+            }),
         };
         let dir = std::env::temp_dir().join(format!("kern-imgcfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1955,6 +1963,28 @@ mod net_resource_tests {
             r.exposed_ports, c.exposed_ports,
             "the image's EXPOSE (used by the pod port-collision warning) must survive the sidecar"
         );
+        // THE SIDECAR IS THE ONLY COPY: a field that does not round-trip is a field the box never
+        // sees, however correctly the registry blob was parsed. `STOPSIGNAL` decides which signal
+        // stops the service, and the healthcheck decides whether `depends_on: service_healthy` ever
+        // completes, so both fail SILENTLY when they are dropped here.
+        assert_eq!(r.stop_signal, c.stop_signal);
+        assert_eq!(
+            r.healthcheck, c.healthcheck,
+            "the image's HEALTHCHECK (command, order, and every number) must survive the sidecar"
+        );
+        // A NUMBER LINE WITHOUT A COMMAND IS NOT A CHECK. Read on its own it would build a
+        // healthcheck with no command, and a check with nothing to run can never turn healthy.
+        let orphan = dir.join("orphan.image");
+        std::fs::write(
+            &orphan,
+            "hcinterval	30
+stopsignal	SIGTERM
+",
+        )
+        .expect("write");
+        let o = read_image_config(&orphan);
+        assert!(o.healthcheck.is_none(), "numbers alone are not a check");
+        assert_eq!(o.stop_signal.as_deref(), Some("SIGTERM"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1980,16 +2010,152 @@ mod net_resource_tests {
         }
     }
 
+    /// KERN MUST NOT GENERATE A NAME KERN THEN REFUSES.
+    ///
+    /// A service with `build:` and no `image:` gets a synthesised tag built from its box name, and
+    /// the box name carries the project directory. MEASURED on the real repository
+    /// `alitarhinisv/Notes-FE`: the clone directory produced
+    /// `kern-compose-alitarhinisvNotes-FE-…:latest` and `kern build` refused it, because OCI
+    /// repository names are lowercase. The project builds under Docker and could not start at all
+    /// here, and the refusal told the user to fix a name they had never typed.
+    #[test]
+    fn a_synthesized_build_tag_is_always_a_valid_oci_reference() {
+        // The case that broke: a capital letter anywhere in the project or service name.
+        let t = synthesized_build_tag("alitarhinisvNotes-FE-84bf8e84-app");
+        assert_eq!(t, "kern-compose-alitarhinisvnotes-fe-84bf8e84-app:latest");
+        assert!(
+            !t.chars().any(|c| c.is_ascii_uppercase()),
+            "an OCI repository name is lowercase: {t}"
+        );
+        // Already-lowercase names are unchanged, so nothing that worked before moves.
+        assert_eq!(
+            synthesized_build_tag("proj-abc123-api"),
+            "kern-compose-proj-abc123-api:latest"
+        );
+        // Digits, dashes and underscores survive: they are all legal in a repository name.
+        assert_eq!(synthesized_build_tag("a_b-9"), "kern-compose-a_b-9:latest");
+    }
+
+    /// THE HOST'S PUBLISH POLICY IS A CEILING, NOT A DEFAULT, AND IT IS NEVER SILENT.
+    ///
+    /// An operator who writes `[kern] publish_bind = "127.0.0.1"` is saying "nothing on this host is
+    /// published beyond loopback". A policy any compose file could defeat by writing
+    /// `0.0.0.0:8080:80` would not be a policy, so it overrides a WRITTEN address too, and the caller
+    /// reports how many specs it moved.
+    ///
+    /// `None` is the shipped behaviour and must be a true no-op: it is what every box gets when there
+    /// is no `kern.toml`, which is most hosts.
+    #[test]
+    fn the_publish_policy_overrides_even_a_written_address_and_counts_what_it_moved() {
+        let pm = |ip, host| kern_isolation::PortMap {
+            bind_ip: ip,
+            host,
+            box_port: 80,
+            udp: false,
+        };
+        const LO: u32 = 0x7f00_0001;
+
+        // No policy: nothing moves, nothing is reported.
+        let mut ports = vec![pm(0, 8080), pm(LO, 8081)];
+        let before = ports.clone();
+        assert_eq!(apply_publish_policy(&mut ports, None), 0);
+        assert_eq!(ports, before, "the shipped behaviour must be a no-op");
+
+        // Loopback policy: the wildcard moves, the one already on loopback does not, and only the
+        // moves are counted - a count that included the no-ops would report a change that did not
+        // happen.
+        let mut ports = vec![pm(0, 8080), pm(LO, 8081), pm(0, 8082)];
+        assert_eq!(apply_publish_policy(&mut ports, Some(LO)), 2);
+        assert!(ports.iter().all(|p| p.bind_ip == LO));
+
+        // A WRITTEN `0.0.0.0` is overridden too: that is what makes it a ceiling.
+        let mut ports = vec![pm(0, 9090)];
+        assert_eq!(apply_publish_policy(&mut ports, Some(LO)), 1);
+        assert_eq!(ports[0].bind_ip, LO);
+
+        // And the policy can also be the wide one, which moves an explicit loopback the other way.
+        let mut ports = vec![pm(LO, 9091)];
+        assert_eq!(apply_publish_policy(&mut ports, Some(0)), 1);
+        assert_eq!(ports[0].bind_ip, 0);
+    }
+
+    /// THE OPTIONS KERN CAN APPLY MUST BE APPLIED, AND THE HARDENING FLOOR MUST NOT BE REACHABLE.
+    ///
+    /// `mode=`, `noexec` and `ro` used to be parsed, recognised, and announced as "not applied": the
+    /// second element of a `(path, size)` tuple had nowhere to put them. `nosuid` and `nodev` are a
+    /// different case and stay unreachable on purpose - a `suid` or `dev` token asks kern to be less
+    /// confining than it is, which is the one thing a file it was handed may not decide.
+    ///
+    /// The mode is checked HERE because it travels to `mount(2)` as text: a value the kernel cannot
+    /// parse makes the whole mount fail, and the box would be missing its `/tmp` with nothing said.
+    #[test]
+    fn tmpfs_applies_mode_noexec_and_ro_and_never_relaxes_nosuid_nodev() {
+        let one = |spec: &str| -> kern_isolation::TmpfsMount {
+            parse_tmpfs(&[spec.into()])
+                .expect("valid spec")
+                .into_iter()
+                .next()
+                .expect("one mount")
+        };
+
+        let m = one("/run:size=16m,mode=0755,noexec");
+        assert_eq!(m.size, "16m");
+        assert_eq!(m.mode, "0755");
+        assert!(m.noexec, "noexec must reach the mount");
+        assert!(!m.read_only);
+
+        let ro = one("/run:ro");
+        assert!(ro.read_only, "ro must reach the mount");
+
+        // `exec` and `rw` are kern's defaults, so they are satisfied by doing nothing - and must not
+        // be reported as unsupported either.
+        let dflt = one("/run:rw,exec");
+        assert!(!dflt.noexec && !dflt.read_only && dflt.mode.is_empty());
+
+        // The floor: asking for `suid`/`dev` parses (the file still runs) and changes nothing that
+        // this struct can express, because the mount flags are OR-ed in unconditionally downstream.
+        let weak = one("/run:suid,dev");
+        assert_eq!(
+            weak,
+            kern_isolation::TmpfsMount {
+                path: "/run".into(),
+                ..Default::default()
+            }
+        );
+
+        // A mode the kernel could not parse is refused at the flag, not at mount time.
+        for bad in ["mode=9999", "mode=", "mode=0o755", "mode=12345"] {
+            assert!(
+                parse_tmpfs(&[format!("/run:{bad}")]).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        // Positive control: the octal forms a compose file actually writes are accepted.
+        for good in ["1777", "0755", "755", "0"] {
+            assert!(
+                parse_tmpfs(&[format!("/run:mode={good}")]).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
     #[test]
     fn tmpfs_parse_and_blocked_mounts() {
         assert_eq!(
             parse_tmpfs(&["/scratch:64M".into()]).unwrap(),
-            vec![("/scratch".to_string(), "64m".to_string())]
+            vec![kern_isolation::TmpfsMount {
+                path: "/scratch".to_string(),
+                size: "64m".to_string(),
+                ..Default::default()
+            }]
         );
-        // No size → empty (kernel default).
+        // No size → empty (kernel default), and every other setting at kern's default.
         assert_eq!(
             parse_tmpfs(&["/cache".into()]).unwrap(),
-            vec![("/cache".to_string(), String::new())]
+            vec![kern_isolation::TmpfsMount {
+                path: "/cache".to_string(),
+                ..Default::default()
+            }]
         );
         // Hardened mounts and their subpaths are refused; so are relative/`..` paths and bad sizes.
         for bad in [
@@ -2089,7 +2255,7 @@ mod net_resource_tests {
             top.to_string_lossy().into_owned(),
             base.to_string_lossy().into_owned(),
         ];
-        let r = merged_view_extract(&chain, Some("/app"), &out);
+        let r = merged_view_extract(&chain, Extract::Entry("/app"), &out);
         // The copy of `/app` must succeed and contain ONLY `marker` - never the opaque-hidden `token`.
         assert!(r.is_ok(), "merged_view_extract failed: {r:?}");
         assert!(
@@ -2101,6 +2267,67 @@ mod net_resource_tests {
             "SECRET RESURRECTED: the opaque-hidden token must not appear in the merged copy"
         );
         for d in [&base, &top, &out] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// `Contents` IS NOT `Entry`, and the difference is the whole reason [`Extract`] is an enum.
+    ///
+    /// Seeding a named volume mounted at `/app` must put the image's files AT THE ROOT of the
+    /// volume: the volume IS `/app`, so a nested `app/` is the content delivered one level too deep
+    /// and the service finds nothing where its files should be. MEASURED as exactly that bug with a
+    /// real two-layer image - `ls /app/conf` inside the box returned `conf` - before this arm
+    /// existed.
+    ///
+    /// ASSERTED AT THE COPIER, not at `merged_view_extract`. That function REFUSES TO FORK in a
+    /// multi-threaded process, so a unit test can never reach it: a first version of this test
+    /// called it and reported a skip whose stated reason ("no unprivileged overlay") was not the
+    /// real one. `copy_confined_tree` is where the layout is decided, it needs no fork and no
+    /// privilege, and `dst_name` is the whole difference between the two arms.
+    #[test]
+    fn the_copier_places_a_directory_by_name_or_its_entries_bare() {
+        use std::os::unix::io::AsRawFd;
+        let pid = std::process::id();
+        let src = std::env::temp_dir().join(format!("kern-ccsrc-{pid}"));
+        let (out_e, out_c) = (
+            std::env::temp_dir().join(format!("kern-ccoute-{pid}")),
+            std::env::temp_dir().join(format!("kern-ccoutc-{pid}")),
+        );
+        for d in [&src, &out_e, &out_c] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(src.join("app/sub")).unwrap();
+        std::fs::write(src.join("app/top.txt"), b"t").unwrap();
+        std::fs::write(src.join("app/sub/deep.txt"), b"d").unwrap();
+        std::fs::create_dir_all(&out_e).unwrap();
+        std::fs::create_dir_all(&out_c).unwrap();
+
+        let root = std::fs::File::open(&src).unwrap();
+        let de = std::fs::File::open(&out_e).unwrap();
+        let dc = std::fs::File::open(&out_c).unwrap();
+        // SAFETY: three live directory descriptors owned by this test for the duration of the calls.
+        let (ce, cc) = unsafe {
+            (
+                copy_confined_tree(root.as_raw_fd(), "app", de.as_raw_fd(), Some("app"), 0),
+                copy_confined_tree(root.as_raw_fd(), "app", dc.as_raw_fd(), None, 0),
+            )
+        };
+        assert_eq!((ce, cc), (0, 0), "both copies must succeed");
+
+        // `Entry` (`dst_name = Some(basename)`): the directory itself arrives.
+        assert!(out_e.join("app/top.txt").exists(), "Entry keeps `app/`");
+        assert!(!out_e.join("top.txt").exists(), "Entry does NOT flatten");
+        // `Contents` (`dst_name = None`): the entries arrive, the directory does not.
+        assert!(out_c.join("top.txt").exists(), "Contents flattens");
+        assert!(!out_c.join("app").exists(), "Contents drops the directory");
+        // And it is still a RECURSIVE copy: a flattening that stopped at the first level would
+        // deliver a volume missing every subdirectory the image put there.
+        assert!(
+            out_c.join("sub/deep.txt").exists(),
+            "Contents must still descend"
+        );
+
+        for d in [&src, &out_e, &out_c] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
@@ -2453,7 +2680,7 @@ mod image_rm_tests {
                  and the fixture cannot pin the bug; the forced removal is still asserted"
             );
         }
-        force_remove_dir_all(&base);
+        let _ = force_remove_dir_all(&base); // a test fixture: a leftover is not a test failure
         assert!(
             !base.exists(),
             "the tree survived the delete: rmi would report bytes it never freed"
@@ -3811,6 +4038,57 @@ mod port_collision_tests {
         );
     }
 
+    /// THE ONE SERVICE `--no-pod` BRING-UP CANNOT ORDER MUST BE NAMED, BY NAME.
+    ///
+    /// Every other box is held at a pre-exec gate until its relays exist. A service with `restart:`
+    /// is installed as a systemd unit instead and started by the manager, which inherits no
+    /// descriptor from `up`, so nothing can hold it. MEASURED with one fixture and that line as the
+    /// only variable, three runs each: as a consumer connecting at t=0 it got `NO-API` three of
+    /// three with `restart:` and the peer's payload three of three without it.
+    ///
+    /// The three silences are asserted with the note, because a line printed on every bring-up is
+    /// how a reader learns to skip the one that matters: a stack in a pod is ordered by the pod, a
+    /// single service has no peer to be early for, and a stack where nothing sets `restart:` has
+    /// nothing to say.
+    #[test]
+    fn a_restart_service_is_named_as_the_one_no_pod_cannot_order() {
+        let plain = |name: &str| crate::compose::ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            ports: vec!["7001:8080".to_string()],
+            ..Default::default()
+        };
+        let managed = |name: &str| crate::compose::ComposeBox {
+            restart_always: true,
+            ..plain(name)
+        };
+
+        let mixed = [plain("api"), managed("db")];
+        let note = no_pod_restart_gate_note(&mixed, true)
+            .expect("a `restart:` service under --no-pod is not held by the gate");
+        assert!(
+            note.contains("'db'") && !note.contains("'api'"),
+            "the note must name the service that is not held, and only it: {note}"
+        );
+        assert!(
+            note.contains("restart:"),
+            "and the key that causes it, so the reader can act: {note}"
+        );
+
+        assert!(
+            no_pod_restart_gate_note(&mixed, false).is_none(),
+            "in a pod every service is ordered, `restart:` or not"
+        );
+        assert!(
+            no_pod_restart_gate_note(&[managed("db")], true).is_none(),
+            "a single service has no peer it could start ahead of"
+        );
+        assert!(
+            no_pod_restart_gate_note(&[plain("api"), plain("db")], true).is_none(),
+            "a stack where nothing sets `restart:` is fully ordered and has nothing to report"
+        );
+    }
+
     /// A SERVICE THAT DECLARES NO PORT CANNOT BE REACHED BY NAME, and that was discoverable only as
     /// `Connection refused` in a peer's log.
     ///
@@ -4166,15 +4444,26 @@ mod port_collision_tests {
         assert_collides(&boxes, &["'lan'", "'wild'"]);
     }
 
+    /// A BARE SPEC IS THE WILDCARD NOW, AND IT STILL COLLIDES WITH AN EXPLICIT LOOPBACK.
+    ///
+    /// The default moved from `127.0.0.1` to `0.0.0.0` (Docker's), so the two used to collide by
+    /// being the SAME address and now collide by the wildcard owning every address on the port. The
+    /// outcome must not change: the checker exists to agree with the real bind, and a bare `9500:80`
+    /// that no longer clashed with `127.0.0.1:9500:81` would let a stack past preflight and fail at
+    /// bind time, which is the failure this check was written to move earlier.
     #[test]
-    fn default_bind_is_loopback_so_bare_and_explicit_loopback_collide() {
-        // A bare `9500:80` defaults to 127.0.0.1 (kern is loopback-default). It MUST clash with an
-        // explicit `127.0.0.1:9500:81` - otherwise the checker would disagree with the real bind.
+    fn a_bare_spec_is_the_wildcard_and_still_collides_with_an_explicit_loopback() {
         let boxes = [
             svc("bare", &["9500:80"]),
             svc("explicit", &["127.0.0.1:9500:81"]),
         ];
         assert_collides(&boxes, &["'bare'", "'explicit'", "9500/tcp"]);
+        // And in the other order, because the wildcard arm is asymmetric in the implementation.
+        let boxes = [
+            svc("explicit", &["127.0.0.1:9501:81"]),
+            svc("bare", &["9501:80"]),
+        ];
+        assert_collides(&boxes, &["'explicit'", "'bare'", "9501/tcp"]);
     }
 
     #[test]

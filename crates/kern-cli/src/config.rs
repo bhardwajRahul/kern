@@ -59,6 +59,42 @@ pub struct KernSettings {
     /// or the generated unit carries the flag itself, which is the self-perpetuating grant on an
     /// unattended machine that the gate exists to prevent.
     pub allow_device_grants: bool,
+    /// `publish_bind` - the host address a `-p`/`ports:` spec binds when it names none.
+    ///
+    /// Absent means [`crate::ports::PUBLISH_DEFAULT_IP`] (`0.0.0.0`), which is what Docker does and
+    /// what a compose file written for Docker means. Set it to `127.0.0.1` to get the narrower
+    /// posture kern shipped before: a published service then stays on loopback unless a spec says
+    /// otherwise.
+    ///
+    /// A STRING AND NOT A BOOL, so the key says which address it means rather than encoding it in a
+    /// name like `expose_all`. Only the two addresses that correspond to a policy are accepted; an
+    /// arbitrary per-host bind address belongs in the spec, where it is visible next to the port it
+    /// applies to.
+    pub publish_bind: Option<String>,
+    /// `compose_memory_max` - the ceiling a `kern compose` SERVICE gets when its file names none.
+    ///
+    /// Absent means the host's own RAM, which is what a `docker compose` service is bounded by:
+    /// Docker imposes no `memory.max` at all, and the machine is the only limit. kern used to give
+    /// such a service `kern box`'s 512 MiB default instead, so a service that runs under Docker was
+    /// OOM-killed at a number written NOWHERE in the file, with exit 137 and nothing to grep for.
+    /// MEASURED on a neutral corpus of 259 compose files: 243 have at least one service in that
+    /// position, which made it the single largest remaining difference from Docker.
+    ///
+    /// NOT UNCAPPED, and the difference matters: the box still carries a `memory.max` and still has
+    /// `memory.oom.group = 1`, so a service that really does exhaust the machine is killed against
+    /// ITS OWN cgroup with kern's message naming the cap, rather than leaving the host OOM killer to
+    /// pick a victim somewhere else. The build step already took exactly this decision, for exactly
+    /// this reason, and this makes the two agree.
+    ///
+    /// A CEILING RATHER THAN A DEFAULT, like [`Self::publish_bind`]: with it set, a service is held
+    /// at the smaller of this value and whatever its `mem_limit:` asks for, so a downloaded file
+    /// cannot raise it by writing a bigger number. That is what makes it a policy instead of a
+    /// suggestion.
+    ///
+    /// `kern box` and `kern run` are NOT affected. Their 512 MiB default is a sensible bound for a
+    /// one-off sandbox typed at a prompt; a compose service is a declared long-running workload
+    /// whose file has a way to say what it needs.
+    pub compose_memory_max: Option<String>,
 }
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
@@ -498,6 +534,35 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         "log_level" => k.log_level = Some(value_string(v)?),
         "crash_recovery" => k.crash_recovery = value_bool(v)?,
         "allow_device_grants" => k.allow_device_grants = value_bool(v)?,
+        // VALIDATED HERE, where the file is read, so a typo cannot silently leave every box on a
+        // policy the operator did not choose. The value decides where services LISTEN, so a value
+        // nobody checked is the shape of an accident nobody notices until a port answers on the LAN.
+        "publish_bind" => {
+            let raw = value_string(v)?;
+            match raw.trim() {
+                "0.0.0.0" | "127.0.0.1" => k.publish_bind = Some(raw.trim().to_string()),
+                other => {
+                    return Err(format!(
+                        "[kern] publish_bind = '{other}': expected \"0.0.0.0\" (Docker's default, \
+                         every interface) or \"127.0.0.1\" (loopback only). A different address \
+                         belongs in the port spec itself, e.g. `10.0.0.5:8080:80`"
+                    ))
+                }
+            }
+        }
+        // VALIDATED HERE for `publish_bind`'s reason: the value decides when a service is killed,
+        // and a size nobody parsed is a policy nobody is applying.
+        "compose_memory_max" => {
+            let raw = value_string(v)?;
+            if kern_common::parse_binary_size(raw.trim()).is_none() {
+                return Err(format!(
+                    "[kern] compose_memory_max = '{raw}': expected a size like \"512m\", \"2g\" \
+                     or a byte count. It is the ceiling a compose service gets when its file names \
+                     none, and it also caps a `mem_limit:` that asks for more"
+                ));
+            }
+            k.compose_memory_max = Some(raw.trim().to_string());
+        }
         _ => warn_unknown_key("kern", key),
     }
     Ok(())

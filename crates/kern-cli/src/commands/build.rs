@@ -275,7 +275,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     }
     let t0 = std::time::Instant::now();
     let result = if multi {
-        build_multi_stage(args.quiet, tag, &ctx, &work, &instrs)
+        build_multi_stage(args.quiet, tag, &ctx, &work, &instrs, args.target)
     } else {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
@@ -311,12 +311,43 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     result
 }
 
+/// Which stage `--target <name>` selects, or the refusal.
+///
+/// A FUNCTION SO THE DECISION CAN BE ASSERTED. It decides which image a build produces, and a wrong
+/// answer here is a stack running an image nobody asked for - the failure `--target` exists to
+/// prevent, so it must not be reachable only through a full build.
+///
+/// AN UNKNOWN NAME IS REFUSED, WITH THE LIST. Falling back to the last stage would build a working
+/// image that is the wrong one, silently. The available names are printed because a bad target is
+/// almost always a typo or a rename, and the reader then has the answer in front of them.
+///
+/// An unnamed stage (a bare `FROM x` with no `AS`) can never be selected: Docker cannot name it
+/// either, so matching it would invent a spelling that works only here.
+fn resolve_target_stage(stage_names: &[Option<String>], target: &str) -> Result<usize, Error> {
+    let want = target.trim();
+    stage_names
+        .iter()
+        .position(|n| n.as_deref().is_some_and(|n| n == want))
+        .ok_or_else(|| {
+            let known: Vec<&str> = stage_names.iter().filter_map(|n| n.as_deref()).collect();
+            Error::Build(format!(
+                "--target '{want}': no stage by that name in this Dockerfile{}",
+                if known.is_empty() {
+                    " (it names none)".to_string()
+                } else {
+                    format!(" (it has: {})", known.join(", "))
+                }
+            ))
+        })
+}
+
 fn build_multi_stage(
     quiet: bool,
     tag: &str,
     ctx: &std::path::Path,
     work: &std::path::Path,
     instrs: &[crate::dockerfile::Instr],
+    target: Option<&str>,
 ) -> Result<(), Error> {
     use crate::dockerfile::Instr;
     // Split into stages at each FROM. `stages[i]` = the instruction slice for stage i (starts with FROM).
@@ -326,7 +357,6 @@ fn build_multi_stage(
         .filter(|(_, x)| matches!(x, Instr::From { .. }))
         .map(|(i, _)| i)
         .collect();
-    let n = from_idxs.len();
     // Stage names in order, for resolving `--from=<name>` (mirrors the parser).
     let stage_names: Vec<Option<String>> = from_idxs
         .iter()
@@ -335,6 +365,29 @@ fn build_multi_stage(
             _ => None,
         })
         .collect();
+    // `--target`: TRUNCATE THE BUILD AT THE NAMED STAGE, which then becomes the final one and takes
+    // the user's tag. Everything after it is not built at all, which is the point of the flag: a
+    // `development` target must not pay for the `production` stage, and on many Dockerfiles the later
+    // stages cannot even run in a dev tree.
+    //
+    // AN UNKNOWN NAME IS REFUSED, WITH THE LIST. Falling back to the last stage would build a working
+    // image that is the wrong one, silently - the failure this flag exists to prevent. The available
+    // names are printed because a target is usually a typo or a rename, and the reader has the answer
+    // in front of them either way.
+    let (instrs, from_idxs, stage_names) = match target {
+        None => (instrs, from_idxs, stage_names),
+        Some(t) => {
+            let k = resolve_target_stage(&stage_names, t)?;
+            // The kept slice ends where the NEXT stage begins, or at the end for the last one.
+            let end = from_idxs.get(k + 1).copied().unwrap_or(instrs.len());
+            (
+                &instrs[..end],
+                from_idxs[..=k].to_vec(),
+                stage_names[..=k].to_vec(),
+            )
+        }
+    };
+    let n = from_idxs.len();
     let pid = std::process::id();
     // Temp tags for the non-final stages, cleaned up at the end (whatever happens).
     let mut stage_tags: Vec<String> = Vec::with_capacity(n);
@@ -521,7 +574,7 @@ fn materialize_final_image(tag: &str) -> Result<(), Error> {
     std::fs::create_dir_all(&tmp)
         .map_err(|e| Error::Sandbox(format!("materialize '{tag}': temp dir: {e}")))?;
     if chain.len() >= 2 {
-        merged_view_extract(&chain, None, &tmp).inspect_err(|_| {
+        merged_view_extract(&chain, crate::commands::Extract::Whole, &tmp).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&tmp);
         })?;
     } else {
@@ -1251,4 +1304,45 @@ fn build_layered_cached(
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     announce_built(tag);
     Ok(())
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::resolve_target_stage;
+
+    /// `--target` PICKS A STAGE OR REFUSES; it never falls back.
+    ///
+    /// Compose spells this `build.target:`, and it is how a project chooses between the
+    /// `development` and `production` stages of one Dockerfile. Before it existed the key was dropped
+    /// in the parser and kern built the LAST stage, so a file asking for `development` got the
+    /// production image with nothing said. Verified end to end after the fix: `target: development`
+    /// produced the development stage's marker and a service without a target produced the final
+    /// stage's.
+    #[test]
+    fn a_target_selects_its_stage_and_an_unknown_one_is_refused_with_the_list() {
+        let names = vec![
+            Some("base".to_string()),
+            Some("deps".to_string()),
+            None, // a bare `FROM x` with no `AS`: unnameable, in Docker too
+            Some("runner".to_string()),
+        ];
+        assert_eq!(resolve_target_stage(&names, "base").ok(), Some(0));
+        assert_eq!(resolve_target_stage(&names, "deps").ok(), Some(1));
+        assert_eq!(resolve_target_stage(&names, "runner").ok(), Some(3));
+        // Surrounding whitespace is the file's, not the author's intent.
+        assert_eq!(resolve_target_stage(&names, "  deps  ").ok(), Some(1));
+
+        // Unknown: refused, and the message carries every name that DOES exist.
+        let e = resolve_target_stage(&names, "prod").expect_err("must refuse");
+        let msg = format!("{e}");
+        assert!(msg.contains("'prod'"), "{msg}");
+        for n in ["base", "deps", "runner"] {
+            assert!(msg.contains(n), "the refusal must list {n}: {msg}");
+        }
+
+        // A file whose stages are all unnamed can satisfy no target at all, and says so.
+        let anon = vec![None, None];
+        let e = resolve_target_stage(&anon, "x").expect_err("must refuse");
+        assert!(format!("{e}").contains("names none"), "{e}");
+    }
 }

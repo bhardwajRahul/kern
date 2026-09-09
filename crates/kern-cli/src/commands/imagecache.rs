@@ -138,6 +138,29 @@ pub(crate) fn write_image_config(
             &format!("{port}/{}", if *udp { "udp" } else { "tcp" }),
         );
     }
+    if let Some(sig) = &c.stop_signal {
+        line("stopsignal", sig);
+    }
+    // THE SIDECAR IS THE ONLY COPY, so a field missing here is a field the box never sees. The
+    // healthcheck round-trips as one `test` line per argv element plus its numbers, which keeps the
+    // format line-based and keeps `Test` order - the first element decides how the rest is read.
+    if let Some(h) = &c.healthcheck {
+        for a in &h.test {
+            line("hctest", a);
+        }
+        for (k, v) in [
+            ("hcinterval", h.interval_ns),
+            ("hctimeout", h.timeout_ns),
+            ("hcstart", h.start_period_ns),
+        ] {
+            if let Some(v) = v {
+                line(k, &v.to_string());
+            }
+        }
+        if let Some(r) = h.retries {
+            line("hcretries", &r.to_string());
+        }
+    }
     std::fs::write(path, s)
 }
 
@@ -162,6 +185,24 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
                     if let Ok(port) = num.parse::<u16>() {
                         c.exposed_ports
                             .push((port, proto.eq_ignore_ascii_case("udp")));
+                    }
+                }
+            }
+            "stopsignal" => c.stop_signal = Some(v.to_string()),
+            "hctest" => c
+                .healthcheck
+                .get_or_insert_with(Default::default)
+                .test
+                .push(v.to_string()),
+            "hcinterval" | "hctimeout" | "hcstart" | "hcretries" => {
+                // A number line WITHOUT a `hctest` line describes a check that has no command, which
+                // is not a check: `healthcheck_after` refuses an empty `Test` for the same reason.
+                if let Some(h) = c.healthcheck.as_mut() {
+                    match k {
+                        "hcinterval" => h.interval_ns = v.parse().ok(),
+                        "hctimeout" => h.timeout_ns = v.parse().ok(),
+                        "hcstart" => h.start_period_ns = v.parse().ok(),
+                        _ => h.retries = v.parse().ok(),
                     }
                 }
             }
@@ -434,9 +475,17 @@ pub(crate) fn is_safe_stem(s: &str) -> bool {
 /// untag, temp-stage drop) deletes the SAME set and can't drift - a leaked `.base`/`.image` would
 /// otherwise linger and misclassify a later same-name pull. Best-effort; a missing artifact is fine.
 /// `stem` MUST already be a [`sanitize_ref`] token (see [`is_safe_stem`]) - never raw user input.
-pub(crate) fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
-    force_remove_dir_all(&cache.join(stem));
-    force_remove_dir_all(&cache.join(format!("{stem}.diff")));
+///
+/// Returns whether every artifact is GONE. The two directories can fail (see `force_remove_dir_all`),
+/// and a caller that prints "freed N bytes" has to know: this used to be a `()` and the two results
+/// were discarded, which is how `rmi` came to report a removal it had not performed.
+pub(crate) fn drop_image_artifacts(cache: &std::path::Path, stem: &str) -> bool {
+    let root = force_remove_dir_all(&cache.join(stem));
+    let diff = force_remove_dir_all(&cache.join(format!("{stem}.diff")));
+    for e in [&root, &diff].into_iter().flat_map(|r| r.as_ref().err()) {
+        eprintln!("kern: warning: {e}");
+    }
+    let complete = root.is_ok() && diff.is_ok();
     for suffix in [
         ".layers",
         ".base",
@@ -449,6 +498,7 @@ pub(crate) fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
     ] {
         let _ = std::fs::remove_file(cache.join(format!("{stem}{suffix}")));
     }
+    complete
 }
 
 /// `remove_dir_all`, retried after restoring owner write+search on the tree.
@@ -464,13 +514,17 @@ pub(crate) fn drop_image_artifacts(cache: &std::path::Path, stem: &str) {
 /// We own the cache (0700, created by us), so restoring `u+rwX` on our own copy changes nothing an
 /// image can observe: the extracted modes are a property of the layer, not of a running box, and
 /// this path runs only when that copy is being destroyed.
-pub(crate) fn force_remove_dir_all(path: &std::path::Path) {
-    // The SAME walk `remove_tree_forced` performs, with the error discarded: callers here are
-    // best-effort cleanups where a leftover is not worth failing a command over. There used to be two
-    // copies of the chmod-descend logic, one of which also swallowed the reason it failed, which is
-    // how `kern gc --images` reported success over an untouched cache. One implementation now, two
-    // call styles.
-    let _ = remove_tree_forced(path);
+pub(crate) fn force_remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    // The SAME walk `remove_tree_forced` performs, plus the id-mapped retry: a layer unpacked with
+    // the image's own ownership leaves directories this process does not own and cannot chmod, and
+    // unlinking inside one needs write permission ON IT. See `remove_tree_mapped`.
+    //
+    // THE ERROR IS RETURNED NOW, NOT DISCARDED. This function's own doc comment above explains that
+    // reporting a removal that did not happen is the costliest defect on this path, and it then
+    // swallowed exactly that: MEASURED, `kern rmi kibana:7.16.1` printed "freed 1.1G" and left 85
+    // entries behind. A caller that genuinely does not care can still ignore the result, but it has
+    // to say so.
+    remove_tree_mapped(path)
 }
 
 /// Delete one cached image, resolved by its ref (as shown in `kern images`) OR its sanitized stem, then
@@ -538,7 +592,17 @@ pub(crate) fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
         if diff.is_dir() {
             freed += dir_size(&diff);
         }
-        drop_image_artifacts(cache, stem);
+        // THE MEASURED SIZE IS ONLY FREED IF THE REMOVAL FINISHED. This function's caller prints
+        // "freed N", and the size was measured BEFORE the delete: counting it after a partial removal
+        // is how `rmi` came to say "freed 1.1G" over 85 surviving entries. Re-measure what is left
+        // and subtract it, so the number is the difference that actually happened.
+        if !drop_image_artifacts(cache, stem) {
+            for d in [&flat, &diff] {
+                if d.is_dir() {
+                    freed = freed.saturating_sub(dir_size(d));
+                }
+            }
+        }
     }
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
     // never dropped while another image's manifest still names it).
@@ -658,7 +722,7 @@ pub(crate) fn materialize_image(
     std::fs::create_dir_all(&tmp).map_err(|e| Error::Oci(format!("squash dir: {e}")))?;
     if chain.len() >= 2 {
         // ≥2 stacked layers → cross-layer opaque is possible → read the kernel-merged view.
-        merged_view_extract(&chain, None, &tmp).inspect_err(|_| {
+        merged_view_extract(&chain, crate::commands::Extract::Whole, &tmp).inspect_err(|_| {
             remove_build_tree(&tmp);
         })?;
     } else {

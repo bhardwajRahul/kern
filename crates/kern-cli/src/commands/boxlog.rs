@@ -84,10 +84,38 @@ pub(crate) struct CappedLog {
     pub(crate) path: std::path::PathBuf,
     pub(crate) written: u64,
     pub(crate) max: u64,
+    /// How many files this log may occupy IN TOTAL, active one included - Docker's `max-file`
+    /// counting, so `3` means `<path>`, `<path>.1` and `<path>.2`. `1` keeps no generation at all and
+    /// truncates in place. Total on-disk use is bounded at `max * files`.
+    pub(crate) files: u32,
+}
+
+/// How large a box log may grow and how many generations are kept.
+///
+/// A STRUCT AND NOT TWO ARGUMENTS because the two are one policy and are read together at every site:
+/// a size without a generation count bounds nothing (the file is truncated), and a count without a
+/// size never triggers. Passing them separately is how a call site comes to set one and forget the
+/// other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LogCap {
+    pub(crate) max_bytes: u64,
+    pub(crate) files: u32,
+}
+
+impl Default for LogCap {
+    /// EXACTLY WHAT EVERY BOX HAD BEFORE THE FLAGS EXISTED: 16 MiB active plus one rotated
+    /// generation. Stated as the default rather than left implicit at the call sites, so adding a
+    /// caller cannot quietly change the bound a box has always had.
+    fn default() -> Self {
+        Self {
+            max_bytes: BOX_LOG_MAX_BYTES,
+            files: 2,
+        }
+    }
 }
 
 impl CappedLog {
-    fn open(path: &std::path::Path, max: u64) -> Option<Self> {
+    fn open(path: &std::path::Path, cap: LogCap) -> Option<Self> {
         let fd = open_log(path, false);
         if fd < 0 {
             return None;
@@ -101,7 +129,11 @@ impl CappedLog {
             fd,
             path: path.to_path_buf(),
             written,
-            max,
+            // A zero cap would make `write` rotate on every byte and never store anything; the
+            // caller's parser refuses zero, and this is the second gate so the invariant holds for
+            // any future caller that reaches this struct another way.
+            max: cap.max_bytes.max(1),
+            files: cap.files.max(1),
         })
     }
 
@@ -109,9 +141,37 @@ impl CappedLog {
     /// a fresh empty file. The rename is atomic, so a reader never sees the path missing. On failure the
     /// old fd is kept and `written` stays at the cap, so the next `write` retries rather than overflowing.
     fn rotate(&mut self) {
-        let mut old = self.path.clone().into_os_string();
-        old.push(".1");
-        if std::fs::rename(&self.path, &old).is_err() {
+        // `files == 1` KEEPS NO GENERATION, which is Docker's `max-file: 1`. There is nothing to
+        // rename to, so the active file is truncated in place: the fd stays valid and no reader ever
+        // sees the path missing. Seeking back to 0 is required as well as truncating - the pump
+        // drives the offset itself (the fd is not `O_APPEND`), so a file truncated without the seek
+        // would be written at the old offset and come back as a sparse hole.
+        if self.files <= 1 {
+            // SAFETY: `self.fd` is the log descriptor this struct owns and keeps open for its whole
+            // life; both calls take it by value and write through no pointer. The `&&` orders them:
+            // the seek only runs if the truncate succeeded, so the offset is never reset on a file
+            // that still holds its old bytes.
+            if unsafe { libc::ftruncate(self.fd, 0) } == 0
+                && unsafe { libc::lseek(self.fd, 0, libc::SEEK_SET) } == 0
+            {
+                self.written = 0;
+            }
+            return;
+        }
+        // Shift the generations down, OLDEST FIRST, so no rename overwrites a file that has not been
+        // moved yet: `.n-2` → `.n-1` (dropping whatever `.n-1` held), then `.n-3` → `.n-2`, and so on
+        // to `.1` → `.2`. `files` counts the active file, so the oldest generation is `.files-1`.
+        // A rename that fails is skipped rather than aborting the rotation: losing one generation is
+        // strictly better than letting the active file grow past its cap.
+        let gen_path = |i: u32| {
+            let mut p = self.path.clone().into_os_string();
+            p.push(format!(".{i}"));
+            std::path::PathBuf::from(p)
+        };
+        for i in (1..self.files - 1).rev() {
+            let _ = std::fs::rename(gen_path(i), gen_path(i + 1));
+        }
+        if std::fs::rename(&self.path, gen_path(1)).is_err() {
             return; // keep the old fd; never grow past the cap
         }
         let fd = open_log(&self.path, false);
@@ -158,8 +218,8 @@ impl CappedLog {
 /// box's cgroup cap. Falls back to `read`+`write` permanently if the filesystem refuses `splice`
 /// (`EINVAL`); drains to `/dev/null` (still zero-copy) when there is no log or the disk is full, so the
 /// box NEVER blocks on a full pipe.
-pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path) {
-    let mut log = CappedLog::open(path, BOX_LOG_MAX_BYTES);
+pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
+    let mut log = CappedLog::open(path, cap);
     // A /dev/null sink for the no-log case and disk-full overflow: the pipe must still be drained.
     let void = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     let mut use_splice = true;
@@ -236,7 +296,7 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path) {
 /// running Rust code in the child (no exec) is sound. The child sheds every inherited fd except the pipe
 /// read end - crucially the readiness-pipe write end, which held here would stop the launcher from ever
 /// seeing EOF and hang `kern box -d`.
-pub(crate) unsafe fn start_log_pump(path: &std::path::Path) -> Option<i32> {
+pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Option<i32> {
     let mut fds = [0i32; 2];
     if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
         return None;
@@ -272,7 +332,7 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path) -> Option<i32> {
         // Shed every OTHER inherited fd except the read end - most importantly the readiness-pipe write
         // end, which held here would stop the launcher from ever seeing EOF and hang `kern box -d`.
         kern_isolation::shed_inherited_fds(rd);
-        pump_capped_log(rd, path);
+        pump_capped_log(rd, path, cap);
         libc::_exit(0);
     }
     libc::close(rd); // the parent keeps only the write end (dup2'd onto 1/2 by the caller, then closed)
@@ -289,14 +349,14 @@ pub(crate) fn open_log_direct(path: &std::path::Path) -> Option<i32> {
 /// child, so an unbounded writer can't fill the tmpfs runtime dir), or `/dev/null` if no log path. So a
 /// detached box neither holds nor spams the terminal, its output is captured, and its log cannot DoS the
 /// user session. If the pump can't start, the log is written directly (uncapped) rather than lost.
-pub(crate) fn detach_stdio(log: Option<&std::path::Path>) {
+pub(crate) fn detach_stdio(log: Option<&std::path::Path>, cap: LogCap) {
     unsafe {
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if null >= 0 {
             libc::dup2(null, 0);
         }
         let sink = log
-            .and_then(|p| start_log_pump(p).or_else(|| open_log_direct(p)))
+            .and_then(|p| start_log_pump(p, cap).or_else(|| open_log_direct(p)))
             .unwrap_or(null);
         if sink >= 0 {
             libc::dup2(sink, 1);
@@ -439,4 +499,134 @@ pub(crate) fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
         }
     }
     Ok(newest.map(|(_, p)| p))
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    /// THE DESCRIPTOR HAS ONE OWNER, AND NOTHING MAY CLOSE IT BESIDE THAT OWNER.
+    ///
+    /// `CappedLog` closes its own fd in `Drop`, so any second `close` of the same field is a double
+    /// close - and a double close does not fail where it is written. It succeeds, having destroyed
+    /// whatever the operating system handed that number to in the meantime, and the crash surfaces
+    /// in an unrelated place: this exact mistake, made in the test below, made `remove_dir_all`
+    /// panic with `closedir: Bad file descriptor` in a DIFFERENT test on each run.
+    ///
+    /// A SOURCE SCAN because no runtime assertion can see it. The victim is another thread, the
+    /// damage is invisible at the call site, and reproducing it takes a dozen runs of the whole
+    /// binary; a rule about where the close may be written is checkable in microseconds.
+    #[test]
+    fn only_rotate_closes_the_log_descriptor_and_only_when_it_replaces_it() {
+        let src = include_str!("boxlog.rs");
+        // THE SHAPES ARE BUILT, NOT WRITTEN. The bug this guards lived in a TEST, so the scan has to
+        // cover the test module too - and a scan that covers itself would count its own search
+        // strings. Assembling them at run time keeps the literals out of the file entirely.
+        let close_of = |holder: &str| format!("libc::{}({holder}.fd)", "close");
+        assert_eq!(
+            src.matches(&close_of("self")).count(),
+            1,
+            "exactly one close in this file: `rotate`, immediately before it assigns the \
+             replacement. `Drop` (in `mod.rs`) closes the last one"
+        );
+        // Every other holder a `CappedLog` is bound to here. Each would be a hand-close of a
+        // descriptor that already has an owner, which is a double close.
+        for holder in ["log", "l", "cap", "logger"] {
+            let shape = close_of(holder);
+            assert_eq!(
+                src.matches(&shape).count(),
+                0,
+                "`{shape}` closes a descriptor `Drop` already closes: the second call succeeds, \
+                 having destroyed whatever the OS handed that number to in the meantime, and the \
+                 crash lands in an unrelated test"
+            );
+        }
+    }
+
+    use super::*;
+
+    /// ROTATION MUST KEEP EXACTLY `files` FILES, COUNTING THE ACTIVE ONE.
+    ///
+    /// That is Docker's `max-file` arithmetic, and getting it wrong in either direction is a bug a
+    /// user only finds when a disk fills: one too many and the bound the caller was promised
+    /// (`max-size * max-file`) is exceeded, one too few and a generation they asked to keep is gone.
+    ///
+    /// `files == 1` IS ITS OWN BRANCH. There is no generation to rename to, so the active file is
+    /// truncated in place - and the offset has to be reset with it, because the pump drives the
+    /// offset itself (the fd is not `O_APPEND`) and a truncate without the seek leaves the next
+    /// write at the old offset, producing a sparse hole instead of a fresh log.
+    #[test]
+    fn rotation_keeps_exactly_max_file_generations_and_truncates_when_it_is_one() {
+        let dir = std::env::temp_dir().join(format!("kern-rot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let run = |name: &str, files: u32| -> Vec<String> {
+            let path = dir.join(name);
+            let _ = std::fs::remove_file(&path);
+            for i in 1..6 {
+                let _ = std::fs::remove_file(dir.join(format!("{name}.{i}")));
+            }
+            let mut log = CappedLog::open(
+                &path,
+                LogCap {
+                    max_bytes: 16,
+                    files,
+                },
+            )
+            .expect("the log opens");
+            // Six caps' worth: enough to rotate past any generation count under test.
+            for _ in 0..6 {
+                log.write(b"0123456789abcdef");
+            }
+            // DROPPED, NEVER HAND-CLOSED. `CappedLog` already has a `Drop` that closes its
+            // descriptor, so the hand-written `close` of that field originally here was a DOUBLE
+            // CLOSE: the explicit call closed the real descriptor, and the drop at the end of this
+            // closure closed the same NUMBER a second time - by which point another test thread had
+            // reopened it as a directory handle.
+            //
+            // MEASURED, because the symptom pointed nowhere near here: the unit binary failed 3
+            // times in 14 with `remove_dir_all` panicking `closedir: Bad file descriptor`, in a
+            // DIFFERENT unrelated test each run, and 0 times in 11 on `main`. A stranger's
+            // descriptor dying is what a second close looks like from the outside, and the only
+            // reason it is intermittent is that the number has to be reused first.
+            //
+            // The explicit `drop` stays (rather than letting it fall out of scope) because the
+            // ordering matters: the bytes must reach the file before the directory is listed.
+            drop(log);
+            let mut found: Vec<String> = std::fs::read_dir(&dir)
+                .expect("readable")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|f| f == name || f.starts_with(&format!("{name}.")))
+                .collect();
+            found.sort();
+            found
+        };
+
+        assert_eq!(run("three", 3), vec!["three", "three.1", "three.2"]);
+        assert_eq!(run("two", 2), vec!["two", "two.1"]);
+        // One file, truncated in place: no generation is ever created.
+        assert_eq!(run("one", 1), vec!["one"]);
+        // And the truncation really reset the offset: a sparse file would be larger than the cap.
+        let size = std::fs::metadata(dir.join("one")).expect("stat").len();
+        assert!(
+            size <= 16,
+            "a truncate without the seek leaves a hole: {size}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE DEFAULT IS WHAT EVERY BOX HAD BEFORE THE FLAGS EXISTED.
+    ///
+    /// The two settings are one policy, and the whole safety of adding them is that an unset flag
+    /// changes nothing. A default that drifted would silently re-bound every box in the field.
+    #[test]
+    fn the_default_log_cap_is_the_historic_one() {
+        assert_eq!(
+            LogCap::default(),
+            LogCap {
+                max_bytes: BOX_LOG_MAX_BYTES,
+                files: 2
+            }
+        );
+    }
 }

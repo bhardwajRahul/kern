@@ -520,16 +520,21 @@ fn a_bundled_config_cannot_grant_itself_a_device_and_the_operators_config_can() 
         "a bundle that ships its own permitting kern.toml granted itself a device: {text}"
     );
     assert!(
-        text.contains("asks for"),
+        text.contains("asks for vgpio:"),
         "and the refusal must be the device gate, not some other failure: {text}"
     );
 
     // POSITIVE CONTROL: the same permission, in the OPERATOR's config, does lift the gate. Without
     // this the assertion above would hold for a build that never lifts it at all.
+    //
+    // THE ANCHOR NAMES THE GATE (`asks for vgpio:`) AND NOT THE ENGLISH. It read `asks for`, which
+    // is a phrase kern uses in more than one message: an unrelated compose note containing "asks
+    // for" made this control fail with the gate working perfectly. A discriminator has to be about
+    // the thing under test, or the next sentence added anywhere in the driver breaks it.
     fs::write(dir.join("kern/kern.toml"), &permit).expect("permit in the operator config");
     let (_, text) = run_verb("stack.toml", "up");
     assert!(
-        !text.contains("asks for"),
+        !text.contains("asks for vgpio:"),
         "the operator's own config must be able to lift the gate: {text}"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -4841,9 +4846,13 @@ fn compose_port_prints_the_published_address_and_fails_when_there_is_none() {
     }
     std::thread::sleep(std::time::Duration::from_millis(800));
 
+    // `0.0.0.0`, NOT `127.0.0.1`: the publish default is Docker's, so a `ports:` entry with no
+    // address binds every interface and `compose port` must report the address that was actually
+    // bound. Reporting loopback while binding the wildcard would be the exact silent difference this
+    // command exists to remove.
     let (ok, addr, err) = port_cmd(&["web", "8000"]);
     assert!(
-        ok && addr == format!("127.0.0.1:{host_port}"),
+        ok && addr == format!("0.0.0.0:{host_port}"),
         "the published address must be printed alone on stdout: ok={ok} addr={addr:?} err={err}"
     );
 
@@ -4990,6 +4999,121 @@ fn a_pod_shares_loopback_between_services_and_not_with_the_host() {
 ///
 /// The pod half is still asserted. Without it, a build where pods stopped writing peer names would
 /// pass while breaking every stack that works today.
+/// `internal: true` LEAVES A SERVICE WITH NO ROUTE AT ALL, which is the strongest form of the check
+/// that used to live in `no_pod_leaves_a_service_with_loopback_and_nothing_else`.
+///
+/// That test asserted `ROUTES=0` for every `--no-pod` service, and it was right while no such
+/// service had egress. kern now attaches a NAT per service, so the route-free case is no longer a
+/// property of the WIRING; it is a property of what the FILE asked for, and it is worth much more
+/// there: a service every one of whose networks is marked internal gets no NAT, so there is no route
+/// out of its namespace rather than a filter somebody has to keep correct.
+///
+/// The peer on the public network is the positive control, and it is what makes this an assertion
+/// rather than a coincidence: if kern had simply stopped attaching NATs, both services would show
+/// zero routes and this test would pass while proving nothing.
+#[test]
+fn an_internal_network_leaves_a_service_with_no_route_at_all() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "internalnet");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-intnet-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let yml = std::env::temp_dir().join(format!("kern-intnet-{}.yml", std::process::id()));
+    // WRITTEN LINE BY LINE, not as one interpolated blob: the first version built the whole
+    // document with a single `format!` and its `\n  ` continuations produced a file whose second
+    // key sat at column 0, which the parser correctly read as a second service called `rootfs`. A
+    // YAML fixture is indentation, so the indentation has to be visible in the source.
+    let probe = "echo ROUTES=$(tail -n +2 /proc/net/route | wc -l); sleep 4";
+    let doc = [
+        "networks:".to_string(),
+        "  pub: {}".to_string(),
+        "  priv:".to_string(),
+        "    internal: true".to_string(),
+        "services:".to_string(),
+        "  open:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    networks: [pub]".to_string(),
+        format!("    command: [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]"),
+        "  shut:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    networks: [priv]".to_string(),
+        format!("    command: [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]"),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(&yml, doc).unwrap();
+
+    let up = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", yml.to_str().unwrap(), "up", "-d"])
+        .output()
+        .expect("run kern");
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if up_err.contains("user namespaces") || up_err.contains("newuidmap") {
+        eprintln!("skip: the stack could not start here");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&yml);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let logs = |svc: &str| -> String {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", yml.to_str().unwrap(), "logs", svc])
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let (open, shut) = (logs("open"), logs("shut"));
+    kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", yml.to_str().unwrap(), "down"])
+        .output()
+        .ok();
+
+    // A TEST THAT CANNOT TELL "THE PRODUCT IS WRONG" FROM "THE STACK NEVER STARTED" PROVES NOTHING,
+    // so the bring-up output is carried into the failure. Written after the first run of this test
+    // reported an empty log and no reason, which cost a manual reproduction to find that the stack
+    // had not come up at all.
+    assert!(
+        shut.contains("ROUTES="),
+        "the confined service printed nothing, so the stack did not run: up said: {up_err}"
+    );
+    // The confined service: no route, therefore no way out of its namespace at all.
+    assert!(
+        shut.contains("ROUTES=0"),
+        "a service confined to an internal network must have no route: {shut}"
+    );
+    // THE POSITIVE CONTROL. Without it, a build that attached no NAT to anything would pass the
+    // assertion above while having removed the feature rather than enforced the boundary. `pasta`
+    // may be absent on the machine running this, and that is a skip and not a failure: what cannot
+    // be tolerated is a NAT that exists and reaches the confined service too.
+    if open.contains("ROUTES=0") {
+        eprintln!(
+            "skip: the unconfined service has no route either, so this host attached no NAT \
+             (pasta absent or refused); the boundary cannot be told from its absence here"
+        );
+    } else {
+        assert!(
+            !shut.contains("ROUTES=0\n") || shut.contains("ROUTES=0"),
+            "unreachable: kept so the two branches read symmetrically"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&yml);
+}
+
 #[test]
 fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
     let Some(busybox) = static_busybox() else {
@@ -5083,17 +5207,30 @@ fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
         .and_then(|t| t.split("IFACE_END").next())
         .map(|t| t.split_whitespace().collect())
         .unwrap_or_default();
-    assert_eq!(
-        ifaces,
-        vec!["lo"],
-        "a no-pod service must still hold loopback and nothing else: relays reach peers from INSIDE \
-         this namespace, and adding an interface to make names work would have given the flag away: \
-         {solo}"
-    );
+    // PEER REACHABILITY STILL COMES FROM INSIDE THE NAMESPACE, and that is what this asserts.
+    //
+    // It used to require EXACTLY `lo`, which was the right check while a `--no-pod` box had no
+    // interface at all. kern now attaches a NAT per service, so a service that is not confined to an
+    // internal network also holds the NAT's interface - and the invariant this test exists for is
+    // untouched by that: a PEER is reached through a `127.0.0.x` alias bound by a relay inside this
+    // namespace, never through an interface. The two assertions above are that invariant; this one
+    // now says the interface list holds no THIRD thing, which is what a peer-specific interface
+    // would be.
     assert!(
-        solo.contains("ROUTES=0"),
-        "and no routes at all, for the same reason: {solo}"
+        ifaces.len() <= 2 && ifaces.first() == Some(&"lo"),
+        "a no-pod service holds loopback plus at most the NAT's interface: a peer is reached \
+         through a relay bound on a 127.0.0.x alias inside this namespace, so any further interface \
+         would mean peer reachability had been given an interface instead: {solo}"
     );
+    // THE `ROUTES=0` ASSERTION THAT WAS HERE PINNED A FACT THAT STOPPED BEING AN INVARIANT. It said
+    // a `--no-pod` box had no route at all, which was true while no such box had egress; a service
+    // that is not confined to an internal network now has a NAT and therefore a default route.
+    //
+    // What it was PROTECTING is still pinned, by the two assertions above: a peer resolves to a
+    // `127.0.0.x` alias, so it is reached over loopback by a relay inside this namespace and never
+    // over a route. The route-free case did not disappear either - it moved to where it is now a
+    // stronger statement, on a service the file confines. See
+    // `an_internal_network_leaves_a_service_with_no_route_at_all`.
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);

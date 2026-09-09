@@ -333,20 +333,100 @@ pub(crate) fn copy_rootfs_snapshot(
 /// On `_exit` the child's mount+user namespaces die, unmounting the overlay BY CONSTRUCTION (no umount
 /// bookkeeping, no leaked mount holding deleted lower files). Only called for a ≥2-layer chain (where
 /// cross-layer opaque is possible); a single-layer/flat image is already merged and copied directly.
+/// WHAT to take out of the merged image view. Three callers want three different things and two of
+/// them differ only in whether the directory itself comes along, which a `bool` argument at the call
+/// site cannot say out loud.
+///
+/// MEASURED WHY THIS IS AN ENUM: the volume seeding was written first as `Entry`, and a named volume
+/// mounted at `/app/conf` came up holding `conf/top.txt` instead of `top.txt`. Both spellings are one
+/// `Option<&str>`, so nothing at the call site could have caught it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Extract<'a> {
+    /// The whole rootfs, contents-first: the push squash.
+    Whole,
+    /// One path, placed under its own BASENAME: `COPY --from=stage /a/b .` produces `./b`.
+    Entry(&'a str),
+    /// The CONTENTS of one directory, without the directory: seeding a named volume mounted at that
+    /// path, where the volume IS the directory.
+    Contents(&'a str),
+}
+
+impl<'a> Extract<'a> {
+    /// The path inside the image this asks for, or `None` for the whole rootfs.
+    fn path(self) -> Option<&'a str> {
+        match self {
+            Extract::Whole => None,
+            Extract::Entry(p) | Extract::Contents(p) => Some(p),
+        }
+    }
+}
+
 pub(crate) fn merged_view_extract(
     chain: &[String],
-    src_rel: Option<&str>,
+    src_rel: Extract<'_>,
     out_dir: &std::path::Path,
 ) -> Result<(), Error> {
     // `chain` is ALREADY top-first (the caller split `resolve_image`'s `top:…:base` on ':'), and
     // overlayfs `lowerdir=` shadows left-to-right (leftmost wins) - so we join it AS-IS (no reverse).
     // Getting this order wrong silently defeats the opaque (base would shadow top), re-leaking the
     // deleted file. The RO mount needs only lowerdir. The opts CString outlives the fork.
-    let lower = chain.join(":"); // top:…:base, order-preserving
+    // SHORT NAMES, NOT THE ABSOLUTE PATHS, because the mount-options buffer is ONE KERNEL PAGE.
+    //
+    // Every layer contributes its full path to `lowerdir=`, and kern's layer paths live under the
+    // image cache with content-addressed directory names, so a deep chain overflows 4 KiB and the
+    // `mount(2)` returns EINVAL. The child then `_exit`ed 104 and the caller printed "extract stage
+    // 104", which tells a reader nothing at all.
+    //
+    // MEASURED on a real repository (`aloshai/aequi-monorepo`, a four-stage bun/turbo Dockerfile):
+    // `bun install` completed, the next stage's `COPY --from=deps /app/node_modules` failed with that
+    // message, and the same Dockerfile builds under Docker. A multi-stage `COPY --from` is one of the
+    // most common shapes in modern Dockerfiles, so this was not an edge.
+    //
+    // The fix is the one moby uses for the same kernel limit: a directory of SYMLINKS with tiny names
+    // (`0`, `1`, `2`, …), each pointing at one layer, and a `lowerdir=` of those names resolved
+    // relative to the child's working directory. A chain of any depth this project can produce then
+    // fits in a few hundred bytes. Overlayfs resolves each entry as an ordinary path, so a symlink to
+    // a directory is exactly equivalent to naming it - and ORDER IS PRESERVED, which is the one thing
+    // that must not change: `lowerdir` shadows left-to-right, and reversing it would silently defeat
+    // every opaque-directory marker in the image.
+    //
+    // ALWAYS, not only for long chains. One code path is one path that gets tested; a threshold would
+    // leave the rare branch to be exercised for the first time by whoever has the deepest image.
+    // OUTSIDE `out_dir`, AND THIS IS NOT A DETAIL. The child copies the merged view INTO `out_dir`,
+    // so a link directory placed there would become part of the extracted image - and when the
+    // extraction IS the image (`src_rel = None`, the whole-rootfs materialisation a final stage
+    // resting on an earlier stage needs), the result is an image carrying a directory of symlinks
+    // into the layer cache. MEASURED the moment it was written that way: `FROM base AS runner`, the
+    // commonest multi-stage shape there is, produced "cached without a usable rootfs" and kern then
+    // tried to PULL the local build tag from Docker Hub. `main` built the same file correctly, which
+    // is how the regression was attributed rather than argued about.
+    //
+    // A sibling of `out_dir`, named after this process, and removed as soon as the child is reaped.
+    let farm = out_dir.with_file_name(format!(
+        ".kern-lower-{}-{}",
+        std::process::id(),
+        out_dir
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let _ = std::fs::remove_dir_all(&farm);
+    std::fs::create_dir_all(&farm)
+        .map_err(|e| Error::Oci(format!("merged-view: layer link dir: {e}")))?;
+    for (i, layer) in chain.iter().enumerate() {
+        std::os::unix::fs::symlink(layer, farm.join(i.to_string()))
+            .map_err(|e| Error::Oci(format!("merged-view: link layer {i}: {e}")))?;
+    }
+    let lower = (0..chain.len())
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(":"); // top:…:base, order-preserving
     let opts = cstring(&format!("lowerdir={lower}"))?;
+    // The child resolves those names, and its mountpoint, relative to this directory.
+    let farm_c = cstring(&farm.to_string_lossy())?;
     // Defence-in-depth (the kernel `openat2(RESOLVE_IN_ROOT)` already confines every component): reject a
     // `..` path COMPONENT up front with a clear error. `None` = whole-rootfs push.
-    if let Some(p) = src_rel {
+    if let Some(p) = src_rel.path() {
         if p.trim_start_matches('/').split('/').any(|c| c == "..") {
             return Err(Error::Build(format!(
                 "COPY --from source '{p}' contains a '..' component (refused)"
@@ -385,12 +465,18 @@ pub(crate) fn merged_view_extract(
     }
     if pid == 0 {
         // ---- CHILD: sets up the ns/mount and copies; never returns (always `_exit`). ----
-        merged_view_child(&opts, out_fd, src_rel, euid, egid);
+        merged_view_child(&opts, &farm_c, out_fd, src_rel, euid, egid);
     }
     // ---- PARENT: close our copy of the out fd, reap the child, map its exit code to a precise error. ----
     unsafe { libc::close(out_fd) };
     let mut status = 0i32;
-    if crate::eintr::waitpid(pid, &mut status, 0) < 0 {
+    let reaped = crate::eintr::waitpid(pid, &mut status, 0);
+    // The links have done their job the instant the child has exited: its mount namespace is gone
+    // with it, so nothing still resolves through them. Removed here rather than at each `return`
+    // below, because there are six of those and one forgotten path is a directory left behind on
+    // every failed build.
+    let _ = std::fs::remove_dir_all(&farm);
+    if reaped < 0 {
         return Err(Error::Oci("merged-view: waitpid failed".into()));
     }
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
@@ -415,6 +501,15 @@ pub(crate) fn merged_view_extract(
         120 => Err(Error::Build(
             "COPY --from source tree is nested too deeply (refused)".into(),
         )),
+        104 => Err(Error::Oci(format!(
+            "the image's layers could not be overlaid for a COPY --from ({} layers). The mount \
+             options are bounded by one kernel page, which is why the layers are named through short \
+             links; a chain this deep is past what overlayfs accepts",
+            chain.len()
+        ))),
+        106 => Err(Error::Oci(
+            "merged-view: could not enter the layer-link directory".into(),
+        )),
         _ => Err(Error::Oci(format!(
             "reading the image's merged overlay view failed (extract stage {code})"
         ))),
@@ -432,12 +527,19 @@ pub(crate) fn merged_view_extract(
 /// keep it robust if that ever changes.
 pub(crate) fn merged_view_child(
     opts: &std::ffi::CStr,
+    farm: &std::ffi::CStr,
     out_fd: libc::c_int,
-    src_rel: Option<&str>,
+    src_rel: Extract<'_>,
     euid: libc::uid_t,
     egid: libc::gid_t,
 ) -> ! {
     unsafe {
+        // 0. Into the layer-link directory: `lowerdir=` names and the mountpoint below are BOTH
+        // resolved from here, which is what keeps the mount options inside one kernel page. Done
+        // before the namespaces so a failure here is distinguishable from a namespace failure.
+        if libc::chdir(farm.as_ptr()) != 0 {
+            libc::_exit(106);
+        }
         // 1. New user + mount namespace.
         if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
             libc::_exit(101);
@@ -482,14 +584,19 @@ pub(crate) fn merged_view_child(
         // 4. Copy. `None` = whole rootfs (push): copy the root dir itself INTO out_fd. `Some(p)` = a
         // single COPY --from path, resolved confined and copied by basename into out_fd.
         let code = match src_rel {
-            None => copy_confined_tree(root_fd, ".", out_fd, None, 0),
-            Some(p) => {
+            Extract::Whole => copy_confined_tree(root_fd, ".", out_fd, None, 0),
+            Extract::Entry(p) => {
                 let rel = p.trim_start_matches('/');
                 // The basename becomes the destination entry name (Docker's `COPY --from x/y .` → `./y`).
                 let name = std::path::Path::new(rel)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned());
                 copy_confined_tree(root_fd, rel, out_fd, name.as_deref(), 0)
+            }
+            // `dst_name = None` is the copier's own spelling of "the CONTENTS of this directory",
+            // which is exactly what `Whole` uses for `.`.
+            Extract::Contents(p) => {
+                copy_confined_tree(root_fd, p.trim_start_matches('/'), out_fd, None, 0)
             }
         };
         libc::_exit(code);

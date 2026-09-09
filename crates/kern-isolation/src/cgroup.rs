@@ -2127,7 +2127,12 @@ fn enable_subtree_controllers(parent: &std::path::Path) {
 }
 
 /// Default memory ceiling for a sandbox (512 MiB) - conservative but generous; `--memory` overrides.
-const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
+///
+/// PUBLIC BECAUSE THE NUMBER IS ALSO A SENTENCE. `kern compose` tells the reader that services with
+/// no `mem_limit:` run under this ceiling (Docker imposes none), and a message carrying its own copy
+/// of the figure is one edit away from describing a cap the kernel is not enforcing. One constant,
+/// enforced and quoted from the same place.
+pub const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
 /// Process-count ceiling - caps fork bombs.
 const DEFAULT_PIDS_MAX: &str = "512";
 /// cgroup v2 CPU period (µs) for `cpu.max`; the quota is `cores * PERIOD`.
@@ -2350,6 +2355,15 @@ pub fn apply_limits(
     pids_max: Option<u64>,
     io_max: &[String],
     io_weight: Option<u64>,
+    // `--memory-reservation` → `memory.low`: a soft floor the kernel honours under pressure. Never
+    // part of the `require_all` gate below, and deliberately: a reservation that does not bind costs
+    // priority under contention, while a `memory.max` that does not bind costs the OOM backstop the
+    // whole box was given. Failing a box over the first would be refusing to run for a hint.
+    memory_low: Option<u64>,
+    // `--cpu-weight` → `cpu.weight`: relative CPU share under contention. Best-effort like
+    // `io.weight`, for the same reason: the controller may not be delegated to a rootless user
+    // scope, and a box that runs with a default share is not a box that runs wrong.
+    cpu_weight: Option<u64>,
     // `--require-limits`: demand that EVERY mandatory cap (memory AND pids) actually bind, not just
     // one of them. Tightens the success gate below from "at least one bound" to "both bound", so a
     // host that delegates one controller and not the other refuses the box instead of running it with
@@ -2540,6 +2554,30 @@ pub fn apply_limits(
     // controller is usually NOT delegated to a rootless user scope, so a write failure is expected
     // and simply skips the limit (the vdisk still works, uncapped) - never a hard error. The lines
     // are built by the CLI from a stat'd loop device, so they can't inject arbitrary content.
+    // SOFT KNOBS FIRST, and they are not part of any success gate. Both are written best-effort into
+    // the SAME child cgroup as the hard caps above, so a host that delegates the controller gets them
+    // and a host that does not runs with the kernel's defaults, which is what it did before these
+    // existed. A failure here is reported by the same channel as `io`, below, only when the caller
+    // actually asked for something.
+    let mut soft_requested = false;
+    let mut soft_applied = true;
+    if let Some(low) = memory_low {
+        soft_requested = true;
+        soft_applied &= fs::write(child.join("memory.low"), low.to_string()).is_ok();
+    }
+    if let Some(w) = cpu_weight {
+        soft_requested = true;
+        // Clamped by the CLI (1..=10000); re-clamped here as defence in depth, exactly as
+        // `io.weight` is.
+        soft_applied &= fs::write(child.join("cpu.weight"), w.clamp(1, 10_000).to_string()).is_ok();
+    }
+    if soft_requested && !soft_applied {
+        eprintln!(
+            "kern: soft limits (--memory-reservation/--cpu-weight) not enforced - the cgroup \
+             controller isn't delegated to this box's cgroup. The box still runs, with the kernel's \
+             default share"
+        );
+    }
     let io_requested = !io_max.is_empty() || io_weight.is_some();
     let mut io_applied = false;
     for line in io_max {

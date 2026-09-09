@@ -4,7 +4,9 @@
 //! `VOLUME`, `HEALTHCHECK` and `STOPSIGNAL` are ACCEPTED (parsed, no build-time effect) so stock
 //! upstream Dockerfiles build instead of failing; `HEALTHCHECK` nudges the user to kern's runtime
 //! `--health-cmd`. `SHELL [...]` swaps the shell that wraps shell-form RUN/CMD/ENTRYPOINT.
-//! Real-world flags are accepted: `FROM --platform=`, BuildKit `RUN --mount/--network/--security`,
+//! Real-world flags are accepted: `FROM --platform=`, BuildKit `RUN --mount/--network/--security`
+//! (except `--mount=type=secret|ssh`, which is REFUSED rather than dropped: without the credential
+//! the command would run unauthenticated and report success),
 //! and `COPY`/`ADD --chown/--link/--exclude/--parents/--keep-git-dir` are dropped; `--checksum` is
 //! HONOURED for the file an `ADD <url>` creates, and `--chmod` is HONOURED for EVERY copied file/dir -
 //! a context `COPY`, a `COPY --from`, an `ADD <url>`, and a `COPY <<heredoc` (Docker applies it
@@ -423,10 +425,12 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             "RUN" => {
                 // A BuildKit heredoc (`RUN <<EOF … EOF`) is folded here: `heredocs` holds the body
                 // lines the parser consumed verbatim. Reduce it to a single `/bin/sh -c` argv.
-                // Strip leading BuildKit RUN flags (`--mount=…`, `--network=…`, `--security=…`) - kern
-                // runs the command without the cache/secret/network sandbox plumbing, so they're
-                // accepted and dropped rather than mistaken for the command.
-                let rest = strip_run_flags(rest);
+                // Strip leading BuildKit RUN flags (`--mount=…`, `--network=…`, `--security=…`) -
+                // kern runs the command without the cache/network sandbox plumbing, so they're
+                // accepted and dropped rather than mistaken for the command. The two that carry a
+                // CREDENTIAL are refused instead of dropped: see `unsupported_run_mount`.
+                let rest =
+                    strip_run_flags(rest).map_err(|m| format!("Dockerfile line {lineno}: {m}"))?;
                 if heredocs.is_empty() {
                     out.push(Instr::Run(cmd_argv(rest, &vars, &shell)))
                 } else {
@@ -826,13 +830,61 @@ fn cmd_argv(rest: &str, vars: &HashMap<String, String>, shell: &[String]) -> Vec
 /// operand, returning the command that follows. These flag tokens contain no whitespace (specs use
 /// commas), so a whitespace-delimited token that starts with `--` is a flag; the first token that
 /// doesn't begins the command (a real command never starts with `--`).
-fn strip_run_flags(rest: &str) -> &str {
+///
+/// `Err` for the flags whose ABSENCE changes what the command does, which is the whole distinction
+/// this function now draws (see [`unsupported_run_mount`]).
+fn strip_run_flags(rest: &str) -> Result<&str, String> {
     let mut r = rest.trim_start();
     while r.starts_with("--") {
         let end = r.find(char::is_whitespace).unwrap_or(r.len());
+        if let Some(msg) = unsupported_run_mount(&r[..end]) {
+            return Err(msg);
+        }
         r = r[end..].trim_start();
     }
-    r
+    Ok(r)
+}
+
+/// Whether a BuildKit `RUN` flag is one that CANNOT be dropped, and the sentence saying why.
+///
+/// DROPPING A FLAG IS ONLY HONEST WHEN THE COMMAND STILL MEANS WHAT IT SAID. `--mount=type=cache`
+/// and `--mount=type=bind` are performance and layout: the command runs, does the same work, and is
+/// merely slower or reading from a path the build already has. `--mount=type=secret` and
+/// `--mount=type=ssh` are the opposite - the command was written BECAUSE the credential would be
+/// there, and without it `npm ci`, `pip install` against a private index, or `git clone` over SSH
+/// runs UNAUTHENTICATED. Two outcomes follow and both are bad: a 401 whose message points at the
+/// registry and the credentials rather than at a flag kern discarded, or, worse, a build that
+/// succeeds against a public mirror and ships something other than what was asked for.
+///
+/// MEASURED BEFORE THE CHANGE: `RUN --mount=type=cache,target=/root/.cache echo … > /m.txt` built
+/// successfully with the flag silently gone, so a `type=secret` mount built successfully too. kern
+/// has no secret-mount implementation to offer, so the honest answer is the refusal: a build that
+/// cannot be performed correctly must not report success.
+///
+/// The pass-through cases stay dropped ON PURPOSE. Refusing everything would fail the large majority
+/// of modern Dockerfiles, which carry a cache mount and nothing else, for a difference that costs
+/// them a rebuild rather than a wrong result.
+fn unsupported_run_mount(flag: &str) -> Option<String> {
+    let spec = flag.strip_prefix("--mount=")?;
+    // `type=` may sit anywhere in the comma-separated spec, and defaults to `bind` when absent.
+    let kind = spec
+        .split(',')
+        .find_map(|f| f.trim().strip_prefix("type="))
+        .unwrap_or("bind")
+        .trim();
+    let what = match kind {
+        "secret" => "a build secret",
+        "ssh" => "the SSH agent",
+        _ => return None,
+    };
+    Some(format!(
+        "`RUN --mount=type={kind}` needs {what} inside the build, and kern's builder has no way to \
+         provide one. kern will NOT drop the flag and run the command without it: the command was \
+         written because the credential would be there, so it would run unauthenticated and either \
+         fail with an error pointing at the registry instead of at the missing credential, or \
+         succeed against something public and ship the wrong result. Bake the credential in with a \
+         build arg (and a squashed final stage), or build this image with BuildKit"
+    ))
 }
 
 /// Whether a `COPY`/`ADD` `--flag` is one kern accepts and drops (no bearing on kern's copy, which
@@ -1058,6 +1110,59 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown:
 
 #[cfg(test)]
 mod tests {
+    /// DROPPING A FLAG IS ONLY HONEST WHEN THE COMMAND STILL MEANS WHAT IT SAID, and this test pins
+    /// the line between the two kinds. MEASURED before the change: a `--mount=type=cache` RUN built
+    /// successfully with the flag silently gone, so a `type=secret` one did too - and that build
+    /// reports success having run `npm ci` unauthenticated.
+    #[test]
+    fn a_run_mount_that_carries_a_credential_is_refused_and_the_rest_stay_dropped() {
+        // REFUSED: without the credential the command does something else and says nothing.
+        for (flag, word) in [
+            ("--mount=type=secret,id=npm,target=/root/.npmrc", "secret"),
+            ("--mount=type=ssh", "ssh"),
+            // `type=` may sit anywhere in the spec, so a scan that only reads the first field would
+            // pass this one straight through.
+            ("--mount=id=npm,type=secret", "secret"),
+        ] {
+            let msg = super::unsupported_run_mount(flag)
+                .unwrap_or_else(|| panic!("must be refused: {flag}"));
+            assert!(msg.contains(word), "must name the mount kind: {msg}");
+            assert!(
+                super::strip_run_flags(&format!("{flag} npm ci")).is_err(),
+                "the refusal must reach the caller: {flag}"
+            );
+        }
+
+        // DROPPED, deliberately: these cost a rebuild, not a wrong result, and refusing them would
+        // fail the large majority of modern Dockerfiles for no benefit.
+        for flag in [
+            "--mount=type=cache,target=/root/.cache",
+            "--mount=type=bind,from=src,target=/s",
+            // No `type=` at all: BuildKit's default is `bind`, which is not a credential.
+            "--mount=target=/s,from=src",
+            "--network=none",
+            "--security=insecure",
+        ] {
+            assert_eq!(super::unsupported_run_mount(flag), None, "{flag}");
+            assert_eq!(
+                super::strip_run_flags(&format!("{flag} echo hi")).unwrap(),
+                "echo hi",
+                "{flag}"
+            );
+        }
+
+        // The command still survives a run of several flags, refusal or not.
+        assert_eq!(
+            super::strip_run_flags("--mount=type=cache,target=/c --network=none echo hi").unwrap(),
+            "echo hi"
+        );
+        assert!(
+            super::strip_run_flags("--mount=type=cache,target=/c --mount=type=secret,id=k npm ci")
+                .is_err(),
+            "a credential mount anywhere in the run is still a credential mount"
+        );
+    }
+
     use super::*;
 
     fn ba() -> HashMap<String, String> {

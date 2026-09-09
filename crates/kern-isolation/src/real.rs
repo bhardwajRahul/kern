@@ -176,9 +176,8 @@ pub struct SandboxSpec {
     /// exits with its status. Off by default (PID 1 execs the command directly), so the common path is
     /// byte-for-byte unchanged.
     pub init: bool,
-    /// `--tmpfs PATH[:size]`: extra fresh tmpfs mounts inside the box (`(path, size_option)` - size is
-    /// a tmpfs `size=` string like `"64m"`, or empty for the default). Blocked over hardened mounts.
-    pub tmpfs: Vec<(String, String)>,
+    /// `--tmpfs PATH[:opts]`: extra fresh tmpfs mounts inside the box. Blocked over hardened mounts.
+    pub tmpfs: Vec<TmpfsMount>,
     /// `--user UID[:GID]`: drop to this uid/gid just before exec (after all privileged setup). `None`
     /// → keep the namespace root. Only ids mapped into the box's userns work (see `--uid-range`).
     pub run_as: Option<(u32, u32)>,
@@ -193,9 +192,32 @@ pub struct SandboxSpec {
     /// cgroup v2 `io.weight` (`--io-weight`, 1..=10000): relative I/O priority for the box. `None`
     /// leaves the default. Best-effort like `io_max` (needs the `io` controller delegated).
     pub io_weight: Option<u64>,
+    /// `--memory-reservation <size>` → cgroup v2 `memory.low`: a SOFT floor, not a cap. The kernel
+    /// reclaims from this box only after it has reclaimed from cgroups that are over their own low
+    /// watermark, so it protects a working set under pressure without ever killing anything.
+    ///
+    /// This is Docker's `mem_reservation`, and the distinction from `--memory` is the whole point of
+    /// having both: `memory.max` kills, `memory.low` prioritises. A file that sets only the
+    /// reservation asked to be protected, not to be capped.
+    pub memory_low: Option<u64>,
+    /// `--cpu-weight <n>` (1..=10000) → cgroup v2 `cpu.weight`: RELATIVE share of CPU under
+    /// contention, the counterpart of `io_weight` for the cpu controller. Orthogonal to `cpus`, which
+    /// is an absolute ceiling: a box may have both a ceiling and a share.
+    pub cpu_weight: Option<u64>,
     /// `--add-host NAME:IP`: extra `/etc/hosts` entries appended inside the box (`host-gateway` is
     /// already resolved to a concrete address by the caller). Empty for none.
     pub extra_hosts: Vec<(String, String)>,
+    /// `--dns IP` (repeatable): the box's resolvers, written as `nameserver` lines in
+    /// `/etc/resolv.conf`. Empty means kern does not touch that file at all, which is the behaviour
+    /// every box had before this existed: the image's own file (usually absent, or empty on the
+    /// debian family) is left exactly as it is.
+    ///
+    /// The values are already validated as IP literals by the CLI, so this layer does no parsing.
+    pub dns: Vec<String>,
+    /// `--dns-search DOMAIN` (repeatable): the `search` line of `/etc/resolv.conf`.
+    pub dns_search: Vec<String>,
+    /// `--dns-option OPT` (repeatable): the `options` line of `/etc/resolv.conf` (e.g. `ndots:2`).
+    pub dns_options: Vec<String>,
     /// `--ulimit NAME=SOFT[:HARD]` (repeatable), resolved to `(RLIMIT_*, soft, hard)` by the CLI so
     /// this layer does no string work. Applied with `setrlimit(2)` before privileges are dropped:
     /// LOWERING a limit always succeeds, RAISING a hard limit needs `CAP_SYS_RESOURCE` in the INIT
@@ -251,6 +273,26 @@ pub struct SandboxSpec {
     /// instance registry so `kern exec` reproduces the SAME filter instead of re-reading the
     /// environment - which would let an exec into an allowlist box fall back to the wider denylist.
     pub seccomp_mode: crate::SeccompFilter,
+}
+
+/// One `--tmpfs` mount, fully resolved by the CLI so this layer parses nothing.
+///
+/// A STRUCT AND NOT A `(path, size)` TUPLE any more: the pair carried exactly one setting, so every
+/// other option a compose file writes (`mode=`, `noexec`, `ro`) had nowhere to travel and was
+/// reported as "recognised but not applied". Widening the tuple would have made the meaning of the
+/// second and third element positional, which is how a call site comes to swap them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TmpfsMount {
+    /// Absolute, `.`/`..`-free mount point inside the box.
+    pub path: String,
+    /// tmpfs `size=` value (`"64m"`), or empty for the kernel default (half of RAM).
+    pub size: String,
+    /// tmpfs `mode=` value (`"1777"`, `"0755"`), or empty for kern's `1777` default.
+    pub mode: String,
+    /// `MS_NOEXEC`: no execution from this mount.
+    pub noexec: bool,
+    /// `MS_RDONLY`: the mount is read-only.
+    pub read_only: bool,
 }
 
 /// A resolved vDisk to mount in the box at `/vdisk/<name>`. When `host_dir` is set, the host prepared
@@ -674,7 +716,43 @@ fn apply_apparmor_onexec(profile: &str) -> Result<(), Error> {
     )))
 }
 
-fn exec(argv: &[CString]) -> Error {
+/// The pre-exec gate descriptor, passed by the launcher in `KERN_GATE_FD`.
+///
+/// 🔴 RESOLVE THIS BEFORE `set_clean_env`, AND NEVER AFTER. `set_clean_env` calls `clearenv()` to
+/// wipe the inherited host environment before the workload runs - its own docstring names "kern
+/// internals like `KERN_SCOPE`" as things it deliberately removes, and `KERN_GATE_FD` is one of
+/// those. Read at the gate itself (line ~760, long past the wipe at ~1055) it answered `None` on
+/// every box, so the gate never engaged and the workload ran while the peer network was still being
+/// built. MEASURED: `DBG child: gate_fd=None env=Err(NotPresent)` in the box log while the launcher
+/// had just printed `fd=3`. The value is therefore captured at the top of `child_setup_and_exec` and
+/// threaded down as an argument, which also makes the dependency visible in the signature instead of
+/// hidden in an environment read.
+///
+/// An ENVIRONMENT VARIABLE and not a fixed number, because the box's setup opens and closes
+/// descriptors and a hard-coded fd would collide with whatever landed there. The launcher creates the
+/// pipe, marks the WRITE end `CLOEXEC` so no other child of the launcher (the health checker, a relay
+/// half, the timeout watchdog) can hold it open and keep the gate from closing on launcher death, and
+/// passes the READ end's number here.
+///
+/// `None` when unset, unparseable or negative: a box with no gate execs immediately, which is every
+/// path that does not go through a multi-box bring-up. Parsing failure reads as "no gate" rather than
+/// as an error, because a box that cannot find its gate must not hang forever waiting on a descriptor
+/// nobody holds - the failure direction is toward running, and the launcher that set the variable is
+/// the one that would have released it anyway.
+fn gate_fd() -> Option<libc::c_int> {
+    let raw = std::env::var("KERN_GATE_FD").ok()?;
+    let fd: libc::c_int = raw.trim().parse().ok()?;
+    (fd >= 0).then_some(fd)
+}
+
+/// The byte a gated box writes on the readiness pipe once it is fully set up and about to wait.
+///
+/// A DISTINCT VALUE and not "any byte", because the pipe already carries a meaning per shape: EOF is
+/// "the workload exec'd" and a byte was "setup failed" (`b"x"`). A third state needs a third symbol,
+/// not an overload of the second, or a launcher would report a prepared box as a failed one.
+pub const READY_PREPARED: u8 = b'P';
+
+fn exec(argv: &[CString], ready_fd: Option<libc::c_int>, gate: Option<libc::c_int>) -> Error {
     // FAIL-CLOSED setup-window choke point (TOCTOU): every workload exec funnels through here, and here
     // refuses to hand control over unless a seccomp filter is provably in force in THIS process. All
     // real paths install it just above their exec (`child_setup_and_exec`, the built-in init's workload
@@ -687,6 +765,108 @@ fn exec(argv: &[CString]) -> Error {
             "refusing to exec the workload: no seccomp filter is installed in this process \
              (setup-window guard)",
         );
+    }
+    // THE PRE-EXEC GATE, AND IT IS THE LAST THING BEFORE `execvp` ON PURPOSE.
+    //
+    // WHAT IT BUYS. A compose stack under `--no-pod` builds its peer relays only once every box has
+    // a PID 1, because a relay binds inside one box's namespace and forwards into another's. The
+    // workload therefore used to run BEFORE the network it was written against existed, and two
+    // independent failures followed, both measured: a service that connects at t=0 and does not
+    // retry (Quarkus, and every client written against Docker, where the network is up before the
+    // process is) got ECONNREFUSED and died; and a stack whose `depends_on: condition:
+    // service_healthy` gate blocked `up` never reached the relay block at all, so the relay it was
+    // waiting for was never built. Deadlock by construction, not a race.
+    //
+    // With the gate, box setup runs to completion and stops here. The launcher builds every relay
+    // against namespaces that exist but hold no workload, then releases. No workload ever observes a
+    // partially built network. That is the invariant, and it is the only reason this costs anything.
+    //
+    // WHY HERE AND NOT EARLIER. Above this line the process is already fully confined: root pivoted,
+    // capabilities dropped, Landlock attached, seccomp installed and PROVEN installed by the check
+    // immediately above. A gated box is therefore a fully-confined PID 1 blocked in one `read`, and
+    // release is one `execvp`. Gating earlier would park a process in a weaker posture and call it
+    // prepared. `read` and `execvp` are in every allowlist this project ships, so the gate cannot be
+    // the thing a filter refuses.
+    //
+    // THE CHILD CANNOT REPORT ITS OWN DEATH HERE. It has a pivoted root and no path to a host file,
+    // so a box that is never released leaves its record through the supervisor, which sees the exit
+    // and knows the release never happened. Nothing is written from this side.
+    //
+    // EOF IS REFUSAL, NOT RELEASE, AND THE DIRECTION IS THE WHOLE POINT.
+    //
+    // The launcher closing its write end without sending a byte means it died, or it decided the
+    // stack cannot come up (a relay that could not be built for a plan or namespace reason). In both
+    // cases the network this workload was gated on does not exist and never will. Releasing on EOF
+    // would start every prepared box of a stack that just failed to build its edges, which is the
+    // silent partial state this gate exists to make impossible. PDEATHSIG does not cover it either:
+    // under compose the box's parent is the `kern box` launcher, which detaches, not the `up` process
+    // that owns the gate.
+    //
+    // So: one byte = release, anything else = refuse and let the caller report it. `EINTR` is retried
+    // because a signal arriving mid-wait is not an answer. A read error other than `EINTR` is treated
+    // as EOF for the same reason it is refused: the channel that was going to carry the release is
+    // gone.
+    //
+    // NO TIMEOUT. The gate waits for an event, not for a duration. A launcher that is alive and
+    // wedged leaves a box visible as prepared, which `kern stop` can end; a duration here would
+    // reintroduce exactly the arbitrary wait this design removes.
+    if let Some(fd) = gate {
+        // ANNOUNCE PREPARED BEFORE BLOCKING, or the launcher waits for an exec that waits for the
+        // launcher. `kern box -d` returns when the readiness pipe reaches EOF, and EOF means the
+        // workload exec'd; under the gate the workload cannot exec until the launcher releases it,
+        // so the two waits close a cycle: compose waits for the launcher, the launcher waits for the
+        // exec, the exec waits for the gate, the gate is written by compose. MEASURED as a four-way
+        // wait that hung two runs in three.
+        //
+        // The byte is written to the READINESS pipe, not to the gate pipe, because the launcher is
+        // already blocked reading that one. EOF keeps its meaning for every ungated box, and the
+        // failure byte keeps its meaning for both, so nothing that exists today changes.
+        if let Some(rfd) = ready_fd {
+            let b = [READY_PREPARED];
+            loop {
+                // SAFETY: one byte from a live local buffer to a descriptor this process inherited.
+                let n = unsafe { libc::write(rfd, b.as_ptr().cast::<libc::c_void>(), 1) };
+                if n == 1 {
+                    break;
+                }
+                // SAFETY: `__errno_location` is always valid for the calling thread.
+                let err = unsafe { *libc::__errno_location() };
+                if err != libc::EINTR {
+                    // The launcher is gone. The gate below will read EOF and refuse, which is the
+                    // same outcome, so there is nothing to report from here.
+                    break;
+                }
+            }
+        }
+        let mut byte = [0u8; 1];
+        let released = loop {
+            // SAFETY: `fd` is a raw descriptor this process inherited and owns for the duration of
+            // this call; the buffer is a live local of exactly the length passed.
+            let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+            if n == 1 {
+                break true;
+            }
+            if n == 0 {
+                break false;
+            }
+            // SAFETY: `__errno_location` is always valid for the calling thread.
+            let err = unsafe { *libc::__errno_location() };
+            if err != libc::EINTR {
+                break false;
+            }
+        };
+        // SAFETY: closing a descriptor this process owns, exactly once.
+        unsafe { libc::close(fd) };
+        // NOTHING TO REMOVE FROM THE ENVIRONMENT HERE: `set_clean_env` wiped the whole inherited
+        // environment hundreds of lines above, `KERN_GATE_FD` with it, so the workload never sees the
+        // name and never sees a number that is no longer open. That wipe is also why this descriptor
+        // arrives as an argument rather than as an environment read.
+        if !released {
+            return Error::Unsupported(
+                "never released: the launcher closed the pre-exec gate without releasing this box \
+                 (the stack failed to build its peer network, or `up` died) - the workload did not run",
+            );
+        }
     }
     let mut ptrs: Vec<*const c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(ptr::null());
@@ -787,6 +967,9 @@ fn child_setup_and_exec(
     ready_fd: Option<i32>,
     allow_nesting: bool,
 ) -> Result<Infallible, Error> {
+    // FIRST STATEMENT, AND THE POSITION IS THE POINT: `set_clean_env` below calls `clearenv()`, so
+    // every environment read after it answers `None` for a kern-internal name. See `gate_fd`.
+    let gate = gate_fd();
     let mut t = PhaseTimer::new();
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(Error::last("unshare(CLONE_NEWNS)"));
@@ -864,8 +1047,11 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
+    setup_cpu_topology(&spec.root, spec.cpuset.as_deref());
     setup_etc_identity(&spec.root, &spec.hostname);
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
+    // AFTER the hosts files, because the two are independent and this one only fires when asked.
+    setup_resolv_conf(&spec.root, &spec.dns, &spec.dns_search, &spec.dns_options);
     t.mark("volumes");
     // Self-pivot into the new root. The old root is left stacked at "/"; mount a fresh `proc`
     // (cwd-relative, while the old root still provides the visible proc instance the kernel
@@ -1062,7 +1248,25 @@ fn child_setup_and_exec(
     // the init/non-init split, so it also covers the `--init` reaper PID 1 (which does not itself
     // `exec` and would otherwise keep the caller's fds readable via `/proc/1/fd`). The pty slave, if
     // any, was already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
-    shed_inherited_fds(ready_fd.unwrap_or(-1));
+    // THE PRE-EXEC GATE DESCRIPTOR IS THE SECOND EXCEPTION, and leaving it out silently broke the
+    // gate: `shed_inherited_fds` closes every inherited fd >= 3, so the gate's read end was closed
+    // here and the `read` below returned EBADF, which the gate reads as EOF, which is REFUSAL. A box
+    // that should have waited refused instead, and the reason was four hundred lines away from the
+    // symptom. It is listed rather than ranged because the exception must be as narrow as the
+    // readiness pipe's: exactly one descriptor, named, and closed by the gate itself before `execvp`.
+    // TWO SHAPES, AND THE FAST ONE IS THE DEFAULT. `shed_inherited_fds` closes the two ranges around
+    // the kept descriptor with `close_range(2)`: two syscalls. `shed_inherited_fds_keeping` cannot do
+    // that for an arbitrary set and falls back to 1021 individual `close()` calls.
+    //
+    // MEASURED, and this is why the branch exists rather than the list always: routing every box
+    // through the list form cost **+207 us on box start p50** (2903 against a 2696 baseline, n=300,
+    // same binary, alternated) - eight times the 25 us that was set as the stop-and-look line before
+    // the number was taken. A gate exists only for a multi-box `--no-pod` stack, so a box that has
+    // none must not pay for one.
+    match gate {
+        None => shed_inherited_fds(ready_fd.unwrap_or(-1)),
+        Some(g) => shed_inherited_fds_keeping(&[ready_fd.unwrap_or(-1), g]),
+    }
     // THE LAST THING PID 1 DOES BEFORE THE WORKLOAD, and until this mark existed it was invisible.
     // `box lifetime` minus the marked phases left a residue of about 670 us that did not move with the
     // image, the rootfs, the workload's linkage or the network namespace - constant across four
@@ -1072,10 +1276,10 @@ fn child_setup_and_exec(
     t.mark("shed-fds");
     if spec.init {
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
-        run_init(spec, argv, ready_fd)
+        run_init(spec, argv, ready_fd, gate)
     } else {
         // Default: PID 1 IS the workload - exec directly, byte-for-byte the original path.
-        Err(exec(argv))
+        Err(exec(argv, ready_fd, gate))
     }
 }
 
@@ -1085,7 +1289,14 @@ fn child_setup_and_exec(
 /// unwinds. `ready_fd` is the readiness pipe write end: PID 1 closes its own copy right after the fork
 /// so the launcher still sees EOF when the workload execs; the workload child writes the failure byte
 /// if ITS exec fails (so a detached box reports "exited before starting" instead of hanging).
-fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
+/// `gate` is threaded rather than re-read from the environment for the reason in [`gate_fd`]: by the
+/// time `--init` forks its workload child, `clearenv` has already run.
+fn run_init(
+    spec: &SandboxSpec,
+    argv: &[CString],
+    ready_fd: Option<i32>,
+    gate: Option<libc::c_int>,
+) -> ! {
     // The forwarding signal handler needs the workload pid; a static is the only way to reach it.
     static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     extern "C" fn forward(sig: libc::c_int) {
@@ -1109,7 +1320,7 @@ fn run_init(spec: &SandboxSpec, argv: &[CString], ready_fd: Option<i32>) -> ! {
         // On exec failure, write the byte HERE (this is not PID 1, so the parent's byte-write below
         // won't fire for us) so the launcher learns it failed, then report and exit.
         // `exec` only ever returns on failure (its type is `-> Error`).
-        let e = exec(argv);
+        let e = exec(argv, ready_fd, gate);
         if let Some(fd) = ready_fd {
             let _ = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
         }
@@ -2280,8 +2491,9 @@ fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
 /// `NOSUID|NODEV` - a scratch tmpfs never hosts a device node or setuid binary. The CLI already
 /// blocked the hardened mounts (`/proc`, `/sys`, `/dev`) and validated the path/size. Best-effort per
 /// entry; the mountpoint's parents are created on the way in.
-fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
-    for (path, size) in entries {
+fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
+    for m in entries {
+        let path = &m.path;
         // Defence-in-depth: the CLI guarantees an absolute, `..`-free path, but re-check before it
         // becomes a host-resolved (pre-pivot) mount target.
         if !path.starts_with('/') || path.split('/').any(|c| c == "..") {
@@ -2301,12 +2513,37 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
                 unsafe { libc::mkdir(c.as_ptr(), 0o755) };
             }
         }
-        let opts = if size.is_empty() {
-            "mode=1777".to_string()
-        } else {
-            format!("size={size},mode=1777")
-        };
-        let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        // MODE IS THE CALLER'S, SIZE IS THE CALLER'S, THE HARDENING IS NOT.
+        //
+        // `mode=1777` stays the DEFAULT because that is what a scratch `/tmp` has to be, and it is
+        // what every box got before this was configurable. A file that writes `mode=0755` (a
+        // Postgres socket directory, in the corpus this came from) gets 0755, because that is a
+        // property of the directory and not of the confinement.
+        //
+        // `MS_NOSUID | MS_NODEV` ARE NOT NEGOTIABLE and are OR-ed in unconditionally. A `suid` or
+        // `dev` token in a compose file is a request for kern to be less confining than it is, and
+        // the flag parser names it as recognised-and-never-applied rather than acting on it. That
+        // is the same treatment `privileged: true` gets, and for the same reason: the alternative is
+        // a runtime whose isolation is decided by the file it is handed.
+        //
+        // `MS_NOEXEC` and `MS_RDONLY` ARE the caller's: neither weakens the box (both only remove
+        // capability from the mount), and `noexec` on `/tmp` is a hardening measure real files ask
+        // for.
+        let mut opts = String::with_capacity(32);
+        if !m.size.is_empty() {
+            opts.push_str("size=");
+            opts.push_str(&m.size);
+            opts.push(',');
+        }
+        opts.push_str("mode=");
+        opts.push_str(if m.mode.is_empty() { "1777" } else { &m.mode });
+        let mut hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        if m.noexec {
+            hardening |= libc::MS_NOEXEC as libc::c_ulong;
+        }
+        if m.read_only {
+            hardening |= libc::MS_RDONLY as libc::c_ulong;
+        }
         if let (Ok(t), Ok(ty), Ok(o)) = (cstr(&full), cstr("tmpfs"), cstr(&opts)) {
             unsafe {
                 libc::mount(
@@ -2343,6 +2580,65 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
 /// ships its own, and the pod bind, whose file already carries these two localhost lines plus every
 /// peer's name. `setup_extra_hosts` appends after this, so `--add-host` entries land under the
 /// seeds instead of into an empty file.
+/// The three `/sys/devices/system/cpu` files a modern allocator reads before it will run.
+///
+/// WITHOUT THEM, WIDELY-USED IMAGES ABORT BEFORE THEIR FIRST INSTRUCTION. A kern box mounts no
+/// `sysfs` at all (measured: no `/sys` line in the box's `/proc/mounts`), and recent tcmalloc calls
+/// `NumPossibleCPUs` at startup, finds nothing to read, and fails a `CHECK`. MEASURED on the
+/// official `mongo:latest` image, which is one of the most common services in any compose file:
+///
+/// ```text
+/// tcmalloc/internal/sysinfo.cc:123] CHECK in NumPossibleCPUsNoCache: cpus.has_value() (false)
+/// ```
+///
+/// The experiment that made this a fact rather than a guess: the same image, same box, with a
+/// directory holding these three files bind-mounted at that path, got PAST the abort and failed on
+/// something else entirely (MongoDB refusing kernel 6.19+, which is MongoDB's own limit and happens
+/// under Docker too). One variable, two outcomes.
+///
+/// PLAIN FILES, NOT A `sysfs`, AND NOT THE HOST'S. Docker mounts the host's real `/sys` read-only,
+/// which hands a container the whole machine's topology; kern writes three files into the box's own
+/// root, so nothing about the host is exposed beyond the CPU RANGE the box is allowed to run on.
+/// When `--cpuset-cpus` names a set, that set is what the box is told - which is MORE truthful than
+/// Docker, where a capped container still reads the host's full list and sizes its thread pools for
+/// CPUs it will never get.
+///
+/// DELIBERATELY THREE FILES AND NOTHING ELSE. This is not an emulated `sysfs` and must not grow into
+/// one: every addition is another host fact leaving the machine. If an image needs more than the CPU
+/// range, it needs a real `sysfs`, and that is a different decision from this one.
+///
+/// Best-effort in every branch, like its neighbours: a box that cannot be given these still starts,
+/// exactly as it did before they existed.
+fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
+    // The range the box may run on. A `--cpuset-cpus` is already validated as a CPU list by the CLI;
+    // without one, the host's own `possible` line is the truthful answer, and `0` is the floor for a
+    // host that will not say (a machine always has at least one CPU, and an EMPTY file is what the
+    // allocator already cannot parse).
+    let range = match cpuset {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => std::fs::read_to_string("/sys/devices/system/cpu/possible")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "0".to_string()),
+    };
+    // A value that travels into a file an allocator parses: digits, `-` and `,` only. Anything else
+    // would be a range nothing can read, which is the state this function exists to leave behind.
+    if !range
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b == b'-' || b == b',')
+    {
+        return;
+    }
+    let dir = format!("{root}/sys/devices/system/cpu");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for f in ["possible", "present", "online"] {
+        let _ = std::fs::write(format!("{dir}/{f}"), format!("{range}\n"));
+    }
+}
+
 /// Write the two `/etc` files a container runtime owns: `/etc/hosts` and `/etc/hostname`.
 ///
 /// WHY BOTH IN ONE FUNCTION, AND WHY NOT `open_in_root`
@@ -2570,6 +2866,107 @@ fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
         if wfd >= 0 {
             unsafe {
                 libc::write(wfd, block.as_ptr().cast(), block.len());
+                libc::close(wfd);
+            }
+        }
+    }
+}
+
+/// Write the box's `/etc/resolv.conf` from `--dns` / `--dns-search` / `--dns-option`.
+///
+/// SILENT WHEN NOTHING WAS ASKED, and that is the whole compatibility contract. A box with no DNS
+/// flags is byte-identical to every box kern has ever started: the image's own file is left alone,
+/// including the EMPTY one the debian family ships. Only an explicit request makes kern take
+/// ownership of the file, so this cannot change the behaviour of any existing stack.
+///
+/// O_TRUNC, NOT APPEND, and the asymmetry with `/etc/hosts` is deliberate. Hosts is additive: the
+/// image's entries and kern's seeds and the pod's peers all coexist, and appending is how they do.
+/// A resolver list is not additive: `resolv.conf` is read top-down with at most `MAXNS` (3) servers
+/// honoured by glibc, so appending kern's servers under an image's would leave the image's in front
+/// and the requested ones unused past the third line. A caller who names their resolvers means those
+/// resolvers.
+///
+/// SYMLINK-SAFE BY THE SAME WALK AS `setup_extra_hosts`. `open_in_root` refuses a symlinked `/etc`
+/// or `/etc/resolv.conf`, so a hostile image cannot redirect this write out of the box root; the
+/// writable reopen goes through `/proc/self/fd` on the pinned inode rather than re-resolving the
+/// path, so nothing can be swapped between the check and the write.
+///
+/// INJECTION IS REFUSED PER VALUE, not per file. `resolv.conf` is line-oriented, so a value carrying
+/// a newline would write a directive the caller did not ask for; a value carrying whitespace would
+/// split into two fields. Both are dropped here, and the CLI already refuses a `--dns` that is not
+/// an IP literal, so this is the second of two independent gates rather than the only one.
+///
+/// Best-effort in every branch, like its two neighbours: DNS that could not be written must not stop
+/// a box that may not need to resolve anything.
+fn setup_resolv_conf(root: &str, dns: &[String], search: &[String], options: &[String]) {
+    if dns.is_empty() && search.is_empty() && options.is_empty() {
+        return;
+    }
+    /// A value that may be written into a line-oriented file: no whitespace (which includes the
+    /// newline that would forge a directive) and no control characters.
+    fn clean(s: &str) -> bool {
+        !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+    }
+    let mut body = String::new();
+    for ip in dns.iter().filter(|v| clean(v)) {
+        body.push_str("nameserver ");
+        body.push_str(ip);
+        body.push('\n');
+    }
+    let mut push_line = |head: &str, values: &[String]| {
+        let mut wrote_head = false;
+        for v in values.iter().filter(|v| clean(v)) {
+            if !wrote_head {
+                body.push_str(head);
+                wrote_head = true;
+            }
+            body.push(' ');
+            body.push_str(v);
+        }
+        if wrote_head {
+            body.push('\n');
+        }
+    };
+    push_line("search", search);
+    push_line("options", options);
+    // Every value was rejected: writing an EMPTY resolv.conf would be worse than writing none, since
+    // an empty file makes glibc fall back to 127.0.0.1 rather than to the image's own configuration.
+    if body.is_empty() {
+        return;
+    }
+    let Ok(rc) = cstr(root) else {
+        return;
+    };
+    let root_fd = unsafe {
+        libc::open(
+            rc.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return;
+    }
+    let path_fd = open_in_root(root_fd, "etc/resolv.conf", false);
+    unsafe { libc::close(root_fd) };
+    let Ok(path_fd) = path_fd else {
+        return; // a symlinked /etc or /etc/resolv.conf - refuse rather than escape the box root
+    };
+    // SAFETY: `proc_path` is a live `CString` for the duration of the call, and the descriptor it
+    // names is the one `open_in_root` just pinned - so this reopen does NOT re-resolve the box path
+    // and the symlink guard above still holds.
+    let ok_reopen = cstr(&format!("/proc/self/fd/{path_fd}")).map(|proc_path| unsafe {
+        libc::open(
+            proc_path.as_ptr(),
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+        )
+    });
+    unsafe { libc::close(path_fd) };
+    if let Ok(wfd) = ok_reopen {
+        if wfd >= 0 {
+            // SAFETY: `body` is a live local `String` and `body.len()` is its exact byte length; the
+            // descriptor is the one opened immediately above and is closed exactly once, here.
+            unsafe {
+                libc::write(wfd, body.as_ptr().cast(), body.len());
                 libc::close(wfd);
             }
         }
@@ -3005,6 +3402,139 @@ fn apply_userns_range(
     Ok(())
 }
 
+/// Is a subordinate id RANGE usable on this host (a `newuidmap`/`newgidmap` pair plus an
+/// `/etc/subuid` allocation)? The precondition for [`with_id_mapped_userns`], asked separately so a
+/// caller can decide what it is going to do BEFORE it forks - the layer unpack has to choose its
+/// `tar` flags in the parent and must not answer that question a second time in the child.
+/// Run `f` as uid 0 of a user namespace carrying kern's SUBORDINATE ID RANGE, and return its status.
+///
+/// WHY THIS EXISTS. Layers are extracted on the host, as the caller's uid, which cannot `chown` to
+/// anything else - so extraction passes `--no-same-owner` and every file in an image ends up owned by
+/// the caller. Inside a box that is uid 0, so an image that `chown`s a directory to a NON-ROOT user
+/// and then runs as that user cannot write to its own directory. MEASURED on three real stacks:
+/// Prometheus dies with `mkdir data/: permission denied`, Kibana with `EACCES` on its uuid file, and
+/// Logstash the same way; all three run as a non-root user the image created.
+///
+/// The box already maps a full range (box uid 1..N → the caller's `/etc/subuid` allocation), so the
+/// ownership those images want IS representable on disk. It is only lost because `tar` runs outside
+/// the namespace where the range exists. Inside this one, uid 0 holds `CAP_CHOWN` over every mapped
+/// id, so `tar` can restore it - and `CAP_DAC_OVERRIDE`, which is what makes the resulting files
+/// REMOVABLE again (an unprivileged caller cannot unlink inside a directory a subuid owns).
+///
+/// The closure is told whether it got a RANGE or a single-uid map, read back from the installed map
+/// rather than from what was asked for. Without a range there is exactly one id to own anything, and
+/// a caller told otherwise would try to create ownership that cannot exist.
+///
+/// `Err` when no user namespace could be mapped at all. The closure is NOT run in that case, so a
+/// caller that has a degraded path can take it - ask [`single_threaded`] first if it must keep the
+/// closure.
+///
+/// FORK-SAFETY: refused in a multi-threaded process, for [`crate::single_threaded`]'s reason - the
+/// child runs Rust code between the fork and its `_exit`, and a lock held by another thread at fork
+/// time is held forever in the child.
+pub fn id_range_available() -> bool {
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    detect_id_range(euid, egid).is_some()
+}
+
+pub fn with_id_mapped_userns<F: FnOnce(bool) -> i32>(f: F) -> Result<i32, Error> {
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let range = detect_id_range(euid, egid);
+    if !single_threaded() {
+        return Err(Error::Unsupported(
+            "id-mapped work: refusing to fork in a multi-threaded process (fork-safety)",
+        ));
+    }
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(Error::last("fork(id-mapped)"));
+    }
+    if child == 0 {
+        // CHILD. A failure to become ns-root must not run `f` at all: it would run with the caller's
+        // own identity and no capabilities, which is neither of the two states `f` is written for.
+        let mapped = match &range {
+            // `apply_userns_range` unshares AND maps, and degrades to the single-uid map itself when
+            // the helpers turn out to be unusable here.
+            Some(r) => apply_userns_range(libc::CLONE_NEWUSER, euid, egid, r, None).is_ok(),
+            None => {
+                let unshared = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
+                unshared && write_single_uid_map(euid, egid).is_ok()
+            }
+        };
+        if !mapped {
+            unsafe { libc::_exit(121) };
+        }
+        // The map is in place but this process still carries its old ids; become uid 0 OF THE
+        // NAMESPACE, which is where the capabilities over the mapped range live.
+        if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
+            unsafe { libc::_exit(122) };
+        }
+        // WHICH MAP WE ACTUALLY GOT, READ BACK rather than assumed. `apply_userns_range` degrades to
+        // a single-uid map on its own when the helpers are present but unusable, and a caller told
+        // "you have a range" when it does not would extract an image whose ownership cannot exist.
+        let code = f(uid_map_is_ranged());
+        unsafe { libc::_exit(code) };
+    }
+    let mut st = 0;
+    if unsafe { libc::waitpid(child, &mut st, 0) } < 0 {
+        return Err(Error::last("waitpid(id-mapped)"));
+    }
+    let code = if libc::WIFEXITED(st) {
+        libc::WEXITSTATUS(st)
+    } else {
+        // Killed by a signal: not an exit code, and reporting one would let 0 mean success.
+        return Err(Error::Unsupported("id-mapped work was killed by a signal"));
+    };
+    match code {
+        121 => Err(Error::Unsupported(
+            "id-mapped work: could not map a user namespace",
+        )),
+        122 => Err(Error::Unsupported(
+            "id-mapped work: could not become root of the mapped namespace",
+        )),
+        c => Ok(c),
+    }
+}
+
+/// Does THIS process's uid map cover more than the single self-mapped id?
+///
+/// Read from `/proc/self/uid_map` and not deduced from what was requested: the range helpers can be
+/// present and still fail (not setuid, no `/etc/subgid` row), and the mapper degrades to a single-uid
+/// map when they do. The only honest answer to "can a file be owned by a non-root box user here" is
+/// the map the kernel actually installed.
+fn uid_map_is_ranged() -> bool {
+    std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|s| map_text_is_ranged(&s))
+}
+
+/// The parse half of [`uid_map_is_ranged`], split from the read so it can be asserted.
+///
+/// A `uid_map` row is `<in-ns start> <host start> <count>`, and the question is whether any row maps
+/// MORE THAN ONE id: with a single row of count 1 there is exactly one identity in the namespace, so
+/// no file can belong to anyone else and a caller told otherwise would try to create ownership that
+/// cannot exist. A file kern cannot parse answers `false`, which is the conservative direction: it
+/// keeps `--no-same-owner`, which is what every host did before any of this.
+fn map_text_is_ranged(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.split_whitespace()
+            .nth(2)
+            .and_then(|c| c.parse::<u64>().ok())
+            .is_some_and(|count| count > 1)
+    })
+}
+
+/// Whether this process is single-threaded, the precondition [`with_id_mapped_userns`] enforces.
+///
+/// Read from `/proc/self/status` rather than remembered: a caller cannot know what a library it
+/// links has spawned, and a wrong answer here is a deadlock in a forked child.
+pub fn single_threaded() -> bool {
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            == Some(1)
+    })
+}
+
 /// Write the dependency-free single-uid identity map (box uid/gid 0 → caller) for the CURRENT,
 /// already-unshared user namespace: deny `setgroups` first (the kernel requires this before an
 /// unprivileged `gid_map`), then the one-row uid/gid maps. Shared by the no-range default and the
@@ -3170,6 +3700,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         spec.pids_max,
         &spec.io_max,
         spec.io_weight,
+        spec.memory_low,
+        spec.cpu_weight,
         spec.require_limits, // demand BOTH memory and pids bind, not just one
         true, // supervisor_forks_workload: `kern box` forks PID 1, which joins the capped cgroup itself
     );
@@ -4882,7 +5414,8 @@ pub fn exec_in_box(
         // `execvp` into the box. No readiness pipe on the exec path, so keep none; the pty slave was
         // already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
         shed_inherited_fds(-1);
-        let err = exec(&argv);
+        // `kern exec` has no readiness pipe and no gate: nothing to announce, nothing to wait for.
+        let err = exec(&argv, None, None);
         // `execve` returned, so it FAILED. ENOENT & friends = "command not found" (127). EACCES = the
         // kernel FOUND it but refused to run it (126, the POSIX code for "found but not executable") -
         // and with `--apparmor` in play that is almost always the LSM refusing the profile transition
@@ -6088,5 +6621,110 @@ mod loopback_tests {
             "fresh-netns loopback check failed at step {code} (10..13 = the control itself broke, \
              14..17 = bring_loopback_up did not raise lo, or was not idempotent)"
         );
+    }
+}
+
+#[cfg(test)]
+mod cpu_topology_tests {
+    use super::setup_cpu_topology;
+
+    /// THE THREE FILES A MODERN ALLOCATOR READS, AND THE BOX'S OWN CPU SET IN THEM.
+    ///
+    /// A kern box mounts no `sysfs`, and recent tcmalloc fails a `CHECK` at startup when it cannot
+    /// read the possible-CPU list: measured on the official `mongo:latest` image, which aborted
+    /// before its first instruction. The experiment that made it a fact: the same image and box with
+    /// these three files present got past the abort and failed on MongoDB's own kernel-version check.
+    ///
+    /// WITH A CPUSET, THE BOX IS TOLD ITS OWN SET, which is more truthful than Docker: there a capped
+    /// container still reads the host's full list and sizes its thread pools for CPUs it will never
+    /// be scheduled on.
+    ///
+    /// A VALUE THAT IS NOT A CPU LIST WRITES NOTHING. The files are parsed by an allocator, and a
+    /// malformed range is the state this function exists to leave behind, not one to create.
+    #[test]
+    fn the_cpu_topology_reports_the_boxs_own_set_and_refuses_anything_that_is_not_a_range() {
+        let root = std::env::temp_dir().join(format!("kern-cputop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+        let read = |f: &str| -> Option<String> {
+            std::fs::read_to_string(root.join("sys/devices/system/cpu").join(f)).ok()
+        };
+
+        // An explicit cpuset is what the box is told, in all three files.
+        setup_cpu_topology(&root.to_string_lossy(), Some("0-1"));
+        for f in ["possible", "present", "online"] {
+            assert_eq!(read(f).as_deref(), Some("0-1\n"), "{f}");
+        }
+
+        // A list form, not just a range.
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+        setup_cpu_topology(&root.to_string_lossy(), Some("0,2,4"));
+        assert_eq!(read("possible").as_deref(), Some("0,2,4\n"));
+
+        // Anything that is not a CPU list writes NOTHING rather than a file nothing can parse.
+        for bad in ["0-1; rm -rf /", "all", "0-1\n0-2", "0 1"] {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::create_dir_all(&root);
+            setup_cpu_topology(&root.to_string_lossy(), Some(bad));
+            assert!(read("possible").is_none(), "must refuse {bad:?}");
+        }
+
+        // No cpuset: the host's own range, which is what an uncapped box may really run on. The
+        // value is whatever this machine says, so the assertion is on the SHAPE, not the number.
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+        setup_cpu_topology(&root.to_string_lossy(), None);
+        let got = read("possible").unwrap_or_default();
+        assert!(
+            !got.trim().is_empty()
+                && got
+                    .trim()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b'-' || b == b','),
+            "an uncapped box still needs a readable range, got {got:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod id_map_tests {
+    use super::*;
+
+    /// WHETHER OWNERSHIP CAN EXIST AT ALL, and the answer decides how a layer is unpacked.
+    ///
+    /// With a single-uid map there is exactly one identity in the namespace, so no file can belong to
+    /// anyone else and `tar` must be told `--no-same-owner`. With a range, an image's uid 1000 lands
+    /// on the caller's subuid base and a service that runs as that user can write its own directories
+    /// (measured on `kibana:7.16.1`: `EACCES` before, writable after). A wrong answer here is either
+    /// an extraction that fails on every chown, or one that silently keeps the old flattening.
+    #[test]
+    fn a_map_is_ranged_only_when_some_row_covers_more_than_one_id() {
+        // The single-uid map kern writes when no subordinate range is available.
+        assert!(!map_text_is_ranged("         0       1000          1\n"));
+        // The ranged map a box gets: the second row is what makes it a range.
+        assert!(map_text_is_ranged(
+            "         0       1000          1\n         1     100000      65536\n"
+        ));
+        // A range on the FIRST row counts too: the shape is not fixed.
+        assert!(map_text_is_ranged("0 100000 65536\n"));
+
+        // AN UNPARSEABLE OR EMPTY MAP IS NOT A RANGE. That is the conservative direction: it keeps
+        // `--no-same-owner`, which is what every host did before any of this. Reading it as a range
+        // would make every layer fail on a chown that cannot succeed.
+        assert!(!map_text_is_ranged(""));
+        assert!(!map_text_is_ranged("garbage\n"));
+        assert!(
+            !map_text_is_ranged("0 1000\n"),
+            "a row with no count column"
+        );
+        assert!(
+            !map_text_is_ranged("0 1000 x\n"),
+            "a count that is not a number"
+        );
+        // Count zero maps nothing and is not a range either.
+        assert!(!map_text_is_ranged("0 1000 0\n"));
     }
 }

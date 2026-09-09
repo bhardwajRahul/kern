@@ -87,9 +87,16 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 pub use cgroup::box_cgroup_dir;
 /// Did the box this process supervised die to its own memory cap? See [`cgroup::box_was_oom_killed`].
 pub use cgroup::box_was_oom_killed;
+pub use cgroup::DEFAULT_MEMORY_MAX;
+pub use real::bring_loopback_up;
+pub use real::id_range_available;
+pub use real::single_threaded;
+pub use real::with_id_mapped_userns;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
-pub use real::bring_loopback_up;
+/// The readiness-pipe byte a gated box writes when it is set up and waiting on its pre-exec gate.
+/// Exported so the launcher and the box agree on one symbol instead of two literals.
+pub use real::READY_PREPARED;
 
 /// The same question asked of /proc, for a host with no per-box cgroup. See [`cgroup::live_box_supervisors_via_proc`].
 pub use cgroup::env_flag;
@@ -176,7 +183,8 @@ pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
     set_cpu_affinity, shed_inherited_fds, shed_inherited_fds_keeping, sub_range, trusted_helper,
-    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, UidRange, VdiskMount, Volume,
+    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, TmpfsMount, UidRange, VdiskMount,
+    Volume,
 };
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};

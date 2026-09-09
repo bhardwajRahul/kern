@@ -253,6 +253,162 @@ wants, naming the service and a port to use rather than describing the shape of 
 because there is no configuration that gives one stack BOTH two services on a single
 internal port AND peers that can reach each other on it.
 
+A PUBLISHED PORT BINDS `0.0.0.0`, LIKE DOCKER. `ports: "8080:80"` means what it means under Docker:
+every interface. kern used to bind `127.0.0.1` and warn, and that single choice was the largest
+source of behavioural difference in this implementation. MEASURED on a NEUTRAL corpus of 259 compose
+files, one per repository, sampled across 733 repositories: **203 of them (78%)** published at least
+one port and therefore behaved differently from what the file says. Nothing else came close, and the
+whole "kern is deliberately less permissive" family (`privileged`, `security_opt`) was worth 8 files
+on the same corpus. Closing it moved the share of files with ZERO behavioural difference from **14%
+to 63%**, measured before and after on the same corpus.
+
+The narrower posture is one line of `kern.toml`:
+
+```toml
+[kern]
+publish_bind = "127.0.0.1"
+```
+
+It is a CEILING, not a default: with it set, even a spec that writes `0.0.0.0:8080:80` is bound to
+loopback, because a policy a downloaded compose file could defeat by writing an address is not a
+policy. The box says how many specs it narrowed, so the difference is never silent. If `kern.toml`
+cannot be parsed, publishing falls back to loopback and says so: the two wrong guesses are not
+symmetric, and only one of them exposes ports an operator wrote a file to prevent.
+
+THE WIRING IS CHOSEN FROM THE FILE. With neither `--pod` nor `--no-pod`, kern gives each service its
+own network namespace exactly when the file's `networks:` leave two services with nothing in common,
+and keeps one shared namespace otherwise. The choice is announced with what it costs (a relay hop
+between peers: measured at -34% bulk throughput and -16% connection rate), the separated pairs are
+named before anything starts, and `--pod` keeps the single namespace. A file whose networks separate
+nothing is told nothing: MEASURED on a neutral corpus of 259 files, 75 declare per-service networks
+and only 11 of them actually separate a pair, so a note on all 75 would have been a warning about a
+loss that did not happen.
+
+THE DIFFERENCES THAT BREAK NOTHING ARE THE ONES KERN NOW SAYS OUT LOUD. A compatibility rate measured
+from kern's own warnings is blind to whatever kern does not know it does, so it counts a silent
+difference as a perfect file. Five of them are named at `up` and at `config` as of this release, and
+the honest consequence is that the measured rate FELL when they were: the differences were always
+there, the measurement was not.
+
+  * **A service with no `mem_limit:` now gets the host's RAM, as it does under Docker.** It used to
+    get `kern box`'s 512 MiB default, so a service that runs under Docker was OOM-killed at a number
+    written nowhere in the file. MEASURED on the neutral corpus: 243 of 259 files have at least one
+    service in that position, which made it the largest remaining difference after the publish
+    default. It is not uncapped: the box still carries a `memory.max` and `oom.group = 1`, so the
+    failure stays attributable to its own cgroup. `[kern] compose_memory_max` restores a strict
+    ceiling and caps a bigger `mem_limit:` too; see [CONFIG.md](CONFIG.md).
+  * **In one shared namespace the services share `127.0.0.1`.** A port a service binds on the
+    loopback is reachable from every other service in the stack, which under Docker it would not be:
+    an admin endpoint, `/metrics`, a pprof handler or anything trusting `127.0.0.0/8` without
+    authentication. This is an exposure and not a failure, so nothing ever complained about it.
+    `--no-pod` gives each service its own loopback at the cost of a relay hop.
+  * **A service mounting `/var/run/docker.sock` has nothing to talk to.** kern is daemonless: no
+    Docker daemon, no Engine API. The mount succeeds and the service fails later inside its own code
+    with an error pointing at Docker. There is no kern equivalent; such a service needs real Docker.
+  * **`RUN --mount=type=secret` and `type=ssh` are REFUSED, not dropped.** The command was written
+    because the credential would be there, so running it without one means `npm ci` or `pip install`
+    goes out unauthenticated: either a 401 whose message points at the registry rather than at the
+    discarded flag, or a build that succeeds against something public and ships the wrong result.
+    `--mount=type=cache` and `type=bind` stay dropped, because those cost a rebuild and not a wrong
+    answer.
+  * **`external: true` on a volume that does not exist is refused, as Docker refuses it.** kern
+    auto-creates a named volume on first use, which is right for a volume the file owns and wrong for
+    one whose data belongs to something else: the service would start, find nothing, and initialise
+    over the top. Create it with `kern volume create <name>` first.
+
+AN EMPTY NAMED VOLUME IS SEEDED FROM THE IMAGE, WHICH IS WHAT DOCKER DOES. Docker copies the image's
+content at the mount point into a named volume the first time that volume is used while it is still
+empty; kern mounted an empty directory over the top, so a service came up and found NOTHING where its
+image had put a default configuration, an initial database or a web root. It then failed with an
+error of its own making, which points at the application and never at the mount. Measured: a box on
+`nginx:alpine` with an empty volume at `/etc/nginx` saw 0 files and now sees 8. Only ever when the
+volume is EMPTY, so it costs nothing after first use and can never write over data that is already
+there, and only for a NAMED volume: a bind mount of a host path is your own directory and is never
+touched. A multi-layer image is read through the kernel-merged overlay view, so a file a higher layer
+DELETED does not come back. The volume's own root also takes the image directory's owner and mode: a
+mount point the image left EMPTY copies no content at all, and that is the common shape (Prometheus's
+`/prometheus`).
+
+THE IMAGE'S OWN `HEALTHCHECK` AND `STOPSIGNAL` ARE READ. Docker runs the check an image ships whether
+or not the compose file mentions one, and `depends_on: {condition: service_healthy}` waits on exactly
+that; kern read only what the file said, so such a service reported `HEALTH = "-"` forever. Measured
+on a box whose image declares a check: the branch reports `healthy` when the check passes and
+`unhealthy` when it fails, where before it reported `-` in both cases. A `healthcheck:` in the file
+replaces the image's ENTIRELY (Compose's rule), numbers included. `STOPSIGNAL` is used when no
+`--stop-signal`/`stop_signal:` is given, so nginx gets its `SIGQUIT` drain instead of a `SIGTERM` that
+cuts live connections; an explicit signal wins even when it names `SIGTERM`, and a signal name kern
+does not know leaves the box on `SIGTERM` rather than refusing to start it.
+
+`${VAR:?message}` IS A REFUSAL. That form exists to stop a file being rendered without the value and
+is what a compose file writes for a password or a token; kern used to warn and substitute the empty
+string, so a stack came up with `MYSQL_PASSWORD=`. It now refuses and names every variable that has
+no value, not just the first. `${VAR}` and `${VAR:-default}` are unchanged.
+
+EGRESS IS PER SERVICE WITHOUT A POD. Each service gets its own rootless NAT, attached through the
+same `pasta` mechanism a pod uses, while the service is held at its pre-exec gate: every namespace is
+built, no instruction has run, so a workload never sees a namespace without a route one instant and
+with one the next. Before this, a `--no-pod` box held only `lo` and could not reach the internet at
+all.
+
+`internal: true` IS THEREFORE A REAL BOUNDARY, and this is the first wiring in which it can be one. A
+service confined to internal networks is given NO NAT, so there is no route out of its namespace
+rather than a filter that has to stay correct. Measured on one stack, one run: the public service
+reported two routes and reached `1.1.1.1:443`, the confined one reported zero and could not. Two
+exceptions are named rather than hidden: a service on the host network already has the host's
+connectivity, and a service with `restart:` is installed as a systemd unit, so `up` never holds it
+and cannot attach a NAT to it.
+
+THE NAT DOES NOT REOPEN THE PATH THE SEGREGATION CLOSED, and that was worth checking rather than
+assuming: giving each service egress could have let a service reach a segregated peer through the
+peer's PUBLISHED port on the host. Measured from inside a segregated service, with a positive control
+so a blanket failure could not be mistaken for a boundary: `1.1.1.1:443` CONNECTED (the NAT works),
+while the host's own address answered `refused` on a port the host really was listening on and on the
+segregated peer's published port. The mechanism is visible from inside: pasta gives the box the
+host's address (`192.168.1.32/24` in the namespace), so that address means "me" there and reaches
+nothing on the host. Under Docker the same pair is reachable through the published port.
+
+`networks:` IS ENFORCED WITHOUT A POD, AND INERT INSIDE ONE. A kern stack in a pod is ONE network
+namespace, so nothing in it can segregate anything and the key is reported as dropped. Under
+`--no-pod` each service has its own namespace and reachability is built edge by edge out of relays,
+so the memberships decide which edges exist: two services with no network in common get no relay AND
+no entry in each other's `/etc/hosts`, so the peer's name does not resolve at all. Measured on a
+three-service stack (`web` on `front`, `app` on both, `db` on `back`): `web` reaches `app` and `app`
+reaches `db` with their payloads, `web -> db` and `db -> web` both answer `nc: bad address`, and the
+plan drops from six relays to four. The segregation is enforced by the ABSENCE of a relay, not by a
+filter, so there is no rule that can be misconfigured into permissiveness.
+
+A SERVICE WITH NO `networks:` KEY IS ON THE IMPLICIT `default` NETWORK, so it is separated from the
+services that name one. That is the Compose Specification's rule and it is the half that surprises
+people. It is also the dominant case in practice: measured over 240 real compose files, 113 declare
+`networks:` on at least one service and **52 have at least one pair that loses its edge**, of which
+**40 are exactly this mixed case**. `up` therefore names every cut pair with both memberships before
+starting anything, because a removed edge otherwise surfaces minutes later as `bad address '<peer>'`
+in a service log, which is the same symptom as a typo or a dead peer.
+
+NOT VERIFIED AGAINST A DOCKER DAEMON. There is no Docker on the machine this was developed on and the
+board that has one was unreachable, so the `default`-network rule above is taken from the Compose
+Specification rather than measured. Everything stated about kern's own behaviour IS measured.
+
+`internal: true` DIFFERS BY WIRING, AND BOTH ANSWERS ARE MEASURED. In a pod the key is all-or-nothing:
+it becomes the pod's `--no-outbound` only when every service is confined to internal networks, and
+otherwise outbound stays open for everyone (measured: a pod member sees `lo` plus pasta's interface
+and reaches `1.1.1.1:443`). Without a pod every service is confined already (measured: the box holds
+only `lo` and the same TCP connect is refused), so the key is satisfied for the services that asked
+for it AND for the ones that did not. That over-application is stated at parse time, because a stack
+that calls an external API will fail with nothing pointing at the network.
+
+`devices:` IS A BIND, AND ITS CEILING IS THE INVOKING USER. A device node named there is bound into
+the box with the host's own owner and mode, exactly as `volumes:` has always been able to do
+(measured before any of this: `-v /dev/kvm:/dev/kvm` gives a workload a working
+`crw-rw---- 10, 232 /dev/kvm`). Measured through `devices:` on one host, as the invoking user:
+`/dev/mem` denied, `/dev/kmsg` denied, and the raw disk `/dev/nvme0n1` READABLE, because that user is
+in group `disk` and the node is `root:disk` 0660, so it is readable outside a box too. A rootless
+kern box is bounded by the user who started it and never by root: a stack can reach exactly what that
+person could already reach with `cat`, and no more. `/dev/net/tun` is the one entry that does not
+become a bind: creating a tunnel interface needs `CAP_NET_ADMIN` in the box's network namespace, so
+it maps to `--tun`, which delivers the node AND the capability. A device the host does not have is
+refused by name before the box starts, and nothing is created in its place.
+
 `--no-pod` is not the loss it used to be. Each service gets its own network namespace and a stack-wide
 loopback alias, `127.0.0.2` upward; a service resolves its own name to `127.0.0.1`, where its listener
 is, and each peer to that peer's alias, where a relay is bound inside this box. MEASURED on a native
@@ -283,6 +439,23 @@ any direction that is down.
 The two remedies are: change one internal port, or make one service bind `127.0.0.1` explicitly
 instead of `0.0.0.0`, which is often a one-line config change against a renumber that touches every
 caller.
+
+BRING-UP IS ORDERED, so no workload observes a half-built network. A relay needs PID 1 of both boxes
+and can only be built once every box exists, which used to mean a service that connected out at
+startup ran before the relay it needed. kern now holds each box at a gate placed in its PID 1 after
+seccomp is installed and immediately before `exec`: a held box is a fully confined process that has
+not yet run a single instruction of the workload. `up` builds the relays, then releases the boxes in
+dependency order. Measured on the case that used to fail: a client connecting at t=0 got no answer
+three runs of three before, and its peer's payload three runs of three after.
+
+ONE KIND OF SERVICE IS NOT HELD. A service that sets `restart:` outside a pod is installed as a
+systemd unit and started by the manager, in a process that inherits nothing from `up`, so there is no
+descriptor to gate it with. If it only listens, nothing changes: starting early is not a problem for
+something that has to be listening anyway (measured: as a producer it delivers, three of three). If
+it connects out at startup, that first connection can precede the relay and needs a retry (measured
+with the same fixture and the one line as the only variable: `NO-API` three of three with
+`restart:`, the payload three of three without it). `up` names any such service at bring-up rather
+than leaving it to be discovered from a service log.
 
 What relays cost, measured on an x86 desktop with the release binary, against the same stack in a
 pod. Throughput and connection rate are the price of the extra hop: bytes cross two TCP connections

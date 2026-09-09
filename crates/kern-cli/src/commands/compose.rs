@@ -35,6 +35,182 @@ pub fn compose_verbs_help() -> String {
 /// It was inline in `compose`, which meant the naming contract - the one a field report got wrong,
 /// and acted on by editing a working file - could not be asserted without starting a stack. Every
 /// claim in the paragraph above is now a case in this module's tests.
+/// The descriptor number the gate's read end is pinned to in the box process.
+///
+/// HIGH AND FIXED. kern's own setup opens descriptors from the bottom of the table and marks them
+/// `CLOEXEC`, so anything it hands out is recycled well below this; 900 sits above every one of them
+/// and below the 1024 that `shed_inherited_fds_keeping` sweeps, which is what lets that sweep keep
+/// exactly this descriptor and close the rest.
+const GATE_FD: libc::c_int = 900;
+
+/// Give every service the memory ceiling the policy says it gets, and return the sentence that owes
+/// the reader, if any.
+///
+/// TAKES THE POLICY RATHER THAN READING IT, so the whole rule can be asserted without a `kern.toml`
+/// on the developer's machine - the split `apply_publish_policy` already makes for the same reason.
+/// It also keeps the decision out of `compose()`, which is long enough that a block buried in it is
+/// a block nobody finds.
+fn apply_memory_policy(
+    boxes: &mut [crate::compose::ComposeBox],
+    (ceiling, host_ram): (Option<u64>, Option<u64>),
+) -> Option<String> {
+    let mut moved: Vec<String> = Vec::new();
+    for b in boxes.iter_mut() {
+        let before = b.memory.clone();
+        b.memory = crate::commands::service_memory_cap(before.as_deref(), ceiling, host_ram);
+        // NAMED ONLY WHEN THE CEILING ACTUALLY MOVED THE SERVICE, compared by VALUE and not by the
+        // string. The first version compared the strings, so a service whose `mem_limit: 32m` was
+        // already under the ceiling was named as capped: `"32m"` and `"33554432"` are different text
+        // for the same number. An operator reading that goes looking for a limit that was never
+        // applied, which is the false-alarm class that teaches people to skip the line that matters.
+        if ceiling.is_some() && crate::commands::ceiling_moved(before.as_deref(), &b.memory) {
+            moved.push(b.service_name().to_string());
+        }
+    }
+    let named: Vec<&str> = moved.iter().map(String::as_str).collect();
+    crate::commands::memory_ceiling_note(&named, ceiling?)
+}
+
+/// The refusal a stack has earned by declaring `external: true` on a volume that does not exist, or
+/// `None`. `exists` answers "is this volume present on this host".
+///
+/// A FUNCTION TAKING THE EXISTENCE TEST, rather than the check written inline where the volumes
+/// directory is at hand: the decision is the behaviour, and a decision taken inline inside the `up`
+/// path can be asserted by nothing short of creating volumes on the developer's own machine. The
+/// same reasoning already produced `internal_note` and `outbound_targets`.
+///
+/// SORTED AND DEDUPED because the same volume is normally mounted by several services, and a message
+/// naming it three times reads as three problems.
+fn missing_external_volumes(
+    boxes: &[crate::compose::ComposeBox],
+    exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut missing: Vec<&str> = boxes
+        .iter()
+        .flat_map(|b| b.external_volumes.iter())
+        .map(String::as_str)
+        .filter(|n| !exists(n))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if missing.is_empty() {
+        return None;
+    }
+    let one = missing.len() == 1;
+    Some(format!(
+        "the file declares {} `external: true`, which means kern must NOT create {}, and {} does \
+         not exist: {}. Create it with `kern volume create <name>` (or drop `external: true` to let \
+         kern create it on first use, accepting that the service starts on empty storage).",
+        if one { "this volume" } else { "these volumes" },
+        if one { "it" } else { "them" },
+        if one { "it" } else { "they" },
+        missing.join(", "),
+    ))
+}
+
+/// A `CLOEXEC` pipe for one box's pre-exec gate: `(read, write)`.
+///
+/// `pipe2(O_CLOEXEC)` and not `pipe()` + two `fcntl`s, because the atomic form is the only one with
+/// no window in which a concurrently spawning worker can inherit a descriptor it must not hold. The
+/// read end's `CLOEXEC` is cleared later, in the child, where exactly one process sees it.
+///
+/// Panic-free: every failure is the caller's `Error`, and no descriptor leaks on the error path
+/// because `pipe2` either fills both slots or fills neither.
+/// Which services get a NAT of their own, decided from the file before anything starts.
+///
+/// A FUNCTION AND NOT AN INLINE FILTER, because this decides where a workload can reach and that is
+/// the kind of decision a test has to be able to ask about. The same lesson as `internal_note`: a
+/// rule written inside the loop that consumes it can be checked by nothing.
+///
+/// IN A POD, NOBODY. The pod carries one NAT for every member, and attaching a second per box would
+/// put two default routes in one namespace.
+///
+/// WITHOUT A POD, EVERY SERVICE EXCEPT THREE KINDS:
+///  * one confined to internal networks - this is the first wiring in which `internal: true` can
+///    mean what Compose says it means, and it means it by the ABSENCE of a route rather than by a
+///    filter that has to stay correct;
+///  * one on the host network, which already has the host's own connectivity;
+///  * one with `restart:`, which is installed as a systemd unit and started later by the manager, so
+///    `up` never holds it at the gate and there is no instant at which a NAT could be attached. That
+///    limit is named at bring-up rather than left to be discovered.
+#[must_use]
+fn outbound_targets(
+    boxes: &[crate::compose::ComposeBox],
+    use_pod: bool,
+) -> std::collections::HashSet<String> {
+    if use_pod {
+        return std::collections::HashSet::new();
+    }
+    boxes
+        .iter()
+        .filter(|b| !b.net && !b.net_none && !b.restart_always && !b.only_internal_networks)
+        .map(|b| b.name.clone())
+        .collect()
+}
+
+fn gate_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), Error> {
+    use std::os::fd::FromRawFd;
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: `fds` is a live array of exactly the two elements `pipe2` writes; the flag is a valid
+    // constant. On failure nothing is written and both slots stay `-1`.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(Error::Compose(format!(
+            "cannot create the pre-exec gate pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both descriptors were just created by `pipe2` and are owned by this process; each is
+    // wrapped exactly once, so ownership is not duplicated.
+    let rd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+    let wr = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+    Ok((rd, wr))
+}
+
+/// Release one prepared box by writing the single gate byte. `true` when the box was released.
+///
+/// A short write cannot happen for one byte on a pipe with a live reader, and `EINTR` is retried
+/// because a signal is not an answer. Any other error means the box is already gone, which is not a
+/// reason to fail the stack: the settle check reports a box that died, and reporting the same fact
+/// twice in two different words is worse than reporting it once.
+fn gate_release(fd: &std::os::fd::OwnedFd) -> bool {
+    let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+    let byte: [u8; 1] = [1];
+    // SIGPIPE IS SET TO `SIG_DFL` BY THIS BINARY, ON PURPOSE (`main.rs`: so `kern … | head` dies like
+    // a Unix tool). A write to a gate whose reader is gone therefore KILLS `up` instead of returning
+    // `EPIPE`, and the caller never gets to report which service went missing. Ignoring it for the
+    // duration of this one write turns the signal back into the error code the loop below already
+    // handles, and the previous disposition is restored immediately so the pipe behaviour of every
+    // other path is untouched.
+    //
+    // THE DISPOSITION IS PROCESS-WIDE, so this is only correct because the release loop is
+    // sequential: `topo_levels` is walked one box at a time under the registry lock, and two
+    // overlapping save/restore pairs would end with whichever thread restored last, leaving SIGPIPE
+    // ignored for the rest of the run. If that loop is ever given a worker pool, this has to become
+    // a single ignore around the whole loop rather than one per write.
+    //
+    // SAFETY: `signal` on the calling process with a valid handler constant; the returned previous
+    // disposition is restored below on every path out of this function.
+    let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    let restore = |r: bool| -> bool {
+        // SAFETY: restoring the disposition captured one statement above.
+        unsafe { libc::signal(libc::SIGPIPE, prev) };
+        r
+    };
+    loop {
+        // SAFETY: writing one byte from a live local buffer to a descriptor this process owns.
+        let n = unsafe { libc::write(raw, byte.as_ptr().cast::<libc::c_void>(), 1) };
+        if n == 1 {
+            return restore(true);
+        }
+        // SAFETY: `__errno_location` is always valid for the calling thread.
+        let err = unsafe { *libc::__errno_location() };
+        if err != libc::EINTR {
+            return restore(false);
+        }
+    }
+}
+
 fn resolve_box_names(
     boxes: &mut [crate::compose::ComposeBox],
     pod: &str,
@@ -79,6 +255,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ComposeOpts {
         files,
         action,
+        force_pod,
         no_pod,
         allow_device_grants,
         tail,
@@ -124,12 +301,40 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .map(|t| crate::compose::parse_dotenv(&t))
             .unwrap_or_default(),
     };
-    let mut boxes = crate::compose::parse_with_env(&text, &dotenv).map_err(Error::Compose)?;
+    // THE MODE IS KNOWN HERE AND ONLY HERE, so it is handed to the parser rather than guessed there.
+    // `networks:` means opposite things in the two wirings, and the parser's sentence about it is a
+    // claim about what this run will do.
+    // THE WIRING IS CHOSEN FROM THE FILE, so the parser cannot be told which one it is yet.
+    //
+    // A file that puts two services on networks with nothing in common has asked for a boundary, and
+    // the only wiring that can give it one is a namespace per service. Deciding that needs the parse,
+    // and the parse's own sentence about `networks:` needs the decision - so the parser is handed
+    // `Undecided`, stays silent about `networks:` and `internal:`, and this function says both once
+    // it knows. An explicit `--no-pod` or `--pod` settles it before the file is read at all.
+    // ALWAYS `Undecided`, even when a flag settled the wiring before the file was read.
+    //
+    // The driver is the ONE emitter of the `networks:`/`internal:` sentences now, and letting the
+    // parser also emit them when the mode happened to be known produced the file's note TWICE:
+    // measured with `--pod`, the `networks: ignored` line appeared once from the parser's
+    // `warn_once` and once from here. Two copies of one fact is the defect class this codebase keeps
+    // paying for, and the fix is one emitter, not a second deduplication.
+    let stack_net = crate::compose::StackNet::Undecided;
+    if o.no_pod && force_pod {
+        return Err(Error::Compose(
+            "--no-pod and --pod ask for opposite wirings; pass one or neither (without either, kern \
+             uses a namespace per service only when the file's `networks:` actually separate two \
+             services)"
+                .to_string(),
+        ));
+    }
+    let mut boxes =
+        crate::compose::parse_with_env(&text, &dotenv, stack_net).map_err(Error::Compose)?;
     // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
     for extra in &files[1..] {
         let t = std::fs::read_to_string(extra)
             .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
-        let over = crate::compose::parse_override(&t, &dotenv).map_err(Error::Compose)?;
+        let over =
+            crate::compose::parse_override(&t, &dotenv, stack_net).map_err(Error::Compose)?;
         boxes = crate::compose::merge_stacks(boxes, over);
     }
     // Per-service validation, on the MERGED stack and UNCONDITIONALLY. Merged, because an override
@@ -210,6 +415,118 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             )));
         }
     }
+    // THE WIRING IS DECIDED HERE, BEFORE THE VERBS SPLIT, and said here for the same reason.
+    //
+    // `config` is the verb that answers "what will this file be", so it must give the same answer as
+    // `up`. Deciding inside the `up` path put the selection after this dispatch and left `config`
+    // saying nothing at all about `networks:` - which is exactly the split this file already closed
+    // once, for the `--no-pod` trade and again for the segregated pairs. One decision, before the
+    // fork, read by every verb.
+    //
+    // AUTO-SELECTION: a file whose `networks:` leave two services with nothing in common has asked
+    // for a boundary that ONE namespace cannot provide, so the stack is wired per service and the
+    // boundary is real. Every other file keeps the pod, which is faster (measured previously at -34%
+    // bulk throughput and -16% connection rate for the relay hop) and simpler. MEASURED on a neutral
+    // corpus of 259 compose files, one per repository: 75 of them express segregation the pod
+    // silently dropped, the largest remaining difference from Docker after the publish default.
+    //
+    // Never silent and never irreversible: the selection is announced with what it costs, and
+    // `--pod` keeps the old wiring for anyone who prefers the speed to the boundary.
+    let segregates = !crate::nopod::segregated_pairs(
+        &boxes
+            .iter()
+            .map(|b| (b.service.clone(), b.networks.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .is_empty();
+    // THE SECOND REASON ONE NAMESPACE CANNOT EXPRESS THE FILE: two services claiming the same
+    // internal port. Docker runs such a stack because each container has its own namespace; kern
+    // used to refuse it outright. MEASURED on a real project (`AP0827/Multi-Threaded-Web-Server`, an
+    // app and a modsecurity proxy both on 8080): `config` errored, and the same file with `--no-pod`
+    // parsed and ran. A file Docker runs and kern refuses is the difference this implementation
+    // exists to remove, so the collision now SELECTS the wiring that expresses it instead of ending
+    // the run. `--pod` still gets the refusal, which is the right answer for someone who asked for
+    // one namespace.
+    let collides = crate::commands::pod_would_collide(&boxes);
+    let auto_no_pod = !no_pod && !force_pod && (segregates || collides);
+    if auto_no_pod {
+        let why = if segregates {
+            "separates services with `networks:`"
+        } else {
+            "puts two services on the same internal port"
+        };
+        eprintln!(
+            "kern: note: this file {why}, which ONE shared namespace cannot do, so kern gives each \
+             service its own network namespace (as `--no-pod` does). That costs a relay hop between \
+             peers; pass `--pod` to keep one shared namespace instead, where kern refuses the \
+             stack rather than running it with the separation dropped"
+        );
+    }
+    let no_pod = no_pod || auto_no_pod;
+    // The two sentences the parser no longer says, said once, now that the wiring is settled.
+    //
+    // ONLY WHEN THE MEMBERSHIPS SEPARATE SOMETHING. A file can name three networks and still put
+    // every pair of services on a shared one, and then the pod reaches exactly what the file says it
+    // reaches: nothing is dropped, nothing is enforced, and "'networks:' ignored" is a warning about
+    // a loss that did not happen. MEASURED on a neutral corpus of 259 files: 75 declared per-service
+    // networks and only 11 of them actually separate a pair, so the sentence was firing on 64 files
+    // where it had nothing to report - which is how a reader learns to skip the line that matters.
+    if segregates {
+        let mode = if no_pod {
+            crate::compose::StackNet::PerService
+        } else {
+            crate::compose::StackNet::Pod
+        };
+        if let Some(note) = crate::compose::networks_note(mode) {
+            eprintln!("kern: warning: compose: {note}");
+        }
+        if boxes.iter().any(|b| b.on_internal_network) {
+            if let Some(note) =
+                crate::compose::internal_note(mode, crate::compose::stack_is_internal_only(&boxes))
+            {
+                eprintln!("kern: warning: compose: {note}");
+            }
+        }
+    }
+    // THE MEMORY CEILING EVERY SERVICE ACTUALLY GETS, RESOLVED ONCE FOR THE WHOLE STACK.
+    //
+    // A Docker container with no `mem_limit:` has no memory limit and is bounded by the machine; a
+    // kern box with no `--memory` used to get `kern box`'s 512 MiB default, so a service that runs
+    // under Docker was OOM-killed at a number written NOWHERE in the file. MEASURED on a neutral
+    // corpus of 259 files: 243 have at least one service in that position, which made it the largest
+    // remaining difference from Docker after the publish default.
+    //
+    // A service with nothing written now gets the HOST'S RAM - the same bound Docker leaves it, and
+    // the same decision the build step already took for the same measured reason - so the failure
+    // stays attributable to the box's own cgroup instead of the host OOM killer choosing a victim.
+    // `[kern] compose_memory_max` restores a strict ceiling and is a CEILING: it also caps a
+    // `mem_limit:` that asks for more, because a limit a downloaded file can raise limits nothing.
+    //
+    // BEFORE THE VERB DISPATCH, so `config` shows the caps `up` applies. This file has paid three
+    // times for a decision taken inside the `up` branch.
+    if let Some(note) = apply_memory_policy(&mut boxes, crate::commands::compose_memory_policy()) {
+        eprintln!("kern: note: compose: {note}");
+    }
+    // THE DIFFERENCES FROM DOCKER THAT BREAK NOTHING AND THEREFORE SAY NOTHING.
+    //
+    // Each is a difference the compatibility measurement CANNOT see, because that measurement counts
+    // a file as compatible when kern prints nothing about it - the tool is kern's own warnings, so it
+    // is blind by construction to whatever kern does not know it does. A service holding a socket
+    // with no daemon behind it, and services sharing one loopback, both come up green and behave
+    // differently from Docker. Closing that gap is naming them; the numbers move or they do not.
+    if let Some(note) = crate::compose::docker_socket_note(&boxes) {
+        eprintln!("kern: warning: compose: {note}");
+    }
+    if let Some(note) = crate::compose::wiring_note(
+        if no_pod {
+            crate::compose::StackNet::PerService
+        } else {
+            crate::compose::StackNet::Pod
+        },
+        boxes.len(),
+    ) {
+        eprintln!("kern: note: compose: {note}");
+    }
     // Verbs that answer a question about the stack rather than changing it return here.
     if run_terminal_verb(
         action,
@@ -270,6 +587,25 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 "them"
             },
         )));
+    }
+
+    // `external: true` MEANS "DO NOT CREATE IT", so a missing one is a refusal and not a warning.
+    //
+    // kern auto-creates a named volume on first use, which is the right answer for a volume the file
+    // owns and the worst possible answer for this one: the key is written precisely when the data
+    // belongs to something else, and handing the service a fresh empty directory instead lets it
+    // start, find nothing, and initialise over the top of where the real data was supposed to be.
+    // Docker refuses the stack; kern used to say nothing at all, because the top-level `volumes:`
+    // block was skipped unread.
+    //
+    // ON THE MUTATING PATH ONLY, deliberately, and this is not the `config`-must-agree-with-`up`
+    // class: the answer depends on which volumes exist ON THIS HOST rather than on anything in the
+    // file, so it is not a fact `config` is being asked about. Docker draws the line in the same
+    // place (`docker compose config` renders such a file, `up` refuses it).
+    if let Some(msg) =
+        missing_external_volumes(&boxes, |n| crate::volume::volumes_dir().join(n).exists())
+    {
+        return Err(Error::Compose(msg));
     }
 
     let mut levels = crate::compose::topo_levels(&boxes).map_err(Error::Compose)?;
@@ -477,6 +813,35 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         );
     }
     let use_pod = use_pod;
+    // THE PRE-EXEC GATE IS ACTIVE EXACTLY WHEN PEER RELAYS WILL BE BUILT, and that condition is
+    // written once here rather than re-derived at the three points that consume it. A stack with no
+    // relays has no network to finish building, so its boxes exec the moment they are set up and the
+    // gate costs nothing but the variable being unset.
+    let gate_active = !use_pod && boxes.len() > 1;
+    // WHICH SERVICES GET EGRESS, decided once, from the file, before anything starts.
+    //
+    // In a pod this is empty: the pod itself carries one NAT for every member, and attaching a
+    // second per box would put two default routes in one namespace.
+    //
+    // Without a pod each service has its own namespace, so egress is per service - which is the
+    // first time `internal: true` can mean what it says in Compose. A service every one of whose
+    // networks is marked internal gets NO NAT, and that is a real boundary: there is no route in its
+    // namespace at all, not a filter that has to stay correct. Every other service gets one, which
+    // is what Docker gives it.
+    //
+    // A SERVICE WITH `restart:` IS EXCLUDED, for the same reason it is excluded from the gate: it is
+    // installed as a systemd unit and started later by the manager, so `up` never holds it and there
+    // is no safe instant to attach a NAT to. It is already named in the bring-up note.
+    let outbound_for = outbound_targets(&boxes, use_pod);
+    // Write ends, one per PREPARED box, held by `up` and keyed by box name so the release can be
+    // ordered by dependency level.
+    //
+    // `OwnedFd` AND NOT A RAW `c_int`, because every early `return Err(...)` between here and the
+    // release must close them. A closed write end is EOF on the box's side, and the box reads EOF as
+    // REFUSAL: it never execs and leaves a "never released" record. That is fail-closed obtained
+    // from the type system rather than from remembering to clean up on eleven error paths.
+    let gates: std::sync::Mutex<Vec<(String, std::os::fd::OwnedFd)>> =
+        std::sync::Mutex::new(Vec::new());
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
         // the single statement of that rule). A pod member setns's into the holder's user ns and writes
@@ -591,7 +956,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // has TCP ports keeps those, and the UDP ones are named per service.
         let mut udp_only: Vec<String> = Vec::new();
         let mut udp_ports: Vec<String> = Vec::new();
-        let services: Vec<(String, String, Vec<u16>)> = boxes
+        let services: Vec<(String, String, Vec<u16>, Vec<String>)> = boxes
             .iter()
             .map(|b| {
                 let declared = declared_container_ports(b);
@@ -617,7 +982,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         udp_ports.push(format!("{} ({list}/udp)", b.service));
                     }
                 }
-                (b.service.clone(), b.name.clone(), tcp)
+                (b.service.clone(), b.name.clone(), tcp, b.networks.clone())
             })
             .collect();
         for who in &udp_only {
@@ -632,6 +997,20 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             );
         }
         let plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
+        // THE PAIRS THE FILE ASKED TO SEPARATE, NAMED BEFORE ANYTHING STARTS. A removed edge shows
+        // up as `bad address '<peer>'` in a service log, which is the same symptom as a typo or a
+        // dead peer; saying it here is what makes it readable as enforcement. Printed before the
+        // boxes so it precedes the failure it explains, unlike the unreachable-pair report, which
+        // can only be measured from RUNNING services.
+        let cut = crate::nopod::segregated_pairs(&crate::nopod::membership_of(&plan));
+        if !cut.is_empty() {
+            eprintln!(
+                "kern: note: {} service pair(s) share no network, so they get no relay and do not \
+                 resolve each other: {}",
+                cut.len(),
+                cut.join("; ")
+            );
+        }
         // THE MESH IS QUADRATIC, and the 253-service alias cap does not bound it: 253 services with
         // one port each is 63,756 relays and 127,513 processes, more than the `RLIMIT_NPROC` of the
         // machine this was measured on. Refused with the arithmetic, because the alternative is
@@ -702,20 +1081,44 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         let b = boxes.iter().find(|b| &b.name == name)?;
                         // `boxes` is no longer captured: it was here only to ask whether some peer
                         // waited on this box's completion, and every box gets the exit key now.
-                        let (started, pod, up_token, self_exe, project_dir, address_plan) = (
+                        // REBOUND AS REFERENCES so the `move` closure borrows instead of taking
+                        // ownership: every one of these is read by more than one worker and by the
+                        // release loop after them, and a `move` that consumed one would compile only
+                        // for the first spawn.
+                        let (
+                            started,
+                            pod,
+                            up_token,
+                            self_exe,
+                            project_dir,
+                            address_plan,
+                            gates,
+                            outbound_for,
+                        ) = (
                             &started,
                             &pod,
                             &up_token,
                             &self_exe,
                             &project_dir,
                             &address_plan[..],
+                            &gates,
+                            &outbound_for,
                         );
                         // `Some(...)`: `filter_map` wants an `Option`, and the `?` above is the
                         // miss. The spawn itself always succeeds.
                         Some(scope.spawn(move || -> Result<(), Error> {
                             // Conditional deps (healthy/completed) live in an earlier, already-started
                             // level; plain `depends_on` is honored by the level barrier itself.
-                            wait_for_conditions(b, pod, up_token)?;
+                            //
+                            // UNDER THE GATE THIS MOVES TO RELEASE. `service_healthy` asks about a
+                            // workload, and under the gate no workload has run yet: waiting here would
+                            // block forever on a health that cannot exist, which is the same deadlock
+                            // the gate was added to remove, arriving through the other door. The wait
+                            // is performed in the release loop, in dependency order, which is where
+                            // "start only after the dependency is healthy" actually means something.
+                            if !gate_active {
+                                wait_for_conditions(b, pod, up_token)?;
+                            }
                             let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             let dep = if b.depends_on.is_empty() {
                                 String::new()
@@ -738,8 +1141,28 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // Record the fingerprint WITH the box, so the next `up` can compare.
                             cmd.arg("--def-hash").arg(definition_hash(b));
                             b.push_box_flags(&mut cmd);
+                            // DNS FOR A SERVICE THAT WILL GET A NAT, handed over as `--dns` at
+                            // launch rather than as a file bound later.
+                            //
+                            // The pod binds a `resolv.conf` it wrote; a box outside a pod writes its
+                            // own from these arguments, which is the mechanism `dns:` already uses.
+                            // The CONTENT is the same function in both wirings, so a stack cannot
+                            // resolve names differently depending on how it was started.
+                            //
+                            // Only when the file named none: an explicit `dns:` is the service's
+                            // decision and must not be appended to, or a service that pinned one
+                            // resolver would quietly get three.
+                            if outbound_for.contains(&b.name) && b.dns.is_empty() {
+                                for ns in crate::pod::host_nameservers() {
+                                    cmd.arg("--dns").arg(ns);
+                                }
+                            }
                             // A box not on the host net joins the stack pod → reachable by name from peers.
-                            if use_pod && !b.net {
+                            //
+                            // `network_mode: none` STAYS OUT TOO, for the opposite reason to `host`:
+                            // that one already has the host's network, this one asked for none at
+                            // all, and a pod would hand it both peers and egress.
+                            if use_pod && !b.net && !b.net_none {
                                 cmd.arg("--pod").arg(pod);
                             }
                             // Without a pod, the same reachability is spelled out: every peer at its
@@ -753,6 +1176,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                     for e in entries {
                                         cmd.arg("--add-host").arg(e);
                                     }
+                                }
+                                // `links:` ALIASES, IN EITHER MODE. A box on the host net is skipped
+                                // for the same reason as above: it resolves what the host resolves,
+                                // and a stack alias pointing at a loopback would break that.
+                                for e in
+                                    crate::nopod::link_host_args(&b.links, address_plan, use_pod)
+                                {
+                                    cmd.arg("--add-host").arg(e);
                                 }
                             }
                             // EVERY box gets the stack+run-scoped exit KEY, and that key is CLEARED
@@ -773,13 +1204,101 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             let key = exit_key(pod, up_token, &b.name);
                             registry::clear_exit(&key);
                             cmd.env("KERN_EXIT_KEY", &key);
+                            // THE GATE PIPE. Both ends are created `CLOEXEC` so no other child of
+                            // `up` (a health checker, a relay half, the timeout watchdog) can inherit
+                            // the write end and keep the gate from closing when `up` dies. The READ
+                            // end has its `CLOEXEC` cleared in the child, between fork and exec, so
+                            // it survives into the box and nowhere else - which is why this is done
+                            // in `pre_exec` rather than by creating the pipe without `CLOEXEC`: with
+                            // concurrent workers a non-`CLOEXEC` read end would leak into every box
+                            // started at the same moment.
+                            let mut gate_rd: Option<std::os::fd::OwnedFd> = None;
+                            // A BOX THAT WILL BE RUN BY SYSTEMD CANNOT BE GATED, AND MUST NOT BE
+                            // GIVEN A GATE IT WILL NEVER READ.
+                            //
+                            // Outside a pod, a service that sets `restart:` is installed as a systemd
+                            // unit: this launcher writes the unit and exits, and the box is started
+                            // later by the manager, in a process that inherits nothing from here. A
+                            // descriptor does not cross that boundary, so the gate's read end dies
+                            // with the launcher while `up` still holds the write end and later writes
+                            // to it. MEASURED, three runs of three: `EXIT=141` - SIGPIPE, because
+                            // `main` sets `SIGPIPE` to `SIG_DFL` on purpose so `kern … | head`
+                            // behaves like a Unix tool - and no peer payload delivered.
+                            //
+                            // The box is therefore left ungated. It starts when the manager starts
+                            // it, which is also when it would have started without any of this, so
+                            // nothing regresses for it; what it does not get is the guarantee that
+                            // its peers' relays exist first. That limit is the manager's, not the
+                            // gate's, and it is stated in the note below rather than papered over.
+                            let gate_this = gate_active && !b.restart_always;
+                            if gate_this {
+                                let (rd, wr) = gate_pipe()?;
+                                let raw = std::os::fd::AsRawFd::as_raw_fd(&rd);
+                                // A RESERVED NUMBER, NOT WHATEVER `pipe2` HANDED OUT. The gate is
+                                // read by the box's PID 1, hundreds of setup steps after the fork:
+                                // mounts, the pivot, the uid map and the loopback all open and close
+                                // descriptors, so the low number `pipe2` returned is long since
+                                // recycled by the time it is read. MEASURED: the launcher passed
+                                // `fd=3`, PID 1 resolved `gate=Some(3)` correctly, read one byte
+                                // from whatever now sat on 3, and released itself instantly - the
+                                // workload ran while the relays were still being built, and the
+                                // number was right the whole time. `dup2` in the child pins it above
+                                // everything kern opens; `shed_inherited_fds_keeping` covers the
+                                // range and keeps exactly this one.
+                                cmd.env("KERN_GATE_FD", GATE_FD.to_string());
+                                // SAFETY: `pre_exec` runs between fork and exec in the child. The
+                                // closure calls one async-signal-safe syscall on a descriptor the
+                                // child inherited, allocates nothing and takes no lock.
+                                unsafe {
+                                    std::os::unix::process::CommandExt::pre_exec(
+                                        &mut cmd,
+                                        move || {
+                                            // Pin to the reserved number, then clear CLOEXEC on the
+                                            // pinned copy: `dup2` already returns a descriptor
+                                            // WITHOUT `FD_CLOEXEC`, but the clear is kept explicit so
+                                            // the invariant does not depend on that detail of dup2.
+                                            if libc::dup2(raw, GATE_FD) < 0 {
+                                                return Err(std::io::Error::last_os_error());
+                                            }
+                                            if libc::fcntl(GATE_FD, libc::F_SETFD, 0) < 0 {
+                                                return Err(std::io::Error::last_os_error());
+                                            }
+                                            Ok(())
+                                        },
+                                    )
+                                };
+                                match gates.lock() {
+                                    Ok(mut g) => g.push((b.name.clone(), wr)),
+                                    // A poisoned lock means another worker panicked while holding it.
+                                    // Dropping `wr` here closes it, the box reads EOF and refuses to
+                                    // exec: the stack fails closed rather than starting half gated.
+                                    Err(_) => return Err(Error::Compose(
+                                        "internal: the pre-exec gate registry was poisoned by a \
+                                             failed worker; no box was released"
+                                            .to_string(),
+                                    )),
+                                }
+                                // THE READ END STAYS OPEN UNTIL AFTER THE SPAWN. Closing it here
+                                // closed the number the child was told to read, and every box failed
+                                // with `Bad file descriptor (os error 9)`: `Command` does not
+                                // duplicate the descriptor at configuration time, it inherits
+                                // whatever is open at fork. It is dropped below, once the child has
+                                // it, so the parent does not hold a pipe open for a box that is gone.
+                                gate_rd = Some(rd);
+                            }
                             cmd.arg("-d");
                             if !b.command.is_empty() {
                                 cmd.arg("--").args(&b.command);
                             }
-                            let status = cmd.status().map_err(|e| {
-                                Error::Compose(format!("starting '{}': {e}", b.name))
-                            })?;
+                            let status = cmd
+                                .status()
+                                .map_err(|e| Error::Compose(format!("starting '{}': {e}", b.name)));
+                            // The child has the read end now (or the spawn failed and nobody will).
+                            // Either way the parent must not keep it: a live read end in `up` means
+                            // the pipe never reaches EOF, so a box whose launcher died would wait
+                            // forever instead of refusing.
+                            drop(gate_rd);
+                            let status = status?;
                             if !status.success() {
                                 return Err(Error::Compose(format!(
                                     "box '{}' failed to start",
@@ -856,6 +1375,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             if let Some(note) = no_pod_peer_names_note(&boxes, no_pod) {
                 eprintln!("{note}");
             }
+            // WITH the pairs, for the same reason they are: this names the services whose bring-up
+            // order kern does not control, and it is only actionable next to the relay report.
+            if let Some(note) = no_pod_restart_gate_note(&boxes, no_pod) {
+                eprintln!("{note}");
+            }
             if report.up > 0 {
                 // A `kern: note:` and NOT `progress!`, though it opens with the same arrow. Gating it
                 // on a terminal was wrong and a test said so: with `--no-pod` the relays ARE the
@@ -882,6 +1406,103 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             // convention already in this tree.
             for line in &report.blocked {
                 eprintln!("kern: unreachable: {line}");
+            }
+        }
+    }
+    // RELEASE, IN DEPENDENCY ORDER, AFTER EVERY EDGE EXISTS.
+    //
+    // This is the second half of the pre-exec gate and the reason the first half is worth its cost.
+    // Every box above is PREPARED: namespaces, cgroup, mounts, uid map, capability drop, Landlock and
+    // seccomp are all done, PID 1 is registered, and the workload has not run. The relay block ran
+    // against that, so by the time the first instruction of the first workload executes, every peer
+    // alias it can resolve already answers.
+    //
+    // THE CONDITION WAITS HAPPEN HERE, not in the prepare loop, and the order is the reason. Under
+    // the gate no workload has run, so `depends_on: condition: service_healthy` evaluated during
+    // preparation would wait for a health that cannot exist - the same deadlock the gate removes,
+    // through the other door. Waiting here, level by level, is what "start only after the dependency
+    // is healthy" means when "start" is the release.
+    //
+    // LEVELS, IN ORDER, AND SEQUENTIALLY WITHIN A LEVEL. `topo_levels` already ordered them; a level
+    // holds boxes with no dependency on each other, so releasing them one after another costs one
+    // write each and needs no worker pool. The cost of a pool here would be paid on every stack to
+    // save microseconds on none.
+    //
+    // A BOX WITH NO GATE IS NOT AN ERROR. `levels` may name a box that was filtered out of this run
+    // by reconciliation, and `gates` only holds the ones this `up` prepared. The lookup misses and
+    // the loop moves on, which is the same tolerance the prepare loop applies to the same case.
+    if gate_active {
+        let released = match gates.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(Error::Compose(
+                    "internal: the pre-exec gate registry was poisoned; no box was released"
+                        .to_string(),
+                ))
+            }
+        };
+        for level in &levels {
+            for name in level {
+                let Some(b) = boxes.iter().find(|b| &b.name == name) else {
+                    continue;
+                };
+                let Some((_, fd)) = released.iter().find(|(n, _)| n == name) else {
+                    continue;
+                };
+                // The wait can fail (a dependency that died, a timeout). Returning here drops
+                // `released`, which closes every remaining write end, and every still-prepared box
+                // reads EOF and refuses to exec. The stack does not come up half-released.
+                // OUTBOUND IS ATTACHED WHILE THE BOX IS STILL HELD, and that ordering is the whole
+                // correctness argument. pasta configures an interface INSIDE the box's network
+                // namespace from outside it; a workload that had already started would observe a
+                // namespace with no route one instant and a route the next, which is precisely the
+                // half-built network the gate exists to make impossible. Held at the gate, PID 1 has
+                // every namespace built, has run no instruction, and its pid cannot be recycled.
+                //
+                // A FAILURE HERE IS NAMED AND NOT FATAL. The stack without egress is the behaviour
+                // `--no-pod` had before this existed, so refusing to start would take away more than
+                // the failure did; but a service that cannot reach the internet fails later, inside
+                // its own code, where the reason is invisible - so it is said here, once, per box.
+                if outbound_for.contains(&b.name) {
+                    match registry::find(&b.name).and_then(|i| i.live_pid1()) {
+                        Some(pid1) => {
+                            // The stack's own directory, which `down` already removes: the NAT's
+                            // pid file and identity record go with the stack rather than into a
+                            // second lifetime somebody has to own.
+                            let dir = match crate::relayhold::stack_dir(&pod) {
+                                Ok(d) => d.join("outbound").join(&b.service),
+                                Err(e) => {
+                                    eprintln!(
+                                        "kern: warning: service '{}': no outbound - the stack \
+                                         directory is unavailable ({e})",
+                                        b.service
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(why) = crate::pod::attach_box_outbound(&dir, pid1) {
+                                eprintln!(
+                                    "kern: warning: service '{}': no outbound - {why}. The box \
+                                     starts, and reaches its peers; it cannot reach the internet",
+                                    b.service
+                                );
+                            }
+                        }
+                        None => eprintln!(
+                            "kern: warning: service '{}': no outbound - its PID 1 is not recorded \
+                             yet, so there was no namespace to attach the NAT to",
+                            b.service
+                        ),
+                    }
+                }
+                wait_for_conditions(b, &pod, &up_token)?;
+                if !gate_release(fd) {
+                    return Err(Error::Compose(format!(
+                        "service '{}': the box was prepared but could not be released (it is no \
+                         longer there) - no other service was released either",
+                        b.service
+                    )));
+                }
             }
         }
     }
@@ -917,6 +1538,247 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::compose::ComposeBox;
+
+    /// `external: true` on a missing volume is a REFUSAL, and the existence test is injected so the
+    /// decision can be asserted without creating volumes on the machine running the suite.
+    #[test]
+    fn a_missing_external_volume_is_refused_and_a_present_one_is_not() {
+        let mut db = ComposeBox {
+            name: "db".into(),
+            external_volumes: vec!["pgdata".into()],
+            ..Default::default()
+        };
+        // Present: kern must say nothing. This is the arm a mutation that inverts the filter breaks.
+        assert_eq!(
+            missing_external_volumes(std::slice::from_ref(&db), |_| true),
+            None
+        );
+        // Absent: refused, naming the volume and the way out.
+        let msg = missing_external_volumes(std::slice::from_ref(&db), |_| false)
+            .expect("a missing external volume must be refused");
+        assert!(msg.contains("pgdata"), "must name the volume: {msg}");
+        assert!(
+            msg.contains("kern volume create"),
+            "must give the way out: {msg}"
+        );
+        assert!(
+            msg.contains("this volume") && msg.contains("does not exist"),
+            "singular for one: {msg}"
+        );
+
+        // A volume with no `external:` declaration reaches this at all only through that field, so a
+        // stack that declares none is never refused however many volumes it mounts.
+        db.external_volumes.clear();
+        assert_eq!(missing_external_volumes(&[db], |_| false), None);
+        assert_eq!(missing_external_volumes(&[], |_| false), None);
+
+        // ONE VOLUME MOUNTED BY THREE SERVICES IS ONE PROBLEM. Naming it three times reads as three.
+        let shared: Vec<ComposeBox> = ["a", "b", "c"]
+            .iter()
+            .map(|n| ComposeBox {
+                name: (*n).to_string(),
+                external_volumes: vec!["shared".into()],
+                ..Default::default()
+            })
+            .collect();
+        let msg = missing_external_volumes(&shared, |_| false).expect("still missing");
+        assert_eq!(msg.matches("shared").count(), 1, "said once: {msg}");
+        assert!(msg.contains("this volume"), "one volume, singular: {msg}");
+
+        // Two distinct volumes: plural, sorted, both named.
+        let two = vec![
+            ComposeBox {
+                name: "a".into(),
+                external_volumes: vec!["zeta".into()],
+                ..Default::default()
+            },
+            ComposeBox {
+                name: "b".into(),
+                external_volumes: vec!["alpha".into()],
+                ..Default::default()
+            },
+        ];
+        let msg = missing_external_volumes(&two, |_| false).expect("both missing");
+        assert!(msg.contains("alpha, zeta"), "sorted and both: {msg}");
+        assert!(msg.contains("these volumes"), "plural for two: {msg}");
+
+        // The test is a MIXTURE, not "all present" or "all absent": only the absent one is named.
+        let msg = missing_external_volumes(&two, |n| n == "zeta").expect("one still missing");
+        assert!(msg.contains("alpha") && !msg.contains("zeta"), "{msg}");
+    }
+
+    /// THE CEILING IS A CEILING, and the truth table is the behaviour.
+    ///
+    /// A Docker container with no `mem_limit:` is bounded by the machine and nothing else; kern used
+    /// to hand such a service `kern box`'s 512 MiB, so it died at a number written nowhere in the
+    /// file. The default now matches Docker's bound, and `[kern] compose_memory_max` is the strict
+    /// posture - as a CEILING, because a limit a downloaded file can raise by writing a bigger
+    /// number is not a limit. Asserted here rather than at the call site for `internal_note`'s
+    /// reason: a decision taken inline can be asserted by nothing.
+    #[test]
+    fn the_memory_ceiling_caps_a_bigger_request_and_never_raises_a_smaller_one() {
+        const MIB: u64 = 1024 * 1024;
+        let cap = |asked, ceiling, ram| crate::commands::service_memory_cap(asked, ceiling, ram);
+
+        // NOTHING WRITTEN ANYWHERE: the machine's RAM, which is Docker's bound.
+        assert_eq!(
+            cap(None, None, Some(64 * MIB)),
+            Some((64 * MIB).to_string())
+        );
+        // ...and when `/proc/meminfo` cannot be read, no flag at all: the box keeps its own default,
+        // which is exactly what kern did before, so an unreadable host never fails in a NEW way.
+        assert_eq!(cap(None, None, None), None);
+
+        // THE OPERATOR'S CEILING BEATS THE MACHINE, and applies to a service that asked for nothing.
+        assert_eq!(
+            cap(None, Some(512 * MIB), Some(64 * MIB)),
+            Some((512 * MIB).to_string())
+        );
+
+        // THE FILE ASKED AND THERE IS NO CEILING: forwarded verbatim, units and all.
+        assert_eq!(cap(Some("256m"), None, Some(64 * MIB)), Some("256m".into()));
+
+        // A BIGGER REQUEST IS CAPPED. This is the arm that makes the key a policy.
+        assert_eq!(
+            cap(Some("8g"), Some(512 * MIB), None),
+            Some((512 * MIB).to_string())
+        );
+        // A SMALLER ONE IS LEFT ALONE: asking for less than the operator allows is allowed, and
+        // raising it to the ceiling would hand a service memory its own file refused.
+        assert_eq!(
+            cap(Some("128m"), Some(512 * MIB), None),
+            Some((128 * MIB).to_string())
+        );
+
+        // AN UNPARSEABLE `mem_limit:` IS FORWARDED, NOT SWALLOWED. Substituting the ceiling would
+        // start the service on a limit nobody wrote; forwarded, the box's flag parser names it.
+        assert_eq!(
+            cap(Some("512 gigs"), Some(512 * MIB), None),
+            Some("512 gigs".into())
+        );
+    }
+
+    /// `"32m"` AND `"33554432"` ARE THE SAME LIMIT, and the first version of the caller compared the
+    /// TEXT. Every service in a stack was then reported as capped the moment a ceiling existed,
+    /// including ones already well under it, which sends an operator looking for a limit that was
+    /// never applied. MEASURED before the fix: `mem_limit: 32m` under a 64 MiB ceiling was named.
+    #[test]
+    fn a_service_is_named_as_capped_only_when_the_number_actually_fell() {
+        let moved = crate::commands::ceiling_moved;
+        // Same value, different spelling: NOT a move.
+        assert!(!moved(Some("32m"), &Some("33554432".into())));
+        assert!(!moved(Some("512m"), &Some("512m".into())));
+        // The ceiling brought it down: a move.
+        assert!(moved(Some("8g"), &Some("67108864".into())));
+        // The file wrote nothing, so the ceiling decided the number. It would otherwise have had the
+        // host's RAM, so this is a move and is worth naming.
+        assert!(moved(None, &Some("67108864".into())));
+        // Nothing to apply at all: no move, and nothing to say.
+        assert!(!moved(Some("32m"), &None));
+        assert!(!moved(None, &None));
+        // Never counted as a move UPWARDS: a ceiling only lowers, and a report of a raise would be
+        // describing something the policy cannot do.
+        assert!(!moved(Some("32m"), &Some("67108864".into())));
+    }
+
+    /// A CONFIG THAT WILL NOT LOAD MUST NOT WIDEN A LIMIT.
+    ///
+    /// The two wrong answers are not symmetric: falling back to the historic 512 MiB costs a service
+    /// that needed more an error naming a cap, while falling through to "no ceiling" hands every
+    /// stack on the machine the whole of its RAM because of a typo in `kern.toml`, silently. The
+    /// same asymmetry `publish_policy` is built on, and the same one this project has already been
+    /// bitten by once (that first version answered `None` on any config error and widened every
+    /// published port to `0.0.0.0`).
+    #[test]
+    fn a_config_that_will_not_load_falls_back_to_the_box_default_and_never_to_no_ceiling() {
+        let ceiling = crate::commands::compose_memory_ceiling;
+        assert_eq!(
+            ceiling(Err(())),
+            Some(kern_isolation::DEFAULT_MEMORY_MAX),
+            "a config that will not load must NOT leave the stack uncapped"
+        );
+        // The key absent is the shipped behaviour: no ceiling, so the host's RAM decides.
+        assert_eq!(ceiling(Ok(None)), None);
+        assert_eq!(ceiling(Ok(Some("64m"))), Some(64 * 1024 * 1024));
+        // A value the config parser would have refused cannot reach here through the shipped path,
+        // and if it did it must NOT read as "no ceiling": that is the fail-open shape again, one
+        // layer down. It falls back to the same historic default an unloadable config does.
+        assert_eq!(
+            ceiling(Ok(Some("banane"))),
+            Some(kern_isolation::DEFAULT_MEMORY_MAX)
+        );
+    }
+
+    /// THE WHOLE POLICY IN ONE PLACE: what each service ends up with AND who gets named for it.
+    ///
+    /// Applied and reported were two loops apart before this was extracted, which is how a service
+    /// came to be named as capped without its number changing.
+    #[test]
+    fn the_policy_caps_each_service_and_names_only_the_ones_it_moved() {
+        const MIB: u64 = 1024 * 1024;
+        let svc = |name: &str, mem: Option<&str>| ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            memory: mem.map(str::to_string),
+            ..Default::default()
+        };
+
+        // NO CEILING: every service gets the host's RAM unless its file named a limit, and nothing
+        // is reported, because kern then does what Docker does.
+        let mut b = vec![svc("free", None), svc("asked", Some("256m"))];
+        assert_eq!(apply_memory_policy(&mut b, (None, Some(64 * MIB))), None);
+        assert_eq!(b[0].memory.as_deref(), Some("67108864"));
+        assert_eq!(b[1].memory.as_deref(), Some("256m"), "verbatim");
+
+        // A CEILING: it decides for the service that asked nothing, caps the one that asked for
+        // more, and leaves the one that asked for less exactly where it was.
+        let mut b = vec![
+            svc("free", None),
+            svc("big", Some("8g")),
+            svc("small", Some("32m")),
+        ];
+        let note = apply_memory_policy(&mut b, (Some(64 * MIB), Some(999 * MIB)))
+            .expect("a ceiling that moved two services owes a sentence");
+        assert_eq!(b[0].memory.as_deref(), Some("67108864"));
+        assert_eq!(b[1].memory.as_deref(), Some("67108864"));
+        assert_eq!(b[2].memory.as_deref(), Some("33554432"), "never raised");
+        assert!(note.contains("free, big"), "names the two it moved: {note}");
+        assert!(
+            !note.contains("small"),
+            "and NOT the one already under it: {note}"
+        );
+
+        // A ceiling nothing sits above is a ceiling that moved nothing: silent.
+        let mut b = vec![svc("small", Some("32m"))];
+        assert_eq!(apply_memory_policy(&mut b, (Some(64 * MIB), None)), None);
+
+        // NEITHER CEILING NOR READABLE HOST: no `--memory` at all, so the box keeps its own default.
+        // This is exactly what kern did before any of this, so an unreadable host never fails in a
+        // new way.
+        let mut b = vec![svc("free", None)];
+        assert_eq!(apply_memory_policy(&mut b, (None, None)), None);
+        assert_eq!(b[0].memory, None);
+    }
+
+    /// A CEILING THAT BINDS IS NEVER SILENT, and one that does not bind says nothing.
+    #[test]
+    fn the_ceiling_note_fires_only_when_the_ceiling_moved_something() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(crate::commands::memory_ceiling_note(&[], 512 * MIB), None);
+        let note = crate::commands::memory_ceiling_note(&["db", "web"], 512 * MIB)
+            .expect("a ceiling that moved two services owes a sentence");
+        assert!(note.contains("db, web"), "must name them: {note}");
+        assert!(note.contains("512 MiB"), "and quote the ceiling: {note}");
+        assert!(
+            note.contains("these services run under"),
+            "plural for two: {note}"
+        );
+        let one = crate::commands::memory_ceiling_note(&["db"], 64 * MIB).expect("one is enough");
+        assert!(
+            one.contains("this service runs under") && one.contains("64 MiB"),
+            "singular, and the figure comes from the argument: {one}"
+        );
+    }
 
     fn svc(name: &str, container_name: Option<&str>) -> ComposeBox {
         ComposeBox {
@@ -1018,5 +1880,67 @@ mod tests {
             vec!["db".to_string(), "database".to_string()],
             "the alias list must not gain a duplicate, and a user's own alias must survive"
         );
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::outbound_targets;
+    use crate::compose::ComposeBox;
+
+    fn svc(name: &str) -> ComposeBox {
+        ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// WHO GETS A ROUTE OUT IS A SECURITY DECISION, so it is asserted rather than read.
+    ///
+    /// `internal: true` finally means something here: with one namespace per service, a service the
+    /// file confines gets NO NAT, so there is no route out of its namespace at all. MEASURED end to
+    /// end on a two-service stack: the public one reported two routes and reached `1.1.1.1:443`, the
+    /// confined one reported zero and could not. The positive control matters as much as the
+    /// assertion - a build that attached no NAT to anything would satisfy "the confined service has
+    /// no route" while having removed the feature instead of enforcing the boundary.
+    ///
+    /// The three exclusions fail differently and are asserted separately: a confined service must
+    /// not have egress, a host-network service already has the host's own, and a `restart:` service
+    /// CANNOT be given one because `up` never holds it at the gate.
+    #[test]
+    fn only_the_services_that_may_reach_out_are_given_a_nat() {
+        let mut confined = svc("db");
+        confined.only_internal_networks = true;
+        let mut on_host = svc("edge");
+        on_host.net = true;
+        let mut managed = svc("cache");
+        managed.restart_always = true;
+        let plain = svc("web");
+        let boxes = [plain, confined, on_host, managed];
+
+        let got = outbound_targets(&boxes, false);
+        assert!(
+            got.contains("web"),
+            "an ordinary service reaches out: {got:?}"
+        );
+        assert!(
+            !got.contains("db"),
+            "a service confined to internal networks must get no NAT: {got:?}"
+        );
+        assert!(
+            !got.contains("edge"),
+            "a service on the host network already has the host's connectivity: {got:?}"
+        );
+        assert!(
+            !got.contains("cache"),
+            "a `restart:` service is started by systemd and cannot be held while a NAT is attached: \
+             {got:?}"
+        );
+        assert_eq!(got.len(), 1, "and nobody else: {got:?}");
+
+        // In a pod the pod carries the one NAT: a second per box would put two default routes in one
+        // namespace.
+        assert!(outbound_targets(&boxes, true).is_empty());
     }
 }

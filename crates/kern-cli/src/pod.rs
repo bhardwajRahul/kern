@@ -882,7 +882,9 @@ pub fn create_with_range(
 ///    always lost - i.e. every real app (node, django, postgres) failed to serve its own published
 ///    port while `compose up` still reported success. A silent partial failure, at runtime.
 ///  * `-T auto` (ns → host) would publish in-pod ports on the host with no `-p` at all, contradicting
-///    kern's explicit-publish, loopback-default model. Off by construction rather than by timing.
+///    kern's EXPLICIT-PUBLISH model: a port reaches the host because a `-p` said so, never because
+///    a service happened to bind it. Off by construction rather than by timing. (The bind ADDRESS a
+///    `-p` gets is Docker's `0.0.0.0` now; what has not changed is that something has to say `-p`.)
 ///
 /// Publishing stays entirely kern's job ([`crate::ports`] → `fork_forwarders`: bind the host port,
 /// `setns` into the box per connection). pasta is left doing exactly what it is here for: NAT'd
@@ -1136,10 +1138,29 @@ fn output_within(
 }
 
 fn setup_outbound(name: &str, holder: i32) -> Outbound {
+    setup_outbound_in(&pod_dir(name), holder)
+}
+
+/// Attach a rootless NAT to the namespaces of `target_pid`, keeping its state in `dir`.
+///
+/// PARAMETERISED ON (DIRECTORY, PID) RATHER THAN ON A POD NAME, because the same mechanism now has
+/// two users: a pod's holder, and a single box held at its pre-exec gate. The pod wrapper above is
+/// the only thing that knows about pod directories, so nothing about this function has to.
+///
+/// EXTRACTED, NOT REWRITTEN. Everything here was already load-bearing for pods: the captured stderr
+/// (pasta's message is the whole diagnosis), the ONE narrow retry for the netns-directory denial,
+/// the `PASTA_WATCHED` marker that records the case teardown need NOT chase, and the `pid:starttime`
+/// identity that keeps teardown from signalling a recycled pid. A second implementation for boxes
+/// would be a second set of those decisions to keep in step.
+///
+/// `target_pid` must be a process whose `/proc/<pid>/ns/{user,net}` the caller keeps alive for the
+/// duration of this call. For a box that is the gate: PID 1 is blocked on a read with its namespaces
+/// fully built, so the pid cannot be recycled and the namespaces cannot vanish underneath pasta.
+fn setup_outbound_in(dir: &std::path::Path, holder: i32) -> Outbound {
     let Some(pasta) = which_pasta() else {
         return Outbound::NotInstalled;
     };
-    let dir = pod_dir(name);
+    let dir = dir.to_path_buf();
     // stderr is CAPTURED, not discarded: when pasta refuses, its message is the whole diagnosis.
     let spawn = |watch_netns: bool| {
         output_within(
@@ -1203,28 +1224,85 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
     // the NAT, so split-horizon/LAN DNS keeps working. Only if the host has NONE that are usable from
     // the ns (e.g. systemd-resolved's 127.0.0.53 stub) do we fall back to a public resolver.
     let mut resolv = String::new();
-    if let Ok(host) = std::fs::read_to_string("/etc/resolv.conf") {
-        for l in host.lines() {
-            if let Some(ns) = l.strip_prefix("nameserver ") {
-                // A resolv.conf value is a single token; take it and drop any trailing comment.
-                let ns = ns.split_whitespace().next().unwrap_or("");
-                if !ns.starts_with("127.") && !ns.is_empty() {
-                    resolv.push_str(&format!("nameserver {ns}\n"));
-                }
-            }
-        }
-    }
-    if resolv.is_empty() {
-        resolv.push_str("nameserver 1.1.1.1\n"); // host has only a local stub → public fallback
+    for ns in host_nameservers() {
+        resolv.push_str(&format!("nameserver {ns}\n"));
     }
     // DNS is only "up" if we actually wrote the resolv.conf the box will bind - else don't claim it.
     // Distinguished from "no outbound at all": the NAT is attached either way, so a box can reach an
     // IP but not resolve a name, and saying "no outbound" would send the reader after the wrong
     // thing entirely.
-    if std::fs::write(resolv_path(name), resolv).is_ok() {
+    // WRITTEN NEXT TO THE OTHER STATE, not at a path derived from a pod name: `resolv_path(name)` is
+    // `pod_dir(name)/resolv.conf`, so the same file for a box lives in the box's own directory. The
+    // caller binds it wherever it belongs.
+    if std::fs::write(dir.join("resolv.conf"), resolv).is_ok() {
         Outbound::Up
     } else {
         Outbound::NoDns
+    }
+}
+
+/// The nameservers a NAT'd namespace should use, derived from the host.
+///
+/// The host's REAL (non-loopback) nameservers, which are reachable through the NAT, so split-horizon
+/// and LAN DNS keep working. A host that has only a local stub (systemd-resolved's `127.0.0.53`)
+/// offers nothing usable from inside a namespace, and the fallback is a public resolver rather than
+/// an empty file: an empty `resolv.conf` makes glibc try `127.0.0.1`, which is the box's own
+/// loopback and answers nothing.
+///
+/// SHARED BY THE POD AND THE PER-BOX PATH, because a stack must not resolve names differently
+/// depending on which wiring it was started with. The pod writes these into a file it binds; a
+/// `--no-pod` box receives the same list as `--dns` arguments and writes its own.
+///
+/// Never empty: the caller can rely on getting at least one resolver.
+#[must_use]
+pub fn host_nameservers() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(host) = std::fs::read_to_string("/etc/resolv.conf") {
+        for l in host.lines() {
+            if let Some(ns) = l.strip_prefix("nameserver ") {
+                // A resolv.conf value is a single token; take it and drop any trailing comment.
+                let ns = ns.split_whitespace().next().unwrap_or("");
+                // A LITERAL, because it travels into a `--dns` argument and then into a file glibc
+                // parses: a value carrying whitespace or anything but an address would be dropped
+                // silently by the resolver, which is the failure mode this whole path exists to
+                // avoid.
+                if !ns.starts_with("127.")
+                    && !ns.is_empty()
+                    && ns.parse::<std::net::IpAddr>().is_ok()
+                    && !out.iter().any(|o| o == ns)
+                {
+                    out.push(ns.to_string());
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("1.1.1.1".to_string()); // host has only a local stub -> public fallback
+    }
+    out
+}
+
+/// Attach a rootless NAT to a BOX's namespaces, so a `--no-pod` service reaches the internet.
+///
+/// THE CALLER MUST HOLD THE BOX AT ITS PRE-EXEC GATE. pasta is attached by opening
+/// `/proc/<pid>/ns/{user,net}`, so the pid must be alive and un-recycled for the duration, and the
+/// workload must not yet have run or it would observe a namespace that has no route one instant and
+/// a route the next. The gate gives exactly that: PID 1 blocked on a read with every namespace built.
+///
+/// Returns `Ok(())` when the NAT is up, and the reason otherwise. `pasta` missing is a reason like
+/// any other here rather than a silent skip: a `--no-pod` stack that expected egress and has none
+/// fails in the workload, far from the cause.
+pub fn attach_box_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), String> {
+    if std::fs::create_dir_all(dir).is_err() {
+        return Err(format!("could not create {}", dir.display()));
+    }
+    match setup_outbound_in(dir, pid1) {
+        // `NoDns` is success HERE, unlike for a pod: the box writes its own `/etc/resolv.conf` from
+        // the `--dns` arguments it was given at launch, so the file this function could not write is
+        // one nothing reads. Reporting it as a failure would refuse egress that is working.
+        Outbound::Up | Outbound::NoDns => Ok(()),
+        Outbound::NotInstalled => Err("pasta (passt) is not installed".to_string()),
+        Outbound::Failed(why) => Err(why),
     }
 }
 

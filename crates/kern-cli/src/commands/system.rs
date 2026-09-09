@@ -56,7 +56,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [ctx]        Build a local image from a Dockerfile
+    {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [--target S] [ctx]  Build a local image from a Dockerfile (--target: stop at that `FROM … AS S` stage)
     {c}images{z} [--json]                                                List pulled (cached) images
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
@@ -85,7 +85,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
-    {c}up{z} [--no-pod] [-d] / {c}down{z}                                      Bring up / tear down the compose file in this dir
+    {c}up{z} [--no-pod|--pod] [-d] / {c}down{z}                                 Bring up / tear down the stack (--no-pod: a namespace per service; --pod: one shared; default: split only when `networks:` separate two services)
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     {c}pod{z} create <name> [--no-outbound] [--uid-range]                Shared-network pod: peers reach each other by name
@@ -128,10 +128,22 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
     -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
     -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
-                        like 8000-8010:8000-8010 works; binds 127.0.0.1 by default, use
-                        0.0.0.0:H:B to expose on all interfaces; repeatable)
+                        like 8000-8010:8000-8010 works; binds 0.0.0.0 (all interfaces) like
+                        Docker, use 127.0.0.1:H:B for loopback only, or set
+                        `[kern] publish_bind` in kern.toml to make loopback the
+                        host's policy; repeatable)
     --add-host N:IP     Add an /etc/hosts entry N → IP in the box; IP may be `host-gateway`
                         (the host's address, to reach a service on the host); repeatable
+    --dns IP            Set the box's resolver: one `nameserver` line in /etc/resolv.conf per
+                        flag (repeatable). Without it the image's own file is left untouched
+    --dns-search DOM    Add a domain to the resolver's `search` line (repeatable)
+    --dns-option OPT    Add a resolv.conf option, e.g. ndots:2 or timeout:2 (repeatable)
+    --log-max-size <sz> Rotate the box's captured log at this size (default 16m)
+    --log-max-file <n>  How many log files to keep, the active one included (default 2)
+    --memory-reservation <size>  Soft memory floor (cgroup memory.low): protected under pressure,
+                        never a cap and never an OOM kill. Docker's mem_reservation
+    --cpu-weight <n>    Relative CPU share under contention (cgroup cpu.weight, 1-10000, 100 =
+                        normal). Orthogonal to --cpus, which is an absolute ceiling
     --secret SPEC       Deliver a secret as /run/secrets/NAME (mode 0400): SRC[:NAME] (file),
                         NAME=- (from stdin), or NAME=value (inline - the value lands in argv, so
                         it is readable by any user via `ps`: use a file or stdin for a real one);

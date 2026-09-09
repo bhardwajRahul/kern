@@ -19,6 +19,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 mod yaml;
+/// The `devices:` normaliser, exported because THREE surfaces must agree on what a device entry
+/// means: a `docker-compose.yml`, a `kern.toml` compose file, and `kern docker run --device`. A
+/// second implementation for the shim is how `/dev/net/tun` would come to mean `--tun` in one place
+/// and a plain bind in another.
+pub use yaml::normalise_devices;
+/// The two sentences the DRIVER owes a reader once it has chosen the wiring.
+///
+/// Exported because the choice moved: a driver that auto-selects the wiring from the file cannot
+/// tell the parser which one it is before parsing, so the parser is handed [`StackNet::Undecided`],
+/// says nothing about `networks:`/`internal:`, and the driver says both here. Pure functions of the
+/// decision, so what gets said can be asserted without capturing stderr.
+pub use yaml::{internal_note, networks_note};
 
 /// A resolved compose `build:` directive. `context` is a path RELATIVE to the compose file's dir (the
 /// caller confines it beneath that dir before use - traversal guard). `dockerfile` is relative to the
@@ -28,6 +40,14 @@ pub struct BuildDirective {
     pub context: String,
     pub dockerfile: Option<String>,
     pub args: Vec<String>,
+    /// `build.target:` - the named stage to stop at in a multi-stage Dockerfile.
+    ///
+    /// IGNORING IT IS A SILENT WRONG ANSWER, which is why it is here. A Dockerfile with
+    /// `AS development` and `AS production` is the standard shape, and a compose file selects
+    /// between them with this key; a builder that ignores it produces the LAST stage and the stack
+    /// then runs an image nobody asked for, with nothing said. That is the one failure mode this
+    /// compose implementation refuses to have.
+    pub target: Option<String>,
 }
 
 /// The resource-profile kinds a compose file may name.
@@ -130,6 +150,14 @@ pub struct ComposeBox {
     /// forks (nginx, supervisord, any `sh -c` wrapper) doesn't accumulate zombies.
     pub init: bool,
     pub net: bool,
+    /// Compose `network_mode: none` - the service gets NO network beyond its own loopback.
+    ///
+    /// Distinct from `net` (which SHARES the host's) and from the default (a pod member, or a
+    /// per-service namespace with a NAT): this one asks for isolation, and kern can give exactly
+    /// that by keeping the box out of the pod and attaching no NAT to it. Before this it was
+    /// reported as "not applied per service", which was true only while a stack was always one
+    /// namespace.
+    pub net_none: bool,
     pub uid_range: bool,
     /// Set when the compose file wrote `uid_range = false` explicitly, so the per-image default
     /// (turn it ON for OCI images) does NOT override a deliberate opt-out.
@@ -140,7 +168,102 @@ pub struct ComposeBox {
     /// member in-process for the stack's lifetime (restart on ANY exit), not degraded to on-failure.
     pub restart_always: bool,
     pub tun: bool,
+    /// Compose `devices:` - host device nodes bound into the box, already normalised to kern's `-v`
+    /// grammar (`src:dst` or `src:dst:ro`).
+    ///
+    /// A FIELD OF ITS OWN AND NOT AN APPEND TO `volumes`, because `volumes` is ASSIGNED by its own
+    /// key arm (`b.volumes = volumes_value(node)`) and the service keys are read in FILE order. A
+    /// push into `volumes` from the `devices` arm was therefore erased by any `volumes:` written
+    /// below it, which is most files. MEASURED before this field existed: the identical string
+    /// under `volumes:` gave the workload `crw-rw---- 10, 232 /dev/kvm` and under `devices:` gave
+    /// `No such file or directory`, from the same tree, in the same second. Order-dependence in a
+    /// parser is a defect even when the order happens to be right.
+    pub devices: Vec<String>,
+    /// tmpfs mounts that came from a LONG-FORM `volumes:` entry (`{type: tmpfs, target: …}`), kept
+    /// apart from `tmpfs` for the same reason `devices` is kept apart from `volumes`: the `tmpfs:`
+    /// key ASSIGNS its field, and the service keys are read in file order, so anything appended to
+    /// `tmpfs` from the `volumes` arm would be erased by a `tmpfs:` written below it. Both lists are
+    /// emitted as `--tmpfs`, so the split is invisible downstream.
+    pub tmpfs_from_volumes: Vec<String>,
+    /// Compose `dns:` → one `--dns` per entry: the box's `nameserver` lines.
+    ///
+    /// Docker accepts a scalar or a list here and so does this; the values are NOT validated in the
+    /// parser, because `kern box` already refuses a `--dns` that is not an IP literal and a second
+    /// copy of that rule is how the two come to disagree. What the parser must not do is interpolate
+    /// a `${VAR}` into something that looks like an address and is not: an unresolved variable
+    /// reaches the flag and is refused there, by name, before any box starts.
+    pub dns: Vec<String>,
+    /// Compose `dns_search:` → one `--dns-search` per entry (the `search` line).
+    pub dns_search: Vec<String>,
+    /// Compose `dns_opt:` → one `--dns-option` per entry (the `options` line).
+    pub dns_options: Vec<String>,
+    /// Compose `logging.options.max-size:` → `--log-max-size`.
+    ///
+    /// FORWARDED AS THE WRITTEN STRING, not as a parsed number: `kern box` owns the size grammar
+    /// (`10m`, `1g`, a bare byte count) and a second parser in this crate is how the two come to
+    /// disagree about what `10m` means. A value this crate cannot make sense of is therefore
+    /// refused by the flag, by name, before the box starts.
+    pub log_max_size: Option<String>,
+    /// Compose `links:` - `SERVICE[:ALIAS]`, normalised to `SERVICE:ALIAS` with the alias defaulting
+    /// to the service name.
+    ///
+    /// A LINK IS A NAME, NOT A NETWORK, in a kern stack. Docker's `links` predates user-defined
+    /// networks and did two things: it created the dependency edge, and it put an ALIAS for the
+    /// target in the source's `/etc/hosts`. kern's stack already gives every service a name, so the
+    /// only part with anything left to do is the alias, and it is the part every real use in a
+    /// 240-file corpus was written for (`db:database`, `s3:s3.amazonaws.com`).
+    ///
+    /// The ORDERING half is honoured too, by pushing the target onto `depends_on`: Docker starts a
+    /// linked service first, and a file that relies on that and gets no edge is a start-order
+    /// regression that shows up as an intermittent connection failure.
+    pub links: Vec<String>,
+    /// Compose `logging.options.max-file:` → `--log-max-file` (counts the active file, as Docker does).
+    pub log_max_file: Option<String>,
+    /// Compose `mem_reservation:` → `--memory-reservation` (cgroup `memory.low`, a soft floor).
+    pub memory_reservation: Option<String>,
+    /// Compose `pull_policy:` → `--pull` (`always` / `never` / `missing`).
+    pub pull: Option<String>,
+    /// Compose `shm_size:` → `--shm-size`.
+    ///
+    /// IT USED TO BE DROPPED ON PURPOSE, and the reasoning was sound for the case it considered:
+    /// kern mounts `/dev/shm` unsized and charges it to the box's memory cgroup, so `mem_limit` is
+    /// the real bound and a fixed size would either be moot or reintroduce Docker's 64 MB default,
+    /// which is the footgun that breaks Postgres under load.
+    ///
+    /// It is wrong in the other direction, which is the direction real files use. MEASURED on a
+    /// neutral corpus of 259 compose files: the two that set it ask for `1g` and `8GB`, both LARGER
+    /// than kern's 512 MiB default memory cap - so the file asked for more shared memory than the
+    /// box was given, and got less without that being the point of the key. Forwarding the value
+    /// restores what the file says; the cgroup still bounds the total, which is kern's own guarantee
+    /// and is stated rather than removed.
+    pub shm_size: Option<String>,
+    /// Compose `volumes_from:` - services whose volumes this one inherits, each optionally with a
+    /// `:ro` suffix. Resolved into `volumes` after the whole file is parsed, because the named
+    /// service may be defined below this one.
+    pub volumes_from: Vec<String>,
+    /// Compose `cpu_shares:` → `--cpu-weight`, converted from Docker's scale to cgroup v2's.
+    ///
+    /// The two scales are different and the conversion is the documented one systemd uses:
+    /// Docker/cgroup-v1 shares run 2..=262144 with 1024 as "normal", cgroup v2 weights run
+    /// 1..=10000 with 100 as "normal". Forwarding the number unconverted would give a service
+    /// asking for the DEFAULT share (1024) a weight ten times the normal one, which is the shape of
+    /// a key that looks applied and means something else.
+    pub cpu_weight: Option<String>,
     pub volumes: Vec<String>,
+    /// Volume names this service mounts that the file declared `external: true`, i.e. "this volume
+    /// already exists, do NOT create it". Empty for every ordinary volume.
+    ///
+    /// THE WHOLE POINT OF THE KEY IS THE REFUSAL. kern auto-creates a named volume on first use,
+    /// which is right for a volume the file owns and wrong for this one: `external: true` is written
+    /// precisely when the data is somebody else's and being handed an empty directory instead is a
+    /// silent data-loss shape (the service starts, finds nothing, and initialises over the top).
+    /// Docker refuses to start such a stack; kern said nothing at all, because the top-level
+    /// `volumes:` block was skipped without being read.
+    ///
+    /// The name recorded here is the name kern will MOUNT, which is the `name:` override when the
+    /// declaration carries one and the compose key otherwise - the same rewrite is applied to
+    /// `volumes` so the existence check and the mount cannot be about two different volumes.
+    pub external_volumes: Vec<String>,
     pub env: Vec<String>,
     pub env_file: Vec<String>,
     pub ports: Vec<String>,
@@ -216,6 +339,21 @@ pub struct ComposeBox {
     /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
     /// resolves it exactly like the service name. Empty for the common (no-alias) case.
     pub net_aliases: Vec<String>,
+    /// The networks this service joins, as written in its `networks:` key.
+    ///
+    /// EMPTY MEANS THE IMPLICIT `default`, which is the Compose Specification's rule and not a
+    /// shortcut: a service with
+    /// no `networks:` key joins a network Compose creates for the project, so two such services can
+    /// reach each other and a service pinned to `backend` cannot reach them. The empty vector is
+    /// resolved to `["default"]` at the one place that compares memberships (`nopod::shares_network`)
+    /// rather than being filled in here, so `config` still prints what the file said.
+    ///
+    /// WHAT IT IS FOR. In a pod this is inert: one namespace, no segregation possible, and the
+    /// parser says so. Without a pod each service has its OWN namespace and reachability is built
+    /// edge by edge out of relays, so the membership decides which edges exist - two services with
+    /// no network in common get no relay and no hosts entry for each other, which is segregation
+    /// enforced by construction rather than by a firewall rule someone has to keep correct.
+    pub networks: Vec<String>,
     /// Every network this service declares is marked `internal: true`, and it declares at least one.
     ///
     /// POSITIVE EVIDENCE, and the shape is the point. kern gives a stack ONE network namespace, so
@@ -226,6 +364,16 @@ pub struct ComposeBox {
     /// the safe direction: a stack that silently loses the internet fails in a way nobody attributes
     /// to a compose key that used to be ignored.
     pub only_internal_networks: bool,
+    /// At least ONE of this service's networks is marked `internal: true`.
+    ///
+    /// The weaker sibling of [`Self::only_internal_networks`], and both are needed: that one says
+    /// "this service is confined", this one says "the key affects this service at all". The driver
+    /// uses this to decide whether the `internal:` sentence is owed to the reader, and the other to
+    /// decide which sentence it is.
+    ///
+    /// A network marked internal that NO service joins sets neither, and nothing is said about it:
+    /// it confines nothing, so there is nothing to report.
+    pub on_internal_network: bool,
 }
 
 impl ComposeBox {
@@ -435,6 +583,39 @@ impl ComposeBox {
         if self.tun {
             cmd.arg("--tun");
         }
+        // `devices:` RIDES THE VOLUME FLAG because that is the mechanism: a device node is bound in,
+        // not re-created, so there is nothing a second flag would express. See the field's own note
+        // for why the entries do not simply live in `volumes`.
+        for v in &self.devices {
+            cmd.arg("--volume").arg(v);
+        }
+        for v in &self.dns {
+            cmd.arg("--dns").arg(v);
+        }
+        for v in &self.dns_search {
+            cmd.arg("--dns-search").arg(v);
+        }
+        for v in &self.dns_options {
+            cmd.arg("--dns-option").arg(v);
+        }
+        if let Some(v) = &self.log_max_size {
+            cmd.arg("--log-max-size").arg(v);
+        }
+        if let Some(v) = &self.log_max_file {
+            cmd.arg("--log-max-file").arg(v);
+        }
+        if let Some(v) = &self.memory_reservation {
+            cmd.arg("--memory-reservation").arg(v);
+        }
+        if let Some(v) = &self.cpu_weight {
+            cmd.arg("--cpu-weight").arg(v);
+        }
+        if let Some(v) = &self.pull {
+            cmd.arg("--pull").arg(v);
+        }
+        if let Some(v) = &self.shm_size {
+            cmd.arg("--shm-size").arg(v);
+        }
         for v in &self.add_host {
             cmd.arg("--add-host").arg(v);
         }
@@ -474,7 +655,7 @@ impl ComposeBox {
         for v in &self.secrets {
             cmd.arg("--secret").arg(v);
         }
-        for v in &self.tmpfs {
+        for v in self.tmpfs.iter().chain(self.tmpfs_from_volumes.iter()) {
             cmd.arg("--tmpfs").arg(v);
         }
         for v in &self.cap_add {
@@ -565,15 +746,123 @@ pub fn stack_is_internal_only(boxes: &[ComposeBox]) -> bool {
     !boxes.is_empty() && boxes.iter().all(|b| b.only_internal_networks)
 }
 
+/// The paths that mean "this service drives a Docker daemon".
+///
+/// Both spellings are in the wild and `/var/run` is a symlink to `/run` on every systemd host, so
+/// matching one of them would miss half the files that do this.
+const DOCKER_SOCKET_PATHS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
+
+/// Join a list of service names for a one-line note, bounded so a 40-service stack does not print a
+/// paragraph. The count is always exact even when the list is cut, because the number is the part a
+/// reader acts on.
+pub fn name_list(names: &[&str]) -> String {
+    const SHOWN: usize = 6;
+    if names.len() <= SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        names[..SHOWN].join(", "),
+        names.len() - SHOWN
+    )
+}
+
+/// The sentence a stack is owed about a mounted Docker socket, or `None` when no service mounts one.
+///
+/// This is the one incompatibility in this group that kern can never close: the mount succeeds, the
+/// stack comes up, and the service fails later inside its own code with a connection error that
+/// points at Docker rather than at kern. Naming it at `up` is the whole remedy available.
+pub fn docker_socket_note(boxes: &[ComposeBox]) -> Option<String> {
+    let users: Vec<&str> = boxes
+        .iter()
+        .filter(|b| {
+            b.volumes.iter().any(|v| {
+                let src = v.split(':').next().unwrap_or("");
+                DOCKER_SOCKET_PATHS.contains(&src)
+            })
+        })
+        .map(ComposeBox::service_name)
+        .collect();
+    if users.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "these services mount the Docker socket: {}. kern is DAEMONLESS: it runs no Docker daemon \
+         and serves no Engine API, so the mount carries whatever that path holds on this host and \
+         the service's Docker client has nothing to talk to. There is no kern equivalent; such a \
+         service needs real Docker",
+        name_list(&users)
+    ))
+}
+
+/// The sentence a stack is owed about the WIRING it got, or `None` when it is owed none.
+///
+/// WHY A POD IS THE ONLY CASE THAT OWES ONE. The per-service wiring is already announced where it is
+/// chosen (and asked for outright by `--no-pod`), and it isolates rather than exposes, so there is
+/// nothing to declare. One shared namespace, on the other hand, means the services SHARE 127.0.0.1,
+/// and that is an exposure and not a failure: nothing breaks, so nothing complains, so the
+/// compatibility measurement counts the file as clean. An admin endpoint, `/metrics`, a pprof
+/// handler or any framework that trusts `127.0.0.0/8` without authentication is reachable from every
+/// other service in the stack, which under Docker it would not be.
+///
+/// Only for a stack with something to expose: below two services there is no peer to be reached
+/// from, and the sentence would be noise on every single-service file in the corpus.
+pub const fn wiring_note(net: StackNet, service_count: usize) -> Option<&'static str> {
+    match net {
+        StackNet::Pod if service_count >= 2 => Some(POD_SHARED_LOOPBACK),
+        // One service: nobody to be reached from. Per service: a namespace each, so each keeps its
+        // own 127.0.0.1 and the choice was already announced. Undecided: the driver has not decided.
+        StackNet::Pod | StackNet::PerService | StackNet::Undecided => None,
+    }
+}
+
+/// The `wiring_note` sentence, named so a test asserts the CHOICE and not a copy of the text.
+pub const POD_SHARED_LOOPBACK: &str =
+    "this stack runs in ONE shared network namespace, so its services share 127.0.0.1: a port a \
+     service binds on the loopback is reachable from every other service in the stack, which under \
+     Docker it would not be. `--no-pod` gives each service its own namespace (and its own loopback) \
+     at the cost of a relay hop between peers";
+
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
-    parse_with_env(text, &DotEnv::default())
+    parse_with_env(text, &DotEnv::default(), StackNet::Pod)
+}
+
+/// How the stack will be wired, which decides what `networks:` MEANS and therefore what the parser
+/// may truthfully say about it.
+///
+/// PASSED IN RATHER THAN INFERRED OR STORED GLOBALLY. The sentence the parser prints about
+/// `networks:` is a claim about what the run will do, and the two modes make OPPOSITE claims true:
+/// in a pod every service shares one namespace and services on separate networks CAN reach each
+/// other; without a pod the relay graph follows the memberships and they CANNOT. A parser that
+/// cannot see the mode has to pick one and be wrong half the time, and a process-global flag would
+/// make the output depend on an assignment nobody can see from the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackNet {
+    /// One shared network namespace for the whole stack: `networks:` cannot segregate anything.
+    Pod,
+    /// One namespace per service, peers reached through relays: `networks:` decides which edges
+    /// exist, so segregation is real.
+    PerService,
+    /// The caller has not chosen yet, because the choice depends on what the file turns out to say.
+    ///
+    /// A DRIVER THAT AUTO-SELECTS THE WIRING CANNOT KNOW THE MODE BEFORE PARSING: it selects the
+    /// per-service wiring precisely when the file expresses segregation, which is a fact the parse
+    /// produces. Handing the parser `Pod` provisionally would make it print the pod's sentence about
+    /// a stack that is about to be wired the other way, which is the one thing these notes exist not
+    /// to do. With this variant the parser stays silent about `networks:` and `internal:` and the
+    /// driver says both, once, after it has decided.
+    Undecided,
 }
 
 /// [`parse`], plus a project `.env` consulted for `${VAR}` interpolation when the process environment
 /// does not define the name. Split from `parse` so the pure-text entry point (and the fuzz target)
 /// keeps its one-argument signature.
-pub fn parse_with_env(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true)
+pub fn parse_with_env(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, true, net)
 }
 
 /// Parse an OVERRIDE layer (`-f base.yml -f override.yml`, every file after the first).
@@ -582,8 +871,12 @@ pub fn parse_with_env(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, St
 /// `image:` - it only restates the keys it changes. Validating each file standalone rejected exactly
 /// the file an override is supposed to be; the "nothing to run" check is therefore deferred to the
 /// MERGED result, where it still catches a service no layer ever gave something to run.
-pub fn parse_override(text: &str, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false)
+pub fn parse_override(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, false, net)
 }
 
 /// Assert every service ended up with something to run. Called on the merged stack (see
@@ -702,6 +995,7 @@ fn parse_layer(
     text: &str,
     dotenv: &DotEnv,
     require_runnable: bool,
+    net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
@@ -715,7 +1009,7 @@ fn parse_layer(
         return Err("the file is empty: a compose file needs a `services:` block".into());
     }
     if is_yaml(text) {
-        yaml::parse_with_env(text, dotenv, require_runnable)
+        yaml::parse_with_env(text, dotenv, require_runnable, net)
     } else {
         parse_toml(text)
     }
@@ -811,6 +1105,7 @@ impl ComposeBox {
         seq!(
             expose,
             volumes,
+            external_volumes,
             env,
             env_file,
             ports,
@@ -1057,6 +1352,35 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "bind_rootfs" => b.bind_rootfs = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "restart" => b.restart = parse_bool(val).map_err(|e| line_err(i, &e))?,
             "tun" => b.tun = parse_bool(val).map_err(|e| line_err(i, &e))?,
+            // kern's own TOML spelling of the same key, so the two parsers describe one schema. The
+            // value is the compose grammar (`HOST[:CONTAINER[:PERMS]]`), normalised by the same
+            // function the YAML arm uses, so `devices` cannot come to mean two things.
+            "links" => {
+                let raw = parse_string_array(val).map_err(|e| line_err(i, &e))?;
+                b.links = crate::yaml::normalise_links(&raw, &mut b.depends_on);
+            }
+            "networks" => b.networks = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "memory_reservation" | "mem_reservation" => {
+                b.memory_reservation = Some(val.trim().trim_matches('"').to_string())
+            }
+            "cpu_weight" => b.cpu_weight = Some(val.trim().trim_matches('"').to_string()),
+            "pull" | "pull_policy" => b.pull = Some(val.trim().trim_matches('"').to_string()),
+            "shm_size" => b.shm_size = Some(val.trim().trim_matches('"').to_string()),
+            "volumes_from" => {
+                b.volumes_from = parse_string_array(val).map_err(|e| line_err(i, &e))?
+            }
+            "log_max_size" => b.log_max_size = Some(val.trim().trim_matches('"').to_string()),
+            "log_max_file" => b.log_max_file = Some(val.trim().trim_matches('"').to_string()),
+            "dns" => b.dns = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "dns_search" => b.dns_search = parse_string_array(val).map_err(|e| line_err(i, &e))?,
+            "dns_opt" | "dns_options" => {
+                b.dns_options = parse_string_array(val).map_err(|e| line_err(i, &e))?
+            }
+            "devices" => {
+                let raw = parse_string_array(val).map_err(|e| line_err(i, &e))?;
+                let svc = b.name.clone();
+                b.devices = crate::yaml::normalise_devices(&raw, &svc, &mut b.tun);
+            }
             "init" => b.init = parse_bool(val).map_err(|e| line_err(i, &e))?,
             // Repeatable flags - arrays of the same CLI strings.
             "command" => b.command = parse_string_array(val).map_err(|e| line_err(i, &e))?,
@@ -2150,7 +2474,7 @@ mod compat_field_tests {
     #[test]
     fn merge_stacks_follows_the_documented_rules() {
         let base = parse("services:\n  a:\n    image: alpine\n    command: base\n    ports: [\"1:1\"]\n    environment: [X=1]\n").expect("base");
-        let over = parse_override("services:\n  a:\n    command: over\n    ports: [\"2:2\"]\n    environment: [Y=2]\n  b:\n    image: busybox\n", &DotEnv::default()).expect("override");
+        let over = parse_override("services:\n  a:\n    command: over\n    ports: [\"2:2\"]\n    environment: [Y=2]\n  b:\n    image: busybox\n", &DotEnv::default(), StackNet::Pod).expect("override");
         let m = merge_stacks(base, over);
         assert_eq!(m.len(), 2, "a service only in the override is added");
         let a = m.iter().find(|b| b.name == "a").expect("a");
@@ -2176,6 +2500,7 @@ mod compat_field_tests {
         let over = parse_override(
             "services:\n  a:\n    environment: [X=1]\n",
             &DotEnv::default(),
+            StackNet::Pod,
         )
         .expect("override parses without image");
         assert!(
@@ -2480,7 +2805,7 @@ mod dotenv_tests {
         let yaml =
             "services:\n  a:\n    image: alpine\n    command: echo ${KERN_DOTENV_PREC_TEST}\n";
 
-        let only_dotenv = parse_with_env(yaml, &de).expect("parses");
+        let only_dotenv = parse_with_env(yaml, &de, StackNet::Pod).expect("parses");
         assert!(
             only_dotenv[0].command.join(" ").contains("da-dotenv"),
             "unset in the shell → the .env value is used: {:?}",
@@ -2488,7 +2813,7 @@ mod dotenv_tests {
         );
 
         std::env::set_var("KERN_DOTENV_PREC_TEST", "da-shell");
-        let with_shell = parse_with_env(yaml, &de).expect("parses");
+        let with_shell = parse_with_env(yaml, &de, StackNet::Pod).expect("parses");
         std::env::remove_var("KERN_DOTENV_PREC_TEST");
         assert!(
             with_shell[0].command.join(" ").contains("da-shell"),
@@ -2535,7 +2860,7 @@ mod dotenv_tests {
         let yaml =
             "services:\n  a:\n    image: alpine\n    command: echo ${KERN_NO_DOTENV_XYZ:-def}\n";
         assert_eq!(
-            parse_with_env(yaml, &DotEnv::default()).map(|b| b[0].command.clone()),
+            parse_with_env(yaml, &DotEnv::default(), StackNet::Pod).map(|b| b[0].command.clone()),
             parse(yaml).map(|b| b[0].command.clone())
         );
     }
@@ -2942,6 +3267,40 @@ mod contract_tests {
             ("depends_completed", "all_deps + the run-to-completion wait"),
             ("build", "`kern build` runs before the box exists"),
             (
+                "volumes_from",
+                "the YAML parser resolves it into `volumes` after the whole file is read (the named \
+                 service may be defined below the one that inherits it), so the box sees ordinary \
+                 `--volume` arguments and this field is the record of where they came from",
+            ),
+            (
+                "external_volumes",
+                "the compose driver refuses `up` when one of these volumes does not exist, which is \
+                 the whole meaning of `external: true`; the mount itself is an ordinary entry in \
+                 `volumes` by then",
+            ),
+            (
+                "net_none",
+                "the compose driver keeps the box out of the pod and attaches no NAT to it, which is \
+                 exactly `network_mode: none`",
+            ),
+            (
+                "on_internal_network",
+                "the compose driver reads it to decide whether the `internal:` sentence is owed at \
+                 all; `only_internal_networks` then decides which of the two sentences it is",
+            ),
+            (
+                "networks",
+                "nopod::shares_network: without a pod the relay graph and the per-service hosts file \
+                 are built only between services with a network in common. In a pod it is inert and \
+                 the parser says so",
+            ),
+            (
+                "links",
+                "nopod::link_host_args turns each `SERVICE:ALIAS` into an `--add-host ALIAS:IP` for \
+                 the source box, in both stack modes; the ordering half is already folded into \
+                 `depends_on` by the parser",
+            ),
+            (
                 "port",
                 "port_env() injects PORT=, and check_pod_global_conflicts claims the slot",
             ),
@@ -3151,5 +3510,91 @@ vcpu = "slim"
             "these `[box.NAME]` keys are accepted by the parser and appear nowhere in \
              docs/CONFIG.md: {missing:?}. Document them, or stop accepting them."
         );
+    }
+}
+
+#[cfg(test)]
+mod stack_note_tests {
+    use super::*;
+
+    fn svc(name: &str) -> ComposeBox {
+        ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_docker_socket_note_fires_on_both_spellings_and_on_nothing_else() {
+        // `/var/run` is a symlink to `/run` on every systemd host and both spellings are in the
+        // wild, so matching one of them would miss half the files that do this.
+        for path in ["/var/run/docker.sock", "/run/docker.sock"] {
+            let mut b = svc("ci");
+            b.volumes = vec![format!("{path}:/var/run/docker.sock")];
+            let note = docker_socket_note(std::slice::from_ref(&b))
+                .unwrap_or_else(|| panic!("must fire for {path}"));
+            assert!(note.contains("ci"), "must name the service: {note}");
+            assert!(
+                note.contains("DAEMONLESS"),
+                "must say why there is nothing behind it: {note}"
+            );
+        }
+
+        // A file of the same NAME somewhere else is not the daemon's socket, and a stack that mounts
+        // an ordinary volume must stay silent: a warning that fires on unrelated paths is one a
+        // reader learns to skip.
+        let mut other = svc("app");
+        other.volumes = vec![
+            "./tools/docker.sock:/x".to_string(),
+            "data:/var/lib/data".to_string(),
+        ];
+        assert_eq!(docker_socket_note(std::slice::from_ref(&other)), None);
+        assert_eq!(docker_socket_note(&[svc("plain")]), None);
+
+        // The note is about the STACK: one line naming every service that does it, not one line each.
+        let mut a = svc("a");
+        a.volumes = vec!["/run/docker.sock:/run/docker.sock".into()];
+        let mut c = svc("c");
+        c.volumes = vec!["/var/run/docker.sock:/var/run/docker.sock".into()];
+        let note = docker_socket_note(&[a, svc("b"), c]).expect("two services do it");
+        assert!(note.contains("a, c"), "both, in file order: {note}");
+        assert!(
+            !note.contains(" b"),
+            "and not the one that does not: {note}"
+        );
+    }
+
+    /// The whole truth table, because the interesting arms are the ones that say NOTHING and a
+    /// mutation that makes them speak is invisible to a test that only checks the positive case.
+    #[test]
+    fn the_wiring_note_is_owed_only_by_a_pod_with_a_peer_to_be_reached_from() {
+        assert_eq!(wiring_note(StackNet::Pod, 2), Some(POD_SHARED_LOOPBACK));
+        assert_eq!(wiring_note(StackNet::Pod, 9), Some(POD_SHARED_LOOPBACK));
+        // One service: there is no peer, so the shared loopback exposes it to nobody. Saying it
+        // anyway would print the line on every single-service file, which is how a reader is taught
+        // to skip the line that matters.
+        assert_eq!(wiring_note(StackNet::Pod, 1), None);
+        assert_eq!(wiring_note(StackNet::Pod, 0), None);
+        // A namespace each: every service keeps its own 127.0.0.1, so there is no exposure to
+        // declare, and the choice was already announced where it was made.
+        assert_eq!(wiring_note(StackNet::PerService, 2), None);
+        assert_eq!(wiring_note(StackNet::PerService, 1), None);
+        // Not decided yet: the driver has not chosen, so nothing here can be true.
+        assert_eq!(wiring_note(StackNet::Undecided, 2), None);
+    }
+
+    #[test]
+    fn a_long_service_list_is_cut_but_the_count_stays_exact() {
+        let names: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Six shown, and the REMAINDER counted: a reader acts on the number, so it is the part that
+        // must not be approximate.
+        assert_eq!(name_list(&refs), "s0, s1, s2, s3, s4, s5, and 3 more");
+        // At the boundary the list is whole, with no "and 0 more" tail.
+        assert_eq!(name_list(&refs[..6]), "s0, s1, s2, s3, s4, s5");
+        assert_eq!(name_list(&refs[..1]), "s0");
+        assert_eq!(name_list(&[]), "");
     }
 }

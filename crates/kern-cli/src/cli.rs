@@ -114,6 +114,23 @@ pub enum Command {
         ports: Vec<kern_isolation::PortMap>,
         /// `--add-host NAME:IP` (repeatable): extra `/etc/hosts` entries; `IP` may be `host-gateway`.
         add_hosts: Vec<(String, String)>,
+        /// `--dns IP` (repeatable): the box's `nameserver` lines. Validated as IP literals HERE, so
+        /// no later layer parses them and a typo is refused before anything is started.
+        dns: Vec<String>,
+        /// `--dns-search DOMAIN` (repeatable): the `search` line of the box's `/etc/resolv.conf`.
+        dns_search: Vec<String>,
+        /// `--dns-option OPT` (repeatable): the `options` line (e.g. `ndots:2`, `timeout:2`).
+        dns_options: Vec<String>,
+        /// `--log-max-size <size>`: how large the box's captured log may grow before it rotates.
+        /// `None` leaves kern's default (16 MiB).
+        log_max_size: Option<u64>,
+        /// `--log-max-file <n>`: how many log files are kept IN TOTAL, active one included (Docker's
+        /// `max-file` counting). `None` leaves kern's default (2: active plus one generation).
+        log_max_file: Option<u32>,
+        /// `--memory-reservation <size>` → cgroup `memory.low`: a soft floor, never a cap.
+        memory_reservation: Option<u64>,
+        /// `--cpu-weight <n>` (1..=10000) → cgroup `cpu.weight`: relative CPU share under contention.
+        cpu_weight: Option<u64>,
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
         /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
         secrets: Vec<String>,
@@ -145,8 +162,9 @@ pub enum Command {
         restart_max: u32,
         /// `--def-hash <hex>`: fingerprint of the compose definition (drift detection).
         def_hash: Option<String>,
-        /// `--stop-signal`: signal sent before the SIGKILL (default SIGTERM).
-        stop_signal: i32,
+        /// `--stop-signal`: signal sent before the SIGKILL. `None` = not given, which lets the
+        /// image's own `STOPSIGNAL` decide (Docker's rule); neither means `SIGTERM`.
+        stop_signal: Option<i32>,
         /// `--stop-timeout <secs>`: grace before the SIGKILL.
         stop_grace: u64,
         /// `--user UID[:GID]` / `-u`: drop to this uid/gid inside the box before the command runs.
@@ -273,6 +291,9 @@ pub enum Command {
         context: String,
         build_args: Vec<String>,
         quiet: bool,
+        /// `--target <stage>`: stop at that stage of a multi-stage Dockerfile (compose's
+        /// `build.target:`).
+        target: Option<String>,
     },
     /// `kern pod create <name> [--no-outbound] [--uid-range]` / `pod ls` / `pod rm <name>`: shared-network pods.
     PodCreate {
@@ -473,6 +494,8 @@ pub enum Command {
         /// Which compose verb to run (see [`commands::ComposeAction`]).
         action: commands::ComposeAction,
         no_pod: bool,
+        /// `--pod`: keep one shared namespace even when the file expresses segregation.
+        force_pod: bool,
         /// `--allow-device-grants`: see [`commands::ComposeOpts::allow_device_grants`]. CLI-only on
         /// purpose, so a compose file cannot grant itself the hardware it names.
         allow_device_grants: bool,
@@ -1229,6 +1252,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut file: Option<String> = None;
             let mut action: Option<commands::ComposeAction> = None;
             let mut no_pod = false;
+            let mut force_pod = false;
             let mut allow_device_grants = false;
             let mut tail: Option<usize> = None;
             let mut follow = false;
@@ -1238,6 +1262,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             while let Some(a) = it.next() {
                 match *a {
                     "--no-pod" => no_pod = true,
+                    // The explicit opt-OUT of the auto-selection below. Without it a file that
+                    // expresses segregation is wired per service, which is what it asked for; with
+                    // it the stack keeps one namespace and the segregation is dropped, which is what
+                    // kern did before and is still the faster wiring.
+                    "--pod" => force_pod = true,
                     "--allow-device-grants" => allow_device_grants = true,
                     "-f" | "--follow" => follow = true,
                     "-a" | "--all" => all = true,
@@ -1323,6 +1352,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files,
                 action: action.unwrap_or(commands::ComposeAction::Up),
                 no_pod,
+                force_pod,
                 allow_device_grants,
                 tail,
                 follow,
@@ -1343,6 +1373,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 commands::ComposeAction::Up
             };
             let no_pod = rest.contains(&"--no-pod");
+            let force_pod = rest.contains(&"--pod");
             let allow_device_grants = rest.contains(&"--allow-device-grants");
             let file = discover_compose_file().ok_or_else(|| {
                 Error::Compose(
@@ -1353,6 +1384,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files: vec![file],
                 action,
                 no_pod,
+                force_pod,
                 allow_device_grants,
                 tail: None,
                 follow: false,
@@ -1465,6 +1497,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
 /// Only signals a stop contract can meaningfully use are accepted; an unknown name is REFUSED rather
 /// than quietly falling back to SIGTERM, because a workload trapping SIGUSR1 that silently got
 /// SIGTERM would shut down the wrong way and look like the trap never ran.
+/// The same table, for a signal that came from an IMAGE rather than from a flag.
+///
+/// `None` RATHER THAN A REFUSAL, and the difference is who wrote the value. A flag is typed by the
+/// person running kern, so an unknown name is their typo and must be refused before anything starts.
+/// An image's `STOPSIGNAL` is written by whoever built the image, is read on a path where there is
+/// no usage error to return, and a name kern does not know (`SIGPWR`, say) must not stop a box from
+/// running: the caller falls back to `SIGTERM`, which is what kern did before it read the field at
+/// all.
+pub(crate) fn parse_signal_name(s: &str) -> Option<i32> {
+    parse_signal(s).ok()
+}
+
 fn parse_signal(s: &str) -> Result<i32, Error> {
     const USAGE: &str = "--stop-signal <NAME|NUM>: TERM INT QUIT HUP USR1 USR2 KILL (or a number)";
     let t = s.trim();
@@ -1594,6 +1638,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut verbose = false;
     let mut ports: Vec<kern_isolation::PortMap> = Vec::new();
     let mut add_hosts: Vec<(String, String)> = Vec::new();
+    let mut dns: Vec<String> = Vec::new();
+    let mut dns_search: Vec<String> = Vec::new();
+    let mut dns_options: Vec<String> = Vec::new();
+    let mut log_max_size: Option<u64> = None;
+    let mut log_max_file: Option<u32> = None;
+    let mut memory_reservation: Option<u64> = None;
+    let mut cpu_weight: Option<u64> = None;
     let mut secrets: Vec<String> = Vec::new();
     let mut ssh_port: Option<u16> = None;
     let mut ssh_key: Option<String> = None;
@@ -1608,7 +1659,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut labels: Vec<String> = Vec::new();
     let mut restart_max: u32 = 0;
     let mut def_hash: Option<String> = None;
-    let mut stop_signal: i32 = libc::SIGTERM;
+    // `None` = the flag was NOT given, which is a different fact from "given as SIGTERM".
+    //
+    // An image may declare its own `STOPSIGNAL` (nginx `SIGQUIT`, apache `SIGWINCH`), and Docker
+    // uses it when the caller names none. Stored as `SIGTERM` outright, the two cases were the same
+    // value and the image's signal could only be honoured by ignoring an explicit `--stop-signal
+    // SIGTERM`, which is somebody's deliberate choice.
+    let mut stop_signal: Option<i32> = None;
     let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
     let mut cap_add: Vec<String> = Vec::new();
@@ -1752,7 +1809,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--stop-signal" => {
                     i += 1;
                     stop_signal = match rest.get(i) {
-                        Some(v) => parse_signal(v)?,
+                        Some(v) => Some(parse_signal(v)?),
                         None => {
                             return Err(Error::Usage("--stop-signal <NAME|NUM> (e.g. SIGTERM, 15)"))
                         }
@@ -2153,6 +2210,117 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         }
                     }
                 }
+                // AN IP LITERAL, REFUSED HERE RATHER THAN WRITTEN AND IGNORED. `resolv.conf` takes
+                // an address, never a name: a resolver cannot resolve the address of its own
+                // resolver. glibc silently skips a `nameserver` line it cannot parse, so a typo
+                // would leave a box with no DNS and no message anywhere - the exact silent
+                // degradation this project refuses. `IpAddr` accepts v4 and v6 and nothing else.
+                "--dns" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+                    {
+                        Some(v) => dns.push((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage(
+                                "--dns <ip> (an IPv4 or IPv6 address, e.g. 1.1.1.1; resolv.conf takes no hostnames)",
+                            ))
+                        }
+                    }
+                }
+                // A DOMAIN AND AN OPTION ARE FREE-FORM, so the only gate is the one that keeps the
+                // file line-oriented: no whitespace (a newline would forge a directive, a space
+                // would split the field) and no control characters. The same predicate runs again
+                // in the box, deliberately: this one gives the caller a message, that one holds
+                // even if a future caller reaches the spec by another route.
+                "--dns-search" => {
+                    i += 1;
+                    match rest.get(i).filter(|v| {
+                        !v.is_empty() && !v.chars().any(|c| c.is_whitespace() || c.is_control())
+                    }) {
+                        Some(v) => dns_search.push((*v).to_string()),
+                        None => {
+                            return Err(Error::Usage(
+                                "--dns-search <domain> (one domain, no spaces; repeat the flag for more)",
+                            ))
+                        }
+                    }
+                }
+                "--dns-option" => {
+                    i += 1;
+                    match rest.get(i).filter(|v| {
+                        !v.is_empty() && !v.chars().any(|c| c.is_whitespace() || c.is_control())
+                    }) {
+                        Some(v) => dns_options.push((*v).to_string()),
+                        None => return Err(Error::Usage(
+                            "--dns-option <opt> (a resolv.conf option, e.g. ndots:2 or timeout:2)",
+                        )),
+                    }
+                }
+                // ZERO IS REFUSED, not clamped. A zero-byte cap makes every write rotate and the
+                // log store nothing, which is a silently broken box rather than a small one; a
+                // caller who wants no log has `>/dev/null` in their command.
+                "--log-max-size" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| parse_size(v)).filter(|n| *n > 0) {
+                        Some(n) => log_max_size = Some(n),
+                        None => {
+                            return Err(Error::Usage(
+                                "--log-max-size <size> (e.g. 10m, 1g; binary units, must be > 0)",
+                            ))
+                        }
+                    }
+                }
+                // COUNTS THE ACTIVE FILE, like Docker's `max-file`, so `1` means no rotated
+                // generation at all (the active file is truncated when it fills) and `3` means the
+                // active file plus `.1` and `.2`. The bound a caller gets is `max-size * max-file`.
+                "--log-max-file" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| *n > 0)
+                    {
+                        Some(n) => log_max_file = Some(n),
+                        None => {
+                            return Err(Error::Usage(
+                                "--log-max-file <n> (how many log files to keep, active one included; 1 or more)",
+                            ))
+                        }
+                    }
+                }
+                // A SIZE, AND NOT ZERO. `memory.low = 0` is the kernel's default (no protection), so
+                // accepting a `0` would let a file ask for something and get nothing, which reads as
+                // applied and is not.
+                "--memory-reservation" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| parse_size(v)).filter(|n| *n > 0) {
+                        Some(n) => memory_reservation = Some(n),
+                        None => return Err(Error::Usage(
+                            "--memory-reservation <size> (e.g. 256m, 1g; a soft floor, not a cap)",
+                        )),
+                    }
+                }
+                // The cgroup v2 range, refused outside it rather than clamped: a caller who wrote
+                // Docker's `cpu_shares` scale (1024) by hand into this flag means something different
+                // from 1024/10000, and silently clamping would hide that. The compose parser converts
+                // the Docker scale explicitly.
+                "--cpu-weight" => {
+                    i += 1;
+                    match rest
+                        .get(i)
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| (1..=10_000).contains(n))
+                    {
+                        Some(n) => cpu_weight = Some(n),
+                        None => {
+                            return Err(Error::Usage(
+                                "--cpu-weight <n> (1-10000, cgroup v2 cpu.weight; relative share under contention)",
+                            ))
+                        }
+                    }
+                }
                 "--secret" => {
                     i += 1;
                     match rest.get(i) {
@@ -2325,6 +2493,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             tty,
             ports,
             add_hosts,
+            dns,
+            dns_search,
+            dns_options,
+            log_max_size,
+            log_max_file,
+            memory_reservation,
+            cpu_weight,
             secrets,
             ssh_port,
             ssh_key,
@@ -2864,6 +3039,7 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
     let mut file: Option<String> = None;
     let mut context: Option<String> = None;
     let mut build_args: Vec<String> = Vec::new();
+    let mut target: Option<String> = None;
     let mut quiet = false;
     let mut i = 1; // rest[0] == "build"
     while i < rest.len() {
@@ -2890,6 +3066,20 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
                         .to_string(),
                 );
             }
+            // `--target <stage>`: stop at that stage of a multi-stage Dockerfile. Compose spells the
+            // same thing `build.target:`, and the builder refuses a name the file does not define
+            // rather than falling back to the last stage, which would build the wrong image quietly.
+            "--target" => {
+                i += 1;
+                target = Some(
+                    rest.get(i)
+                        .filter(|v| !v.trim().is_empty())
+                        .ok_or(Error::Usage(
+                            "--target <stage> (a name from a `FROM … AS <name>`)",
+                        ))?
+                        .to_string(),
+                );
+            }
             "-q" | "--quiet" => quiet = true,
             s if s.starts_with('-') => return Err(Error::Usage("unknown build flag")),
             s if context.is_none() => context = Some(s.to_string()),
@@ -2903,6 +3093,7 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         context: context.unwrap_or_else(|| ".".to_string()),
         build_args,
         quiet,
+        target,
     })
 }
 
@@ -2952,6 +3143,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tty,
             ports,
             add_hosts,
+            dns,
+            dns_search,
+            dns_options,
+            log_max_size,
+            log_max_file,
+            memory_reservation,
+            cpu_weight,
             secrets,
             ssh_port,
             ssh_key,
@@ -3055,6 +3253,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             verbose,
             profiles: &profiles,
             add_hosts: &add_hosts,
+            dns: &dns,
+            dns_search: &dns_search,
+            dns_options: &dns_options,
+            log_max_size,
+            log_max_file,
+            memory_reservation,
+            cpu_weight,
         }),
         Command::Run {
             command,
@@ -3086,12 +3291,14 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             context,
             build_args,
             quiet,
+            target,
         } => commands::build(commands::BuildArgs {
             tag: tag.as_deref(),
             file: file.as_deref(),
             context: &context,
             build_args: &build_args,
             quiet,
+            target: target.as_deref(),
         }),
         Command::PodCreate {
             name,
@@ -3194,6 +3401,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files,
             action,
             no_pod,
+            force_pod,
             allow_device_grants,
             tail,
             follow,
@@ -3206,6 +3414,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files: &files,
             action,
             no_pod,
+            force_pod,
             allow_device_grants,
             tail,
             follow,
@@ -3764,9 +3973,9 @@ mod tests {
         assert_eq!(
             ports,
             vec![
-                pm(0x7f00_0001, 8080, 80, false),
+                pm(0, 8080, 80, false),
                 pm(0, 443, 443, false),
-                pm(0x7f00_0001, 53, 53, true),
+                pm(0, 53, 53, true),
             ]
         );
         // Malformed mappings are usage errors, never silently dropped.

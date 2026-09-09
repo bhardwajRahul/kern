@@ -9,7 +9,7 @@
 //! Design rule (safety over convenience): flags fall into three buckets.
 //! PASS - kern accepts the same flag; forwarded verbatim.
 //! DROP - pure metadata with no runtime effect (labels); dropped with a stderr note.
-//! FAIL - behaviour-changing and unsupported (`--device`, `--gpus`, namespace sharing, ...): we error
+//! FAIL - behaviour-changing and unsupported (`--gpus`, namespace sharing, ...): we error
 //! loudly instead of silently dropping, so a script never runs with different semantics than it
 //! asked for. Unknown flags also FAIL - the opposite of a best-effort shim that silently misbehaves.
 //!
@@ -157,6 +157,9 @@ const RUN_VAL_PASS: &[&str] = &[
     "--cap-add",
     "--cap-drop",
     "--tmpfs",
+    "--dns",
+    "--dns-search",
+    "--dns-option",
     // Implemented by kern with Docker's own spelling and semantics.
     "-l",
     "--label",
@@ -170,7 +173,6 @@ const RUN_VAL_DROP: &[&str] = &["--label-file"];
 /// kern isolates those namespaces by design, so honouring a `=host` share would break its boundary.
 const RUN_VAL_FAIL: &[&str] = &[
     "--security-opt",
-    "--device",
     "--gpus",
     "--pid",
     "--ipc",
@@ -336,6 +338,60 @@ fn translate_run(rest: &[String]) -> Result<Vec<String>, ShimError> {
                 // to run a plain shell in an image that normally starts a daemon). Prepending the empty
                 // string instead made the box try to exec "" and die with ENOENT.
                 entrypoint = if val.is_empty() { None } else { Some(val) };
+                continue;
+            }
+            // `--device` IS A BIND, exactly as `devices:` is in a compose file, and it is translated
+            // through the SAME normaliser so the two surfaces cannot come to disagree about what
+            // `/dev/net/tun` or a `:r` permission field means. It used to fail loudly here as a flag
+            // with no kern equivalent; that was true when a device could only reach a box through
+            // `-v`, and it stopped being true when `devices:` started doing precisely that.
+            if flag == "--device" {
+                let val = value_of(flag, inline, rest, &mut i)?;
+                reject_leading_dash("device", &val)?;
+                let mut tun = false;
+                let binds = kern_compose::normalise_devices(
+                    std::slice::from_ref(&val),
+                    "docker run",
+                    &mut tun,
+                );
+                if tun {
+                    passthrough.push("--tun".into());
+                }
+                for b in binds {
+                    passthrough.push("--volume".into());
+                    passthrough.push(b);
+                }
+                continue;
+            }
+            // `--dns-opt` is Docker's older spelling of `--dns-option`; both name the same field, and
+            // a command line written either way must not fail on a runtime that implements it.
+            if flag == "--dns-opt" {
+                let val = value_of(flag, inline, rest, &mut i)?;
+                passthrough.push("--dns-option".into());
+                passthrough.push(val);
+                continue;
+            }
+            // `--log-opt max-size=… / max-file=…` are the two log options kern applies to its own
+            // capture. Any other `--log-opt` belongs to a driver kern does not have, and is refused
+            // rather than dropped: a rotation policy silently not applied is a disk that fills.
+            if flag == "--log-opt" {
+                let val = value_of(flag, inline, rest, &mut i)?;
+                match val.split_once('=') {
+                    Some(("max-size", v)) => {
+                        passthrough.push("--log-max-size".into());
+                        passthrough.push(v.to_string());
+                    }
+                    Some(("max-file", v)) => {
+                        passthrough.push("--log-max-file".into());
+                        passthrough.push(v.to_string());
+                    }
+                    _ => {
+                        return Err(ShimError::UnsupportedFlag {
+                            cmd: "run",
+                            flag: format!("--log-opt {val}"),
+                        })
+                    }
+                }
                 continue;
             }
             if is(flag, RUN_VAL_FAIL) {
@@ -707,7 +763,7 @@ mod tests {
     fn run_fails_on_flags_with_no_kern_equivalent() {
         // No kern equivalent -> must fail loudly (never silently dropped). Includes the
         // namespace-sharing flags kern isolates by design.
-        for f in ["--security-opt", "--device", "--pid", "--userns"] {
+        for f in ["--security-opt", "--gpus", "--pid", "--userns"] {
             assert!(
                 matches!(
                     translate(&v(&["run", f, "x", "alpine"])),

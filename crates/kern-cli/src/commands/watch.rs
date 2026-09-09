@@ -331,7 +331,12 @@ pub(crate) fn watch_set(
                 tag: b
                     .image
                     .clone()
-                    .unwrap_or_else(|| format!("kern-compose-{}:latest", b.name)),
+                    // Lowercased for the same reason as the builder's own synthesis in
+                    // `commands::mod`: `watch` must rebuild the SAME tag the stack runs, and a box
+                    // name carrying a capital letter (a project directory like `Notes-FE`) produces
+                    // a reference OCI refuses. The two sites must agree or `watch` rebuilds a tag
+                    // nothing runs.
+                    .unwrap_or_else(|| crate::commands::synthesized_build_tag(&b.name)),
                 context: ctx.clone(),
                 dockerfile: df.clone(),
                 args: bd.args.clone(),
@@ -538,6 +543,7 @@ mod tests {
                 context: ".".into(),
                 dockerfile: None,
                 args: vec!["A=1".into()],
+                target: None,
             }),
             ..Default::default()
         };
@@ -575,6 +581,7 @@ mod tests {
                 context: "web".into(),
                 dockerfile: Some("Dockerfile.dev".into()),
                 args: Vec::new(),
+                target: None,
             }),
             ..Default::default()
         };
