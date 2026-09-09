@@ -4365,13 +4365,28 @@ mod tests {
                 || unsafe { libc::getuid() } == 0,
             "an ordinary user must not be able to write the ROOT cgroup.procs; as root it may"
         );
-        let mine = current_v2_cgroup();
-        if let Some(m) = mine {
+        // THE POSITIVE CONTROL IS HERMETIC, and it used to be an assumption about the host.
+        //
+        // It asserted that a process can write its OWN `cgroup.procs`, which is simply not true in
+        // general: on GitHub's runner the job runs as an ordinary user inside
+        // `/sys/fs/cgroup/system.slice/hosted-compute-agent.service`, a cgroup owned by root, where
+        // the file exists and is not writable. That is a legitimate host, and it is precisely the
+        // shape this whole gate was written for, so encoding its opposite as a law made the test
+        // fail on the one machine that most resembles the case it protects.
+        //
+        // What the control has to establish is only that the probe can answer TRUE, so that a build
+        // always answering false is caught. `cgroup_procs_writable` is one `access(dir/cgroup.procs,
+        // W_OK)`, so a directory this test creates with a writable file of that name answers the
+        // question without asking anything of the machine.
+        let tmp = std::env::temp_dir().join(format!("kern-procs-probe-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+        if fs::write(tmp.join("cgroup.procs"), b"").is_ok() {
             assert!(
-                cgroup_procs_writable(&m) || !m.join("cgroup.procs").exists(),
-                "a process must be able to write its OWN cgroup.procs, or the file is not there: {m:?}"
+                cgroup_procs_writable(&tmp),
+                "a writable cgroup.procs must read as writable, or the probe can only ever say no"
             );
         }
+        let _ = fs::remove_dir_all(&tmp);
         assert!(
             !cgroup_procs_writable(std::path::Path::new("/sys/fs/cgroup/kern-no-such-dir-here")),
             "a directory that does not exist must not read as writable"
