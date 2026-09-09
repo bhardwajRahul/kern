@@ -5,7 +5,7 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## v0.9.32
+## v0.9.32 - 2026-09-09
 
 **A published port now binds `0.0.0.0`, not `127.0.0.1`. Read this one.** `-p 8080:80` and a compose
 `ports: "8080:80"` bind every interface, which is what Docker does and what a file written for Docker
