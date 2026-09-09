@@ -7,7 +7,7 @@
 **A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -77,7 +77,7 @@ Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by 
 shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack.
 
 <p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms (docker run takes ~297 ms); 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one static binary, no daemon.">
+  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms; 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one static binary, no daemon.">
 </p>
 
 ## Install
@@ -198,8 +198,8 @@ kern compose stack.toml port web 80 # the host address serving that port, read f
 
 Both official images start, `web` reaches `db` by service name, and the port is published. A compose
 file can also name kern's own things in the spec's extension namespace (`x-kern-vcpu`,
-`x-kern-security-profile`) and still run under Docker unchanged, because every other runtime ignores
-an `x-` field. A typo inside one is reported rather than dropped.
+`x-kern-security-profile`) and still run anywhere else unchanged, because the spec has
+every runtime ignore an `x-` field. A typo inside one is reported rather than dropped.
 
 **One constraint comes with the speed:** a stack is one pod on one network namespace, so two services
 cannot both listen on the same container port even when their published ports differ. `up` refuses
@@ -244,7 +244,7 @@ chip-granular, not per-line**: asking for `pins` binds the whole `/dev/gpiochipN
 line of that controller, so `pins = [17]` is cooperative metadata rather than a boundary. Naming a
 device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCES.md)
 
-## kern vs Docker vs Podman: what a container costs, and what kern does not have
+## What a container costs, and what kern does not have
 
 All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
 7.0.0, with the method in [BENCHMARKS.md](BENCHMARKS.md).
