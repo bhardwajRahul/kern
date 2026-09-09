@@ -275,6 +275,14 @@ pub struct BoxRunArgs<'a> {
     /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret as
     /// `/run/secrets/NAME` (mode 0400) without it hitting the image or the workload env.
     pub secrets: &'a [String],
+    /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.
+    ///
+    /// PER BOX AND NOT PER SECRET, deliberately and measurably: `mode:` under a service's `secrets:`
+    /// does not appear ONCE in 259 real compose files nor in any of Docker's own eight samples that
+    /// use secrets, so a per-secret channel would be machinery for a case that does not occur. A
+    /// file that does declare two DIFFERENT modes for one service is REFUSED by the compose driver
+    /// rather than silently given one of them.
+    pub secret_mode: libc::mode_t,
     /// `--ssh PORT`: run an in-box sshd and publish it on host `PORT` (→ box `:22`). `None` → no SSH.
     pub ssh_port: Option<u16>,
     /// `--ssh-key FILE`: authorize this public key file instead of generating a throwaway keypair.
@@ -1108,7 +1116,7 @@ struct BuildSpec<'a> {
     vgpio_devs: Vec<String>,
     vgpio_sysfs: Vec<String>,
     vdisks: Vec<kern_isolation::VdiskMount>,
-    secrets: Vec<(String, Vec<u8>)>,
+    secrets: Vec<kern_isolation::Secret>,
     ssh: Option<kern_isolation::SshSetup>,
     hostname: Option<String>,
     tun: bool,

@@ -504,3 +504,81 @@ fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
         );
     }
 }
+
+/// EVERY FLAG `kern box` ACCEPTS MUST BE IN `kern box --help`.
+///
+/// The sibling gate above covers only the `HARDENED` verbs, which are the ones that call
+/// `reject_unknown_flags` with an explicit list. `box` has the largest flag set in the CLI and parses
+/// it with a hand-written `match`, so it was outside every gate: a flag could be added, parsed and
+/// shipped with no help entry and nothing would say so.
+///
+/// MEASURED: `--secret-mode` was added and reached a release build undocumented. The frozen-surface
+/// snapshot did not notice either, because that snapshot IS the help text - a flag missing from help
+/// is missing from the snapshot too, so the two agreed on an incomplete picture.
+#[test]
+fn every_flag_box_parses_is_advertised_in_its_help() {
+    let src = include_str!("../src/cli.rs");
+    let body = {
+        let start = src
+            .find("fn parse_box(rest: &[&str])")
+            .expect("`parse_box` must exist");
+        let rest = &src[start..];
+        // The function ends at the first column-0 `}`; every inner brace is indented.
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        &rest[..end]
+    };
+
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["box", "--help"])
+        .output()
+        .expect("`kern box --help` must run");
+    let help = String::from_utf8_lossy(&help.stdout).into_owned();
+
+    // A match arm on a flag literal: `"--flag" => {` or `"--flag" | "-f" => {`, at any indentation.
+    let mut checked = 0;
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix('"') else {
+            continue;
+        };
+        let Some((flag, tail)) = rest.split_once('"') else {
+            continue;
+        };
+        // Only a match ARM: what follows is `=>` or another alternative.
+        if !(tail.trim_start().starts_with("=>") || tail.trim_start().starts_with('|')) {
+            continue;
+        }
+        if !flag.starts_with("--") {
+            continue;
+        }
+        // INTERNAL flags kern passes to ITSELF, never to a person. Each is listed with what writes
+        // it, so the exemption is a statement rather than a hole: an entry here that no longer
+        // matches a real internal caller is caught by the count assertion below.
+        //
+        //  --def-hash        `kern compose` records the fingerprint of the definition a box came
+        //                    from, so a later `up` can tell whether the file still describes it.
+        //  --overlay-lower   the build path hands a RUN step an already-resolved layer chain.
+        //  --overlay-upper   the build path hands it the persistent upper for that step.
+        const INTERNAL: &[&str] = &["--def-hash", "--overlay-lower", "--overlay-upper"];
+        if INTERNAL.contains(&flag) {
+            assert!(
+                !help.contains(flag),
+                "`{flag}` is listed as INTERNAL but help advertises it: remove it from the list"
+            );
+            continue;
+        }
+        checked += 1;
+        assert!(
+            help.contains(flag),
+            "`kern box` parses `{flag}` but `kern box --help` never mentions it. A flag nobody can \
+             read about is a flag nobody can use, and the frozen-surface snapshot cannot catch it \
+             because that snapshot IS the help text."
+        );
+    }
+    // The scan itself must not silently find nothing: a refactor that renames the function or
+    // changes the match shape would otherwise turn this gate into a green no-op.
+    assert!(
+        checked > 40,
+        "expected `parse_box` to yield dozens of flags, found {checked} - the scan stopped matching"
+    );
+}

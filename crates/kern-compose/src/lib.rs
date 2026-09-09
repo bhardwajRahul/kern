@@ -68,6 +68,18 @@ pub const PROFILE_KINDS: [&str; 3] = ["vcpu", "vdisk", "vgpio"];
 /// problems and deserve different sentences.
 pub const ABSENT_PROFILE_KINDS: [&str; 1] = ["vgpu"];
 
+/// The Compose Specification's default mode for a service secret, in octal, as a string because that
+/// is how it goes out on the command line.
+///
+/// Quoted from the specification: "The default value is world-readable permissions (mode `0444`)."
+/// kern's own `--secret` default is `0400`, and the difference is the whole reason this constant
+/// exists: a secret only the owner can read is unreadable to every image that drops to a non-root
+/// user, which is most database images. MEASURED on Docker's `nginx-golang-postgres` sample, whose
+/// `db` declares `user: postgres`: the entrypoint died with `/run/secrets/db-password: Permission
+/// denied` on every start, so the database never came up and the `service_healthy` gate its backend
+/// waits on timed out after 120 s.
+pub const SPEC_SECRET_MODE: &str = "444";
+
 /// One service in a compose file. Most fields mirror a `kern box` flag (`None`/empty/`false` =
 /// "flag absent"); `name`/`command`/`depends_on` are structural - `depends_on` is compose-only, and
 /// `push_box_flags` deliberately skips all three. Frozen key ↔ flag map (non-obvious names):
@@ -288,6 +300,15 @@ pub struct ComposeBox {
     /// is a different socket from `"53/tcp"` and the two do not collide.
     pub expose: Vec<(u16, bool)>,
     pub secrets: Vec<String>,
+    /// The file mode this service's secrets get inside the box, in octal, or `None` for the Compose
+    /// Specification's default.
+    ///
+    /// THE DEFAULT IS THE SPEC'S, NOT KERN'S. The specification says a service secret has
+    /// "world-readable permissions (mode `0444`)"; kern's own `--secret` default is `0400`, which no
+    /// workload running as a non-root user can read. MEASURED on Docker's `nginx-golang-postgres`
+    /// sample, whose `db` declares `user: postgres`: the entrypoint died with
+    /// `/run/secrets/db-password: Permission denied` on every start.
+    pub secret_mode: Option<String>,
     pub tmpfs: Vec<String>,
     /// Compose `extra_hosts:` → one `--add-host` per entry (`name:ip`). Docker also accepts the
     /// `name=ip` spelling and the long mapping form; both are normalised to `name:ip` by the parser.
@@ -651,6 +672,13 @@ impl ComposeBox {
         }
         for v in &self.ports {
             cmd.arg("--publish").arg(v);
+        }
+        // THE MODE GOES OUT WHENEVER A SECRET DOES, and it is the SPECIFICATION's default rather
+        // than kern's: `kern box --secret` alone keeps its owner-only 0400, and a compose service
+        // gets the 0444 the spec mandates, so the widening is attached to the file that asks for it.
+        if !self.secrets.is_empty() {
+            cmd.arg("--secret-mode")
+                .arg(self.secret_mode.as_deref().unwrap_or(SPEC_SECRET_MODE));
         }
         for v in &self.secrets {
             cmd.arg("--secret").arg(v);
@@ -3516,6 +3544,54 @@ vcpu = "slim"
 #[cfg(test)]
 mod stack_note_tests {
     use super::*;
+
+    /// THE MODE HAS TO REACH THE COMMAND LINE, not merely be parsed into a field.
+    ///
+    /// The parse and the emission are two steps, and a test on the field alone passes for a driver
+    /// that never sends it: measured, a mutation replacing the emitted default with kern's `0400`
+    /// left every field-level assertion green while the box got a secret no non-root workload can
+    /// read. That is the whole failure this work exists to close.
+    #[test]
+    fn the_secret_mode_reaches_the_command_line_with_the_specifications_default() {
+        let argv = |b: &ComposeBox| -> Vec<String> {
+            let mut cmd = std::process::Command::new("kern");
+            b.push_box_flags(&mut cmd);
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // A service WITH secrets and no declared mode: the specification's default goes out.
+        let b = ComposeBox {
+            name: "db".into(),
+            secrets: vec!["/p.txt:pw".into()],
+            ..Default::default()
+        };
+        let a = argv(&b);
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--secret-mode", SPEC_SECRET_MODE]),
+            "the spec's default must go out: {a:?}"
+        );
+        assert!(a.windows(2).any(|w| w == ["--secret", "/p.txt:pw"]));
+
+        // A declared mode wins over the default.
+        let b = ComposeBox {
+            name: "db".into(),
+            secrets: vec!["/p.txt:pw".into()],
+            secret_mode: Some("0440".into()),
+            ..Default::default()
+        };
+        assert!(argv(&b).windows(2).any(|w| w == ["--secret-mode", "0440"]));
+
+        // NO SECRETS, NO FLAG. A box that carries none must not be handed a mode for nothing: the
+        // flag would be inert, and an inert flag on every box start is one a reader has to explain.
+        let b = ComposeBox {
+            name: "db".into(),
+            ..Default::default()
+        };
+        assert!(!argv(&b).iter().any(|x| x == "--secret-mode"));
+    }
 
     fn svc(name: &str) -> ComposeBox {
         ComposeBox {

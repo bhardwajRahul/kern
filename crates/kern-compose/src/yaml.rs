@@ -2558,8 +2558,10 @@ fn list_value(node: &Node) -> Vec<String> {
 /// A service's `secrets:` reference names. Short form is a list of names (`[db_pw, api_key]`); long
 /// form is a list of maps each with a `source:` (`[{source: db_pw, target: …}]`) - we take `source`
 /// (the target is always `/run/secrets/<source>` in kern). Returns the referenced secret names.
-fn secret_refs(node: &Node) -> Vec<String> {
+/// Also returns the `mode:` the long form declares, when it declares one; see [`secret_mode_of`].
+fn secret_refs(node: &Node) -> (Vec<String>, Result<Option<String>, String>) {
     let mut out = Vec::new();
+    let mut modes: Vec<String> = Vec::new();
     for it in list_value(node) {
         let it = it.trim();
         if it.starts_with('{') {
@@ -2568,6 +2570,9 @@ fn secret_refs(node: &Node) -> Vec<String> {
             if let Some(src) = n.child("source").and_then(|s| s.scalar.as_deref()) {
                 out.push(scalar_str(src));
             }
+            if let Some(m) = n.child("mode").and_then(|m| m.scalar.as_deref()) {
+                modes.push(scalar_str(m));
+            }
         } else if !it.is_empty() {
             out.push(scalar_str(it));
         }
@@ -2575,7 +2580,37 @@ fn secret_refs(node: &Node) -> Vec<String> {
     // Block long-form (`- source: name` on its own lines) is handled too: `build_tree` folds each
     // block list item's `key: value` children into an inline `{source: name, …}` scalar, so it arrives
     // at the `{`-prefixed branch above. No separate code path needed.
-    out
+    (out, secret_mode_of(&modes))
+}
+
+/// The ONE mode a service's secrets share, or a refusal when it declares more than one.
+///
+/// kern carries the mode PER BOX, and that is a measured choice rather than a shortcut: `mode:`
+/// under a service's `secrets:` does not appear once in 259 real compose files, nor in any of
+/// Docker's own eight samples that use secrets. Building a per-secret channel for a case that does
+/// not occur is machinery with no reader.
+///
+/// A file that DOES declare two different modes for one service is refused rather than silently
+/// given one of them. Two identical declarations are not a conflict and pass.
+fn secret_mode_of(modes: &[String]) -> Result<Option<String>, String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for m in modes {
+        let m = m.trim().trim_start_matches("0o");
+        if !seen.contains(&m) {
+            seen.push(m);
+        }
+    }
+    match seen.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).to_string())),
+        many => Err(format!(
+            "declares {} different `mode:` values for its secrets ({}), and kern applies ONE mode \
+             per box. Give them the same mode, or split the service. (Measured: no `mode:` appears \
+             in 259 real compose files, so this is refused rather than silently resolved.)",
+            many.len(),
+            many.join(", ")
+        )),
+    }
 }
 
 /// Collect top-level `secrets:` definitions into `name -> file` for the `file:`-backed form (the only
@@ -2863,9 +2898,17 @@ fn service_to_box(
             "secrets" => {
                 // A service `secrets: [name, …]` (or long-form `{source: name, target: …}`) references
                 // top-level secret definitions. Map each `file:`-backed one to `--secret <file>:<name>`
-                // (kern delivers it at `/run/secrets/<name>`, mode 0400) - matching compose's mount
-                // point exactly. `<file>` is relative → `compose()` makes it absolute (dir-confined).
-                for entry in secret_refs(node) {
+                // (kern delivers it at `/run/secrets/<name>`) - matching compose's mount point
+                // exactly. `<file>` is relative → `compose()` makes it absolute (dir-confined).
+                //
+                // The MODE travels with them: the specification's default is world-readable, and a
+                // long-form `mode:` overrides it. See `secret_mode_of` for why it is one per box.
+                let (refs, mode) = secret_refs(node);
+                match mode {
+                    Ok(m) => b.secret_mode = m,
+                    Err(why) => return Err(format!("service '{name}': {why}")),
+                }
+                for entry in refs {
                     match secret_files.get(&entry) {
                         Some(file) => b.secrets.push(format!("{file}:{entry}")),
                         None => warn(&format!(
@@ -4893,6 +4936,58 @@ mod tests {
     /// with that string as an OPTION and the database died every time with
     /// `sh: 0: Illegal option --`. After the change the box runs
     /// `docker-entrypoint.sh --default-authentication-plugin=…` and MariaDB reports ready.
+    /// A SECRET ONLY ROOT CAN READ IS UNREADABLE TO MOST DATABASE IMAGES.
+    ///
+    /// The Compose Specification says a service secret has "world-readable permissions (mode
+    /// `0444`)"; kern wrote every secret `0400` into a `0700` directory. MEASURED on Docker's own
+    /// `nginx-golang-postgres` sample, whose `db` declares `user: postgres`: the entrypoint died with
+    /// `/run/secrets/db-password: Permission denied` on every start, the database never came up, and
+    /// the `service_healthy` gate its backend waits on timed out after 120 s. With the mode fixed the
+    /// same file comes up and the proxy answers 200 with rows from the database.
+    #[test]
+    fn a_service_secret_carries_the_specifications_mode_and_a_declared_one_wins() {
+        let mode = |y: &str| parse(y).unwrap().into_iter().next().unwrap().secret_mode;
+        let base = "services:\n  db:\n    image: alpine\n    secrets:";
+        let tail = "\nsecrets:\n  pw:\n    file: ./p.txt\n  other:\n    file: ./o.txt\n";
+
+        // Short form: the file declares no mode, so the SPEC's default applies. `None` here, and the
+        // driver turns it into `SPEC_SECRET_MODE` at the one place that builds the command line.
+        assert_eq!(mode(&format!("{base} [\"pw\"]{tail}")), None);
+        // Long form with a mode: honoured VERBATIM. A leading `0` is kept because the value is read
+        // back with `from_str_radix(.., 8)`, where `0440` and `440` are the same number - stripping
+        // it would be a rewrite with no reader.
+        assert_eq!(
+            mode(&format!("{base} [{{source: pw, mode: 0440}}]{tail}")),
+            Some("0440".to_string())
+        );
+        assert_eq!(
+            mode(&format!("{base} [{{source: pw, mode: 0o400}}]{tail}")),
+            Some("400".to_string())
+        );
+        // Two secrets asking for the SAME mode is not a conflict.
+        assert_eq!(
+            mode(&format!(
+                "{base} [{{source: pw, mode: 0440}}, {{source: other, mode: 0440}}]{tail}"
+            )),
+            Some("0440".to_string())
+        );
+
+        // TWO DIFFERENT MODES ARE REFUSED, not silently resolved. kern carries one mode per box, and
+        // picking one of two would give a secret a permission the file did not ask for.
+        let err = parse(&format!(
+            "{base} [{{source: pw, mode: 0400}}, {{source: other, mode: 0444}}]{tail}"
+        ))
+        .expect_err("two different modes for one service must be refused");
+        assert!(
+            err.contains("different"),
+            "must say what the conflict is: {err}"
+        );
+        assert!(
+            err.contains("400") && err.contains("444"),
+            "and name both: {err}"
+        );
+    }
+
     #[test]
     fn a_string_command_is_split_into_an_argv_and_never_wrapped_in_a_shell() {
         let cmd = |y: &str| parse(y).unwrap().into_iter().next().unwrap().command;

@@ -144,10 +144,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         never a cap and never an OOM kill. Docker's mem_reservation
     --cpu-weight <n>    Relative CPU share under contention (cgroup cpu.weight, 1-10000, 100 =
                         normal). Orthogonal to --cpus, which is an absolute ceiling
-    --secret SPEC       Deliver a secret as /run/secrets/NAME (mode 0400): SRC[:NAME] (file),
-                        NAME=- (from stdin), or NAME=value (inline - the value lands in argv, so
-                        it is readable by any user via `ps`: use a file or stdin for a real one);
-                        repeatable
+    --secret SPEC       Deliver a secret as /run/secrets/NAME: SRC[:NAME] (file), NAME=- (from
+                        stdin), or NAME=value (inline - the value lands in argv, so it is readable
+                        by any user via `ps`: use a file or stdin for a real one); repeatable
+    --secret-mode OCT   File mode for every --secret of this box (octal, default 400 = owner
+                        only). `kern compose` sends 444, the Compose Specification's default, so
+                        an image that runs as a non-root user can read its own secret
     --ssh PORT          Run an in-box sshd, published on host PORT (→ box :22); prints the ssh
                         command (auto-generates a keypair). Needs openssh in the image
     --ssh-key FILE      Authorize this public key instead of generating a throwaway keypair

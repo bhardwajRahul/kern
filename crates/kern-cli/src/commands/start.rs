@@ -1057,7 +1057,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 
     // `--secret`: read the values on the host (files/stdin/inline) BEFORE the fork; the box writes
     // them into a RAM-backed `/run/secrets` tmpfs (mode 0400) that never touches the overlay upper.
-    let secrets = crate::secret::parse_secrets(args.secrets)?;
+    let secrets = crate::secret::parse_secrets(args.secrets, args.secret_mode)?;
 
     // SECURITY: `--ssh` cannot mean anything with `--net`, and what it WOULD do is dangerous.
     // `--ssh <port>` publishes `127.0.0.1:<port>` → box `:22`. With `--net` the box has no network

@@ -44,6 +44,29 @@ stop a file being rendered without the value, and it is what a compose file writ
 a token: a stack came up with `MYSQL_PASSWORD=`. Every variable with no value is named, not just the
 first one found.
 
+**A service secret was written `0400` into a `0700` directory, so no image running as a non-root
+user could read it.** The Compose Specification says a service secret has "world-readable permissions
+(mode `0444`)". Measured on Docker's own `nginx-golang-postgres` sample, whose `db` declares
+`user: postgres`: the entrypoint died with `/run/secrets/db-password: Permission denied` on every
+start, the database never came up, and the `service_healthy` gate its backend waits on timed out
+after 120 s. The mode is now part of the secret: `kern compose` sends the specification's `0444` (or
+a `mode:` the file declares), `kern box --secret` keeps its owner-only `0400`, and `/run/secrets`
+itself is `0755` so a non-root reader can traverse it. Two different `mode:` values on one service
+are refused rather than silently resolved. Measured after: the same sample comes up, the proxy
+answers 200 with rows from the database, and a box whose image declares `USER appuser` reads its
+secret where the old default gave `Permission denied`.
+
+**A relay failure named two services when kern knew which one was missing.** `peer relays: a box is
+not running ('backend' or 'frontend')` sent the reader to look at a service that was running
+perfectly. It now names the one that is absent, and adds its exit code when the registry has one.
+
+**A flag could be added to `kern box` and shipped undocumented.** The parser/help gate covered only
+the verbs that call `reject_unknown_flags`, and the frozen-surface snapshot IS the help text, so a
+flag missing from help was missing from the snapshot too and the two agreed on an incomplete picture.
+`--secret-mode` reached a release build that way. A new gate scans `parse_box`'s own match arms and
+requires each flag to appear in `kern box --help`; the three internal ones kern passes to itself are
+listed with what writes them.
+
 **`kern stop` sent the stop signal TWICE, so a workload's shutdown handler ran twice.** `stop`
 signals every box in phase 1 so a stack tears down in parallel, and the per-box wait then sent the
 same signal again. A shell trap is re-entered on the second delivery: measured on a handler that

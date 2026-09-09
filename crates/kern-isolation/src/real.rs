@@ -82,6 +82,30 @@ impl UidRange {
 }
 
 /// What to run, and how to provide its root filesystem.
+/// One secret to expose at `/run/secrets/<name>` inside the box.
+///
+/// THE MODE IS PART OF THE SECRET, not a constant, and the two callers need different ones. The
+/// Compose Specification is explicit that a service secret defaults to "world-readable permissions
+/// (mode `0444`)" and that a `mode:` in the file overrides it; kern wrote every secret 0400 into a
+/// 0700 directory, which no workload running as a non-root user can read. MEASURED on Docker's own
+/// `nginx-golang-postgres` sample, whose `db` declares `user: postgres`: the entrypoint died with
+/// `/run/secrets/db-password: Permission denied` on every start, so the database never came up and
+/// the `service_healthy` gate its backend waits on timed out after 120 s.
+///
+/// `kern box --secret` keeps 0400 when no mode is given: that surface is kern's own, and a default
+/// nobody asked to widen stays where it was. The compose driver passes the specification's default
+/// explicitly, so the widening is visible at the call site that owes it.
+#[derive(Clone, Debug)]
+pub struct Secret {
+    /// The file name under `/run/secrets`. A single path component, validated by the caller.
+    pub name: String,
+    /// The secret's bytes, read on the host before the fork.
+    pub bytes: Vec<u8>,
+    /// The file mode to create it with. The write bit is dropped whatever is asked for, per the
+    /// specification: "The writable bit must be ignored if set."
+    pub mode: libc::mode_t,
+}
+
 pub struct SandboxSpec {
     /// New-root path the box pivots into. For `Overlay` (what the CLI builds) it's the empty
     /// merge point; `Bind`/`Tmpfs` (the `--plan` recorder + tests) name the rootfs directly.
@@ -164,7 +188,7 @@ pub struct SandboxSpec {
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
     /// on the host before the fork; the box writes them into a RAM-backed tmpfs so they never touch
     /// the persisted overlay upper and are gone when the box exits.
-    pub secrets: Vec<(String, Vec<u8>)>,
+    pub secrets: Vec<Secret>,
     /// `--ssh`: stand up an in-box `sshd` (authorized to the given public key). `None` → no SSH. The
     /// caller also wires a `-p HOST:22` forwarder; sshd is forked just before the box execs PID 1.
     pub ssh: Option<crate::ssh::SshSetup>,
@@ -2978,7 +3002,7 @@ fn setup_resolv_conf(root: &str, dns: &[String], search: &[String], options: &[S
 /// `/run/secrets` (so a secret never lands in the persisted overlay upper) and write each file. Runs
 /// before pivot. A hostile image shipping `/run/secrets` as a symlink is neutralised, and each file
 /// is created `O_NOFOLLOW | O_EXCL` inside the tmpfs we own - the write can't be redirected out.
-fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> Result<(), Error> {
+fn setup_secrets(root: &str, secrets: &[Secret], run_tmpfs: bool) -> Result<(), Error> {
     if secrets.is_empty() {
         return Ok(());
     }
@@ -3004,10 +3028,16 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
     let dir = format!("{root}/run/secrets");
     let dp = cstr(&dir)?;
     unlink_if_symlink(&dir);
-    unsafe { libc::mkdir(dp.as_ptr(), 0o700) };
+    unsafe { libc::mkdir(dp.as_ptr(), 0o755) };
     if !run_tmpfs {
         let ty = cstr("tmpfs")?;
-        let opts = cstr("mode=0700")?;
+        // 0755, NOT 0700. The directory has to be TRAVERSABLE by whatever user the workload runs as,
+        // or a per-file mode decides nothing: MEASURED on Docker's own `nginx-golang-postgres`
+        // sample, whose `db` service declares `user: postgres` - the entrypoint died with
+        // `/run/secrets/db-password: Permission denied` on every start. The files inside carry the
+        // permission decision; the directory only has to let a reader reach them, which is exactly
+        // what Docker's `/run/secrets` does.
+        let opts = cstr("mode=0755")?;
         let hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
         if unsafe {
             libc::mount(
@@ -3022,7 +3052,7 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
             return Err(Error::last("mount(/run/secrets tmpfs)"));
         }
     }
-    for (name, bytes) in secrets {
+    for Secret { name, bytes, mode } in secrets {
         // Name is a validated single component at the CLI; guard defensively before it hits a path.
         if name.is_empty() || name.contains('/') || name.contains("..") {
             continue;
@@ -3033,14 +3063,24 @@ fn setup_secrets(root: &str, secrets: &[(String, Vec<u8>)], run_tmpfs: bool) -> 
             Err(_) => continue,
         };
         // O_EXCL: the tmpfs is freshly ours, so a pre-existing entry would be an anomaly; O_NOFOLLOW:
-        // never traverse a symlink out of the tmpfs. Mode 0400 - read-only to the owner.
+        // never traverse a symlink out of the tmpfs. The MODE comes from the caller: see [`Secret`].
+        //
+        // `open`'s mode argument is masked by the umask, which a caller's environment sets and this
+        // process inherits, so a 0444 asked for could arrive as 0440. `fchmod` after the fact is not
+        // masked and is the only way to land the mode that was requested.
         let fd = unsafe {
             libc::open(
                 cp.as_ptr(),
                 libc::O_CREAT | libc::O_WRONLY | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o400,
+                *mode,
             )
         };
+        if fd >= 0 {
+            // The write bit is dropped whatever the caller asked for: the Compose Specification says
+            // "the writable bit must be ignored if set", and a writable secret is one a workload can
+            // silently replace for anything else that reads it later.
+            unsafe { libc::fchmod(fd, *mode & 0o555) };
+        }
         if fd < 0 {
             // The tmpfs is freshly box-owned, so this shouldn't happen - but never let a secret go
             // missing *silently* (an app would fall back to a weaker default). Say so.

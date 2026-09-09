@@ -31,8 +31,19 @@ fn name_err(name: &str) -> Error {
 
 /// Parse `--secret` specs into `(name, bytes)` pairs to hand to the sandbox. Reads files/stdin here
 /// (on the host, pre-fork) so the box side only writes already-materialised bytes.
-pub fn parse_secrets(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>, Error> {
-    let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(specs.len());
+/// The mode a secret gets when the caller names none: read-only to the OWNER, which is kern's own
+/// default and predates any compose consideration. `kern compose` passes the Compose Specification's
+/// default (`0444`, world-readable) explicitly, so the wider mode is visible at the call site that
+/// owes it rather than applied to every box on the machine.
+pub const DEFAULT_SECRET_MODE: libc::mode_t = 0o400;
+
+/// `mode` is the file mode each secret is created with inside the box; see
+/// [`kern_isolation::Secret`] for why it is a parameter and not a constant.
+pub fn parse_secrets(
+    specs: &[String],
+    mode: libc::mode_t,
+) -> Result<Vec<kern_isolation::Secret>, Error> {
+    let mut out: Vec<kern_isolation::Secret> = Vec::with_capacity(specs.len());
     let mut stdin_used = false;
     for spec in specs {
         // A `NAME=…` form (inline or stdin) takes precedence over the file form, so a value that
@@ -87,10 +98,10 @@ pub fn parse_secrets(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>, Error> 
                 let bytes = read_secret_file(src)?;
                 (name, bytes)
             };
-        if out.iter().any(|(n, _)| n == &name) {
+        if out.iter().any(|s| s.name == name) {
             return Err(Error::Sandbox(format!("--secret: duplicate name '{name}'")));
         }
-        out.push((name, bytes));
+        out.push(kern_isolation::Secret { name, bytes, mode });
     }
     Ok(out)
 }
@@ -216,13 +227,43 @@ fn read_secret_file(path: &str) -> Result<Vec<u8>, Error> {
 mod tests {
     use super::*;
 
+    /// The pairs a parse produced, as `(name, bytes)`, so an assertion reads the same as it did
+    /// before the mode joined the struct: the tests here are about NAMES and BYTES, and spelling the
+    /// third field into every one of them would be noise around the thing they check.
+    fn pairs(s: &[kern_isolation::Secret]) -> Vec<(String, Vec<u8>)> {
+        s.iter()
+            .map(|x| (x.name.clone(), x.bytes.clone()))
+            .collect()
+    }
+
+    /// THE MODE TRAVELS WITH EVERY SECRET, and the two defaults are different on purpose.
+    ///
+    /// `kern box --secret` keeps owner-only `0400`: that surface is kern's own and nobody asked to
+    /// widen it. `kern compose` passes the Compose Specification's `0444` explicitly, because a
+    /// secret only the owner can read is unreadable to every image that drops to a non-root user.
+    /// MEASURED on a box whose image declares `USER appuser` (uid 1500): with `--secret-mode 444`
+    /// the workload reads the secret, with the `0400` default it gets `Permission denied`.
+    #[test]
+    fn every_secret_carries_the_mode_it_was_parsed_with() {
+        let s = parse_secrets(&["TOKEN=abc".into()], DEFAULT_SECRET_MODE).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].mode, 0o400, "kern's own default is owner-only");
+
+        let s = parse_secrets(&["A=1".into(), "B=2".into()], 0o444).unwrap();
+        assert_eq!(s.len(), 2);
+        assert!(
+            s.iter().all(|x| x.mode == 0o444),
+            "the mode applies to EVERY secret of the box, not just the first"
+        );
+    }
+
     #[test]
     fn inline_and_named_forms() {
-        let s = parse_secrets(&["TOKEN=abc".into()]).unwrap();
-        assert_eq!(s, vec![("TOKEN".to_string(), b"abc".to_vec())]);
+        let s = parse_secrets(&["TOKEN=abc".into()], DEFAULT_SECRET_MODE).unwrap();
+        assert_eq!(pairs(&s), vec![("TOKEN".to_string(), b"abc".to_vec())]);
         // A value containing '=' and ':' survives (split_once on the first '=', not a file).
-        let s = parse_secrets(&["URL=a=b:c".into()]).unwrap();
-        assert_eq!(s, vec![("URL".to_string(), b"a=b:c".to_vec())]);
+        let s = parse_secrets(&["URL=a=b:c".into()], DEFAULT_SECRET_MODE).unwrap();
+        assert_eq!(pairs(&s), vec![("URL".to_string(), b"a=b:c".to_vec())]);
     }
 
     #[test]
@@ -234,20 +275,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         // auto-name = basename
-        let s = parse_secrets(&[f.to_string_lossy().into_owned()]).unwrap();
-        assert_eq!(s, vec![("api.key".to_string(), b"XYZ".to_vec())]);
+        let s = parse_secrets(&[f.to_string_lossy().into_owned()], DEFAULT_SECRET_MODE).unwrap();
+        assert_eq!(pairs(&s), vec![("api.key".to_string(), b"XYZ".to_vec())]);
         // explicit :NAME
         let spec = format!("{}:tok", f.to_string_lossy());
-        let s = parse_secrets(&[spec]).unwrap();
-        assert_eq!(s, vec![("tok".to_string(), b"XYZ".to_vec())]);
+        let s = parse_secrets(&[spec], DEFAULT_SECRET_MODE).unwrap();
+        assert_eq!(pairs(&s), vec![("tok".to_string(), b"XYZ".to_vec())]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn rejects_bad_name_world_writable_and_dupes() {
-        assert!(parse_secrets(&["../evil=x".into()]).is_err());
-        assert!(parse_secrets(&["a/b=x".into()]).is_err());
-        assert!(parse_secrets(&["A=1".into(), "A=2".into()]).is_err());
+        assert!(parse_secrets(&["../evil=x".into()], DEFAULT_SECRET_MODE).is_err());
+        assert!(parse_secrets(&["a/b=x".into()], DEFAULT_SECRET_MODE).is_err());
+        assert!(parse_secrets(&["A=1".into(), "A=2".into()], DEFAULT_SECRET_MODE).is_err());
 
         let tmp = std::env::temp_dir().join(format!("kern-sec2-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -255,7 +296,9 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(parse_secrets(&[format!("{}:k", f.to_string_lossy())]).is_err());
+        assert!(
+            parse_secrets(&[format!("{}:k", f.to_string_lossy())], DEFAULT_SECRET_MODE).is_err()
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

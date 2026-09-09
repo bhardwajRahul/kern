@@ -92,6 +92,7 @@ pub use real::bring_loopback_up;
 pub use real::id_range_available;
 pub use real::single_threaded;
 pub use real::with_id_mapped_userns;
+pub use real::Secret;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
 /// The readiness-pipe byte a gated box writes when it is set up and waiting on its pre-exec gate.

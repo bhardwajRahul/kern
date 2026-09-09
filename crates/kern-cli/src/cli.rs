@@ -134,6 +134,11 @@ pub enum Command {
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
         /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
         secrets: Vec<String>,
+        /// `--secret-mode <octal>`: the mode every secret of this box is created with. Defaults to
+        /// `secret::DEFAULT_SECRET_MODE` (0400); `kern compose` passes the Compose Specification's
+        /// `0444` explicitly, because a secret only the owner can read is unreadable to every image
+        /// that drops to a non-root user.
+        secret_mode: libc::mode_t,
         /// `--ssh PORT`: run an in-box sshd, published on host `PORT` (→ box `:22`).
         ssh_port: Option<u16>,
         /// `--ssh-key FILE`: authorize this public key instead of generating a throwaway keypair.
@@ -1665,6 +1670,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     // uses it when the caller names none. Stored as `SIGTERM` outright, the two cases were the same
     // value and the image's signal could only be honoured by ignoring an explicit `--stop-signal
     // SIGTERM`, which is somebody's deliberate choice.
+    let mut secret_mode: libc::mode_t = crate::secret::DEFAULT_SECRET_MODE;
     let mut stop_signal: Option<i32> = None;
     let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
@@ -1805,6 +1811,24 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         Some(v) => v,
                         None => return Err(Error::Usage("--restart-max <n>")),
                     };
+                }
+                "--secret-mode" => {
+                    i += 1;
+                    // OCTAL AND BOUNDED. A mode is written in octal everywhere it appears (the
+                    // specification says "in octal notation"), and a value above 0o777 would carry
+                    // setuid/setgid/sticky bits into a file kern creates for a workload.
+                    secret_mode =
+                        match rest.get(i).and_then(|v| {
+                            libc::mode_t::from_str_radix(v, 8)
+                                .ok()
+                                .filter(|m| *m <= 0o777)
+                        }) {
+                            Some(m) => m,
+                            None => return Err(Error::Usage(
+                                "--secret-mode <OCTAL>: three or four octal digits, at most 777 \
+                                 (e.g. 400 owner-only, 444 world-readable)",
+                            )),
+                        };
                 }
                 "--stop-signal" => {
                     i += 1;
@@ -2501,6 +2525,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             memory_reservation,
             cpu_weight,
             secrets,
+            secret_mode,
             ssh_port,
             ssh_key,
             hostname,
@@ -3151,6 +3176,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             memory_reservation,
             cpu_weight,
             secrets,
+            secret_mode,
             ssh_port,
             ssh_key,
             hostname,
@@ -3218,6 +3244,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tty,
             ports: &ports,
             secrets: &secrets,
+            secret_mode,
             ssh_port,
             ssh_key: ssh_key.as_deref(),
             hostname: hostname.as_deref(),

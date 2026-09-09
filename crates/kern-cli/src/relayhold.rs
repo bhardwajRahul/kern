@@ -940,19 +940,53 @@ fn try_spawn(r: &crate::nopod::RelayPlan, pump_cap: usize) -> Attempt {
     try_spawn_in(&crate::registry::list(), r, pump_cap)
 }
 
+/// A clause naming how a service ended, when the registry recorded it, else nothing.
+///
+/// "not running" is where the reader's question STARTS; the exit code is the answer, and it is one
+/// lookup away in a sidecar kern already keeps. Leaving it out made every relay failure look the
+/// same whether the service crashed, was never started, or exited 0 on purpose.
+fn exited_note(name: &str) -> Option<String> {
+    let e = crate::registry::list_exited()
+        .into_iter()
+        .find(|e| e.name == name)?;
+    Some(format!(" ('{}' exited {})", e.name, e.code))
+}
+
 /// [`try_spawn`] against a registry snapshot the caller already has.
 fn try_spawn_in(
     snapshot: &[crate::registry::Instance],
     r: &crate::nopod::RelayPlan,
     pump_cap: usize,
 ) -> Attempt {
-    let (Some(a), Some(b)) = (
+    let (in_pid1, to_pid1) = (
         live_pid1_in(snapshot, &r.in_box),
         live_pid1_in(snapshot, &r.to_box),
-    ) else {
+    );
+    let (Some(a), Some(b)) = (in_pid1, to_pid1) else {
+        // NAME THE ONE THAT IS MISSING, and say whether it EXITED. kern knows which of the two it
+        // could not find and whether the registry holds an exit code for it; reporting "'a' or 'b'"
+        // sends the reader to look at a service that is running perfectly.
+        //
+        // MEASURED on Docker's `react-express-mongodb` sample, whose `frontend` dies on its own
+        // dependency mismatch: kern said "a box is not running ('backend' or 'frontend')" while
+        // `backend` was up and connected to Mongo, so the first place a reader looked was the wrong
+        // service.
+        let missing: Vec<&str> = [(&r.in_box, in_pid1), (&r.to_box, to_pid1)]
+            .iter()
+            .filter(|(_, pid)| pid.is_none())
+            .map(|(n, _)| n.as_str())
+            .collect();
         return Attempt::Failed(format!(
-            "a box is not running ('{}' or '{}')",
-            r.in_box, r.to_box
+            "{} not running{}",
+            match missing.as_slice() {
+                [one] => format!("service '{one}' is"),
+                _ => format!("services {} are", missing.join(", ")),
+            },
+            missing
+                .iter()
+                .filter_map(|n| exited_note(n))
+                .collect::<Vec<_>>()
+                .join(""),
         ));
     };
     // A HOLDER THAT DOES NOT DECLARE THE PORT WILL NEVER BIND IT, so the alias is free by
