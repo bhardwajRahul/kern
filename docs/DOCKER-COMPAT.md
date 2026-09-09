@@ -1,240 +1,141 @@
 # Docker compatibility
 
-kern speaks Docker's **formats**, so existing images and stacks work, but it does **not** reimplement
-the Docker Engine API. It is a lightweight alternative, not a drop-in clone. This page is the full
-matrix: what is supported, what is not, and where the differences bite.
+kern speaks Docker's **formats**, so existing images and stacks work. It does **not** reimplement the
+Docker Engine API. This page is the reference: what is supported, what is not, and where the
+differences bite.
+
+Every FIGURE on this page is measured, and the measurement is named where it matters. Statements
+about what Docker does are taken from the Compose Specification: there is no Docker daemon on the
+machine kern is developed on.
 
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd**, digest-pinned `@sha256:` refs **content-verified** (the manifest is checked against the pin) |
-| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|systemd]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
-| **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage**, `COPY --from=…` (a build stage **or** an external image), **COPY globs** (`*.txt`, `src/*`, `[ab].conf`), BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first, including steps before the edit |
-| **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context: keeps `.git`/secrets out of the image (last-match-wins, `!` re-include, `**`) |
-| **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: export/import an image tar, `docker load`-compatible |
+| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|systemd]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
+| **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first |
+| **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context (last-match-wins, `!` re-include, `**`) |
+| **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
-| **Image management** (`docker images` / `rmi` / `search`) | ✅ `kern images` (list cached), `kern rmi` (remove, frees unshared layers), `kern search` (Docker Hub) |
-| **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem to a reusable image (warm start); skips volumes/secrets |
-| **`docker run` security flags** (`--security-opt`, `--cap-drop`, `--read-only`, `--tmpfs`) | ✅ `kern box`: **`--apparmor <profile>`** (Docker's `--security-opt apparmor=`, opt-in, enters a pre-loaded LSM profile), `--cap-drop`/`--cap-add`, `--read-only`, `--tmpfs`, an opt-in **`--security-profile untrusted`** bundle (seccomp allowlist + `--cap-drop ALL` + `--read-only`), and `--landlock-rw`; seccomp is **always on**. What kern does **not** have: **SELinux** labelling, and a **default** AppArmor profile (Docker/Podman apply one automatically; kern applies none unless you pass `--apparmor`). Full posture: [SECURITY.md](../SECURITY.md) |
-| **Docker Engine API** / `docker.sock` | ❌: tools that attach to the socket (Docker Desktop, some IDE/CI plugins) won't connect |
-| **Swarm** (multi-host orchestration) | ❌ and there is no workaround: clustering, service replicas and rolling updates across machines are out of scope for a single-host, daemonless runtime. `kern compose` is one machine, one pod. |
+| **Image management** (`docker images` / `rmi` / `search`) | ✅ `kern images`, `kern rmi` (frees unshared layers), `kern search` |
+| **`docker commit`** (container → image) | ✅ `kern commit <box> <image>`: snapshots the box's filesystem; skips volumes/secrets |
+| **`docker run` security flags** | ✅ `kern box`: `--apparmor <profile>`, `--cap-drop`/`--cap-add`, `--read-only`, `--tmpfs`, an opt-in `--security-profile untrusted` bundle, `--landlock-rw`; seccomp is **always on**. Not present: **SELinux** labelling, and a **default** AppArmor profile. Full posture: [SECURITY.md](../SECURITY.md) |
+| **Docker Engine API** / `docker.sock` | ❌ tools that attach to the socket will not connect |
+| **Swarm** (multi-host orchestration) | ❌ no workaround: out of scope for a single-host, daemonless runtime |
 
-**One stack, one network namespace.** The services of a `kern compose` stack share a
-single network namespace, like the containers of a Kubernetes pod: they reach each
-other by service name on `127.0.0.1`, with no bridge, no IPAM and no DNS server.
-That is what makes a stack start in milliseconds, and it has two consequences worth
-knowing before you choose kern.
+## How a stack is wired
 
-The first is a limit: **two services cannot both listen on the same
-container port**, even when their published ports differ. Two apps that both default
-to `:3000` is the common case, so kern refuses it *before* starting anything and names
-both services. The same applies to `net.*` sysctls, which belong to the namespace and
+kern picks the wiring from the file, and says which one it picked.
+
+**One shared namespace (the default).** Services reach each other by name on `127.0.0.1`: no bridge,
+no IPAM, no DNS server, and a stack that starts in milliseconds. Two services cannot both listen on
+the same container port here, so a file that asks for it gets the other wiring instead; under an
+explicit `--pod` kern refuses the stack and names both. `net.*` sysctls belong to the namespace and
 therefore to the whole stack.
 
-The second is a trust boundary, and it is the same fact read from the other side:
-**a stack is one network trust domain**. Every service reaches every other service's
-listening ports, published or not, because they share one loopback. MEASURED: a service
-listening on `9999` and publishing nothing is reachable from a peer in the same stack.
-The host's loopback is NOT reachable from inside (measured: the host's `:22` listener is
-invisible to a service), so the boundary is between the stack and the host, not between
-the services of one stack. Put a service you do not trust with its peers in its own
-stack, not in this one.
+**A namespace per service.** Chosen automatically when the file's `networks:` leave two services with
+nothing in common, or when two services claim the same internal port; `--no-pod` forces it and
+`--pod` forces the shared namespace. Peers are reached through per-service loopback aliases
+(`127.0.0.2` upward) carried by relays, so a namespace still holds only `lo` with no routes. The cost
+is a relay hop: measured at -34% bulk throughput and -16% connection rate.
 
-**That includes the `networks:` block in your file.** A compose file that puts `frontend`
-on one network and `backend` on another is expressing a separation kern does not apply:
-both services land in the same namespace and reach each other, and so does `internal:
-true`, which does not stop egress. kern says so on `up` and on `config`, naming the
-consequence rather than the feature, and then starts the stack anyway. If the separation
-is the point of the file rather than documentation of intent, split it into two stacks.
+**`networks:` is enforced in that wiring and inert in a pod.** Two services with no network in common
+get no relay and no `/etc/hosts` entry, so the peer's name does not resolve at all. The boundary is
+the ABSENCE of a relay, not a filter, so no rule can be misconfigured into permissiveness. A service
+with no `networks:` key is on the implicit `default` network and is therefore separated from services
+that name one; measured over 240 real files, 52 have at least one pair that loses an edge and 40 are
+exactly that mixed case, so `up` names every cut pair before starting anything.
 
-**Outbound needs `pasta`, and kern says so when it is missing.** Reaching the internet
-from a rootless network namespace needs a userspace network stack, so `kern compose up`
-attaches `pasta` (the `passt` package) to the pod for NAT'd egress and DNS. It is on by
-default whenever `pasta` is installed; a compose stack has no flag to turn egress off
-(`--no-outbound` is a `kern pod create` option, not a compose one). If `pasta` is not installed the pod comes up
-**loopback-only**, and the bring-up line says which state you got rather than
-leaving you to discover it when a `pip install` inside a service times out.
+**A shared namespace is one network trust domain.** The host's loopback is not reachable from inside
+it, so the boundary is between the stack and the host rather than between the services of one stack.
+Put a service you do not trust with its peers in its own stack. What that costs is the first entry
+under *Differences that bite*.
 
-There are **five**, not two. This page listed two until a user hit one of the other
-three and had no line to match it against ([issue #5](https://github.com/getkern/kern/issues/5)):
+## Egress
 
-```
-network: services reach each other by name + outbound to the internet (pasta)
-network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)
-network: loopback-only - services reach each other; pasta IS installed but did not start: <why>
-network: outbound is up but DNS is not - the pod can reach an IP and cannot resolve a name
-network: loopback-only (--no-outbound) - services reach each other; no egress
-```
+`kern compose up` attaches `pasta` (the `passt` package) for NAT'd egress and DNS. Without `pasta`
+installed a pod comes up loopback-only and the bring-up line says so. Outside a pod each service gets
+its own NAT, attached while it is held at its pre-exec gate, so no workload ever sees a half-built
+network.
 
-The third is the one worth knowing about, because `kern doctor` reports `pasta: found`
-and the pod still has no egress: `doctor` asserts the binary EXISTS, never that it
-started here. The fourth and the third look identical from inside a box until you try
-an IP literal rather than a name. `curl http://1.1.1.1` failing in **0 ms** is no route
-at all; `curl` by name failing while the IP answers is the DNS half alone.
+`internal: true` is a real boundary without a pod: a service confined to internal networks is given
+no NAT, so there is no route out of its namespace. Two exceptions are named rather than hidden: a
+service on the host network already has the host's connectivity, and a service with `restart:` becomes
+a systemd unit that `up` never holds. In a pod the key is all-or-nothing and `up` says which answer
+the stack got.
 
-**On Fedora and the RHEL family, SELinux refuses pasta and the audit log says nothing.**
-Reported from Fedora 43 ([issue #6](https://github.com/getkern/kern/issues/6)) and then
-reproduced in a Fedora 43 VM, kernel 6.17.1, `passt-selinux` installed, `pasta` running
-confined as `pasta_exec_t`. With the shipped v0.9.2 the pod came up loopback-only:
+The NAT does not reopen what segregation closed: measured from inside a segregated service, a public
+address connected while the host's own address answered `refused` on both a real listener and the
+segregated peer's published port.
 
-```
-network: loopback-only - ...; pasta IS installed but did not start: netns dir open: Permission denied, exiting
-```
+What pasta costs, measured on one host against the same targets: about **3.6 ms per network round
+trip**, and about 9% less download throughput. A pod has no DNS cache, so a host running a caching
+resolver answers a repeated name faster; on a name neither side had resolved before the pod was the
+faster of the two.
 
-One variable, same binary and same host, is what identifies the cause:
+## Differences that bite
 
-```
-setenforce 0  ->  services reach each other by name + outbound to the internet (pasta)
-setenforce 1  ->  loopback-only ... netns dir open: Permission denied, exiting
-```
+**In one shared namespace the services share `127.0.0.1`.** A port bound on the loopback is reachable
+from every peer, which under Docker it would not be: admin endpoints, `/metrics`, pprof, anything
+trusting `127.0.0.0/8` without authentication. `--no-pod` gives each service its own loopback.
 
-**Do not go to the audit log.** `ausearch -m avc -ts recent` and the kernel journal are
-both EMPTY while this happens, because the policy `dontaudit`s the denial, so the obvious
-diagnostic says SELinux is not involved when it is. Toggling enforcement is the check that
-works.
+**A published port binds `0.0.0.0`, like Docker.** kern used to bind `127.0.0.1`, which was the single
+largest source of behavioural difference: on a neutral corpus of 259 files, one per repository, 203
+(78%) publish at least one port. The narrower posture is one line, and it is a CEILING rather than a
+default, so a downloaded file cannot defeat it by writing an address:
 
-It is not a Fedora quirk, and it is not one kernel. `passt-selinux` is `noarch`, so it is
-the same policy on x86_64 and aarch64, and **`passt` requires it**, so installing pasta
-installs the confinement with it. Run in a VM per distro, each Enforcing out of the box:
-
-| | kernel | passt | with the retry |
-|---|---|---|---|
-| Fedora 43 | 6.17 | `0^20250919` | page fetched from the box |
-| AlmaLinux 9.8 | 5.14 | | page fetched from the box |
-| AlmaLinux 10.2 | 6.12 | | page fetched from the box |
-| Rocky Linux 10.2 | 6.12 | `0^20251210` | page fetched from the box |
-| CentOS Stream 10 | 6.12 | `0^20260728` | page fetched from the box |
-
-Each reproduced `netns dir open: Permission denied` on the shipped v0.9.2 first. Rocky and
-CentOS Stream were listed here as unverified until they were run; on both, the surviving pasta
-carries `--no-netns-quit`, which is how you know the policy refused the first attempt rather
-than the host simply being permissive.
-
-Five distributions, three kernel generations and four passt builds, one result. **The audit log
-was empty on every one of them.** The wording kern matches has been stable across those builds:
-`netns dir open: %s, exiting` is present in the 2024-02, 2025-09, 2025-12 and 2026-07 packages.
-Only the 2023-03 build in Debian 12 words it differently, and there it is a warning that keeps
-the NAT, so nothing needs matching.
-
-**And the reporter confirmed the cause on aarch64**, which is the half of it these VMs cannot
-reach: everything in the table is x86_64. On his own Fedora 43 aarch64 guest, `setenforce 0`
-makes the pod reach the internet ([#6](https://github.com/getkern/kern/issues/6)). So the
-architecture-plus-policy combination is measured for the FAULT, by the person who has the
-machine. Whether the retry fixes it there is still his to say.
-
-Amazon Linux 2023 ships the same `passt-selinux` and its image did not boot here, so its default
-enforcement mode is still unverified.
-
-One thing worth knowing if you build your own images: **a RHEL 10 guest needs a CPU model that
-advertises x86-64-v3.** Rocky 10 and CentOS Stream 10 panic on `init` under QEMU's default model
-and boot fine with `-cpu host`. That is a property of RHEL 10's baseline, not of kern, and it
-cost a first run here that looked like a broken image.
-
-Running it yourself, on any host, with or without SELinux:
-
-```
-sh scripts/certify-issue6.sh --self-check      # the assertions, against fixed strings
-sh scripts/certify-issue6.sh ./target/release/kern
+```toml
+[kern]
+publish_bind = "127.0.0.1"
 ```
 
-A stub `pasta` refuses only the attempt that watches the namespace, which is what the policy
-does, so the shape reproduces without a policy. Where SELinux **is** Enforcing the script adds
-a block that uses the real pasta and nothing simulated, and it tells the two apart by reading
-`--no-netns-quit` off the surviving process: an Enforcing host that does not refuse the open
-skips rather than passing, because a green there would mean "this host is fine", not "the fix
-works". 31 cases on Fedora 43, 29 where there is no SELinux, and it has been run on four hosts:
-Fedora 43 Enforcing, this workstation, an Ubuntu 24.04 VPS, and a **Raspberry Pi 5 on aarch64**,
-which is the reporter's architecture. The Rust suite also runs on a second aarch64 board, a
-Jetson on kernel 5.15, where `doctor` prints the **permissive** SELinux verdict against a real
-host rather than a test fixture.
+**A service with no `mem_limit:` gets the host's RAM**, as it does under Docker. It is not uncapped:
+the box carries a `memory.max` and `oom.group = 1`, so a failure stays attributable to its own cgroup
+instead of the host OOM killer picking a victim. `[kern] compose_memory_max` restores a strict ceiling
+and caps a bigger `mem_limit:` too; see [CONFIG.md](CONFIG.md).
 
-**The message is not the same in every passt, and where it differs there is nothing to fix.**
-Measured by reading the installed binaries:
+**An empty NAMED volume is seeded from the image**, contents, owner and mode. Only when the volume is
+empty, and never for a bind mount of a host path. A multi-layer image is read through the
+kernel-merged overlay view, so a file a higher layer deleted does not come back.
 
-| passt | ships in | on a refused watch |
-|---|---|---|
-| `0.0~git20230309` | Debian 12 | `inotify_init(): won't quit once netns is gone` and it CARRIES ON |
-| `0.0~git20240220` | Ubuntu 24.04 | `netns dir open: %s, exiting` |
-| `0^20250919` | Fedora 43 | `netns dir open: %s, exiting` |
+**The image's own `HEALTHCHECK` and `STOPSIGNAL` are used** when the file declares none. A
+`healthcheck:` in the file replaces the image's entirely, numbers included. An explicit
+`stop_signal:` wins even when it names `SIGTERM`; a signal name kern does not know leaves the box on
+`SIGTERM` rather than refusing to start it.
 
-The older build treats the refusal as a warning and keeps the NAT, so #6 cannot happen on it and
-kern having no phrase to match is correct rather than a gap. The battery tells the two apart and
-skips rather than passing or failing blindly. Somewhere between March 2023 and February 2024 the
-same condition became fatal, and that is the window in which the retry is needed.
+**A service mounting `/var/run/docker.sock` has nothing to talk to.** kern is daemonless. The mount
+succeeds and the service fails later inside its own code. Such a service needs real Docker.
 
-Beyond the fix itself it covers the shapes around it: a refusal that is not on the first line
-(measured on WSL2, where pasta's first line is informational), a pasta that never returns, one
-that floods stderr before refusing, pid files naming a live process that is not ours, and pid
-files holding `0`, `-1` and other values that must never reach `kill`. The last assertion is
-the script's own footprint, because an earlier version of these cases leaked seven pod holders
-per run and seven orphaned holders is what had already shown up as an unexplained failure in
-the acceptance matrix.
+**`restart:` in a pod does not survive a reboot.** A pod member is supervised in-process and restarted
+on any exit for the life of the stack, but a systemd unit cannot re-join the pod's network namespace.
+For reboot-survival run that service as a standalone box: `kern box <name> --restart unless-stopped`,
+which has no pod and therefore no pod egress.
 
-It goes red against the shipped v0.9.2 at 12 cases, on this host and in the VM, and against
-three mutations: removing the retry, putting `--no-netns-quit` on the first attempt as well
-(which still works, and would quietly make the retry unreachable on every real policy host),
-and dropping the teardown signal. That last one is the leak the fix itself creates: a pasta
-started without the netns watch does not notice the namespace disappear, so nothing but the
-signal stops it.
+**`devices:` is a bind, and its ceiling is the invoking user.** A rootless box reaches exactly what
+the person who started it could already reach; a device the host does not have is refused by name
+before the box starts. `/dev/net/tun` maps to `--tun` instead, because creating a tunnel interface
+needs `CAP_NET_ADMIN` in the box's namespace.
 
-**Where AppArmor confines pasta instead, the same access is granted.** upstream passt's own
-profile (`/etc/apparmor.d/abstractions/pasta`) allows it, and names the function while doing it:
+**Secrets are delivered at `/run/secrets/<source>`**, owned by the box's root, mode `0444` (the
+specification's default) or the `mode:` the file declares. `target:`, `uid:` and `gid:` are read and
+named as not applied.
 
-```
-@{PROC}/[0-9]*/ns/    r,    # pasta_netns_quit_init(),
-```
+## What is refused rather than dropped
 
-So the problem is that SELinux policy specifically, not confinement in general.
+**`${VAR:?message}`** with no value. That form exists to stop a file being rendered without it, and it
+is what a compose file writes for a password. Every variable with no value is named, not just the
+first. `${VAR}` and `${VAR:-default}` are unchanged.
 
-This page used to say "openSUSE is the other way round and needs nothing", which was read out
-of upstream packaging rather than measured, and the measurement does not support it: **openSUSE
-Leap 15.6 has no `passt` in its repositories at all**, so there is no pasta to confine, no
-abstraction file on disk, and a pod there is loopback-only for the ordinary reason. kern's
-acceptance matrix passes 38/38 on Leap; issue #6 simply cannot arise on it. Whether Tumbleweed
-packages passt was not checked.
+**`RUN --mount=type=secret` and `type=ssh`.** Dropping the flag runs the command unauthenticated:
+either a 401 pointing at the registry rather than at the discarded flag, or a build that succeeds
+against something public and ships the wrong result. `type=cache` and `type=bind` stay dropped,
+because those cost a rebuild and not a wrong answer.
 
-kern recovers from this by itself now: pasta opens the netns's DIRECTORY only to watch it
-and quit when it disappears, so on that one refusal kern retries once with
-`--no-netns-quit`, which drops that open. Verified end to end under Enforcing: a box in the
-pod fetched `http://example.com` and got the page back. Nothing needs to be turned off.
+**`external: true` on a volume that does not exist**, as Docker refuses it. Create it with
+`kern volume create <name>` first, or drop the key and accept that the service starts on empty
+storage.
 
-**A one-service stack gets a pod too.** Before v0.9.2 it did not: the pod was created
-only from two services up, on the reasoning that a pod's other job is letting services
-find each other. The pod is also the only thing that attaches `pasta`, so a lone
-service came up with no egress and no `/etc/resolv.conf`, and the failure read as DNS.
-
-**`restart:` in a pod does not survive a reboot.** A pod member is supervised
-in-process, so it is restarted on any exit for the life of the stack, but it is not
-handed to a systemd unit: a unit that outlives the pod holder cannot re-join the
-network namespace it was started in. Docker's `restart: unless-stopped` does come back
-after a reboot, so `kern compose up` prints a note when a service asks for one. For
-reboot-survival, run that service as a standalone box (`kern box <name> --restart
-unless-stopped`), which has no pod and therefore no pod egress.
-
-`pasta` is the only thing in kern that is worth installing separately, and it buys
-exactly this one capability. What it costs, measured on an Intel i7-14700KF, Linux 7.0,
-against the same targets from the host in the same session:
-
-| | in a pod | on the host | |
-|---|---:|---:|---|
-| service to service (shared loopback) | **0.14 ms** p50 | n/a | no bridge, no NAT, no DNS server |
-| TCP connect to a public IP | 28.4 ms | 29.3 ms | identical |
-| TLS handshake | 34.0 ms | 35.1 ms | identical |
-| DNS, name never resolved before | 32.8 ms p50 | 53.3 ms p50 | identical; both are just network latency |
-| download throughput | 1.64 MB/s | 1.80 MB/s | about 9% less |
-
-What `pasta` costs is **about 3.6 ms per network round trip**, measured against the same
-public IP from inside the pod and from the host: connect 29.8 ms against 26.2, and the
-request/response leg after it 30.0 against 26.4. It is a flat per-round-trip cost, so it
-shows up multiplied on anything with several: an HTTPS request, whose TLS handshake adds
-two more, reads about four times that.
-
-The other asymmetry worth knowing is that a pod has **no DNS cache**: a host running a
-caching resolver answers a repeated name in well under a millisecond, while the pod pays
-the full lookup every time, so a warm host can look ~29 ms faster per request on a name it
-has already seen. That is caching, not NAT: on a name neither side had resolved before, the
-pod was the faster of the two.
-
-Declare the port each service listens on and the conflict goes away:
+**Two services on the same internal port under `--pod`.** Declare the port each one listens on and
+the conflict goes away; `expose:` says the same thing and is honoured identically:
 
 ```yaml
 services:
@@ -242,502 +143,59 @@ services:
   admin:  { image: node:20-slim, port: 3100 }
 ```
 
-kern passes it as `PORT` and reserves it for that service, so peers keep using the name
-(`http://admin:3100`) with nothing remapped at run time. Docker's own `expose:` says the
-same thing and is honoured identically, so a stack that already uses it needs no edit.
+kern passes it as `PORT`. That is a convention, not a contract: an image reading a variable of its own
+needs that one set instead.
 
-`PORT` is a **convention, not a contract.** Most images read it; an image that reads a
-variable of its own needs that one set instead, so for those the edit is this line plus
-knowing which variable the image honours. The refusal says so, and it spells the change it
-wants, naming the service and a port to use rather than describing the shape of an edit,
-because there is no configuration that gives one stack BOTH two services on a single
-internal port AND peers that can reach each other on it.
+## Resource profiles from a compose file
 
-A PUBLISHED PORT BINDS `0.0.0.0`, LIKE DOCKER. `ports: "8080:80"` means what it means under Docker:
-every interface. kern used to bind `127.0.0.1` and warn, and that single choice was the largest
-source of behavioural difference in this implementation. MEASURED on a NEUTRAL corpus of 259 compose
-files, one per repository, sampled across 733 repositories: **203 of them (78%)** published at least
-one port and therefore behaved differently from what the file says. Nothing else came close, and the
-whole "kern is deliberately less permissive" family (`privileged`, `security_opt`) was worth 8 files
-on the same corpus. Closing it moved the share of files with ZERO behavioural difference from **14%
-to 63%**, measured before and after on the same corpus.
+`x-kern-vcpu`, `x-kern-vdisk`, `x-kern-vgpio` and `x-kern-security-profile` attach a `kern.toml`
+profile to a service. `x-` is the specification's extension mechanism, so the file stays portable:
+Docker ignores the key and runs the service without the profile.
 
-The narrower posture is one line of `kern.toml`:
+A profile buys only what compose cannot already say. `cpus`, `cpuset` and `mem_limit` are compose's
+own and are used directly. A `tmpfs` size cap is honoured and charged to the box's memory cap.
 
-```toml
-[kern]
-publish_bind = "127.0.0.1"
-```
+`vgpio` is gated: a profile name means different hardware on different hosts, so `kern compose <file>
+config` prints what each name resolves to here, and `--allow-device-grants` (or the operator's own
+`kern.toml`) is required before it runs. A profile kind this build does not have is named as absent
+rather than treated as a typo.
 
-It is a CEILING, not a default: with it set, even a spec that writes `0.0.0.0:8080:80` is bound to
-loopback, because a policy a downloaded compose file could defeat by writing an address is not a
-policy. The box says how many specs it narrowed, so the difference is never silent. If `kern.toml`
-cannot be parsed, publishing falls back to loopback and says so: the two wrong guesses are not
-symmetric, and only one of them exposes ports an operator wrote a file to prevent.
+## Starting a stack at boot
 
-THE WIRING IS CHOSEN FROM THE FILE. With neither `--pod` nor `--no-pod`, kern gives each service its
-own network namespace exactly when the file's `networks:` leave two services with nothing in common,
-and keeps one shared namespace otherwise. The choice is announced with what it costs (a relay hop
-between peers: measured at -34% bulk throughput and -16% connection rate), the separated pairs are
-named before anything starts, and `--pod` keeps the single namespace. A file whose networks separate
-nothing is told nothing: MEASURED on a neutral corpus of 259 files, 75 declare per-service networks
-and only 11 of them actually separate a pair, so a note on all 75 would have been a warning about a
-loss that did not happen.
+`kern compose <file> systemd` generates a unit. It adds no supervision beyond each service's own
+`restart:` policy. A single long-running box installs its own unit automatically; the stack path is
+manual on purpose.
 
-THE DIFFERENCES THAT BREAK NOTHING ARE THE ONES KERN NOW SAYS OUT LOUD. A compatibility rate measured
-from kern's own warnings is blind to whatever kern does not know it does, so it counts a silent
-difference as a perfect file. Five of them are named at `up` and at `config` as of this release, and
-the honest consequence is that the measured rate FELL when they were: the differences were always
-there, the measurement was not.
-
-  * **A service with no `mem_limit:` now gets the host's RAM, as it does under Docker.** It used to
-    get `kern box`'s 512 MiB default, so a service that runs under Docker was OOM-killed at a number
-    written nowhere in the file. MEASURED on the neutral corpus: 243 of 259 files have at least one
-    service in that position, which made it the largest remaining difference after the publish
-    default. It is not uncapped: the box still carries a `memory.max` and `oom.group = 1`, so the
-    failure stays attributable to its own cgroup. `[kern] compose_memory_max` restores a strict
-    ceiling and caps a bigger `mem_limit:` too; see [CONFIG.md](CONFIG.md).
-  * **In one shared namespace the services share `127.0.0.1`.** A port a service binds on the
-    loopback is reachable from every other service in the stack, which under Docker it would not be:
-    an admin endpoint, `/metrics`, a pprof handler or anything trusting `127.0.0.0/8` without
-    authentication. This is an exposure and not a failure, so nothing ever complained about it.
-    `--no-pod` gives each service its own loopback at the cost of a relay hop.
-  * **A service mounting `/var/run/docker.sock` has nothing to talk to.** kern is daemonless: no
-    Docker daemon, no Engine API. The mount succeeds and the service fails later inside its own code
-    with an error pointing at Docker. There is no kern equivalent; such a service needs real Docker.
-  * **`RUN --mount=type=secret` and `type=ssh` are REFUSED, not dropped.** The command was written
-    because the credential would be there, so running it without one means `npm ci` or `pip install`
-    goes out unauthenticated: either a 401 whose message points at the registry rather than at the
-    discarded flag, or a build that succeeds against something public and ships the wrong result.
-    `--mount=type=cache` and `type=bind` stay dropped, because those cost a rebuild and not a wrong
-    answer.
-  * **`external: true` on a volume that does not exist is refused, as Docker refuses it.** kern
-    auto-creates a named volume on first use, which is right for a volume the file owns and wrong for
-    one whose data belongs to something else: the service would start, find nothing, and initialise
-    over the top. Create it with `kern volume create <name>` first.
-
-AN EMPTY NAMED VOLUME IS SEEDED FROM THE IMAGE, WHICH IS WHAT DOCKER DOES. Docker copies the image's
-content at the mount point into a named volume the first time that volume is used while it is still
-empty; kern mounted an empty directory over the top, so a service came up and found NOTHING where its
-image had put a default configuration, an initial database or a web root. It then failed with an
-error of its own making, which points at the application and never at the mount. Measured: a box on
-`nginx:alpine` with an empty volume at `/etc/nginx` saw 0 files and now sees 8. Only ever when the
-volume is EMPTY, so it costs nothing after first use and can never write over data that is already
-there, and only for a NAMED volume: a bind mount of a host path is your own directory and is never
-touched. A multi-layer image is read through the kernel-merged overlay view, so a file a higher layer
-DELETED does not come back. The volume's own root also takes the image directory's owner and mode: a
-mount point the image left EMPTY copies no content at all, and that is the common shape (Prometheus's
-`/prometheus`).
-
-THE IMAGE'S OWN `HEALTHCHECK` AND `STOPSIGNAL` ARE READ. Docker runs the check an image ships whether
-or not the compose file mentions one, and `depends_on: {condition: service_healthy}` waits on exactly
-that; kern read only what the file said, so such a service reported `HEALTH = "-"` forever. Measured
-on a box whose image declares a check: the branch reports `healthy` when the check passes and
-`unhealthy` when it fails, where before it reported `-` in both cases. A `healthcheck:` in the file
-replaces the image's ENTIRELY (Compose's rule), numbers included. `STOPSIGNAL` is used when no
-`--stop-signal`/`stop_signal:` is given, so nginx gets its `SIGQUIT` drain instead of a `SIGTERM` that
-cuts live connections; an explicit signal wins even when it names `SIGTERM`, and a signal name kern
-does not know leaves the box on `SIGTERM` rather than refusing to start it.
-
-`${VAR:?message}` IS A REFUSAL. That form exists to stop a file being rendered without the value and
-is what a compose file writes for a password or a token; kern used to warn and substitute the empty
-string, so a stack came up with `MYSQL_PASSWORD=`. It now refuses and names every variable that has
-no value, not just the first. `${VAR}` and `${VAR:-default}` are unchanged.
-
-EGRESS IS PER SERVICE WITHOUT A POD. Each service gets its own rootless NAT, attached through the
-same `pasta` mechanism a pod uses, while the service is held at its pre-exec gate: every namespace is
-built, no instruction has run, so a workload never sees a namespace without a route one instant and
-with one the next. Before this, a `--no-pod` box held only `lo` and could not reach the internet at
-all.
-
-`internal: true` IS THEREFORE A REAL BOUNDARY, and this is the first wiring in which it can be one. A
-service confined to internal networks is given NO NAT, so there is no route out of its namespace
-rather than a filter that has to stay correct. Measured on one stack, one run: the public service
-reported two routes and reached `1.1.1.1:443`, the confined one reported zero and could not. Two
-exceptions are named rather than hidden: a service on the host network already has the host's
-connectivity, and a service with `restart:` is installed as a systemd unit, so `up` never holds it
-and cannot attach a NAT to it.
-
-THE NAT DOES NOT REOPEN THE PATH THE SEGREGATION CLOSED, and that was worth checking rather than
-assuming: giving each service egress could have let a service reach a segregated peer through the
-peer's PUBLISHED port on the host. Measured from inside a segregated service, with a positive control
-so a blanket failure could not be mistaken for a boundary: `1.1.1.1:443` CONNECTED (the NAT works),
-while the host's own address answered `refused` on a port the host really was listening on and on the
-segregated peer's published port. The mechanism is visible from inside: pasta gives the box the
-host's address (`192.168.1.32/24` in the namespace), so that address means "me" there and reaches
-nothing on the host. Under Docker the same pair is reachable through the published port.
-
-`networks:` IS ENFORCED WITHOUT A POD, AND INERT INSIDE ONE. A kern stack in a pod is ONE network
-namespace, so nothing in it can segregate anything and the key is reported as dropped. Under
-`--no-pod` each service has its own namespace and reachability is built edge by edge out of relays,
-so the memberships decide which edges exist: two services with no network in common get no relay AND
-no entry in each other's `/etc/hosts`, so the peer's name does not resolve at all. Measured on a
-three-service stack (`web` on `front`, `app` on both, `db` on `back`): `web` reaches `app` and `app`
-reaches `db` with their payloads, `web -> db` and `db -> web` both answer `nc: bad address`, and the
-plan drops from six relays to four. The segregation is enforced by the ABSENCE of a relay, not by a
-filter, so there is no rule that can be misconfigured into permissiveness.
-
-A SERVICE WITH NO `networks:` KEY IS ON THE IMPLICIT `default` NETWORK, so it is separated from the
-services that name one. That is the Compose Specification's rule and it is the half that surprises
-people. It is also the dominant case in practice: measured over 240 real compose files, 113 declare
-`networks:` on at least one service and **52 have at least one pair that loses its edge**, of which
-**40 are exactly this mixed case**. `up` therefore names every cut pair with both memberships before
-starting anything, because a removed edge otherwise surfaces minutes later as `bad address '<peer>'`
-in a service log, which is the same symptom as a typo or a dead peer.
-
-NOT VERIFIED AGAINST A DOCKER DAEMON. There is no Docker on the machine this was developed on and the
-board that has one was unreachable, so the `default`-network rule above is taken from the Compose
-Specification rather than measured. Everything stated about kern's own behaviour IS measured.
-
-`internal: true` DIFFERS BY WIRING, AND BOTH ANSWERS ARE MEASURED. In a pod the key is all-or-nothing:
-it becomes the pod's `--no-outbound` only when every service is confined to internal networks, and
-otherwise outbound stays open for everyone (measured: a pod member sees `lo` plus pasta's interface
-and reaches `1.1.1.1:443`). Without a pod every service is confined already (measured: the box holds
-only `lo` and the same TCP connect is refused), so the key is satisfied for the services that asked
-for it AND for the ones that did not. That over-application is stated at parse time, because a stack
-that calls an external API will fail with nothing pointing at the network.
-
-`devices:` IS A BIND, AND ITS CEILING IS THE INVOKING USER. A device node named there is bound into
-the box with the host's own owner and mode, exactly as `volumes:` has always been able to do
-(measured before any of this: `-v /dev/kvm:/dev/kvm` gives a workload a working
-`crw-rw---- 10, 232 /dev/kvm`). Measured through `devices:` on one host, as the invoking user:
-`/dev/mem` denied, `/dev/kmsg` denied, and the raw disk `/dev/nvme0n1` READABLE, because that user is
-in group `disk` and the node is `root:disk` 0660, so it is readable outside a box too. A rootless
-kern box is bounded by the user who started it and never by root: a stack can reach exactly what that
-person could already reach with `cat`, and no more. `/dev/net/tun` is the one entry that does not
-become a bind: creating a tunnel interface needs `CAP_NET_ADMIN` in the box's network namespace, so
-it maps to `--tun`, which delivers the node AND the capability. A device the host does not have is
-refused by name before the box starts, and nothing is created in its place.
-
-`--no-pod` is not the loss it used to be. Each service gets its own network namespace and a stack-wide
-loopback alias, `127.0.0.2` upward; a service resolves its own name to `127.0.0.1`, where its listener
-is, and each peer to that peer's alias, where a relay is bound inside this box. MEASURED on a native
-Linux host: under `--no-pod` a two-service stack answers `127.0.0.2 srv` for its peer and `127.0.0.1`
-for itself, `nc` connects, and the namespace still holds **only `lo` with no routes at all**. Nothing
-was traded away to make names work; the reachability is carried by a relay that lives inside the
-namespace rather than by an interface added to it. No box gets an `/etc/resolv.conf` either way: peer
-names travel through `/etc/hosts`.
-
-A peer also arrives with its OWN address rather than as loopback. The connector binds the calling
-service's alias as the SOURCE before it connects, so a service sees `127.0.0.2` for one peer and
-`127.0.0.3` for another (verified from inside a box: `netstat -tn` in the target shows the caller's
-alias, not `127.0.0.1`). That matters because loopback is the most trusted source in most default
-configurations, and a stack run with `--no-pod` asked for separation.
-
-WHAT A SHARED INTERNAL PORT COSTS UNDER `--no-pod` IS MEASURED, NOT ASSUMED. On one port, two
-SPECIFIC binds on different addresses do not conflict at all, while a specific bind and a WILDCARD
-bind refuse each other in both orders, `SO_REUSEADDR` or not. A service that binds `127.0.0.1:8080`
-explicitly leaves `127.0.0.2:8080` free and its relay works; only a service on `0.0.0.0:8080` takes
-the whole port.
-
-A compose file declares a port and never an address, so kern reads `/proc/<pid1>/net/tcp` for the box
-that would host each relay once the services have bound. The direction whose host binds the wildcard
-is named with both remedies; the other direction is served. Two services that both declare 8080 may
-therefore lose one direction, both, or neither, and `up` says which. `kern compose ps` keeps printing
-any direction that is down.
-
-The two remedies are: change one internal port, or make one service bind `127.0.0.1` explicitly
-instead of `0.0.0.0`, which is often a one-line config change against a renumber that touches every
-caller.
-
-BRING-UP IS ORDERED, so no workload observes a half-built network. A relay needs PID 1 of both boxes
-and can only be built once every box exists, which used to mean a service that connected out at
-startup ran before the relay it needed. kern now holds each box at a gate placed in its PID 1 after
-seccomp is installed and immediately before `exec`: a held box is a fully confined process that has
-not yet run a single instruction of the workload. `up` builds the relays, then releases the boxes in
-dependency order. Measured on the case that used to fail: a client connecting at t=0 got no answer
-three runs of three before, and its peer's payload three runs of three after.
-
-ONE KIND OF SERVICE IS NOT HELD. A service that sets `restart:` outside a pod is installed as a
-systemd unit and started by the manager, in a process that inherits nothing from `up`, so there is no
-descriptor to gate it with. If it only listens, nothing changes: starting early is not a problem for
-something that has to be listening anyway (measured: as a producer it delivers, three of three). If
-it connects out at startup, that first connection can precede the relay and needs a retry (measured
-with the same fixture and the one line as the only variable: `NO-API` three of three with
-`restart:`, the payload three of three without it). `up` names any such service at bring-up rather
-than leaving it to be discovered from a service log.
-
-What relays cost, measured on an x86 desktop with the release binary, against the same stack in a
-pod. Throughput and connection rate are the price of the extra hop: bytes cross two TCP connections
-instead of one.
-
-| | in a pod | with relays | |
-|---|---|---|---|
-| bulk transfer | ~1270 MB/s | ~840 MB/s | -34% |
-| connection rate | ~1980 conn/s | ~1660 conn/s | -16% |
-
-The userspace copy is NOT what costs it: raising the pump's buffer from 16 KB to 64 KB moved
-throughput less than the run-to-run spread (635 to 851 MB/s across repeats either way), so `splice`
-would buy nothing here. The extra TCP connection is the cost, and it is inherent to the design.
-
-Bring-up scales sub-linearly in the relay count and the process count does not. Same machine, one
-port per service: 2 services is 2 relays and `up` in 187 ms; 8 is 56 relays and 218 ms; 16 is 240
-relays and 388 ms; 32 is 992 relays, 1,987 processes, 474 MB of resident memory and 1.54 s. A relay
-costs two processes and roughly 240 kB.
-
-That product is why `up` refuses a stack needing more than **1024 relays**, before starting anything.
-The 253-service alias range does not bound it: 253 services with one port each would be 63,756 relays
-and 127,513 processes, more than the `RLIMIT_NPROC` of the machine this was measured on. A mesh that
-wide is not what `--no-pod` is for, and the refusal says so with the arithmetic.
-
-An idle stack costs almost nothing: the holder measures **0.10% of a core** with 56 relays up and
-nothing wrong.
-
-A named volume shared by two services that run as **different users** behaves exactly as it does under
-Docker, which means the second service can be refused at runtime and nothing warns at start-up.
-MEASURED on a Raspberry Pi 5 (which has `newuidmap`, `newgidmap` and both `/etc/sub*id` allocations):
-`writer` running as `0:0` creates `/data/f` mode `0640` owned by `0:0`, `reader` running as `1000:1000`
-mounts the same volume, `up` exits 0 with no warning, and the read fails with `Permission denied`
-INSIDE the reader, seconds later.
-
-kern does not chown a shared volume to fit the second consumer, deliberately: that would silently
-rewrite ownership of data the first service owns, and it would differ from Docker on a file layout
-people already depend on. The answer is the same one Docker gives, so a stack that works there works
-here, and one that does not needs the same fix: matching users, a group both are in, or permissions
-that admit both. Under a user namespace the in-box uid is what matters, so `user:` is what decides it.
-
-Note that a service using `rootfs:` rather than `image:` keeps a SINGLE-uid map by default, and a
-`user:` naming any other uid is then refused at start-up rather than at runtime, naming
-`--uid-range` as the fix. That refusal is the loud half of this; the volume case above is the quiet
-half, and it is quiet because it is a filesystem permission and not a mapping.
-
-`kern compose <file> watch [service...]` is the development loop: it watches each selected service's
-`build.context` and, on a change, rebuilds that service's image and restarts that service alone,
-leaving its peers running. Measured on an x86 desktop, a full edit-to-serving cycle for a
-one-instruction image is 258 to 261 ms. It is not Docker Compose's `develop.watch`: kern invents no
-new compose key, and follows the build context because that is already the set of files a rebuild
-reads. A service that runs a published `image:` has no such set and is excluded, by name.
-
-`kern compose <file> port <service> <container-port>` answers the other direction, like
-`docker compose port`: it prints the host address serving that box port, read from the RUNNING box
-rather than from the file, and exits non-zero when there is no answer. Scripts can rely on the exit
-code: `addr=$(kern compose f port web 8000) || exit 1`.
-
-Three spellings, one space: `ports:` (published), `port:` (declared and passed as
-`PORT`), `expose:` (declared only). A service that publishes nothing is visible to the
-check only if it declares something. Every edge case is decided rather than left to chance
-(a conflicting `PORT=` is refused by name, a range in `ports:` is expanded and checked
-port by port, a range in `expose:` is never silently expanded, `--no-pod` lifts the
-constraint entirely): [compose-declared-ports.sh](../examples/compose-declared-ports.sh) runs
-through them.
-
-One deliberate asymmetry: a malformed entry in *your* kern profile is refused with its
-line number, while the same entry in someone else's `docker-compose.yml` is warned about
-and skipped. Failing a whole stack over one line of documentation is the wrong trade for a
-file kern did not write; for a file you did, a typo should be named at once.
-
-`kern compose <file> config` prints what kern understood, reservations included, and
-refuses exactly what `up` would refuse: a dry run that disagreed with the bring-up would
-be worse than no dry run.
-
-### Resource profiles from a compose file
-
-A `docker-compose.yml` can name a `kern.toml` resource profile through the Compose Specification's
-own extension fields:
-
-```yaml
-services:
-  trainer:
-    image: tensorflow/tensorflow:2.20.0
-    cpus: 3.0            # already honoured, inline
-    mem_limit: 3g        # already honoured, inline
-    x-kern-vcpu: ml      # a [[vcpu]] profile in kern.toml
-    x-kern-vdisk: scratch
-    x-kern-vgpio: leds
-    x-kern-security-profile: untrusted
-```
-
-`x-kern-security-profile: untrusted` is the one that needs no `kern.toml` at all: it is the opt-in
-hardening bundle (seccomp allowlist, `--cap-drop ALL`, `--read-only`) under one name. Compose has no
-way to say "this code is not trusted", and the flags it would take instead are easy to get
-half-right. Measured on a service carrying it: `touch` in the rootfs answers `Read-only file system`
-and `CapEff` reads `0000000000000000`.
-
-They resolve to the `vcpu:`/`vdisk:`/`vgpio:` tokens `kern box` already takes, so `kern.toml` and a
-compose file reach the same profiles. `leds` and `vgpio:leds` name the same one.
-
-WHAT THEY BUY, which is only what compose cannot already say. `cpus`, `cpuset` and `mem_limit` are
-honoured inline and need no profile. A `vcpu` profile also carries `numa`, `nice`, `backend` and
-`extends`; a `vdisk` carries `size`, `persistent`, `backend`, `iops` and `bandwidth`; a `vgpio`
-carries nineteen device classes. None of those has a compose spelling.
-
-`x-kern-vgpio` is the one with no equivalent anywhere. A compose file reaches GPIO today by writing
-`devices: /dev/gpiochip0`, so the service file decides which hardware it may touch. With a profile
-the service declares intent and `kern.toml` holds the grant, so the operator decides what `leds`
-resolves to on this host - which matters because the grant is chip-granular rather than per-line.
-
-**The file stays portable, the grant does not.** `x-` is the spec's extension mechanism and Docker
-Compose validates these keys and echoes them back unchanged, so one file runs on both runtimes. It
-runs there WITHOUT the profile: a service relying on a `vdisk` size cap gets no cap under Docker, and
-nothing says so. Keep anything a workload needs for correctness in the inline fields both runtimes
-enforce, and use a profile for what only kern can grant.
-
-**A key that GRANTS and a key that CONSTRAINS fail in opposite directions, and the second one is the
-dangerous one.** Drop `x-kern-vdisk` and the service gets less than it asked for: it runs slower, or
-it fills a disk, and the failure is loud and in front of you. Drop `x-kern-security-profile` - or run
-the same file under Docker, which drops it for you - and the service runs with every capability and a
-writable rootfs, which is the failure that shows nothing at all. Judge each key by what its absence
-does: kern reads this one because the alternative is three separate flags that are easy to get
-half-right, but **do not treat a file carrying it as hardened until you know which runtime read it.**
-`kern compose <file> config` prints the line, marked as kern-only, so at least the runtime that
-enforces it says so out loud. Docker cannot be made to.
-
-**A `tmpfs` size cap is honoured, and it is charged to the box's memory cap.** The short form is what
-both runtimes read: `tmpfs: ["/scratch:size=64m"]` keeps its `size=` and drops Docker's other options
-with a warning. The cap itself holds - measured on the flag it becomes, a 16m tmpfs written with 64m
-leaves a file of exactly 16777216 bytes. But those pages are the box's memory, so a tmpfs larger than
-`mem_limit` is an OOM waiting for a workload to find it: measured, a 256m tmpfs under a 64m
-`mem_limit` writing 128m is killed, exit 137. Size the two together. The LONG form (`volumes: [{type:
-tmpfs, target: /s, tmpfs: {size: N}}]`) is not read - kern warns and skips it, so a service relying on
-it gets no tmpfs at all:
-
-```
-kern compose: service volume long-form {type: tmpfs, target: /s2, ...} has no usable
-              source+target (tmpfs: use kern --tmpfs) - skipped
-```
-
-An unrecognised key in the `x-kern-` namespace is NAMED rather than ignored, and a typo and a key
-from another build are told apart. The spec says a tool must ignore the extension fields it does not
-understand, and every other vendor's prefix is left alone, but this one is kern's, so silence would
-mean a mistyped key does nothing and says nothing. The two cases get different sentences because they
-need different fixes:
-
-```
-x-kern-vgpi:  'x-kern-vgpi:' is not read by this build - kern reads x-kern-vcpu,
-              x-kern-vdisk, x-kern-vgpio, and x-kern-security-profile
-x-kern-vgpu:  'x-kern-vgpu:' names the 'vgpu' profile kind, which this build of kern
-              does not have - the key is ignored, and the service runs without it
-```
-
-Telling the author of `x-kern-vgpu` how `x-kern-vdisk` is spelled would send them looking for a
-mistake they did not make.
-
-**A `vgpio` profile is gated, and the reason is structural rather than a judgement about severity.**
-Every other kind NARROWS: the file names a want, `kern.toml` holds the grant, and the local grant is a
-ceiling, so a downloaded file naming `x-kern-vdisk: scratch` cannot get more than this host allows and
-"the local one wins" is the conservative answer by construction. A `vgpio` profile does not narrow,
-because its resolution is a DEVICE rather than a bound and device nodes have no ordering:
-`/dev/gpiochip0` is not a smaller `/dev/gpiochip1`. One host's `leds` may be an LED, another's a relay
-board. So a stack that resolves to any host device is refused, naming the exact paths, unless the
-person running it passes `--allow-device-grants` - a command-line flag, where the compose file cannot
-reach. The gate is on the property (did this resolve to a device?) and not on a list of kinds, so a
-future kind that also resolves to hardware inherits it.
-
-**What a name means here is not what it meant there, and `config` says so.** `kern compose <file>
-config` prints what each profile resolved to on THIS host: the caps for a `vcpu`, the size and flags
-for a `vdisk`, and the device paths for a `vgpio`. One file against two machines used to print the
-identical line while one meant a 64 MB scratch and the other a 50 GB persistent one.
-
-**Deliberately not built:** a key carrying the author's expectation (`scratch` was 64m where they
-wrote it) so kern could report the difference. A purely COMPARATIVE annotation would pass the delete
-test, since removing it removes an explanation and nothing runs less confined. A CONDITIONAL one - the
-same key making kern refuse on a mismatch - would not, because it is a constraint expressed in a
-portable file that Docker drops in silence. The line is between reporting and refusing, and the second
-version is the one to say no to.
-
-The profile must already exist: a compose file names a grant, it does not create one, which is the
-whole point of the split. `kern compose <file> config` refuses a name that does not resolve, with the
-`kern config add` line that creates it, and it refuses exactly what `up` would - including an
-`x-kern-security-profile` value `kern box` does not take, which it asks the runtime's own vocabulary
-about rather than keeping a second copy of the list.
-
-`docker compose up -d` is the most common way anyone starts a stack, so `-d`/`--detach` is
-accepted and does exactly what it says: `kern compose <file> up` starts the services and
-returns, which is Docker's detached behaviour and kern's only one. It is accepted silently
-rather than with a "no effect" note, because that note would be false. The presentation and
-scheduling flags are the ones with no effect, and they say so when you pass them:
-`--ansi`, `--progress`, `--no-ansi`, `--compatibility`, `--dry-run`, and `--parallel`, which
-is deliberately not honoured because kern has its own concurrency cap.
-
-### Starting a stack at boot
-
-kern is daemonless, so after a reboot PID 1 starts, not kern. `kern compose <file> systemd` prints a
-unit on stdout and installs nothing: where it belongs is a decision about your machine.
-
-```console
-$ kern compose stack.yml systemd > ~/.config/systemd/user/kern-shop.service
-$ systemctl --user daemon-reload && systemctl --user enable --now kern-shop.service
-$ loginctl enable-linger $USER        # or the unit stops when you log out
-```
-
-**The unit adds no supervision beyond each service's own `restart:` policy.** kern's per-service
-supervisor already restarts a service that dies mid-run (`on-failure` on a non-zero exit,
-`always`/`unless-stopped` on any exit, for the stack's lifetime); what the generated unit does not do
-is re-run a stack that failed as a whole, and it says so in its own comments rather than letting you
-assume otherwise. Walk-through: [compose-systemd-unit.sh](../examples/compose-systemd-unit.sh).
-
-**A single long-running box installs its own unit, automatically** - the stack path above is manual
-because where a stack's unit belongs is a per-machine decision, but one service is not. `kern box
-<name> -d --restart always` (or `unless-stopped`, standalone, not a pod member) does more than set a
-policy: it writes and `systemctl --user enable --now`s a `~/.config/systemd/user/kern-<name>.service`
-(`Restart=always`, `RestartSec=1`) and turns on `enable-linger`, so the box is restarted on any exit
-by systemd itself and **survives a reboot and a logout** with no further step. This is real
-long-running supervision, delegated to systemd, for the single-box case; `kern stop <name>` removes
-the unit. (The one still-maturing piece is the in-process supervisor for `always` **pod members**,
-which lives and dies with the stack rather than with systemd.)
-
-### Everyday `docker` commands
-
-Most container-lifecycle verbs you type daily have a 1:1 `kern` equivalent (same name where it makes sense):
+## Everyday `docker` commands
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY, `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD, as docker does (`--entrypoint ""` clears it) |
-| `exec` | `exec` | joins the box's namespaces |
-| `ps` | `ps` | `-a`/`--all` (also lists recently-exited boxes), `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
+| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY, `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD (`--entrypoint ""` clears it) |
+| `exec` | `exec` | joins the box's namespaces, with the box's own environment |
+| `ps` | `ps` | `-a`/`--all`, `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
 | `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
-| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s) for the workload to flush and exit, then SIGKILLs what is left. `kill` is an ALIAS of it, not Docker's immediate kill: MEASURED at 3019 ms against stop's 3013 on the same three-second grace, so a script that reaches for `kill` to skip the wait wants `--stop-timeout 0`. A grace that provably cannot end is skipped, not sat out: an init with no handler for the signal is one the kernel would discard it for |
+| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s), then SIGKILLs what is left. `kill` is an ALIAS, not Docker's immediate kill: to skip the wait use `--stop-timeout 0`. A grace that provably cannot end is skipped, not sat out |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
 | `attach` | `attach` | Ctrl-C detaches, box keeps running |
-| `cp` | `cp` | host↔box, symlinks can't escape the box root |
+| `cp` | `cp` | host↔box, symlinks cannot escape the box root |
 | `inspect` | `inspect` | `--json` |
 | `stats` | `stats` | per-box CPU / memory |
-| `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI for every box |
+| `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
-| `wait` | `wait` | prints the exit code the workload itself exited with, including after a `stop` that let it shut down cleanly; also resolves a box that has already exited, via its `waitexit` breadcrumb. Reading that code back is exact where the box has its OWN cgroup (a delegated one, or its per-box systemd scope) and BEST-EFFORT where it does not: kern reads the init's status from its unreaped zombie, and only a box it can cap is a box whose reaper it can hold still for the read. On a host with no delegation a clean shutdown can therefore still record `137` - measured at 1 run in 12 there, against 12 in 12 where a cgroup exists. `kern doctor` says which host you are on |
+| `wait` | `wait` | the code the workload exited with, including after a clean `stop`. Exact where the box has its OWN cgroup, best-effort where it does not: on a host with no delegation a clean shutdown can still record `137`. `kern doctor` says which host you are on |
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
-| `start` (resume a *stopped* container) | *(none)* | a box can run **as long as you want** (detach with `-d --restart` for a DB or server that stays up for days) and its **volumes persist on disk**; what's not supported is *resuming* a box you already stopped - you launch a fresh one that re-attaches the same volume |
+| `start` (resume a stopped container) | *(none)* | a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume |
 
-Multi-service stacks **are** supported: `kern compose` reads your `docker-compose.yml` and brings the
-services up in a pod, with `depends_on` ordering and healthchecks, daemonless. What needs a daemon
-does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything that attaches to it.
-
-`shm_size:` is recognised but intentionally **not** mapped: kern mounts `/dev/shm` unsized and charges
-it to the box memory cgroup, so `mem_limit` / `--memory` is the real bound (Docker's 64 MB `/dev/shm`
-default is what breaks Postgres under load). Size shared memory with `mem_limit`, not a separate cap.
+What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
+that attaches to it.
 
 ## Building and publishing images
 
+`kern build` reads a Dockerfile and `kern push` sends the result to a registry. Each `RUN` is a real
+box rather than a layer commit, so a build is subject to the same isolation as a run.
 
-kern builds OCI images from a Dockerfile **without a daemon**: each `RUN` is a real `kern box`, each
-step a content-addressed layer, reused on an unchanged rebuild.
-
-```sh
-kern build -t app:1 -f Dockerfile .          # FROM RUN COPY ADD ENV WORKDIR USER CMD ENTRYPOINT SHELL …
-kern build -t app:1 --build-arg VER=9 .       # build args; multi-stage (FROM … AS b; COPY --from=b)
-kern save app:1 -o app.tar                    # export a docker-load-compatible image tar …
-kern load -i app.tar                          # … and import one (docker save format)
-kern tag app:1 registry.example/app:1         # give a cached image a second name
-kern commit devbox warmenv:1                  # snapshot a running box's fs into a reusable image
-kern login registry.example                   # (private) creds stored 0600
-kern push registry.example/app:1              # publish as a single-layer OCI image
-```
-
-**Warm start (`kern commit`).** Bake an expensive one-time setup (`apt`/`pip` installs, a warmed cache,
-compiled artifacts) into a local image once, then start the next box from it instantly. It reads the
-box's kernel-merged overlay through `/proc/<pid1>/root`, so whiteouts are already resolved, and skips
-every nested mount, so a `-v` volume or a secret is never baked into the image. It's `docker commit`,
-daemonless. A filesystem snapshot, not live memory: processes restart fresh (write state to disk if you
-need it back).
-
-kern parses **real-world Dockerfiles** as-is (comments inside `\` continuations, `SHELL`, BuildKit
-`RUN --mount`/`ADD <url>` with `--checksum`/`--chmod`, `COPY <<heredoc`, `FROM scratch`, `# escape`
-and BOM) and honours **`.dockerignore`** (also `.kernignore`), so a `COPY . /app` won't bake your
-`.git`, `.env` or secrets into the image. **Multi-stage** builds run each stage in its own box and
-confine `COPY --from=<stage>` to that stage's filesystem (a hostile source path or symlink can't read
-the host). Layers pull as gzip **or zstd**. `push` normalizes ownership and strips setuid/setgid, so an
-untrusted base can't smuggle a privilege-bit into what you publish. (`build`/`push` are the newest
-surface, see [Status](../README.md#status).)
+**Warm start (`kern commit`).** Bake an expensive one-time setup (`apt`/`pip` installs, a warmed
+cache) into a reusable image instead of paying for it on every box start.
