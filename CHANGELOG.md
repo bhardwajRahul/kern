@@ -5,614 +5,81 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.9.32
 
-**Five silent differences from Docker were named, and one of them was a refusal.** The compatibility
-rate for `kern compose` had been measured from kern's own warnings, which makes it blind by
-construction to any difference kern does not know it has: a file kern says nothing about counts as
-perfect. Five such differences are now stated at `up` and at `config`, and the measured rate fell
-when they were, because the differences were always there and the measurement was not.
-
-A service with no `mem_limit:` runs under kern's 512 MiB ceiling while a Docker container with none
-runs uncapped, so a service that needs more is OOM-killed at a number written nowhere in the file.
-243 of the 259 files in the neutral corpus have at least one service in that position; kern names
-them once per stack, quoting the constant the cgroup actually enforces rather than a copy of it.
-
-In one shared namespace the services share `127.0.0.1`, so a port a service binds on the loopback is
-reachable from every other service in the stack. That is an exposure rather than a failure, which is
-why nothing had ever reported it, and it now gets a line on any multi-service pod. A single-service
-stack is told nothing: there is no peer to be reached from.
-
-A service mounting `/var/run/docker.sock` (or `/run/docker.sock`) is told that kern is daemonless and
-that there is nothing behind the path. That difference cannot be closed, and naming it is the whole
-remedy available.
-
-`RUN --mount=type=secret` and `--mount=type=ssh` are now REFUSED instead of silently stripped. The
-command was written because the credential would be there, so dropping the flag runs it
-unauthenticated: either a 401 whose message points at the registry rather than at the discarded flag,
-or a build that succeeds against a public mirror and ships something other than what was asked for.
-`type=cache` and `type=bind` stay dropped, since those cost a rebuild rather than a wrong answer.
-
-`external: true` on a volume that does not exist is refused, as Docker refuses it. The top-level
-`volumes:` block was previously not read at all, so kern auto-created the volume and the service
-started on empty storage where somebody else's data was supposed to be. An `external:` declaration
-carrying `name:` is honoured, and that name is validated as a volume name: a first version let it
-name a host path, which kern's `-v` classifier then bind-mounted.
-
-**`${VAR:?message}` refuses the file instead of substituting an empty string.** That form exists to
-stop a file being rendered without the value, and it is what a compose file writes for a password or
-a token: a stack came up with `MYSQL_PASSWORD=`. Every variable with no value is named, not just the
-first one found.
-
-**`target:`, `uid:` and `gid:` under a service's `secrets:` were read and dropped in silence.** Each
-changes where the file lands or who may read it, and kern honours none of them: every secret is
-delivered at `/run/secrets/<source>`, owned by the box's root, with the mode from `mode:`. Measured:
-a service declaring all three produced nothing on stderr and the file appeared at `/run/secrets/pw`
-owned by root rather than at `/etc/mypw` owned by 1500. Named rather than implemented, for the reason
-that put the mode on the box: none of the three appears once in 259 real compose files nor in
-Docker's own samples.
-
-**A service secret was written `0400` into a `0700` directory, so no image running as a non-root
-user could read it.** The Compose Specification says a service secret has "world-readable permissions
-(mode `0444`)". Measured on Docker's own `nginx-golang-postgres` sample, whose `db` declares
-`user: postgres`: the entrypoint died with `/run/secrets/db-password: Permission denied` on every
-start, the database never came up, and the `service_healthy` gate its backend waits on timed out
-after 120 s. The mode is now part of the secret: `kern compose` sends the specification's `0444` (or
-a `mode:` the file declares), `kern box --secret` keeps its owner-only `0400`, and `/run/secrets`
-itself is `0755` so a non-root reader can traverse it. Two different `mode:` values on one service
-are refused rather than silently resolved. Measured after: the same sample comes up, the proxy
-answers 200 with rows from the database, and a box whose image declares `USER appuser` reads its
-secret where the old default gave `Permission denied`.
-
-**A relay failure named two services when kern knew which one was missing.** `peer relays: a box is
-not running ('backend' or 'frontend')` sent the reader to look at a service that was running
-perfectly. It now names the one that is absent, and adds its exit code when the registry has one.
-
-**A flag could be added to `kern box` and shipped undocumented.** The parser/help gate covered only
-the verbs that call `reject_unknown_flags`, and the frozen-surface snapshot IS the help text, so a
-flag missing from help was missing from the snapshot too and the two agreed on an incomplete picture.
-`--secret-mode` reached a release build that way. A new gate scans `parse_box`'s own match arms and
-requires each flag to appear in `kern box --help`; the three internal ones kern passes to itself are
-listed with what writes them.
-
-**`kern stop` sent the stop signal TWICE, so a workload's shutdown handler ran twice.** `stop`
-signals every box in phase 1 so a stack tears down in parallel, and the per-box wait then sent the
-same signal again. A shell trap is re-entered on the second delivery: measured on a handler that
-takes 2 s, `stop` took 4006, 4007 and 4007 ms across three runs with the box's own log showing the
-trap entered twice, against 2005/2007/2006 ms and a single entry after the fix. Latency is the
-smaller half of it - a handler that flushes, deregisters or writes a final record did all of it
-twice, on every stop. The other arms are unchanged and stay immediate: a workload that ignores the
-signal is killed at once (4 ms), one that does not touch it dies at once (5 ms), and a declared
-`stop_grace_period` is still honoured to the millisecond.
-
-**`kern exec` and every health probe ran with a bare environment inside an image whose workload is
-not root.** `exec_in_box` inherits the box's environment by reading `/proc/<pid1>/environ`, and that
-read fails there: the file belongs to the workload's mapped uid and reading it needs `CAP_SYS_PTRACE`
-in the box's user namespace, which the box has dropped. Measured on
-`rabbitmq:3.12-management-alpine`: the environ is owned by uid 100099 and unreadable, so `kern exec`
-saw the default `PATH`, `rabbitmq-diagnostics` was not on it, and the image's own `HEALTHCHECK`
-reported the service UNHEALTHY while its management API answered 200. kern now records the
-environment it gave each box, in a NUL-separated sidecar beside the health record, and `exec` and the
-probe read it back; an explicit `-e` still wins. The same stack now reports `healthy`.
-
-**An image's file OWNERSHIP survives the unpack, so a service that runs as a non-root user can write
-its own directories.** Layers were extracted with `--no-same-owner`, which gave every file to the
-caller: inside a box that is uid 0, so an image that `chown`s a directory to a non-root user and then
-runs as that user could not write to it. Measured on three real stacks, all of which died on it:
-Prometheus (`mkdir data/: permission denied`), Kibana (`EACCES` on its uuid file) and Logstash. All
-three now come up, and Kibana answers 200.
-
-The box already maps a full subordinate range, so the ownership those images want was always
-representable on disk; it was lost because `tar` ran outside the namespace where the range exists.
-The unpack now runs as root of a namespace carrying that same range, which also let the hand-rolled
-single-uid map inside the OCI crate be deleted in favour of the one owner of that primitive. An image
-that names a uid the range cannot cover (OpenShift-style ids in the millions) is retried the old way,
-because `tar` exits 2 on such a chown and the image must stay pullable; measured on a crafted layer.
-
-Directory ownership needed a second fix: the layer merge RE-CREATES directories and only moved the
-files, so on `kibana:7.16.1` all 26920 files carried their ids and all 6680 directories did not. The
-merge now restores owner and mode on directories and symlinks, for the reason the code already gave
-for restoring the mode.
-
-**A named volume inherits the image directory's owner and mode, not just its contents.** `cp` fills a
-directory and leaves the directory alone, so a volume mounted where the image put an EMPTY directory
-owned by a non-root user copied nothing and stayed owned by in-box root. That is the Prometheus case
-exactly, and it survived the ownership fix above until the volume root was given the same treatment.
-
-**`kern rmi` no longer reports a removal it did not perform.** With ownership preserved, an image
-leaves directories this process does not own, and unlinking inside one needs write permission on it:
-measured, `kern rmi kibana:7.16.1` printed "freed 1.1G" and left 85 entries behind. The removal now
-retries as root of the mapped namespace, the result is returned instead of discarded, and the freed
-figure is reduced by whatever survived. `kern volume rm` takes the same path, for the same reason.
-
-**A string `command:` is an argv, not a shell line.** kern wrapped it as `sh -c "<string>"`, so
-Docker's own `awesome-compose` WordPress sample - `command: '--default-authentication-plugin=…'` on
-`mariadb` - started `sh` with that string as an OPTION and the database died on every start with
-`sh: 0: Illegal option --`. The Compose Specification is explicit that the shell-form syntax "does
-not implicitly run in the context of the SHELL instruction" and tells the author to write
-`/bin/sh -c` when they want one. Measured on the neutral corpus: of 83 string commands, 13 use shell
-syntax and all but two of those already write their own `sh -c`, which splitting preserves verbatim.
-Two more files carried the same broken shape (a command beginning with `-`).
-
-A string `entrypoint:` no longer DROPS `command`. That rule belongs to Dockerfiles, where
-`ENTRYPOINT some string` becomes `/bin/sh -c "…"` and has nowhere to put arguments; the specification
-says the Compose string form does not run in a shell, so the premise is absent. kern cleared the
-command and warned, silently discarding arguments the file asked for.
-
-**A block scalar carrying a tag was not folded at all.** `command: !!str |` with a body left the
-literal `|` in the value, so the service tried to execute a program called `|`. The fold scan
-required the value to BEGIN with the indicator and did not look past a tag it otherwise accepts. It
-was invisible while a string command was wrapped in a shell, where it became a run-time syntax error
-instead of a start failure, and the test that covered it asserted only that some argument contained
-the body.
-
-**An empty named volume is seeded from the image, as Docker does.** Docker copies the image's content
-at the mount point into a named volume the first time it is used while still empty; kern mounted an
-empty directory over the top, so a service found nothing where its image had put a default
-configuration or an initial database, and then failed with an error of its own making. Measured on
-`nginx:alpine` with an empty volume at `/etc/nginx`: 0 files before, 8 after. Only when the volume is
-EMPTY, and only for a NAMED volume; a bind mount of a host path is never touched. A multi-layer image
-is read through the kernel-merged overlay view, so a file a higher layer deleted does not come back.
-`merged_view_extract` gained an `Extract` enum for this: a first version placed the directory itself
-inside the volume, one level too deep, and `Option<&str>` could not say which of the two was meant.
-
-**The image's own `HEALTHCHECK` and `STOPSIGNAL` are read.** Docker runs an image's check whether or
-not the compose file mentions one, and `depends_on: {condition: service_healthy}` waits on exactly
-that; kern read neither, so such a service reported `HEALTH = "-"` forever. Measured on a box whose
-image declares a check: `healthy` when it passes, `unhealthy` when it fails, `-` on `main` in both
-cases. A `healthcheck:` in the file replaces the image's entirely, numbers included, which is
-Compose's rule. `--stop-signal` became optional at the flag boundary so an explicit `SIGTERM` can be
-told apart from the default and still win over an image that asks for something else.
-
-**A double close in the log-rotation test was corrupting unrelated tests.** `CappedLog` closes its
-descriptor in `Drop`, and the test added with `logging:` closed it by hand as well. The second close
-succeeds, having destroyed whatever the operating system handed that number to in the meantime, so
-the suite failed intermittently in a different unrelated test each run with `remove_dir_all`
-panicking `closedir: Bad file descriptor`. Measured at 3 failures in 14 runs before, 0 in 14 after,
-0 in 11 on `main`. A source-scan test now fails the build if any holder closes that field again.
-
-**Six Docker Compose keys stopped being warnings and started being behaviour.** Each was chosen from
-what real files ask for: 240 compose files from 221 public repositories were parsed and their values
-counted, so the work follows the distribution rather than Docker's vocabulary.
-
-`devices:` is applied. It is a bind mount, which is what it always was: measured before any of this,
-`kern box -v /dev/kvm:/dev/kvm` already gave a workload a working `crw-rw---- 10, 232 /dev/kvm`, so
-refusing the key whose only purpose is to say that was withholding a spelling, not a privilege. The
-node arrives with the host's own owner and mode, so a caller who cannot open it on the host cannot
-open it in the box. `/dev/net/tun`, which is 37 of the 83 `devices:` values in that corpus, maps to
-`--tun` instead of a plain bind, because the node alone is useless without the `CAP_NET_ADMIN` that
-creating a tunnel interface needs. Docker's third field is honoured where kern has it: a spec with no
-`w` becomes a read-only bind.
-
-`dns:`, `dns_search:` and `dns_opt:` are applied, through three new flags: `--dns`, `--dns-search`
-and `--dns-option`. A box that names none is byte-identical to every box kern has started so far:
-the image's own `/etc/resolv.conf` is left alone, including the empty one the debian family ships. A
-`--dns` that is not an IP literal is refused at the flag, because glibc silently skips a `nameserver`
-line it cannot parse and the box would otherwise run with no DNS and no message.
-
-`logging:`'s `max-size` and `max-file` are applied, through `--log-max-size` and `--log-max-file`.
-kern's capture has always been a size-capped rotating log; the options now set its cap and its
-generation count, with Docker's counting (`max-file: 3` means the active file plus `.1` and `.2`).
-
-`links:` is applied. The alias lands in the source service's `/etc/hosts` in both stack modes, and
-the ordering edge Docker implies is added to `depends_on`.
-
-`ipc:` and `pid:` are answered with measurements instead of a blanket "unsupported": every box
-already has a private IPC and PID namespace, so `private` is reported as ALREADY ENFORCED, and two
-members of one stack were measured to share only their network namespace, which is what makes
-`pid: service:X` unsatisfiable here rather than merely unimplemented.
-
-`tmpfs:` options are applied. `size=`, `mode=`, `noexec` and `ro` now reach the mount; `nosuid` and
-`nodev` are kern's floor and a `suid` or `dev` token is named as recognised-and-never-applied rather
-than acted on. A long-form `{type: tmpfs}` volume entry, which used to be dropped with a pointer to
-`--tmpfs`, is now translated into one.
-
-`kern docker run` follows: `--device`, `--dns`, `--dns-search`, `--dns-option`, `--dns-opt` and
-`--log-opt max-size/max-file` are translated instead of refused, `--device` through the same
-normaliser the compose parser uses so the two surfaces cannot disagree. Any other `--log-opt` is
-still refused rather than dropped.
-
-**`networks:` is now enforced by default, and `internal: true` is a real boundary for the first
-time.** A compose file whose networks leave two services with nothing in common gets one network
-namespace PER SERVICE, so the separation it asked for is enforced by the absence of a relay rather
-than dropped. kern says so at bring-up, names the pairs it separated, and `--pod` keeps the old
-single-namespace wiring for anyone who prefers the speed. A file whose networks separate nothing
-keeps the pod and is told nothing, because nothing is lost.
-
-Making that usable needed egress per service, which did not exist: outside a pod a box held only
-`lo` and could not reach the internet at all. kern now attaches a rootless NAT to each service's own
-namespace, through the same `pasta` machinery the pod has always used, at the one instant it is safe
-to: the service is held at its pre-exec gate with every namespace built and no instruction run, so a
-workload never observes a namespace that has no route one moment and a route the next.
-
-`internal: true` then means what Compose says it means. A service confined to internal networks gets
-NO NAT, so there is no route out of its namespace rather than a filter that has to stay correct.
-Measured on one stack, one run: the service on a public network reported two routes and reached
-`1.1.1.1:443`, the confined one reported zero and could not. A service with `restart:` gets no NAT
-either way and is named at bring-up: it is installed as a systemd unit, so `up` never holds it.
-
-**Docker Compose compatibility, measured before and after on the same neutral corpus** of 259 files,
-one per repository, sampled across 733 repositories: the share of files kern runs with NO behavioural
-difference from what the file says went from **14% to 94%**. What remains is dominated by keys that
-ask kern to be less confining than it is (`privileged: true`, `security_opt`) and by
-`network_mode: host`, which one namespace per stack cannot express.
-
-**A PUBLISHED PORT NOW BINDS `0.0.0.0`, NOT `127.0.0.1`. Read this one.** `-p 8080:80` and a compose
+**A published port now binds `0.0.0.0`, not `127.0.0.1`. Read this one.** `-p 8080:80` and a compose
 `ports: "8080:80"` bind every interface, which is what Docker does and what a file written for Docker
-means. Until now kern bound loopback and warned; a stack that looked published was reachable only
-from the machine it ran on.
+means. Until now kern bound loopback and warned, so a stack that looked published was reachable only
+from the host. `[kern] publish_bind` in `kern.toml` is a ceiling no file can widen, and an explicit
+`127.0.0.1:8080:80` still means loopback.
 
-This is a deliberate change of a security-relevant default, and the reason is measured. On a neutral
-corpus of 259 compose files, one per repository, sampled across 733 repositories, **203 files (78%)**
-published a port and therefore behaved differently under kern than their own text says. It was by a
-wide margin the largest source of difference: the next cause was worth 75 files, and every key kern
-refuses on purpose (`privileged`, `security_opt`) was worth 8 together. Closing it moved the share of
-files with zero behavioural difference from **14% to 63%** on that corpus.
+**Docker Compose compatibility went from 14% to 94%**, measured before and after on the same neutral
+corpus of 259 files, one per repository, sampled across 733 repositories: the share of files kern
+runs with no behavioural difference from what the file says. What remains is dominated by keys asking
+kern to be less confining than it is (`privileged: true`, `security_opt`) and by `network_mode: host`,
+which one namespace per stack cannot express. The earlier "15% irreducible" was an artefact of a
+corpus weighted toward those keys.
 
-The previous posture is one line, and it is stronger than the old default was:
+**Twelve compose keys stopped being warnings and became behaviour**, among them `mem_reservation`
+(cgroup `memory.low`), `devices:`, `dns:`, `logging:`, `tty:`, `stdin_open:`, `secrets:` long syntax,
+and an image's own `HEALTHCHECK` and `STOPSIGNAL`. A string `command:` is now an argv rather than a
+shell line, a tagged block scalar folds, and an empty named volume is seeded from the image as Docker
+does.
 
-```toml
-[kern]
-publish_bind = "127.0.0.1"
+**`networks:` is a boundary, not a warning.** Under `--no-pod`, services with no network in common
+cannot reach each other by name or by address, and `internal: true` is the absence of NAT rather than
+a filter, so a published port does not open a way out. In a pod the two say something different, and
+both are stated at bring-up. A key that is absent means the `default` network, which is 52 of 187
+files rather than the 18 that name one.
+
+**`${VAR:?message}` refuses the file instead of substituting an empty string.** A stack whose
+password variable was unset started with an empty one.
+
+**An image's file ownership survives the unpack**, so a service running as a non-root user can write
+the directories its image gave it. A named volume inherits the image directory's owner and mode, not
+only its contents, and `kern rmi` no longer reports a removal it did not perform.
+
+**A service secret is written with the mode the Compose Specification mandates.** It was `0400` in a
+`0700` directory, so no image running as a non-root user could read its own secret. `target:`, `uid:`
+and `gid:` were read and dropped in silence; they are applied or named.
+
+**`kern run` no longer pays for a systemd scope it does not need: 4.70 ms to 0.87 ms.** It bought its
+caps with a transient `systemd-run --user --scope`, one per invocation; it now caps directly under
+kern's delegated `kern.slice`, the way `kern box` already did.
+
+```
+                  median     p99      max
+before             4.700    5.735   15.304 ms
+after              0.870    1.267    1.487
 ```
 
-That key is a CEILING, not a default: it overrides even a spec that explicitly writes
-`0.0.0.0:8080:80`, so a compose file obtained from anywhere cannot decide where the host listens. It
-is read only from the default config, never from a `--config` a compose file named. The box reports
-how many specs it narrowed, so the policy is never silent. If `kern.toml` cannot be parsed, kern
-publishes on loopback and says so rather than assuming the wide answer.
+The tail moved more than the median because a D-Bus round trip to a shared user manager is a queue.
+Throughput at concurrency 200 goes from 86 to 4052 runs per second: a path that serialises on a
+shared service gets worse as concurrency rises, and a benchmark at concurrency 1 reports that only as
+"slow". Finding the delegated slice turned out not to be the same as being allowed to enter it:
+cgroup v2 delegation containment needs write access to the `cgroup.procs` of the common ancestor, and
+a host outside that tree gets the scope path rather than an uncapped run.
 
-**Four more compose keys are applied.** `mem_reservation` becomes cgroup `memory.low` through a new
-`--memory-reservation` (a soft floor, never a cap and never an OOM kill); `cpu_shares` becomes
-`cpu.weight` through a new `--cpu-weight`, CONVERTED between the two scales so Docker's normal (1024)
-lands on cgroup v2's normal (100) rather than on 39; `cpu_quota` + `cpu_period` are divided into
-`--cpus`, which is the same `cpu.max` line written the short way; `pull_policy` becomes `--pull`.
+**`kern exec` stopped refusing where there was no cap to escape**, and its fail-closed refusal now
+names both causes and the way through (`KERN_ALLOW_UNCAPPED=1`). A `--health-cmd` probe is never
+refused. `kern exec` and every health probe now run with the image's environment rather than a bare
+one, and `kern stop` sends the stop signal once instead of twice.
 
-**`networks:` became a boundary instead of a warning, under `--no-pod`.** A stack in a pod is one
-network namespace and cannot segregate anything, so there the key is still reported as dropped.
-Without a pod each service has its own namespace and reachability is built edge by edge out of
-relays, so the memberships now decide which edges exist: two services with no network in common get
-no relay AND no entry in each other's `/etc/hosts`, so the peer's name does not resolve. Measured on
-a three-service stack, the plan drops from six relays to four and the two cut directions answer
-`nc: bad address` while every shared-network pair still delivers its payload. The boundary is the
-absence of a relay rather than a filter, so there is no rule that can be misconfigured open.
+**`kern doctor` names the cgroup it probed** on every row that denies a cap, so the verdict can be
+checked against `/proc/<pid>/cgroup` instead of taken on trust, and it asks about both directories a
+box can be capped in. `kern inspect --json` gains `memory_max_enforced`, read back from the box's own
+cgroup: `memory_max` is the value the box was started with, and on a host that caps another way the
+two differ.
 
-A service with no `networks:` key is on the implicit `default` network and is therefore separated
-from the services that name one. That is the Compose Specification's rule, and measured over 240 real
-compose files it is the dominant case: 52 files have at least one pair that loses its edge, 40 of
-them through exactly this. `up` names every cut pair with both memberships before starting anything,
-because a removed edge otherwise appears minutes later as `bad address '<peer>'` in a service log,
-indistinguishable from a typo or a dead peer.
-
-**`internal: true` now says something different in each wiring, and both are measured.** In a pod it
-is all-or-nothing and becomes `--no-outbound` only when every service qualifies; outbound otherwise
-stays open (measured: a pod member reaches `1.1.1.1:443`). Without a pod every service is confined
-already (measured: the box holds only `lo`, the same connect is refused), so the key is satisfied for
-the services that asked and for the ones that did not. The over-application is stated rather than
-left to be discovered by a stack that calls an external API.
+**A box's terminal has a name.** `tty` inside an alpine box printed "not a tty" while `isatty` said
+otherwise, because the `-it` pair was allocated on the host and the box's private devpts does not
+contain it. It is now allocated from the box's own devpts and the master passed back over a
+socketpair, so both C libraries resolve it. Certified on Fedora 44, CentOS Stream 10, Rocky Linux
+10.2, Debian 13, openSUSE Leap 15.6 and Ubuntu 24.04, three with SELinux Enforcing.
 
 **CLI surface: six flags added, none changed or removed.** `--dns`, `--dns-search`, `--dns-option`,
-`--log-max-size`, `--log-max-file` and `--secret-mode`. Additive, so nothing that runs today stops
+`--log-max-size`, `--log-max-file`, `--secret-mode`. Additive, so nothing that runs today stops
 running.
-
-**`tty` said "not a tty" inside every alpine box, and the terminal now has a name.**
-
-`kern box -it` and `kern exec -it` allocated the PTY pair on the HOST and handed the slave to the
-box as its stdio. The box mounts its own private devpts at `/dev/pts`, which does not contain that
-node, so inside the box:
-
-```
-isatty(0)                 1              the fd IS a terminal
-readlink /proc/self/fd/0  /dev/pts/2     the HOST's path
-stat /dev/pts/2           ENOENT         that path does not exist in the box
-```
-
-musl's `ttyname_r` is exactly that readlink, a `stat` and a device comparison, with no second
-strategy, so it returned ENOENT. glibc's falls back to scanning `/dev`, where it found the
-`/dev/console` bind kern already installed, and reported `/dev/console`. So the same box looked
-correct on a Debian image and broken on an alpine one, which is the image most people run. podman
-does not have it: `podman exec -it c sh -c tty` prints `/dev/pts/0`, because its slave comes from
-the container's devpts.
-
-The pair is now opened from the BOX's `/dev/ptmx` in the process that holds the box's mount
-namespace, and the master is passed back to the CLI over a socketpair with `SCM_RIGHTS` (a pipe
-cannot carry a descriptor). Both libraries then read `/dev/pts/0` and the node is there. Measured,
-same probe, before and after:
-
-```
-box -it, musl     ttyname_r FAILED rc=2      ->   /dev/pts/0
-box -it, glibc    ttyname_r = /dev/console   ->   /dev/pts/0
-exec -it, musl    ttyname_r FAILED rc=2      ->   /dev/pts/0
-```
-
-The host pair is still opened and is still the fallback: a box that cannot produce a terminal of its
-own (no devpts, a `--rootfs` kern did not populate, a kernel that refused the mount) behaves exactly
-as it did before. A terminal is a convenience, and failing a box over one would be a worse defect
-than the one being fixed. `/dev/console` is kept for that case, and the comment that used to call it
-the fix now says which library it was ever the fix for.
-
-`scripts/certify-ttyname.sh` is the certificate. It builds its own static probe, so it runs from a
-fresh clone with no fixture, and it is RED on the previous binary rather than merely green on this
-one. Measured on six distributions, three of them SELinux Enforcing, all passing both `box -it` and
-`exec -it`: Fedora 44 (6.19), CentOS Stream 10 (6.12), Rocky Linux 10.2 (6.12), Debian 13 (6.12),
-openSUSE Leap 15.6 (6.4) and Ubuntu 24.04 (6.8).
-
-Those VMs found a second defect this developer's host could not: `libc::ioctl` takes a `c_ulong`
-request against glibc and a `c_int` against musl, so the first version of the new code compiled
-cleanly here and failed to build for `x86_64-unknown-linux-musl`, which is the target kern ships.
-
-**A `kern doctor` row that denies a memory cap now names the cgroup it probed, and `kern inspect`
-reports the cap the kernel actually holds.**
-
-An outside reviewer held a review on this. doctor said a `--memory` write is "accepted and silently
-never bites", and on the same host a box started with `--memory 64m` reported `memory_max` 67108864
-and an `exec` that overran it exited 137. Two statements, no way to tell whether they were even about
-the same cgroup, because neither named one.
-
-Both halves are now checkable rather than asserted:
-
-- Every doctor row that says a cap does not bind names the directories the write-probe used, taken
-  from the same call the probe resolves its targets with, so the row can never name a directory the
-  probe did not touch. Its remedy also says how to check it against a running box.
-- `kern inspect --json` gains `memory_max_enforced`, read back from the box's own cgroup. The
-  existing `memory_max` is the value the box was STARTED with, echoed from the registry, which is
-  what the reviewer read as a cap in force. `null` means nothing is holding it. The human row says
-  `(requested, NOT enforced here)` in that case. `--json` is additive by contract.
-
-What the two observations do NOT establish, and the code no longer claims: the cgroup v2 root has no
-`memory.max` file at all, so a box whose PID 1 is in `0::/` has nothing capping it, and exit 137 is
-SIGKILL, which a system OOM kill delivers identically. A kill by kern's own cap always prints kern's
-own OOM message. The comment that had recorded "the cap bound; the probe said it would not" as a
-settled fact records the measurement instead.
-
-Separately, the probe already asked BOTH directories a box can be capped in; previously it asked
-`kern.slice` and stopped, and on that reviewer's host reported on a directory no box went near.
-
-The `mem-cap` row's four cases moved out of `inspect`'s 245-line body into a pure `mem_cap_row`,
-because the branch that matters most is the one this developer's host cannot produce: `enforced ==
-None` needs a box outside every kern leaf. Buried in an I/O function it was unreachable by any test,
-which is why an outside reviewer had to find it by hand. It is now pinned by four tests, each verified
-to go red under mutation of its own arm.
-
-`docs/RESOURCES.md` promised its way past the same host class: it said both verbs "carry a default
-memory cap of 512 MiB whether or not you ask for one", and named the two mechanisms that deliver it
-without naming the host where NEITHER exists. It now says so, and shows the two `inspect` fields and
-the 137 caveat.
-
-**`kern run` no longer pays for a systemd scope it does not need: 4.70 ms to 0.87 ms.**
-
-`kern run` bought its resource caps with a transient `systemd-run --user --scope`, one per
-invocation. `kern box` stopped doing that long ago and caps directly under kern's delegated
-`kern.slice`; `run` was excluded by a single flag, and the scope was the entire difference between the
-two verbs. Measured on one desktop, the shipped extreme binary, 200 samples per column, medians:
-
-```
-kern run -- /bin/true                    4.700 ms
-KERN_NO_SCOPE=1 kern run -- /bin/true    0.577 ms   (the same work, no scope, no caps)
-systemd-run --user --scope -- /bin/true  3.867 ms
-```
-
-The scope was 4.12 ms of the 4.70. Paired and alternating sample by sample against the previous
-binary, `kern run` is **-3.3 to -4.0 ms** depending on how busy the user manager is (two runs, 300
-pairs each: -4.004 ms, 95% interval [-4.074, -3.940], and -3.335 ms, [-3.384, -3.256]); `kern box` is
-unchanged, its interval containing zero. The whole surface on that host, same binary and recipe as a
-release, 400 samples each: `exec` 0.79 ms, `run` 0.87 ms, `box --rootfs` 2.39 ms, `box --image alpine`
-3.38 ms, against bubblewrap 0.9.0 at 2.72 ms for the same namespaces and rootfs.
-
-**The tail moved more than the median, and it is the better half of the result.** Over 400 samples,
-`kern run`'s p99 goes from 5.735 ms to 1.267 ms and its worst sample from 15.304 ms to 1.487 ms. A
-D-Bus round trip to a shared, single-threaded user manager is a queue, and a queue is what a tail is
-made of.
-
-**It also scales now, where it did not before.** `kern run -- /bin/true` in parallel, amortised
-runs per second:
-
-```
-concurrency      1      8     32    100    200
-before         214    496    288    151     86
-this branch   1053   4734   4891   4601   4052
-```
-
-The old path got SLOWER as concurrency rose, because every run serialised on the same manager. Zero
-failures on either column, and under a 200-way burst 400 out of 400 runs read exactly `67108864` from
-their own `memory.max`, so nothing about the cap is traded for the throughput.
-
-The reason recorded for excluding `run` was that it `exec()`s the workload in place, leaving no
-process behind to remove the cgroup the way the scope's `--collect` does. That had stopped being true:
-the scope path itself forks a proxy, so a `kern run` was already `caller -> kern -> workload`. The
-fork is now performed on the direct path too, and the parent is what removes the leaf. **The process
-topology is unchanged**, and so is everything a caller can observe: the command's exit code, a
-forwarded Ctrl-C (130), the OOM message on a 137, stdin and stdout, and `--landlock-rw` applied to the
-command and not to kern.
-
-Two behaviours that are new and worth knowing:
-
-- `kern run`'s cgroup is now `kern-run-<pid>`, not `kern-box-run-<pid>`. With the box prefix, a live
-  `kern run` was reported by `kern ps` as a box with no registry record that `kern stop` could not
-  reach. A box may legitimately be named `run`, so a reserved tag could not have separated them.
-- The orphan sweep reaps a `kern run` leaf but **never kills what is still inside it**. A box's
-  processes are the box's; `kern run` governs processes the caller started, and a backgrounded child
-  outliving the launcher is an ordinary use. Under the scope it kept the scope alive and was collected
-  when it exited; the sweep now leaves it alone and removes the directory once it is empty. Verified
-  against a real cgroup: a survivor of a SIGKILL'd launcher is still running after a `kern box`, a
-  `kern gc` and a `kern run`, and its directory goes only once it exits.
-- `kern run` now runs that sweep itself, in the parent, WHILE the workload runs. Nothing on this
-  verb's path ever called it, so a machine that only ever ran `kern run` accumulated one directory per
-  killed launcher until a `kern box` or a `kern gc` came along. It is free: with 130 entries planted to
-  be stat'd and skipped, the paired difference against the same binary without the call is -7.9 us.
-
-Where kern's `kern.slice` is not usable - no systemd user manager, `KERN_NO_SCOPE=1`, inside a box, a
-`kern build` RUN step, a `--restart` unit - `kern run` takes exactly the path it took before.
-
-**The fork is not gated on the systemd path, and the first version of this change got that wrong.**
-An outside reviewer measured the shipped v0.9.31 on two hosts, 200 sequential `kern run` each:
-
-```
-Ubuntu, systemd user manager present    0 leftover cgroup dirs -> 200 runs -> 0
-WSL2 Alpine, no user manager            2                      -> 200 runs -> 201
-```
-
-The host that leaks is the one WITHOUT a manager, because there the leaf is a plain directory kern
-made and `exec()` in place leaves nothing to remove it. The host that does not leak is the one with a
-manager, where the leaf lives inside the transient scope and systemd reaps the whole unit. Gating the
-fork on the direct path therefore fixed the case that was already fine and left the broken one alone,
-and the broken one is the configuration of the WSL rootfs this project publishes. The fork is now
-decided by `run_should_fork`, a pure function of two facts: a capped leaf exists, and nothing outside
-already supervises the workload. On a host with an outer enforcer - kern's own scope proxy, a
-`--restart` unit, a build step - it still `exec()`s in place, because that proxy already waits,
-forwards signals, reports the OOM and propagates the code.
-
-The same host also lost its OOM diagnostic: with no process outliving the workload, a run killed by
-the 512 MiB default nobody typed printed the shell's bare `Killed`. A supervisor restores the message
-there for free.
-
-**Two notices were wrong and are fixed with it.** The check behind "this command runs with no RAM
-ceiling" read `/proc/self/cgroup`, which is the SUPERVISOR's cgroup once `kern run` forks, and that
-one is uncapped by construction: every plain `kern run` would have printed the notice over a workload
-holding exactly 536870912. And the notice named `KERN_NO_SCOPE` as the cause whatever the cause was,
-so a host with no user manager was told to unset a variable it never set. It now names the reason it
-can actually name.
-
-**`kern run` also sweeps the cgroup it can actually reach.** The per-start sweep only ever looked in
-`kern.slice`, the one directory a host without a user manager does not have, so nothing on that path
-ever swept anything. It now sweeps the caller's own cgroup as well, deduplicated where they coincide,
-and it runs in the parent while the workload does, so it costs nothing measurable: paired against the
-same binary without it, `kern run` differs by -2.9 us and `kern box` by -0.0 us, both intervals
-containing zero.
-
-**`/dev/tty` stays out of a box, and it can no longer be created by accident.** The device is excluded
-because a controlling terminal enables TIOCSTI-style injection on unhardened kernels, and that reason
-was re-measured rather than trusted: under a real pty, a box started WITHOUT `-it` inherits the
-launcher's controlling terminal, `tty_nr=34816` for both, so the device inside the box would be the
-operator's own terminal. What was wrong is that `/dev` is a tmpfs the box's root owns, so a redirect
-CREATED a regular file there and a program writing a prompt got no error and wrote into nothing. The
-path is now a directory: `open` for writing is EISDIR whether or not `O_CREAT` is passed, so the write
-fails loudly and nothing that worked before changes.
-
-**A box that could not be BUILT now says what to check, from either process that reports it.** The
-message is printed twice in kern, and one of the two could never carry a hint: `report_exec_failure`
-runs in the forked child and `_exit`s, so the error never reaches the CLI's hint function. A reviewer
-measured `kern: sandbox setup failed: mount(overlay) failed: Invalid argument (os error 22)` arriving
-bare while every neighbouring branch carried advice. The remedy is one constant used by both, naming
-the four things a setup failure is (the mount, the uid map, the seccomp filter, the AppArmor profile)
-and pointing at `kern doctor`, which reports all four. The older wording named two of the four.
-
-**A box whose kern binary was replaced is visible again to the channel that exists to find it.** The
-kernel appends `" (deleted)"` to `/proc/<pid>/exe` once the file behind a running process is gone,
-which is the state of every already-running kern the moment an upgrade overwrites the binary.
-`live_box_supervisors_via_proc` compared against the bare name, so those processes read as not-kern
-and their boxes disappeared from the fallback channel that exists precisely to find boxes the registry
-has lost, on the one event most likely to lose them. Found on this desktop as a disagreement between
-the two channels in the same second: the cgroup channel reported a box the `/proc` channel did not.
-
-**`kern doctor` asks about both directories a box can be capped in.** `apply_limits` caps under
-`kern.slice` on the direct path and under the caller's own cgroup otherwise; the probe used
-`or_else`, which reaches the second only when the first is absent, so on a host where the slice exists
-but boxes do not use it the probe reported on a directory no box goes near. An outside reviewer
-measured the consequence: doctor said a `--memory` write "silently never bites" while a box on the
-same host held `memory_max = 67108864` and an exec that overran it was killed with 137. Both
-directories are asked now, and the better answer wins.
-
-**The cap probe's leftovers are reaped.** Its throwaway child is removed on every path the probe
-returns from, so one survives only when the process died in between; nothing collected those, because
-the sweep knew only the two box prefixes. Measured: one `kern-capprobe-*` in `kern.slice` from a pid
-long gone, which four consecutive `kern doctor` runs did not add to and `kern gc` did not remove. The
-sweep knows the family now, and never kills anything in it, because it is empty by construction.
-
-**`kern exec` no longer refuses when there is no cap to escape.** The fail-closed asked "was the
-command placed in the box's cgroup" and never "is there a cgroup, carrying a real limit, to be outside
-of". On a host with no delegation `apply_limits` returns `None`, the box sits in the caller's own
-cgroup, the placement has nothing to place, and `kern exec` refused with 126 while telling the operator
-the command would run outside `--memory`/`--pids` caps the box did not have. Reported by an outside
-reviewer on a box that was NOT at its pids limit.
-
-The function that answers the real question was already there and its result was thrown away: the block
-that called it read `let placed = true; if !placed`, dead since the migration was replaced by
-`clone3`. It is consulted now, before the `setns`, because it reads `memory.max` and `pids.max` through
-the cgroup's descriptor and the same read through a path afterwards reports a capped box as uncapped.
-A box at its `--pids-limit` still refuses, because a pids ceiling is a real limit.
-
-**`kern doctor` names the way through, and the health probe stopped writing into a hole.** The
-refusal points at `kern doctor` to tell its two causes apart; the row it points at did not name
-`KERN_ALLOW_UNCAPPED`, so a reader who followed the pointer learned which cause they had and not what
-to do about it. It names it now, along with the verb that refuses and the probe that does not.
-
-The probe's own notice is gone rather than kept, and the reason is measured: a marker written to
-stderr from inside the probe's child appears in a foreground `kern exec` and does NOT appear in
-`kern logs` or in the box's log file, which stays 0 bytes. A detached supervisor's stdout and stderr
-are one pipe that nothing reads. A notice nobody can read is the silent-success shape this codebase
-refuses, and keeping it would have been worse than not having it, because it would have looked like
-the condition was reported. It is reported, in the one place an operator looks when a host behaves
-this way.
-
-**`kern exec` no longer loses a whole class of host to its own fail-closed, and the health check no
-longer reports a healthy box as unhealthy there.** The refusal is right: a command that steps around
-the box's `--memory`/`--pids-limit` while the operator believes it is capped is the escape it exists
-to stop. But it fires for two causes, and only one of them is the box's fault. The other is cgroup v2
-delegation containment, which needs write access to the `cgroup.procs` of the COMMON ANCESTOR of the
-source and destination cgroups: from a shell in `/init.scope` that ancestor is the root cgroup, so on
-WSL2 with `systemd=true` every `kern exec` refused, on hosts where nothing was wrong. No
-implementation fixes that one, because a process there cannot reach the user's delegated tree and
-cannot move itself into it either.
-
-So the default stays REFUSE and `KERN_ALLOW_UNCAPPED` is the way through, which is the meaning that
-variable already carries in `SECURITY.md`, `INSTALL.md` and `RESOURCES.md`: explicitly accept running
-uncapped where a cgroup cap cannot be applied. It adds no CLI surface, which matters because that
-surface is frozen. The command then runs and says what it gave up; the box's namespaces, seccomp
-filter and AppArmor profile still apply to it, and only the resource ceiling does not.
-
-`exec_in_box` has a second caller that nobody had looked at: kern's own `--health-cmd` probe. Refusing
-there turned the same host property into a permanent false "unhealthy" for every box with a health
-check, with nothing in the health output naming the cause. The probe now proceeds, warning once per
-process rather than once per interval. What that costs is stated rather than glossed: on those hosts
-the probe runs outside the box's caps, which is the same tradeoff already documented for its baseline
-capabilities and its unconfined AppArmor, and on the same narrow set of hosts.
-
-**`kern exec`'s fail-closed refusal now names what to do about it.** It states that the command could
-not be placed in the box's cgroup, which is the consequence; it did not say which of the two causes it
-was, and they need opposite actions. A reviewer hit it on every `kern exec` on WSL2 with
-`systemd=true`, where the previous release ran the command uncapped and warned, and had no way to tell
-a box at its `--pids-limit` from a host layout on which no exec can ever join. Both are named now, and
-`kern doctor`, which reports which cap path a host takes in its first two lines, is pointed at.
-
-**A fork failure is no longer blamed on user namespaces or the rootfs, for any errno.** That hint has
-now been wrong twice, to two reviewers, under two different errnos: EAGAIN from a tightened
-`RLIMIT_NPROC`, which got a branch of its own last release, and ENOMEM on WSL2, measured
-deterministically. Both times the reader was sent to two places that were already fine, because by
-the time any fork on this path runs the user namespace exists and the rootfs has been validated. The
-rule is now the CLASS rather than one errno at a time, which is how the third one would otherwise have
-been found by a user. It states what the errno is, names the two limits a fork can actually hit, and
-does not guess at a cause: `clone3(CLONE_INTO_CGROUP)` into a cgroup it may not write answers EACCES
-on the developer's host and EBUSY into a populated one, neither of which is the ENOMEM measured in the
-field, and a hint that guessed would be the defect it replaces.
-
-**Finding the delegated slice is not the same as being allowed to enter it, and the difference is a
-class of host.** cgroup v2's delegation containment rule needs write access to the `cgroup.procs` of
-the COMMON ANCESTOR of the source and destination cgroups, not just of the destination. From a shell
-in `/init.scope` that ancestor is the root cgroup, owned by root, so a `kern.slice` that is delegated,
-writable and correctly capped is still unreachable. Measured on WSL2 with `systemd=true`: the leaf was
-created, both caps were written and read back, and then `clone3(CLONE_INTO_CGROUP)` and the
-`cgroup.procs` write both failed. `kern run` warned and ran UNCAPPED where the previous release had
-capped it; `kern box`, which is fail-closed on the same placement, would have refused to start at all.
-The decision site now asks the kernel's own question with one `access(2)` on that ancestor, so a host
-that cannot place takes the systemd scope exactly as it did before.
-
-**And a whole class of hosts could not reach the fast path at all, for a reason that had nothing to
-do with the fork.** kern derived its delegated `kern.slice` by walking UP from its own cgroup looking
-for a `user@<uid>.service`. On WSL2 with `systemd=true` a user manager is running and the login shell
-sits in `0::/init.scope`, whose only ancestors are itself and the root: the search answered "no
-delegated slice on this host" while the tree sat one directory away. Measured there, same binary:
-`kern run` 11.5 ms with the per-invocation scope against 1.0 ms with the scope skipped. When the
-ancestor search finds nothing, kern now tries the canonical `user.slice/user-<uid>.slice/
-user@<uid>.service` built from the real uid, and uses it only if the directory is really there. A host
-laid out some other way answers exactly what it answered before.
-
-**The numbers above are warm, and the FIRST invocation on an idle machine is not.** Measured on the
-same host by removing `kern.slice` before each sample, three samples each: the new binary reads 19.2,
-1.6 and 27.9 ms and the previous one 16.2, 23.4 and 22.4. That cost is systemd's, not kern's - a
-standalone `systemd-run --user -p Delegate=yes --slice=kern.slice --scope -- true` on the same idle
-manager is 19.5 ms on its own - and both binaries pay it. The change moves the warm case and leaves the
-cold one where it was.
 
 ## v0.9.31 - 2026-09-09
 
