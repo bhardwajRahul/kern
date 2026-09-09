@@ -233,6 +233,84 @@ fn health_dir() -> io::Result<PathBuf> {
     runtime_subdir("health")
 }
 
+/// The environment directory - a sidecar `<name>-<pid>` per box holding the environment kern gave
+/// it, NUL-separated exactly like `/proc/<pid>/environ`.
+///
+/// WHY THIS EXISTS AT ALL. `kern exec` inherits the box's environment by reading
+/// `/proc/<pid1>/environ`, and that read FAILS for every image whose workload runs as a non-root
+/// user: the file belongs to that user's mapped uid, and reading it needs `CAP_SYS_PTRACE` in the
+/// target's user namespace, which the box has dropped. MEASURED on `rabbitmq:3.12-management-alpine`
+/// (`USER rabbitmq`): `/proc/<pid1>/environ` is owned by uid 100099 and is unreadable, so `kern exec`
+/// ran with a bare `PATH` and the image's own `HEALTHCHECK` (`rabbitmq-diagnostics ping`) reported
+/// the service UNHEALTHY while its management API answered 200.
+///
+/// Recording it removes the dependency on a file kern cannot read, and it is what the container
+/// engines do: the environment is part of the container's recorded configuration, not something
+/// re-derived from a live process.
+///
+/// EXPOSURE, STATED. The file is mode 0600 inside the runtime tree, which is already 0700 and
+/// already holds the box's argv. The same values are visible in the supervisor's own
+/// `/proc/<pid>/cmdline` (`--env K=V`) for anyone who can read this user's `/proc`, so this adds no
+/// reader that did not already have them. A value that must not be readable belongs in `--secret`,
+/// which never passes through the environment.
+fn env_dir() -> io::Result<PathBuf> {
+    runtime_subdir("env")
+}
+
+/// Record the environment kern gave a box. NUL-separated, so a value may contain anything except a
+/// NUL - the same guarantee `execve` itself gives.
+pub fn set_box_env(name: &str, pid: i32, env: &[(String, String)]) {
+    let Ok(d) = env_dir() else {
+        return;
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    for (k, v) in env {
+        // A key with `=` or a NUL in either half cannot round-trip and cannot have come from a real
+        // `execve` either; skipping it keeps the file unambiguous rather than writing a record that
+        // reads back as a different variable.
+        if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+            continue;
+        }
+        buf.extend_from_slice(k.as_bytes());
+        buf.push(b'=');
+        buf.extend_from_slice(v.as_bytes());
+        buf.push(0);
+    }
+    let path = d.join(format!("{name}-{pid}"));
+    if fs::write(&path, &buf).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The environment recorded for a box, or empty when there is none (a box started by an older kern,
+/// or a runtime dir that was cleared). An empty answer is not an error: the caller falls back to the
+/// `/proc` read, which is what it did before this file existed.
+pub fn box_env(name: &str, pid: i32) -> Vec<(String, String)> {
+    let Ok(d) = env_dir() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read(d.join(format!("{name}-{pid}"))) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| {
+            let text = std::str::from_utf8(e).ok()?;
+            let (k, v) = text.split_once('=')?;
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Drop a box's environment sidecar. Called wherever the health sidecar is dropped, so the two
+/// cannot diverge into one file that outlives the box and one that does not.
+pub fn clear_box_env(name: &str, pid: i32) {
+    if let Ok(d) = env_dir() {
+        let _ = fs::remove_file(d.join(format!("{name}-{pid}")));
+    }
+}
+
 /// Record a box's latest health (`healthy`/`unhealthy`/`starting`); written by the health-checker.
 pub fn set_health(name: &str, pid: i32, status: &str) {
     if let Ok(d) = health_dir() {
@@ -334,7 +412,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 9] = [
+const AUTHORITATIVE_DIRS: [&str; 10] = [
     "instances",
     "claims",
     "exit",
@@ -342,6 +420,13 @@ const AUTHORITATIVE_DIRS: [&str; 9] = [
     "health",
     "pods",
     "ssh",
+    // The environment kern gave each box, recorded because it cannot be read back from a workload
+    // running as a non-root user. AUTHORITATIVE on BOTH counts the class names: kern reads it and
+    // acts on it for another box (it decides the environment a `kern exec` and every health probe
+    // run under, so a box able to write a peer's record chooses that peer's PATH and therefore which
+    // binary a probe executes), and it is a cross-box secret (it carries whatever the compose file
+    // put in its environment block, passwords included).
+    "env",
     // `relays/` holds a `--no-pod` stack's peer address plan: which box forwards which alias:port
     // into which other box. AUTHORITATIVE for the same reason `mounts/` is, and more directly: a box
     // able to write a line there redirects where a PEER's traffic goes, which is a forgery vector
@@ -3859,5 +3944,62 @@ mod tests {
         // a SIBLING sharing a name prefix, and unrelated paths → no path overlap (identity check next).
         assert_eq!(refuse("/run/user/1000/kern-other"), None);
         assert_eq!(refuse("/tmp/project"), None);
+    }
+}
+
+#[cfg(test)]
+mod box_env_tests {
+    /// THE BOX'S ENVIRONMENT MUST ROUND-TRIP EXACTLY, because `kern exec` and the health probe run
+    /// on what comes back. It is NUL-separated for the reason `execve` is: a value may contain `=`,
+    /// spaces, quotes and newlines, and any line-based encoding would split one of them.
+    ///
+    /// MEASURED failure this replaces: `/proc/<pid1>/environ` is unreadable for a workload running
+    /// as a non-root user (owned by its mapped uid, and the read needs `CAP_SYS_PTRACE` in the box's
+    /// user namespace, which the box has dropped), so `kern exec` ran with a bare `PATH` and the
+    /// image's own `HEALTHCHECK` reported a working service UNHEALTHY.
+    #[test]
+    fn a_recorded_environment_survives_every_shape_a_value_can_take() {
+        let name = format!("kern-envtest-{}", std::process::id());
+        let pid = 424_242;
+        let env: Vec<(String, String)> = vec![
+            ("PATH".into(), "/opt/rabbitmq/sbin:/usr/bin".into()),
+            // A value carrying the separator of any line-based format.
+            ("MOTD".into(), "line one\nline two".into()),
+            // A value carrying `=`, which a naive `split('=')` would truncate.
+            ("EQ".into(), "a=b=c".into()),
+            ("SPACED".into(), "two words".into()),
+            ("EMPTY".into(), String::new()),
+        ];
+        super::set_box_env(&name, pid, &env);
+        assert_eq!(super::box_env(&name, pid), env);
+
+        // A pair that cannot round-trip is DROPPED, not written as something else: a key with `=`
+        // would read back as a different variable, and a NUL cannot survive the separator.
+        let bad: Vec<(String, String)> = vec![
+            (String::new(), "no key".into()),
+            ("HAS=EQ".into(), "v".into()),
+            ("NUL\0KEY".into(), "v".into()),
+            ("K".into(), "NUL\0VALUE".into()),
+            ("GOOD".into(), "kept".into()),
+        ];
+        super::set_box_env(&name, pid, &bad);
+        assert_eq!(
+            super::box_env(&name, pid),
+            vec![("GOOD".to_string(), "kept".to_string())]
+        );
+
+        // Owner-only: it carries whatever the file's `environment:` block carried.
+        if let Ok(d) = super::env_dir() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(d.join(format!("{name}-{pid}"))) {
+                assert_eq!(m.permissions().mode() & 0o777, 0o600);
+            }
+        }
+
+        // Cleared, and a box with no record answers EMPTY rather than failing: that is the fallback
+        // path for a box started by an older kern.
+        super::clear_box_env(&name, pid);
+        assert!(super::box_env(&name, pid).is_empty());
+        assert!(super::box_env("kern-envtest-never-existed", 1).is_empty());
     }
 }

@@ -933,6 +933,9 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             let reaped = registry::reap_orphan(b);
             registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
             registry::clear_health(&b.name, b.pid);
+            // The environment sidecar has the same lifetime as the health one: cleared together so a
+            // runtime dir cannot accumulate one and not the other.
+            registry::clear_box_env(&b.name, b.pid);
             cleanup_box_scratch(&b.rootfs);
             if reaped {
                 println!(
@@ -987,6 +990,12 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                 },
                 // What is LEFT of this box's own grace, counted from the phase-1 signal.
                 remaining_grace_ms(b.stop_grace, signalled_at.elapsed()),
+                // PHASE 1 ALREADY SENT IT. Sending it again re-enters the workload's shutdown
+                // handler: measured at 4006 ms for a 2 s handler against 2006 ms without the second
+                // send, with the box's own log showing the trap entered twice. Phase 1 signals
+                // exactly the boxes with `stop_grace > 0`, and for the rest `remaining_grace_ms` is
+                // 0 and the graceful phase is skipped, so this is true in both arms.
+                crate::commands::GraceSignal::AlreadySent,
             )
         };
         // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
@@ -1003,7 +1012,10 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             &b.command,
         );
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
-        registry::clear_health(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
+        registry::clear_health(&b.name, b.pid);
+        // The environment sidecar has the same lifetime as the health one: cleared together so a
+        // runtime dir cannot accumulate one and not the other.
+        registry::clear_box_env(&b.name, b.pid); // a SIGKILL skips the supervisor's own cleanup
         cleanup_box_scratch(&b.rootfs);
         if outcome.confirmed() {
             // Eagerly rmdir the box's now-empty cgroup dir (captured above) - the SIGKILL skipped the

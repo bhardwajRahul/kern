@@ -1988,6 +1988,48 @@ stopsignal	SIGTERM
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE STOP SIGNAL MUST REACH A WORKLOAD EXACTLY ONCE.
+    ///
+    /// `stop` signals every box in phase 1 so a stack tears down in parallel, and
+    /// `kill_box_graceful` then sent the SAME signal again. A shell trap is re-entered on the second
+    /// delivery, so a handler taking 2 s took 4 s (MEASURED at 4006, 4007 and 4007 ms across three
+    /// runs, against 2005/2007/2006 ms after the fix, with the box's own log showing the trap
+    /// entered twice and then once). Latency is the smaller half: a shutdown handler that flushes,
+    /// deregisters or writes a final record ran twice for every `kern stop`.
+    ///
+    /// A SOURCE SCAN, because the double delivery is invisible at either call site: phase 1 is in
+    /// one file and the re-send in another, and the only thing that connects them is the parameter.
+    /// No runtime assertion can see a caller that passes the wrong one.
+    #[test]
+    fn the_stop_signal_is_sent_by_exactly_one_of_the_two_phases() {
+        // The graceful send must be GUARDED by the parameter, not unconditional.
+        let life = include_str!("lifecycle.rs");
+        let guard = format!("if {} == GraceSignal::Send {{", "pre");
+        assert_eq!(
+            life.matches(&guard).count(),
+            2,
+            "both the pidfd path and the group-only fallback must skip the send when the caller              already signalled"
+        );
+
+        // And `stop`, which DOES signal in phase 1, must say so at the call site.
+        let insp = include_str!("inspect.rs");
+        let call = "kill_box_graceful(";
+        assert_eq!(
+            insp.matches(call).count(),
+            1,
+            "one call site in `stop`, or this test is checking the wrong one"
+        );
+        let after = &insp[insp.find(call).unwrap_or(0) + call.len()..];
+        let args = match after.find("\n            )") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        assert!(
+            args.contains("GraceSignal::AlreadySent"),
+            "`stop` signals every box in phase 1, so phase 2 must not send it again; got: {args}"
+        );
+    }
+
     #[test]
     fn hostname_validation() {
         assert_eq!(validate_hostname(None).unwrap(), None);
@@ -3023,7 +3065,7 @@ mod image_rm_tests {
 
         // The fix: `kill_box` signals pid1 directly and confirms the exit before returning.
         assert!(
-            kill_box_graceful(child, child, libc::SIGTERM, 0).confirmed(),
+            kill_box_graceful(child, child, libc::SIGTERM, 0, GraceSignal::Send).confirmed(),
             "kill_box must confirm the foreground box is gone"
         );
         // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).

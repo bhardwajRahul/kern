@@ -1578,6 +1578,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             orphaned: false,
         };
         let path = registry::register(&inst).ok();
+        // RECORDED ALONGSIDE THE ENTRY, because `kern exec` cannot read it back from the box: an
+        // image whose workload runs as a non-root user owns `/proc/<pid1>/environ` as that user's
+        // mapped uid, and reading it needs `CAP_SYS_PTRACE` in the box's user namespace, which the
+        // box has dropped. See `registry::set_box_env`.
+        registry::set_box_env(&inst.name, inst.pid, &spec.env);
         crate::runstats::record_box(); // count this box start for kern top's box-start rate
         Some((inst, path))
     };
@@ -2232,10 +2237,18 @@ pub fn exec(
     // `--apparmor` parity: `box_aa` comes from the RECORDED exec posture (like caps + seccomp), NOT
     // from `/proc/<pid1>`, so an `--init` box (whose PID 1 reaper stays unconfined) re-enters the box's
     // ACTUAL profile instead of running the exec unconfined. `None` when the box ran with no profile.
+    // THE BOX'S OWN ENVIRONMENT FIRST, THE CALLER'S `-e` ON TOP. `exec_in_box` applies what it read
+    // from `/proc/<pid1>/environ` and then this list, so a `-e` the user typed still wins - and the
+    // recorded environment covers the case that read cannot: an image whose workload runs as a
+    // non-root user owns that file as a mapped uid kern cannot read. MEASURED on
+    // `rabbitmq:3.12-management-alpine`: `kern exec` saw a bare `PATH` and could not find the
+    // image's own binaries.
+    let mut exec_env = registry::box_env(&inst.name, inst.pid);
+    exec_env.extend(env.iter().cloned());
     let result = exec_in_box(
         pid1,
         &cmd,
-        &env,
+        &exec_env,
         effective_workdir,
         pty.as_ref().map(|p| p.slave),
         pty.as_ref().map(|p| p.master),
@@ -2695,6 +2708,9 @@ fn run_detached(
         orphaned: false,
     };
     let path = registry::register(&inst).ok();
+    // See the sibling site above: the box's environment is recorded here because `kern exec` cannot
+    // read it back from a workload running as a non-root user.
+    registry::set_box_env(&inst.name, inst.pid, &spec.env);
     crate::runstats::record_box(); // count this box start for kern top's box-start rate
                                    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
                                    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.

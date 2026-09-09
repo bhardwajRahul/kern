@@ -44,6 +44,26 @@ stop a file being rendered without the value, and it is what a compose file writ
 a token: a stack came up with `MYSQL_PASSWORD=`. Every variable with no value is named, not just the
 first one found.
 
+**`kern stop` sent the stop signal TWICE, so a workload's shutdown handler ran twice.** `stop`
+signals every box in phase 1 so a stack tears down in parallel, and the per-box wait then sent the
+same signal again. A shell trap is re-entered on the second delivery: measured on a handler that
+takes 2 s, `stop` took 4006, 4007 and 4007 ms across three runs with the box's own log showing the
+trap entered twice, against 2005/2007/2006 ms and a single entry after the fix. Latency is the
+smaller half of it - a handler that flushes, deregisters or writes a final record did all of it
+twice, on every stop. The other arms are unchanged and stay immediate: a workload that ignores the
+signal is killed at once (4 ms), one that does not touch it dies at once (5 ms), and a declared
+`stop_grace_period` is still honoured to the millisecond.
+
+**`kern exec` and every health probe ran with a bare environment inside an image whose workload is
+not root.** `exec_in_box` inherits the box's environment by reading `/proc/<pid1>/environ`, and that
+read fails there: the file belongs to the workload's mapped uid and reading it needs `CAP_SYS_PTRACE`
+in the box's user namespace, which the box has dropped. Measured on
+`rabbitmq:3.12-management-alpine`: the environ is owned by uid 100099 and unreadable, so `kern exec`
+saw the default `PATH`, `rabbitmq-diagnostics` was not on it, and the image's own `HEALTHCHECK`
+reported the service UNHEALTHY while its management API answered 200. kern now records the
+environment it gave each box, in a NUL-separated sidecar beside the health record, and `exec` and the
+probe read it back; an explicit `-e` still wins. The same stack now reports `healthy`.
+
 **An image's file OWNERSHIP survives the unpack, so a service that runs as a non-root user can write
 its own directories.** Layers were extracted with `--no-same-owner`, which gave every file to the
 caller: inside a box that is uid 0, so an image that `chown`s a directory to a non-root user and then

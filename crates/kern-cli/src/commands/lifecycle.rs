@@ -115,7 +115,11 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
             // probe's filter matches PID 1 by construction - not by the assumption that the checker's
             // environment still equals the box's creation environment.
             let mode = entry.as_ref().map(|b| b.seccomp_mode).unwrap_or_default();
-            let ok = run_probe(pid1, &probe, hc.timeout, mode);
+            // Re-read every round, from the SAME name the pid resolved to: a box that was recreated
+            // under this name has a different environment, and a cached one would probe the new box
+            // with the old box's `PATH`.
+            let box_env = registry::box_env(&cur, pid);
+            let ok = run_probe(pid1, &probe, &box_env, hc.timeout, mode);
             if ok {
                 fails = 0;
                 acted = false;
@@ -708,7 +712,34 @@ pub(crate) fn remaining_grace_ms(own_grace_secs: u64, since_signal: std::time::D
     own.saturating_sub(spent)
 }
 
-pub(crate) fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms: u64) -> Teardown {
+/// Has the box's stop signal ALREADY been delivered when [`kill_box_graceful`] is called?
+///
+/// AN ENUM AND NOT A `bool`, because the two states are not "on and off": they are two different
+/// callers with two different obligations, and the parameter is read at the one site that decides
+/// whether a workload's shutdown handler runs once or twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GraceSignal {
+    /// The caller has not signalled: send it here.
+    Send,
+    /// The caller already signalled this box (`stop`'s phase 1) - wait, do not send again.
+    AlreadySent,
+}
+
+/// `pre` says whether the graceful signal has already gone out; see [`GraceSignal`].
+///
+/// SENDING IT TWICE MADE A WORKLOAD SHUT DOWN TWICE. `stop` signals every box in phase 1 so a stack
+/// tears down in parallel, and this function then sent the same signal again. A shell trap is
+/// re-entered on the second delivery, so a handler that takes 2 s took 4 s: MEASURED at 4006, 4007
+/// and 4007 ms across three runs, against 2006 ms once the second send was removed, with the box's
+/// own log showing the trap entered TWICE. It is not only latency: a shutdown handler that flushes,
+/// deregisters or writes a final record ran twice for every `kern stop`.
+pub(crate) fn kill_box_graceful(
+    pid: i32,
+    pid1: i32,
+    stop_signal: i32,
+    grace_ms: u64,
+    pre: GraceSignal,
+) -> Teardown {
     // The init may ALREADY be gone: `stop` signals the supervisor's process group before it reaches
     // here, and a box init that sits in that group takes that signal too, so it can be an unreaped
     // zombie on arrival. Read its status now, while /proc still has it. Without this the graceful
@@ -723,10 +754,13 @@ pub(crate) fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms:
         let graceful = grace_ms > 0 && already.is_none() && init_catches_signal(pid1, stop_signal);
         if graceful {
             // Graceful phase: the configured signal to the box init, and to the supervisor's group so
-            // a foreground box's helpers hear it too.
-            unsafe { signal_box(fd, pid1, stop_signal) };
-            if pid > 1 {
-                unsafe { libc::kill(-pid, stop_signal) };
+            // a foreground box's helpers hear it too. SKIPPED ENTIRELY when the caller has already
+            // sent it - re-sending re-enters the workload's handler, which is both slower and wrong.
+            if pre == GraceSignal::Send {
+                unsafe { signal_box(fd, pid1, stop_signal) };
+                if pid > 1 {
+                    unsafe { libc::kill(-pid, stop_signal) };
+                }
             }
             if fd >= 0 {
                 let mut pfd = libc::pollfd {
@@ -747,8 +781,13 @@ pub(crate) fn kill_box_graceful(pid: i32, pid1: i32, stop_signal: i32, grace_ms:
         unsafe { signal_box(fd, pid1, libc::SIGKILL) };
         fd
     } else {
+        // No pidfd: the group is the only handle. The same rule applies - a caller that already
+        // signalled must not make the workload handle it a second time - but the wait still has to
+        // happen, because without a pidfd there is nothing to poll.
         if grace_ms > 0 && pid > 1 {
-            unsafe { libc::kill(-pid, stop_signal) };
+            if pre == GraceSignal::Send {
+                unsafe { libc::kill(-pid, stop_signal) };
+            }
             std::thread::sleep(std::time::Duration::from_millis(grace_ms.min(60_000)));
         }
         -1
@@ -902,9 +941,18 @@ pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Optio
 /// `exec_in_box`es the probe (so the checker itself stays on the host); `timeout` > 0 is enforced
 /// inside `exec_in_box`, which SIGKILLs the whole in-box probe group on expiry (→ non-zero) so a hung
 /// check neither stalls the checker nor leaks a live process into the box each interval.
+/// `env` is the environment kern gave the box, recorded at start (`registry::box_env`).
+///
+/// PASSED IN, NOT INHERITED FROM `/proc`. `exec_in_box` inherits the box's environment by reading
+/// `/proc/<pid1>/environ`, and that read fails for every image whose workload runs as a non-root
+/// user. MEASURED on `rabbitmq:3.12-management-alpine`: the probe ran with a bare `PATH`,
+/// `rabbitmq-diagnostics` was not on it, and the image's own `HEALTHCHECK` reported the service
+/// UNHEALTHY while its management API answered 200. A health check that cannot find the binary it
+/// was told to run reports on kern's environment, not on the service.
 pub(crate) fn run_probe(
     pid1: i32,
     probe: &[String],
+    env: &[(String, String)],
     timeout: u64,
     seccomp_mode: kern_isolation::SeccompFilter,
 ) -> bool {
@@ -923,7 +971,7 @@ pub(crate) fn run_probe(
         let code = exec_in_box(
             pid1,
             probe,
-            &[],
+            env,
             None,
             None,
             None,
