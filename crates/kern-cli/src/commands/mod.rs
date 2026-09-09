@@ -810,7 +810,18 @@ fn run_box_interactive(
 ) -> Result<(), Error> {
     let pty = crate::pty::open().map_err(|e| Error::Sandbox(format!("openpty: {e}")))?;
     spec.tty_slave = Some(pty.slave);
+    // THE BOX GETS TO BUILD ITS OWN TERMINAL, and this channel is how its master comes back. The
+    // host pair above is opened anyway and stays the fallback: if the box cannot make one (no
+    // devpts, a `--rootfs` kern did not populate, a kernel that refused the mount) nothing here
+    // changes and the box behaves as it did before. See `kern_isolation::ptybox`.
+    let chan = kern_isolation::fd_channel();
+    if let Some((parent, child)) = chan {
+        spec.pty_sock = Some(child);
+        spec.pty_sock_parent = Some(parent);
+    }
     let saved = crate::pty::raw_with_resize(pty.master);
+    // The master the pump ends up using, so it is closed exactly once at the end whichever pair won.
+    let live_master = std::cell::Cell::new(pty.master);
     // `--timeout N`: same host-namespace watchdog as the non-tty path (forked here, before the
     // unshare), so a hung interactive session is force-stopped after N seconds.
     let timeout_wd = (timeout > 0)
@@ -819,7 +830,18 @@ fn run_box_interactive(
     let result = run_in_sandbox_with(
         &spec,
         None,
-        |pid1| feed_timeout_pid(timeout_wd, pid1),
+        |pid1| {
+            feed_timeout_pid(timeout_wd, pid1);
+            // The child sends at most once and closes; `recv_fd` answers `None` on EOF, so a box
+            // that never got there costs one non-blocking-ish read and the host pty stays in charge.
+            let m = spec.pty_sock_parent.and_then(kern_isolation::recv_fd)?;
+            // The window size was copied onto the HOST master before the fork and `SIGWINCH` was
+            // pointed at it. Both have to follow the terminal that is actually in use, or an
+            // interactive box would start at the wrong size and never learn about a resize.
+            crate::pty::retarget_resize(m);
+            live_master.set(m);
+            Some(m)
+        },
         Some(pty.master),
         ports,
         // `-it`: leave the box tied to the controlling terminal/session, not to a launcher PDEATHSIG -
@@ -830,7 +852,21 @@ fn run_box_interactive(
     if let Some(ref prev) = saved {
         crate::pty::restore(0, prev);
     }
-    unsafe { libc::close(pty.master) };
+    unsafe {
+        libc::close(pty.master);
+        // The box's master, when it won, is a DIFFERENT fd and closing only the host one would leak
+        // a terminal per interactive box.
+        let live = live_master.get();
+        if live != pty.master {
+            libc::close(live);
+        }
+        // Both ends of the handover channel: the child end was inherited across the fork and the
+        // child closes its copy, but this process holds one too.
+        if let Some((parent, child)) = chan {
+            libc::close(parent);
+            libc::close(child);
+        }
+    }
     cleanup_scratch(scratch.as_deref());
     match result {
         Ok(code) => std::process::exit(code),
@@ -1316,6 +1352,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         cpuset: b.cpuset,
         cpus: b.cpus,
         tty_slave: None,
+        pty_sock: None,
+        pty_sock_parent: None,
         vgpio_devs: b.vgpio_devs,
         vgpio_sysfs: b.vgpio_sysfs,
         vdisks: b.vdisks,
@@ -1904,8 +1942,13 @@ struct ScopeReexec<'a> {
     cpuset: Option<&'a str>,
     cpus: Option<f64>,
     pids_max: Option<u64>,
-    /// `kern box` (has a supervisor to hold the RAII guard) may take the direct kern.slice path;
-    /// `kern run` (execs in place) must not, so it uses the systemd `--scope --collect` path.
+    /// May this invocation take the direct `kern.slice` path and skip the per-box systemd scope?
+    ///
+    /// Granted by a caller that leaves a process behind to `rmdir` the leaf afterwards: `kern box`,
+    /// whose supervisor forks the box, and `kern run`, which forks its workload on that path for
+    /// exactly this reason (`run_forked_under_direct_caps`). A caller that `exec()`s in place with
+    /// nothing left behind must NOT grant it - the scope's `--collect` is then the only cleanup there
+    /// is.
     allow_direct: bool,
     /// A FOREGROUND box dies with its launcher (arm PDEATHSIG across the exec into systemd-run).
     die_with_parent: bool,
@@ -1961,9 +2004,52 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
     // the hosts where the cap binds. `systemd-run --scope` puts the child INSIDE the scope, so its
     // cgroup is the box's and the parent of that is the slice that outlives it.
     let oom_dir = kern_isolation::oom_kill_dir_for_pid(child);
-    let oom_before = oom_dir
-        .as_deref()
-        .and_then(kern_isolation::oom_kill_count_at);
+    // Nothing to overlap here: on this path the box's own launcher sweeps after it spawns
+    // (`sweep_orphans_off_hot_path`), and this process is only a proxy in front of `systemd-run`.
+    std::process::exit(proxy_child_to_exit(child, oom_dir.as_deref(), || {}));
+}
+
+/// Become a transparent proxy for `child` and return the code the caller must exit with: forward the
+/// catchable fatal signals to it, wait, and translate its status (`128 + signal` when it was killed).
+///
+/// `oom_dir` is the cgroup whose `memory.events` answers "did the kernel's OOM killer fire while this
+/// ran": the box's own leaf where the caller knows it exactly (`kern run`'s direct path), or the
+/// nearest ancestor that survives the child where it does not (the scope path, where `--collect`
+/// removes the box's own cgroup before this can read it). `None` disables the message rather than
+/// guessing.
+///
+/// SPLIT OUT OF [`scope_reexec_proxy`] rather than copied, because it now has two callers and the part
+/// that is easy to get subtly wrong is not the waiting: it is reading the OOM counter from the SAME
+/// directory before and after. Measured on a root VPS, an earlier version that read the "after" from
+/// kern's own ancestors instead compared two unrelated subtrees and printed the message on one run and
+/// not the next two, which reads as a kernel race and is a wrong line of code.
+///
+/// `while_it_runs` is work that must happen in this process AFTER the fatal-signal handlers are armed
+/// and BEFORE the wait, and it exists for one job: garbage collection that overlaps the workload
+/// instead of preceding it. Putting it before the arming would widen the window in which a Ctrl-C
+/// takes the proxy's default action and orphans the workload; putting it before the fork would put its
+/// cost on the start path, which is the mistake `sweep_orphans_off_hot_path` was written to undo. The
+/// scope caller passes a no-op.
+///
+/// THE WINDOW IS NOT CLOSED, only kept at its floor: between the caller's `fork` and the `sigaction`
+/// below, a SIGINT still kills this process by default and leaves the workload running with no parent
+/// to reap it. Blocking the signals across the fork would close it and would put the burden on the
+/// CHILD to restore the mask before `execve` - an inherited block is a workload that ignores Ctrl-C,
+/// which is a worse and far more likely failure than a race of a few microseconds. The scope path has
+/// carried the same window since it grew this proxy, and there it is LONGER (it waits on the readiness
+/// pipe first).
+///
+/// Never returns to a caller that intends to keep running: the code it hands back is an exit status.
+pub(crate) fn proxy_child_to_exit(
+    child: libc::pid_t,
+    oom_dir: Option<&std::path::Path>,
+    while_it_runs: impl FnOnce(),
+) -> i32 {
+    // THE BASELINE, read before the wait and from the directory the caller resolved. On the scope path
+    // the readiness byte has arrived, so the box's cgroup exists and the workload has not run yet; on
+    // the direct path the leaf was created moments ago and is empty. Both are the first instant at
+    // which the right directory can be named.
+    let oom_before = oom_dir.and_then(kern_isolation::oom_kill_count_at);
     // The scope is up and the box runs under `systemd-run` (our child). Forward the catchable fatal
     // signals so Ctrl-C and a SIGTERM reach `systemd-run` (which relays them to the box) and the proxy
     // does not die first and orphan the wait. This path is `!die_with_parent` (detached / `kern run`):
@@ -1986,6 +2072,7 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
             libc::sigaction(sig, &act, std::ptr::null_mut());
         }
     }
+    while_it_runs();
     let status = reap(child);
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
@@ -2004,9 +2091,13 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
     // charged to the same cap: on a Jetson Orin Nano the vgpu probe was killed this way on every run
     // until the cap was raised, and the only symptom was an empty screen.
     //
-    // The claim is kept to what was measured. The box's own cgroup is gone (`--collect`), so this
-    // reads a hierarchical ancestor counter before and after, which says the OOM killer fired in
-    // this subtree and not which process it took. The wording says that.
+    // The claim is kept to what was measured, and how much it can claim depends on which directory
+    // the caller resolved. On the scope path the box's own cgroup is gone (`--collect`), so this reads
+    // a hierarchical ANCESTOR counter before and after, which says the OOM killer fired in this
+    // subtree and not which process it took; `kern run`'s direct path passes the leaf itself, where the
+    // counter is the workload's own. One wording covers both, and it is the weaker one - "fired in
+    // kern's cgroup while it ran" is true in either case, and claiming more on the path that could
+    // support it would mean two messages to keep honest instead of one.
     if code == 128 + libc::SIGKILL {
         // THE SAME DIRECTORY AS THE BEFORE, which is the whole point of resolving it once. Reading
         // the after with `oom_kill_count()` compares the box's slice against KERN's OWN ancestors:
@@ -2014,9 +2105,7 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
         // Measured on a root VPS, where those are different branches entirely: the same binary
         // printed the message on one run and stayed silent on the next two. That intermittency was
         // this line, not a kernel race.
-        let after = oom_dir
-            .as_deref()
-            .and_then(kern_isolation::oom_kill_count_at);
+        let after = oom_dir.and_then(kern_isolation::oom_kill_count_at);
         if let (Some(a), Some(b)) = (oom_before, after) {
             if b > a {
                 eprintln!(
@@ -2029,7 +2118,7 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
             }
         }
     }
-    std::process::exit(code);
+    code
 }
 
 /// The `systemd-run` child pid, for the async-signal-safe forwarding handler in the scope proxy.

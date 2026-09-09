@@ -69,6 +69,14 @@ pub fn landlock_confine_writes(rw: &[String]) -> Result<bool, Error> {
     landlock::apply_rw_allowlist_host(rw)
 }
 mod outcome;
+/// Allocate the `-it` terminal from the BOX's devpts and pass the master back. See [`ptybox`].
+mod ptybox;
+/// `-it`: the socketpair the box hands its own PTY master back on, and the receive side of it.
+/// The CLI creates the channel, puts both ends in the spec, and reads the master inside
+/// `run_in_sandbox_with`'s `on_started`. See [`ptybox`] for the defect this closes.
+pub use ptybox::{fd_channel, recv_fd};
+/// The two socket ends plus the CLI's `SIGWINCH` hook that `exec -it` needs. See [`real::PtyHandover`].
+pub use real::PtyHandover;
 /// Peer-to-peer reachability between boxes in separate network namespaces.
 pub mod peer;
 mod ports;
@@ -87,12 +95,18 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 pub use cgroup::box_cgroup_dir;
 /// Did the box this process supervised die to its own memory cap? See [`cgroup::box_was_oom_killed`].
 pub use cgroup::box_was_oom_killed;
+/// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must
+/// not share a directory name. See [`cgroup::Leaf`].
+pub use cgroup::Leaf as CgroupLeaf;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
 pub use real::bring_loopback_up;
 
 /// The same question asked of /proc, for a host with no per-box cgroup. See [`cgroup::live_box_supervisors_via_proc`].
 pub use cgroup::env_flag;
+/// Fork the workload into a capped leaf, reporting whether it got there.
+/// See [`cgroup::fork_workload_into_leaf`].
+pub use cgroup::fork_workload_into_leaf;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
 pub use cgroup::gc_orphan_box_cgroups;
@@ -107,7 +121,7 @@ pub use cgroup::live_box_supervisors_via_proc;
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
 pub use cgroup::memory_cap_enforceable;
-/// Is a memory cap of at most `bytes` actually in force on this process's cgroup chain?
+/// Is a memory cap of at most `bytes` actually in force on the chain above a cgroup?
 /// See [`cgroup::memory_cap_in_force_at_or_below`]: `true` when it cannot be told.
 pub use cgroup::memory_cap_in_force_at_or_below;
 /// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
@@ -119,6 +133,9 @@ pub use cgroup::oom_kill_count_at;
 /// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
 /// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
 pub use cgroup::oom_kill_dir_for_pid;
+/// Is something OUTSIDE this process already enforcing and supervising the workload's cgroup - kern's
+/// own scope proxy, a `--restart` unit, or a build step? See [`cgroup::outer_enforcer_present`].
+pub use cgroup::outer_enforcer_present;
 /// Move kern's own processes out of the box's scope root, so the box's whole-box OOM kill takes the
 /// workload and not the supervisor that records its exit code. Call once, at process entry, before any
 /// fork. See [`cgroup::prepare_delegated_scope`].
@@ -140,25 +157,62 @@ pub use cgroup::this_box_cgroup_dir;
 /// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;
 pub use cgroup::warn_unenforced_caps;
+/// The RAII handle on a capped cgroup leaf: it names the directory the workload must run in and
+/// removes it on drop. Exported because `kern run` holds one across its own fork now - the parent
+/// keeps it precisely so that something outlives the workload and can `rmdir` the leaf.
+/// See [`cgroup::CgroupGuard`].
+pub use cgroup::CgroupGuard;
 /// Bytes the per-box scope gets ABOVE the box's `--memory`, to hold kern's supervisor without eating
 /// into the workload's budget. See [`cgroup::SCOPE_SUPERVISOR_HEADROOM`].
 pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
-/// records itself in an in-process marker) and the scrub of an INHERITED marker (a nested kern must
-/// not be poisoned by its parent's decision). The fail-closed consumers (`took_direct_cap_path`,
-/// `env_claims_enforcer_but_none_real`) stay crate-internal - only `real.rs` reads them.
-pub use cgroup::{choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker};
+/// records itself in an in-process marker), the READ-BACK of that decision, and the scrub of an
+/// INHERITED marker (a nested kern must not be poisoned by its parent's decision).
+///
+/// `took_direct_cap_path` is exported because `kern run` now branches on it in the CLI: on the direct
+/// path it forks the workload into a `kern-run-*` leaf and reaps it, on the scope path it `exec()`s in
+/// place as it always did. Reading the RECORDED decision rather than re-deriving it from the
+/// environment is the whole point - a re-derivation reports the direct path on a host where the scope
+/// re-exec was attempted and its `exec()` failed. The remaining fail-closed consumer
+/// (`env_claims_enforcer_but_none_real`) stays crate-internal; only `real.rs` reads it.
+pub use cgroup::{
+    choose_direct_cap_path, choose_direct_cap_path_given, scrub_direct_marker, took_direct_cap_path,
+};
 /// Which local change, if any, would make a cap bind here - so a hint cannot suggest a write that
 /// this user is not allowed to perform. See [`cgroup::delegation_blocker`].
 pub use cgroup::{delegation_blocker, DelegationBlocker};
 pub use cgroup::{fleet_status, FleetStatus};
-pub use cgroup::{memory_cap_signal, record_memory_cap_signal};
 /// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`
 /// / `Absent` / `Unknown`), by creating a throwaway child cgroup and checking a `memory.max` write
 /// binds. Stronger than [`cgroup::memory_cap_enforceable`], which reads controller PRESENCE and
 /// cannot tell "delegated" from "listed but inert". See [`cgroup::memory_cap_state`].
-pub use cgroup::{memory_cap_state, MemoryCapState};
+pub use cgroup::{memory_cap_probe_sites, memory_cap_state, MemoryCapState};
+pub use cgroup::{memory_cap_signal, record_memory_cap_signal};
 pub use outcome::{Outcome, OutputView, ResourceSource};
+
+/// The remedy line for a box that could not be BUILT, as opposed to one whose command was wrong.
+///
+/// ONE DEFINITION, USED FROM TWO PROCESSES, and that is the whole reason it lives here rather than
+/// beside either of its readers. A setup failure is reported from two places that cannot share a
+/// function: `report_exec_failure` prints it from inside the FORKED CHILD and then `_exit`s, so the
+/// error never reaches the CLI, and the CLI prints it for every setup failure that fails before the
+/// fork. An outside reviewer measured the consequence - `kern: sandbox setup failed: mount(overlay)
+/// failed: Invalid argument (os error 22)` arriving with NO hint at all, because the child's path had
+/// none and could not borrow the CLI's.
+///
+/// It names the four things a setup failure is, rather than the two the CLI's older wording named:
+/// the call site's own comment lists them as mount, uid map, seccomp and AppArmor, and "user
+/// namespaces and a valid --rootfs" answers only the first two. `kern doctor` is pointed at because it
+/// reports all four, verified against its output rather than assumed: it prints rows for unprivileged
+/// user namespaces, AppArmor's userns restriction, `max_user_namespaces` and overlayfs.
+///
+/// WRITTEN AS ONE PHYSICAL LINE, and that is not a style choice. A `\`-continued literal is joined
+/// back onto one line by `cargo fmt`, which leaves the indentation behind it as RUNS OF SPACES inside
+/// the string the operator reads. That has now happened three times in this codebase in one day, to
+/// three different messages, and the last one shipped `command: the mount,      the uid map` to a
+/// terminal. `setup_hint_reads_as_one_sentence` asserts the rendering rather than the source.
+pub const SETUP_FAILURE_HINT: &str =
+    "the box could not be BUILT, which is a host capability rather than a wrong command: the mount, the uid map, the seccomp filter or the AppArmor profile. `kern doctor` reports all four, and a `--rootfs` that does not exist or is not a directory fails the same way.";
 pub use ports::{preflight as preflight_ports, PortMap};
 /// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
 /// the box and keep reaping, so kern exits with (and records) the box's own status. See
@@ -176,7 +230,8 @@ pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
     set_cpu_affinity, shed_inherited_fds, shed_inherited_fds_keeping, sub_range, trusted_helper,
-    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, UidRange, VdiskMount, Volume,
+    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, UidRange, Unplaceable, VdiskMount,
+    Volume,
 };
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};

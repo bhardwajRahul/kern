@@ -116,6 +116,26 @@ extern "C" fn on_winch(_sig: libc::c_int) {
     }
 }
 
+/// Point `SIGWINCH` at a DIFFERENT master, and push the current size onto it once.
+///
+/// The box may build its own terminal from its own devpts and hand that master back after the fork
+/// (see `kern_isolation::ptybox`), which leaves the size handling aimed at the host pair the CLI
+/// opened first. Without this the interactive box would start at whatever size the new master
+/// defaulted to and would never learn about a resize: the handler would keep writing to a terminal
+/// nobody is reading.
+///
+/// Safe to call when `install_winch` has not run: the store is what the handler reads, and the
+/// initial `ioctl` pair is the same one the handler performs.
+pub fn retarget_resize(master: RawFd) {
+    WINCH_MASTER.store(master, Ordering::Relaxed);
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 {
+            libc::ioctl(master, libc::TIOCSWINSZ, &ws);
+        }
+    }
+}
+
 /// Forward host terminal resizes to the PTY `master`. No `SA_RESTART`, so the resize also wakes the
 /// pump's `poll()` (it re-polls on `EINTR`).
 fn install_winch(master: RawFd) {

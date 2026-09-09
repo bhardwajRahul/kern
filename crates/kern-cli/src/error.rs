@@ -97,9 +97,36 @@ impl Error {
                  raise `LimitNPROC=`/`DefaultLimitNPROC=` for this session"
                     .into(),
             ),
-            Error::Setup(_) => {
-                Some("needs unprivileged user namespaces and a valid --rootfs directory".into())
-            }
+            // A FORK FAILURE IS NEVER A USERNS OR ROOTFS PROBLEM, whatever the errno, and the
+            // generic hint below asserts that it is.
+            //
+            // The EAGAIN branch above fixed one errno in this class after a reviewer was sent to two
+            // places that were both fine. A second reviewer then hit the same wrong hint under a
+            // DIFFERENT one, on WSL2 kernel 6.6, deterministically 3 of 3:
+            //
+            //   error: sandbox: fork failed: Out of memory (os error 12)
+            //   hint: needs unprivileged user namespaces and a valid --rootfs directory
+            //
+            // and reported, correctly, that the hint invents a diagnosis. So the rule is widened from
+            // one errno to the whole class, because the argument was never about EAGAIN: by the time
+            // any fork on this path runs, the user namespace has been created and the rootfs has been
+            // validated, or control would not have reached it. Naming them is wrong for every errno,
+            // and enumerating errnos one reviewer at a time is how the third one gets found by a user.
+            //
+            // WHAT THIS DELIBERATELY DOES NOT SAY IS THE CAUSE. On the developer's host,
+            // `clone3(CLONE_INTO_CGROUP)` into a cgroup it may not write answers EACCES, and into a
+            // populated one EBUSY; neither is the ENOMEM measured above, and the mechanism behind
+            // that one is not known here. A hint that guessed would be the same defect this branch
+            // exists to remove. It names the errno the kernel gave, says where the failure is not,
+            // and points at the two things a reader can actually inspect.
+            Error::Setup(msg) if msg.contains("fork") => Some(
+                "the process could not be created. The errno above is the kernel's own answer. The two limits a fork can hit are `ulimit -u`, which is per-UID and counts threads across the whole system, and the `pids.max` of the cgroup kern is starting in. The user namespace and the rootfs are already established by the time kern forks, so neither is the cause"
+                    .into(),
+            ),
+            // THE SAME STRING THE ISOLATION CRATE PRINTS from inside the forked child, which cannot
+            // reach this function. Two wordings for one condition drift, and the older one here named
+            // two of the four things a setup failure is.
+            Error::Setup(_) => Some(kern_isolation::SETUP_FAILURE_HINT.into()),
             Error::NotRunning(_) => Some("run `kern ps` to see running boxes".into()),
             Error::AlreadyRunning(_) => {
                 Some("run `kern ps` to see running boxes; `kern stop <name>` frees the name".into())
@@ -202,6 +229,192 @@ mod tests {
         assert!(real.contains("FROM"));
     }
 
+    /// **Every process-creation failure site in the isolation crate reaches the fork branch, and the
+    /// set of them is pinned so a new one cannot be added silently.**
+    ///
+    /// The branch matches on the word `fork` in the rendered message, and an outside reviewer could
+    /// not exercise it end to end because both of our kernels answer `RLIMIT_NPROC=1` with EAGAIN,
+    /// which the more specific branch takes first. So it is proven by CONSTRUCTION instead, through the
+    /// real rendering chain rather than a hand-written string:
+    ///
+    ///     Error::last("fork")  ->  Error::Syscall("fork", io)
+    ///     Display              ->  "fork failed: {io}"
+    ///     the CLI              ->  Error::Setup(e.to_string())
+    ///     hint()               ->  msg.contains("fork")
+    ///
+    /// The remaining hole is a FUTURE site named something the match cannot see - `clone3`, `posix_spawn`,
+    /// `vfork` - which would silently fall through to the generic setup hint and re-open exactly the
+    /// defect that was reported twice. This reads the isolation crate's own source, extracts every
+    /// `Error::last("...")` operation, and requires the process-creation ones to be exactly the set
+    /// named here. Adding one fails this test rather than a user.
+    #[test]
+    fn every_process_creation_failure_site_reaches_the_fork_hint() {
+        let mut ops: Vec<String> = Vec::new();
+        for dir in ["../kern-isolation/src", "crates/kern-isolation/src"] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let Ok(text) = std::fs::read_to_string(e.path()) else {
+                    continue;
+                };
+                let mut rest = text.as_str();
+                while let Some(i) = rest.find("Error::last(\"") {
+                    rest = &rest[i + 13..];
+                    if let Some(j) = rest.find('"') {
+                        ops.push(rest[..j].to_string());
+                        rest = &rest[j..];
+                    }
+                }
+            }
+            if !ops.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            ops.len() > 20,
+            "the isolation source must have been read: found {} operations",
+            ops.len()
+        );
+        ops.sort();
+        ops.dedup();
+        // Anything that creates a process. Matched broadly on purpose, because the point is to CATCH
+        // a name nobody thought of, so the filter has to be wider than the match arm it checks.
+        //
+        // `unshare(...)` is excluded and that exclusion is the one judgement in this test:
+        // `unshare(CLONE_NEWNS)` carries the substring `clone` and creates NO process, it moves the
+        // caller into a new namespace, and the generic setup hint is right for it. The CALL is
+        // excluded rather than the substring, so a future `clone3` still trips the filter.
+        let creators: Vec<&String> = ops
+            .iter()
+            .filter(|o| {
+                let lower = o.to_ascii_lowercase();
+                !lower.starts_with("unshare(")
+                    && (lower.contains("fork")
+                        || lower.contains("clone")
+                        || lower.contains("spawn")
+                        || lower.contains("exec"))
+            })
+            .collect();
+        let names: Vec<&str> = creators.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["execvp", "fork", "fork(idmap helper)"],
+            "the process-creation failure sites changed. A new one must either contain `fork`, so the \
+             hint branch sees it, or be given its own branch: falling through to the generic setup \
+             hint is the defect this test exists to stop"
+        );
+        // `execvp` is deliberately in that list and deliberately NOT a fork failure: it has its own
+        // reporting in the isolation crate, and it must NOT collect the fork hint here.
+        for op in ["fork", "fork(idmap helper)"] {
+            for errno in [libc::EAGAIN, libc::ENOMEM, libc::EPERM, libc::EINVAL] {
+                // THE REAL CHAIN, not a literal: `Display` is what puts the operation into the string
+                // the match arm reads, so a change to it breaks this test rather than the hint.
+                let iso = kern_isolation::Error::Syscall(
+                    match op {
+                        "fork" => "fork",
+                        _ => "fork(idmap helper)",
+                    },
+                    std::io::Error::from_raw_os_error(errno),
+                );
+                let rendered = iso.to_string();
+                assert!(
+                    rendered.contains("fork"),
+                    "the rendering must carry the operation, or the match arm cannot see it: {rendered}"
+                );
+                let hint = Error::Setup(rendered.clone())
+                    .hint()
+                    .unwrap_or_else(|| String::from("<none>"));
+                let expected_specific = errno == libc::EAGAIN;
+                if expected_specific {
+                    assert!(
+                        hint.contains("ulimit -u"),
+                        "EAGAIN keeps its own, more specific branch: {hint}"
+                    );
+                } else {
+                    assert!(
+                        hint.contains("the process could not be created"),
+                        "errno {errno} on {op} must reach the fork branch, got: {hint}"
+                    );
+                }
+                assert!(
+                    !hint.contains("could not be BUILT"),
+                    "a fork failure must never collect the generic setup hint: {hint}"
+                );
+            }
+        }
+    }
+
+    /// **No fork failure is blamed on user namespaces or the rootfs, for ANY errno.**
+    ///
+    /// The EAGAIN test below covers one errno with a measured mechanism. This one covers the CLASS,
+    /// and it exists because a real-failure test could not: on the developer's host `RLIMIT_NPROC=1`
+    /// produces EAGAIN, which the more specific branch catches first, so the end-to-end test in
+    /// `tests/smoke.rs` stays GREEN with this branch deleted. It asserts the guard it names without
+    /// exercising it, which is the same defect this project has now made twice.
+    ///
+    /// A constructed value is adequate HERE and not for EAGAIN, and the difference is structural
+    /// rather than a shortcut: that branch matches on `(os error 11)`, a suffix appended by
+    /// `io::Error`'s Display, so it can be lost by a change in how an errno reaches the formatter and
+    /// needs a real failure to prove it survives. This branch matches on the word `fork`, which comes
+    /// from kern's own message and from nowhere else.
+    ///
+    /// The ENOMEM case is the one an external reviewer measured on WSL2 kernel 6.6, deterministic
+    /// 3 of 3, where the hint told them to check user namespaces and `--rootfs` and both were fine.
+    #[test]
+    fn no_errno_makes_a_fork_failure_a_userns_or_rootfs_problem() {
+        // Every rendering kern can produce for a failed fork, including the two errnos measured in
+        // the field and the two the developer's own kernel returns for an unreachable cgroup.
+        for errno in [
+            libc::EAGAIN,
+            libc::ENOMEM,
+            libc::EACCES,
+            libc::EBUSY,
+            libc::EPERM,
+            libc::EINVAL,
+        ] {
+            let io = std::io::Error::from_raw_os_error(errno);
+            for msg in [
+                format!("fork failed: {io}"),
+                format!("fork(idmap helper) failed: {io}"),
+            ] {
+                let hint = Error::Setup(msg.clone())
+                    .hint()
+                    .unwrap_or_else(|| String::from("<no hint>"));
+                // THE EXACT SENTENCE, not the words in it. This hint mentions the rootfs in order
+                // to RULE IT OUT, which is the opposite of pointing at it, and an assertion on the
+                // bare word failed against the CORRECT message. What is forbidden is the generic
+                // setup hint being handed to a fork failure, so that is what is named.
+                assert!(
+                    !hint.contains("needs unprivileged user namespaces and a valid --rootfs"),
+                    "errno {errno} rendered as {msg:?} got the generic setup hint: {hint}"
+                );
+                // AND IT MUST READ AS A SENTENCE. A `\`-continued literal that rustfmt joins back
+                // onto one line keeps the indentation as runs of spaces INSIDE the string, and the
+                // user sees them. That happened while writing this very hint.
+                assert!(
+                    !hint.contains("  "),
+                    "errno {errno}: the hint carries collapsed indentation as double spaces: {hint:?}"
+                );
+                assert!(
+                    hint != "<no hint>",
+                    "errno {errno} was left with no hint at all: {msg:?}"
+                );
+            }
+        }
+        // THE CONTROL, or the loop above is satisfiable by a build that returns nothing for every
+        // Setup error: a setup failure that is NOT a fork must still get the general hint.
+        //
+        // Compared against the CONSTANT and not against a phrase copied out of it. The first version
+        // of this line asserted the words "unprivileged user namespaces", and when that wording was
+        // replaced the test went red for a reason that had nothing to do with what it guards. A test
+        // that breaks when the prose is edited is a test nobody will keep.
+        let general = Error::Setup("unshare(CLONE_NEWUSER) failed".into())
+            .hint()
+            .expect("a non-fork setup error must still carry the general hint");
+        assert_eq!(general, kern_isolation::SETUP_FAILURE_HINT);
+    }
+
     /// A setup failure caused by EAGAIN on a fork is a process-limit problem, and the userns/rootfs
     /// hint sends the reader to two places that are both already fine: the code could not have
     /// reached the fork otherwise. Reported by an external reviewer who hit it with a tightened
@@ -222,15 +435,17 @@ mod tests {
         );
         let h = Error::Setup(rendered).hint().unwrap();
         assert!(h.contains("ulimit -u"), "got: {h}");
-        assert!(
-            !h.contains("user namespaces"),
-            "still pointing at userns for a fork that ran out of process slots: {h}"
+        assert_ne!(
+            h,
+            kern_isolation::SETUP_FAILURE_HINT,
+            "a fork that ran out of process slots must not collect the generic setup hint"
         );
-        // Every other setup failure keeps the hint it had.
+        // Every other setup failure keeps the hint it had, compared against the CONSTANT so that
+        // editing the prose does not fail a test about routing.
         let other = Error::Setup("pivot_root failed: Invalid argument (os error 22)".into())
             .hint()
-            .unwrap();
-        assert!(other.contains("user namespaces"), "got: {other}");
+            .unwrap_or_default();
+        assert_eq!(other, kern_isolation::SETUP_FAILURE_HINT, "got: {other}");
     }
 
     #[test]

@@ -99,12 +99,31 @@ reads and writes. The full schema, every field, the 7-layer precedence and `exte
 
 They compose: `run` inside `box`. Both ship today.
 
-**Both carry a default memory cap of 512 MiB whether or not you ask for one**, plus no swap and a
-ceiling of 512 tasks, applied by the transient systemd scope kern re-execs into. A workload past it is
-OOM-killed and kern names `--memory` as the fix. Two ways to change it, and they are not the same:
+**Both carry a default memory cap of 512 MiB where the host can hold one**, plus no swap and a
+ceiling of 512 tasks. Where kern's delegated `kern.slice` is usable, both write those three caps
+straight into a cgroup of their own; where it is not, they re-exec into a transient systemd scope that
+carries the same three. A workload past the ceiling is OOM-killed and kern names `--memory` as the
+fix. Two ways to change it, and they are not the same:
 `--memory <size>` raises or lowers the ceiling, which is the one you want; `KERN_NO_SCOPE=1` removes
 the scope and with it all three ceilings, leaving the command in the cgroup of whatever started it,
 usually your shell's. kern warns when that happens, and `KERN_ALLOW_UNCAPPED=1` silences the warning.
+
+**And there is a third case, which this page used to promise its way past.** A host with no systemd
+user manager whose own cgroup cannot take a capped child has neither of the two mechanisms above, so
+NO cap is in force, default or asked-for. kern warns at start rather than pretending, `kern doctor`
+names the directories it probed and what it found there, and for a running box the answer is a fact
+you can read rather than a promise you have to trust:
+
+```console
+$ kern inspect web --json | grep memory
+"memory_max":67108864,"memory_max_enforced":null
+```
+
+`memory_max` is what you asked for; `memory_max_enforced` is what the kernel will hold the box to,
+read back from the box's own cgroup. `null` means nothing is enforcing it, and the human output says
+`64M (requested, NOT enforced here)`. Note that exit **137** alone does not tell you a cap bit: it is
+SIGKILL, which the system OOM killer delivers identically. A kill by the box's own cap always carries
+kern's own OOM message on stderr.
 
 **One boundary crosses the split.** `--landlock-rw <path>` works on `run` as well as on `box`, because
 Landlock restricts the calling process rather than needing a mount namespace. So

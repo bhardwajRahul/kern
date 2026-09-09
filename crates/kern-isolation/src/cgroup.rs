@@ -409,6 +409,52 @@ pub fn fork_into_cgroup(cg: Option<&CgroupRef>) -> (libc::pid_t, bool) {
     (unsafe { libc::fork() }, false)
 }
 
+/// Fork a child that runs INSIDE `guard`'s capped leaf, and report whether it got there.
+///
+/// Fork semantics: returns `(child_pid, _)` in the parent, `(0, placed)` in the child, `(-1, _)` if
+/// the fork failed. `placed` is meaningful in the CHILD and is the answer to the only question that
+/// matters on this path - is this process under the memory ceiling and the fork-bomb guard the caller
+/// just created, or outside them.
+///
+/// This is [`fork_into_cgroup`] plus the child-side fallback, packaged so a caller outside this crate
+/// never has to hold a `CgroupRef`. `clone3(CLONE_INTO_CGROUP)` places the child before the syscall
+/// returns, so on that path there is no window in which the child is outside; where the kernel refuses
+/// it (pre-5.7, or a cgroup this process may not write) the child writes itself in instead, which has
+/// a window but ends in the same place. The descriptor is closed in the child as soon as the decision
+/// is made: it is `O_CLOEXEC` anyway, and nothing between here and the workload's `execve` has any
+/// business holding an open handle on `/sys/fs/cgroup`.
+///
+/// The POLICY on `placed == false` is deliberately NOT here. `kern box` refuses (a box outside its own
+/// cgroup is not a box); `kern run` is a cooperative governor and warns. Returning the fact and letting
+/// the caller decide is what keeps those two from being one hardcoded answer.
+#[must_use]
+pub fn fork_workload_into_leaf(guard: &CgroupGuard) -> (libc::pid_t, bool) {
+    // A FAILED FORK REPORTS `placed = false`, ALWAYS, on every arm below. The two halves of this
+    // tuple must never contradict each other: `(-1, true)` reads as "no child, and it is capped",
+    // which is a sentence about a process that does not exist. The CLI checks `pid < 0` first and
+    // would not be misled today, but this is a crate-public function and the invariant belongs in it
+    // rather than in the discipline of its callers.
+    let report = |pid: libc::pid_t, placed: bool| (pid, placed && pid >= 0);
+    if !guard.supervisor_is_outside() {
+        // The supervisor is INSIDE the capped cgroup, so the child inherits it across the fork and
+        // there is nothing to place. Not a failure: `placed` is true.
+        return report(unsafe { libc::fork() }, true);
+    }
+    let Some(cg) = CgroupRef::open(&guard.dir) else {
+        // The cap is real and its directory cannot be opened, so the child cannot be put in it. Fork
+        // anyway and report the truth; refusing here would be a policy decision (see the doc above).
+        return report(unsafe { libc::fork() }, false);
+    };
+    let (pid, born) = fork_into_cgroup(Some(&cg));
+    if pid != 0 {
+        // Parent (or a failed fork). `placed` describes the CHILD, which reports its own below.
+        return report(pid, true);
+    }
+    let placed = born || join_box_cgroup(&cg);
+    cg.close();
+    (0, placed)
+}
+
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
         // Vacate first - move the supervisor back to where it came from - so the now-empty dirs can be
@@ -816,13 +862,25 @@ fn unix_socket_live(path: &std::path::Path) -> bool {
     live
 }
 
+/// Is an OUTER cgroup, or an outer kern process, already enforcing and supervising this workload?
+///
+/// TWO CALLERS, ONE QUESTION. `choose_direct_cap_path` uses it to refuse the kern.slice relocation;
+/// `kern run` uses it to decide whether to fork a supervisor of its own. Both are asking the same
+/// thing - is there already something outside me responsible for this workload's cgroup - and the
+/// answer must not be re-derived twice from the same three env vars.
+///
+/// Under `KERN_SCOPE` the outer process is kern's own scope proxy: it already waits on the workload,
+/// forwards its signals, reports its OOM and propagates its exit code, and `systemd-run --collect`
+/// already removes the cgroup. A second fork inside would add a third process to the chain and buy
+/// none of it.
+///
 /// Is an OUTER cgroup already enforcing this box's caps, so the direct kern.slice path must NOT be taken?
 /// Three cases, all of which run with `KERN_SCOPE` unset-or-set but are already capped/tracked by an
 /// ancestor: our own transient systemd `--scope` re-exec (`KERN_SCOPE`), a persistent `--restart` unit
 /// (`KERN_MANAGED`, capped by its `kern-<name>.service` cgroup), and a `kern build` RUN step
 /// (`KERN_BUILD_STEP`). Taking the direct path for these would move the box OUT of the enforcing ancestor
 /// (breaking `stop`/kill for managed units) and could fail-closed-refuse a build/restart into a crash-loop.
-fn outer_enforcer_present() -> bool {
+pub fn outer_enforcer_present() -> bool {
     crate::cgroup::env_flag("KERN_SCOPE")
         || crate::cgroup::env_flag("KERN_MANAGED")
         || crate::cgroup::env_flag("KERN_BUILD_STEP")
@@ -997,13 +1055,75 @@ const SCOPE_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(1
 ///
 /// NOT for the box-start hot path (a box ensures the slice itself). Its one caller, doctor, invokes it
 /// at most once; do not place it in a per-box-start or per-syscall loop.
+/// The two directories a `--memory` cap can land in on this host, in the order `apply_limits` picks
+/// them: `(kern.slice, the caller's own cgroup)`. Either may be `None`.
+///
+/// Public so `kern doctor` can NAME the places it probed instead of asserting an unlocated verdict.
+/// An outside reviewer refused a release over exactly that gap: doctor said a `--memory` write
+/// "silently never bites" while a box on the same host exited 137, and the sentence pointed at no
+/// directory, so neither of us could tell whether doctor or the 137 was describing kern's cap. A
+/// claim about a cgroup that does not say WHICH cgroup cannot be checked against `/proc/<pid>/cgroup`.
+///
+/// Single source for both callers: deriving these paths a second time inside doctor is the duplicated
+/// derived condition that made the previous version of this probe report on a directory no box used.
+///
+/// SIDE EFFECT: like [`memory_cap_state`], resolving the first site may CREATE the persistent
+/// `kern.slice` - the same thing a box start does. Not for a hot path.
+pub fn memory_cap_probe_sites() -> (Option<PathBuf>, Option<PathBuf>) {
+    (ensure_kern_slice(), current_v2_cgroup())
+}
+
 pub fn memory_cap_state() -> MemoryCapState {
-    let Some(target) = ensure_kern_slice().or_else(current_v2_cgroup) else {
+    // BOTH DIRECTORIES A BOX CAN BE CAPPED IN, because `or_else` answered a narrower question than the
+    // one asked and the two answers disagreed on a real host.
+    //
+    // `apply_limits` picks `kern.slice` when the direct path was chosen and the caller's OWN cgroup
+    // (`origin`) otherwise. `or_else` only reaches the second when the first is `None`, so on a host
+    // where the slice EXISTS but boxes do not use it, this probed the slice and reported on a
+    // directory no box goes near.
+    //
+    // MEASURED by an outside reviewer, uid 0, no user manager: `kern doctor` printed "the `memory`
+    // controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and
+    // silently never bites", and on the same host in the same session a box started with
+    // `--memory 64m` reported `memory_max = 67108864` and an `exec` that overran it exited 137.
+    // Their box's PID 1 sat in `0::/`, the v2 ROOT, which `or_else` never reached because
+    // `ensure_kern_slice()` had answered `Some`: the probe reported on a directory no box went near,
+    // which is a defect on its own and is what the two-site probe below fixes.
+    //
+    // WHAT THAT REPORT DOES NOT ESTABLISH, and the reason this comment no longer says the cap bound:
+    // `memory_max` in `inspect` was the value the box was STARTED with, echoed from the registry, not
+    // a read-back, and the v2 root has no `memory.max` file at all, so a box in `0::/` has nothing to
+    // be capped by. Exit 137 is SIGKILL, which a system OOM kill delivers identically. The two
+    // observations are consistent with the probe being right. Neither reading is settled here, so
+    // both are made checkable instead: `inspect` now reports `memory_max_enforced` read back from the
+    // box's own cgroup, and doctor NAMES the directories below so its claim can be falsified against
+    // the same `/proc/<pid1>/cgroup` the operator can read.
+    //
+    // A box is capped if EITHER parent binds, so both are asked and the better answer wins. The cost
+    // is one extra throwaway child cgroup on a command that runs once, and only when the first
+    // directory did not already answer `Enforced`.
+    let (slice, own) = memory_cap_probe_sites();
+    let Some(first) = slice.clone().or_else(|| own.clone()) else {
         return MemoryCapState::Unknown;
     };
-    let direct = memory_cap_state_at(&target);
+    let mut direct = memory_cap_state_at(&first);
     if direct == MemoryCapState::Enforced {
         return direct;
+    }
+    // The second directory, only when it is a DIFFERENT one: probing the same path twice would double
+    // the cost to re-derive the answer just obtained.
+    if let Some(second) = own.filter(|o| Some(o) != slice.as_ref()) {
+        let alt = memory_cap_state_at(&second);
+        if alt == MemoryCapState::Enforced {
+            return alt;
+        }
+        // Keep the more INFORMATIVE of the two negatives. `PresentNotDelegated` says the controller is
+        // in the tree and merely not reaching a child, which is actionable; `Absent` says it is not
+        // there at all. Reporting `Absent` for a host where one of the two directories has it would
+        // name a cause the operator cannot fix because it is not the cause.
+        if direct == MemoryCapState::Absent || direct == MemoryCapState::Unknown {
+            direct = alt;
+        }
     }
     // The direct write does not bind - but on the boards that is not how a box is capped. There kern
     // re-execs into a transient scope and the MANAGER applies `MemoryMax` to it, which the direct
@@ -1128,7 +1248,9 @@ fn scope_probe_read(unit: &str, what: &std::path::Path) -> Option<String> {
 /// for the same reason `config::load_impl` is - a unit test can drive it against a synthetic tree
 /// without reading (or mutating) the real `/proc/self/cgroup`.
 fn memory_cap_state_at(cur: &std::path::Path) -> MemoryCapState {
-    let child = cur.join(format!("kern-capprobe-{}", unsafe { libc::getpid() }));
+    let child = cur.join(format!("{CAPPROBE_LEAF_PREFIX}{}", unsafe {
+        libc::getpid()
+    }));
     // Create the throwaway child. `AlreadyExists` is a leftover from a crashed probe: remove and
     // retry once. Any other creation error means child cgroups cannot be created here at all, which
     // is the not-delegated signal, refined below by whether the controller is even present.
@@ -1367,14 +1489,57 @@ fn kern_slice_path() -> Option<PathBuf> {
         // `systemd-run --system --slice=kern.slice` lands the slice at the top of the cgroup-v2 mount.
         return Some(PathBuf::from("/sys/fs/cgroup").join(KERN_SLICE_NAME));
     }
-    let cur = current_v2_cgroup()?;
-    let root = cur.ancestors().find(|p| {
-        p.file_name().is_some_and(|n| {
-            let n = n.to_string_lossy();
-            n.starts_with("user@") && n.ends_with(".service")
+    // THE DELEGATION ROOT IS NOT ALWAYS AN ANCESTOR OF THE CALLER, and assuming it was made the
+    // direct cap path unreachable on a whole class of hosts.
+    //
+    // MEASURED by an outside reviewer on WSL2 with `systemd=true`, 2026-09-09: a user manager IS
+    // running, and the login shell sits in `0::/init.scope`, whose only ancestors are `/init.scope`
+    // and the root. Neither matches, so this returned `None`, `direct_caps_available()` was false,
+    // and every `kern run` there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms
+    // the same host reaches with `KERN_NO_SCOPE=1`. The delegated tree was there the whole time,
+    // one directory away, and kern could not name it because it was looking UP instead of AT it.
+    if let Some(root) = delegation_root_above(current_v2_cgroup().as_deref()) {
+        return Some(root.join(KERN_SLICE_NAME));
+    }
+    // The canonical layout, built from the REAL uid, and taken ONLY if it is really there. This is
+    // where systemd puts a user manager on every host that has one, and it is the same tree
+    // `systemd-run --user --scope` lands a transient unit in, so a box capped here is capped exactly
+    // where the scope path would have put it. `getuid` and not `geteuid`, matching `as_root` above:
+    // the manager belongs to the real user, not to a setuid binary's effective one.
+    //
+    // FAILS TO `None` IF THE DIRECTORY IS ABSENT, which is the whole safety of it: on a host with no
+    // user manager, or one laid out some other way, this answers exactly what it answered before and
+    // the caller falls back to the per-box scope. It cannot invent a delegation that is not there,
+    // because `ensure_kern_slice` still has to create and cap a child under it before anything is
+    // used, and `slice_can_cap` checks that the controllers actually arrived.
+    let canonical = canonical_delegation_root(unsafe { libc::getuid() });
+    canonical.is_dir().then(|| canonical.join(KERN_SLICE_NAME))
+}
+
+/// The `user@<uid>.service` ancestor of `cur`, if there is one. Split out from [`kern_slice_path`]
+/// with no filesystem in it, so both of its answers can be asserted against a literal path rather
+/// than against whichever cgroup the test binary happened to be started in.
+fn delegation_root_above(cur: Option<&Path>) -> Option<PathBuf> {
+    cur?.ancestors()
+        .find(|p| {
+            p.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("user@") && n.ends_with(".service")
+            })
         })
-    })?;
-    Some(root.join(KERN_SLICE_NAME))
+        .map(Path::to_path_buf)
+}
+
+/// Where systemd puts a user manager on a host that has one, built from the uid alone.
+///
+/// Pure, so the string is checked by a test instead of by reading it: this path is the FALLBACK for
+/// a caller whose own cgroup has no delegation root above it, and a typo in it would silently mean
+/// "no delegated slice here" on every host. That failure is invisible, because it degrades to the
+/// behaviour this replaced instead of erroring.
+fn canonical_delegation_root(uid: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+    ))
 }
 
 /// Apply a FLEET-WIDE budget to kern's shared parent slice (`kern.slice`): a hard `memory.max` and/or
@@ -1462,18 +1627,96 @@ fn render_cgroup_max(n: u64) -> String {
     }
 }
 
-/// Reap orphaned box cgroup dirs under kern.slice: a `kern-box-<tag>-<pid>` whose supervisor `<pid>` is
-/// DEAD. Self-heals the one leak the RAII guard can't cover - a DETACHED box whose supervisor is
-/// SIGKILL'd by `kern stop` never runs `Drop`, leaving its (now-empty) dir behind. RACE-SAFE: a LIVE box's
-/// pid is alive (`/proc/<pid>` exists) → skipped, including one mid-creation; only dead-owner dirs are
-/// `rmdir`'d, and `rmdir` itself fails on any still-populated cgroup. Cheap (one readdir + a stat/entry),
-/// run once per box start when kern.slice is confirmed usable.
-/// Reap dead-supervisor `kern-box-<tag>-<pid>` cgroup dirs under `slice`. `limit` caps how many entries
-/// are examined (a `/proc/<pid>` stat each) so the PER-BOX-START call (kern is daemonless → once per box
-/// process) stays O(1) instead of O(entries) - Σ over an N-box burst would otherwise be O(N²). Orphans
-/// past the cap are cleared by a later start or by `kern gc` (which passes `0` = unbounded). The
-/// `/proc/<pid>` check (not a bare rmdir-if-empty) is deliberate: a box is momentarily EMPTY between its
-/// cgroup `mkdir` and the `cgroup.procs` write, so only a truly dead pid is reaped.
+/// Is this `/proc/<pid>/exe` basename kern's, in either spelling the kernel produces?
+///
+/// The kernel appends `" (deleted)"` when the binary behind a running process has been replaced or
+/// removed, which is the state of every already-running kern the moment `install.sh` overwrites it.
+/// A comparison against the bare name reports those processes as not-kern.
+///
+/// Pure, so both spellings and the near misses are asserted against literals rather than against
+/// whatever happens to be running on the machine the test runs on.
+fn exe_stem_is_kern(name: &str) -> bool {
+    name == "kern" || name == "kern (deleted)"
+}
+
+/// Is the process that OWNS a capped leaf dead? `rest` is the leaf name with its family PREFIX already
+/// stripped, so this reads the trailing `-<pid>` that `kern-box-<tag>-<pid>` and `kern-run-<pid>` both
+/// end in. The tag may itself contain '-', so the pid is the LAST field and never the second.
+///
+/// `-sup` is stripped first, because the supervisor's sibling leaf is `kern-box-<tag>-<pid>-sup` and
+/// its last field is the literal `sup`, which parses as no pid at all: without this the leaf is
+/// invisible to the sweep and never reaped. MEASURED: 434 of them accumulated under `kern.slice` in one
+/// session, one per box. They are empty and harmless on their own, and not harmless in aggregate - the
+/// sweep examines at most `limit` entries per box start, so a pile of unreapable directories crowds out
+/// the orphans it exists to find. The `a_box_start_still_reaps_an_orphan_cgroup` test failed exactly
+/// that way, and passed again the moment the pile was cleared. The pid is the SUPERVISOR's in both
+/// names, so one liveness check covers a leaf and the box it belongs to.
+///
+/// ASKED OF `/proc` AND NOT OF THE DIRECTORY'S CONTENTS, deliberately: a box is momentarily EMPTY
+/// between its `mkdir` and its `cgroup.procs` write, so a rmdir-if-empty rule would reap a box that is
+/// starting. It also puts the pid-reuse hazard on the safe side - a reused pid reads as ALIVE, so the
+/// leaf is skipped and never killed.
+fn leaf_owner_is_dead(rest: &str) -> bool {
+    rest.strip_suffix("-sup")
+        .unwrap_or(rest)
+        .rsplit('-')
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .is_some_and(|pid| !proc_entry_exists(pid))
+}
+
+/// Does `/proc/<pid>` exist, asked WITHOUT allocating?
+///
+/// This is the body of the sweep's loop: it runs once per directory entry, up to `SWEEP_LIMIT` of
+/// them, twice per box start now that both candidate directories are swept. The obvious spelling,
+/// `PathBuf::from(format!("/proc/{pid}")).exists()`, is two heap allocations and a `String` format
+/// per entry, and it is on a path this project measures in microseconds. The digits are written into
+/// a stack buffer instead and the question is asked with one `access(2)`.
+///
+/// `[u8; 24]` is sized for the longest possible answer and checked by the compiler through the
+/// `debug_assert` below rather than by counting in a comment: `/proc/` is 6 bytes, a `u32` is at most
+/// 10 digits, and the NUL is one, so 17 is the maximum and 24 leaves the buffer aligned with room to
+/// spare. Nothing here can overflow it, and the write loop cannot run off the end because the index
+/// is bounded by the digit count.
+fn proc_entry_exists(pid: u32) -> bool {
+    let mut buf = [0u8; 24];
+    buf[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    let mut v = pid;
+    // Emitted least-significant first into a scratch array, then reversed: a division-free forward
+    // encoding would need the power of ten, which is another loop for no gain at ten digits.
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == digits.len() {
+            break;
+        }
+    }
+    debug_assert!(
+        6 + n < buf.len(),
+        "/proc/<u32> plus its NUL must fit the buffer"
+    );
+    for i in 0..n {
+        buf[6 + i] = digits[n - 1 - i];
+    }
+    buf[6 + n] = 0;
+    // SAFETY: `buf` is a live stack array, NUL-terminated at `6 + n` by the line above, and `access`
+    // only reads up to that NUL. `F_OK` asks existence and never follows anything writable.
+    unsafe { libc::access(buf.as_ptr().cast(), libc::F_OK) == 0 }
+}
+
+/// Reap the capped leaves under `slice` whose owner is dead, self-healing the one leak the RAII guard
+/// cannot cover: a process SIGKILL'd before its `Drop` could run leaves its (now-empty) dir behind.
+///
+/// `limit` caps how many entries are examined (a `/proc/<pid>` stat each) so the per-start call (kern
+/// is daemonless → once per box process) stays O(1) instead of O(entries) - Σ over an N-box burst would
+/// otherwise be O(N²). Orphans past the cap are cleared by a later start or by `kern gc`, which passes
+/// `0` = unbounded.
+///
+/// BOTH LEAF FAMILIES ARE SWEPT AND ONLY ONE IS KILLED; see [`Leaf`] and the `may_kill` decision below.
+/// `rmdir` is the safety valve under either: it fails on a cgroup that still holds anything.
 fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
     let Ok(rd) = fs::read_dir(slice) else { return };
     for (seen, e) in rd.flatten().enumerate() {
@@ -1482,27 +1725,20 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
         }
         let name = e.file_name();
         let name = name.to_string_lossy();
-        // trailing `-<pid>` of `kern-box-<tag>-<pid>` (tag may contain '-', pid is always the last field).
-        //
-        // `-sup` FIRST, because the supervisor's sibling leaf is `kern-box-<tag>-<pid>-sup` and its last
-        // field is the literal `sup`, which parses as no pid at all: without this the leaf is invisible
-        // to the sweep and never reaped. MEASURED: 434 of them accumulated under `kern.slice` in one
-        // session, one per box. They are empty and harmless on their own, and they are not harmless in
-        // aggregate - this sweep examines at most `limit` entries per box start, so a pile of unreapable
-        // directories crowds out the orphans it exists to find. The `a_box_start_still_reaps_an_orphan_cgroup`
-        // test failed exactly that way, and passed again the moment the pile was cleared.
-        //
-        // The pid is the SUPERVISOR's in both names, so the liveness check is the same one: while that
-        // process runs, both its box dir and its leaf are skipped.
-        let dead = name
-            .strip_prefix("kern-box-")
-            .map(|s| match s.strip_suffix("-sup") {
-                Some(base) => base,
-                None => s,
-            })
-            .and_then(|s| s.rsplit('-').next())
-            .and_then(|p| p.parse::<u32>().ok())
-            .is_some_and(|pid| !PathBuf::from(format!("/proc/{pid}")).exists());
+        // The name decides BOTH answers, and they are separate questions: `leaf_owner_is_dead` reads
+        // the trailing pid (the same parse for either family), while `may_kill` is the whole
+        // difference BETWEEN the families and is decided by the PREFIX - never by what happens to be
+        // inside the directory.
+        let (dead, may_kill) = match (
+            name.strip_prefix(BOX_LEAF_PREFIX),
+            name.strip_prefix(RUN_LEAF_PREFIX),
+            name.strip_prefix(CAPPROBE_LEAF_PREFIX),
+        ) {
+            (Some(rest), _, _) => (leaf_owner_is_dead(rest), true),
+            (None, Some(rest), _) => (leaf_owner_is_dead(rest), false),
+            (None, None, Some(rest)) => (leaf_owner_is_dead(rest), false),
+            (None, None, None) => (false, false),
+        };
         if dead {
             // The supervisor `<pid>` is gone. A detached box whose supervisor was SIGKILL'd/OOM-killed
             // ran no cleanup, and its PID-ns init carries no launcher PDEATHSIG, so the whole tree
@@ -1511,8 +1747,21 @@ fn sweep_orphan_boxes(slice: &std::path::Path, limit: usize) {
             // then the (now-emptying) dir is `rmdir`'d - a straggler zombie's dir falls to the next
             // sweep once the kernel reaps it. No pid-reuse hazard: a reused `<pid>` makes `/proc/<pid>`
             // exist, so `dead` is false and the box is skipped, never killed.
+            //
+            // NEVER FOR A `kern run` LEAF, and this asymmetry is the point of splitting the families.
+            // A box's processes belong to the box: killing them when the box's supervisor died is
+            // finishing a teardown someone already started. `kern run` is a resource GOVERNOR over
+            // processes the caller started on the host - `kern run -- ./server &` and a workload that
+            // backgrounds a child are both ordinary uses - and its contract is that nothing dies with
+            // the launcher. Under the systemd `--scope` this path replaces, a survivor kept the scope
+            // alive and was collected when it exited; a `cgroup.kill` here would instead reach in and
+            // SIGKILL a process the user is still using. So a populated `kern run` leaf is simply left
+            // alone: `remove_dir` no-ops on it, and the sweep that runs after the last survivor exits
+            // removes it then.
             let path = e.path();
-            let _ = kill_cgroup(&path);
+            if may_kill {
+                let _ = kill_cgroup(&path);
+            }
             let _ = fs::remove_dir(&path);
         }
     }
@@ -1584,7 +1833,7 @@ pub fn live_box_cgroups() -> Vec<(String, u32)> {
         for e in rd.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            let Some(rest) = name.strip_prefix("kern-box-") else {
+            let Some(rest) = name.strip_prefix(BOX_LEAF_PREFIX) else {
                 continue;
             };
             // The supervisor's sibling leaf is `…-sup` and names the SAME box, so counting it would
@@ -1660,9 +1909,29 @@ pub fn live_box_supervisors_via_proc() -> Vec<(String, u32)> {
         };
         // `exe` is a symlink the KERNEL maintains: a process cannot point it elsewhere by rewriting
         // its own argv.
+        //
+        // AND THE KERNEL APPENDS " (deleted)" TO IT once the binary is gone, which is the ordinary
+        // state of every running box after an upgrade: `install.sh` replaces the file, and from that
+        // moment `/proc/<pid>/exe` of every kern already running reads `/path/to/kern (deleted)`.
+        // MEASURED on this desktop, a box whose binary had been rebuilt underneath it:
+        //
+        //     ppid=1691739  parent_exe=/home/alex/dev/.../kern (deleted)
+        //     pid 1691741   userns=4026535815 (ours: 4026531837)   <- a real box supervisor
+        //
+        // `file_name() == "kern"` was false there, so the whole box was invisible to THIS channel -
+        // the fallback that exists to find boxes the registry has lost, failing on the one event most
+        // likely to lose them. The cgroup channel reported the same box in the same second, which is
+        // how the disagreement surfaced.
+        //
+        // Matched on the stem so both spellings resolve. Deliberately NOT a `starts_with("kern")`:
+        // that would also claim `kernel-something`, and this set decides which processes kern will
+        // then ask for children and report as boxes.
         if fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
-            .and_then(|p| p.file_name().map(|f| f == "kern"))
+            .and_then(|p| {
+                p.file_name()
+                    .map(|f| exe_stem_is_kern(&f.to_string_lossy()))
+            })
             .unwrap_or(false)
         {
             kern_pids.insert(pid.to_string());
@@ -1748,14 +2017,25 @@ fn gc_orphan_box_cgroups_in(dirs: &[Option<PathBuf>]) -> usize {
     reaped
 }
 
-/// How many `kern-box-*` dirs sit directly in `dir`. Split out because [`gc_orphan_box_cgroups`] now
-/// measures more than one directory and a closure over a single captured path no longer fits.
+/// How many of kern's own capped-leaf dirs sit directly in `dir`. Split out because
+/// [`gc_orphan_box_cgroups`] now measures more than one directory and a closure over a single captured
+/// path no longer fits.
+///
+/// COUNTS BOTH FAMILIES because it is the before/after of the sweep, and the sweep reaps both: a count
+/// that saw only `kern-box-*` would report `kern gc` as having removed nothing on a host whose leftovers
+/// were all `kern-run-*`, which is the number an operator uses to decide whether to look further.
 fn count_box_cgroups(dir: &std::path::Path) -> usize {
     fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("kern-box-"))
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with(BOX_LEAF_PREFIX)
+                || n.starts_with(RUN_LEAF_PREFIX)
+                || n.starts_with(CAPPROBE_LEAF_PREFIX)
+        })
         .count()
 }
 
@@ -1804,7 +2084,7 @@ fn is_kern_box_leaf(leaf: &str) -> bool {
     //
     // Refusing it here makes `box_cgroup_dir` return `None` for that window instead of a wrong path,
     // and `None` is already the "no dedicated cgroup" case every caller handles.
-    leaf.starts_with("kern-box-") && !leaf.ends_with("-sup")
+    leaf.starts_with(BOX_LEAF_PREFIX) && !leaf.ends_with("-sup")
 }
 
 /// Parse a cgroup-v2 `/proc/<pid>/cgroup` body (`0::<path>`) into kern's own box-cgroup dir, or `None`.
@@ -1894,6 +2174,23 @@ pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
 /// both reads failed, neither looked like a real limit, and a box capped at `--pids-limit 2
 /// --memory 64M` was reported as having nothing worth warning about. The failure to read and the
 /// absence of a cap produced the same answer.
+/// Does a failed placement actually COST the caller a cap?
+///
+/// The two inputs are "the box has a cgroup of its own" and "that cgroup carries a real limit". Both
+/// have to hold, and reading them as one condition is what hid a defect for a release: `kern exec`
+/// refused on a host with no delegation, where `apply_limits` returns `None`, the box sits in the
+/// caller's own cgroup, `box_cgroup_dir_for_exec` answers `None` and the placement therefore has
+/// nothing to place. The command was refused for a loss that did not happen, with a message naming
+/// caps that did not exist. Reported by an outside reviewer on a box that was not at its pids limit.
+///
+/// A pure function of two bools so all four combinations are asserted without a cgroup filesystem,
+/// which is the same treatment `supervisor_needs_leaf` and `caps_gate_satisfied` get for the same
+/// reason: the expression is trivial and the consequence of getting it backwards is not.
+#[must_use]
+pub const fn placement_failure_costs_a_cap(box_has_own_cgroup: bool, cap_is_real: bool) -> bool {
+    box_has_own_cgroup && cap_is_real
+}
+
 #[must_use]
 pub fn exec_join_outcome_after_failure(cg: &CgroupRef) -> ExecCgroupJoin {
     let real = |f: &CStr| cg.read_control(f).is_some_and(|v| is_real_limit(&v));
@@ -1930,8 +2227,26 @@ pub fn exec_join_outcome_after_failure(cg: &CgroupRef) -> ExecCgroupJoin {
 /// Best-effort and bounded by `SWEEP_LIMIT`, exactly as before. A no-op when the slice is not the
 /// path this host caps through, because then there is nothing of ours in it.
 pub fn sweep_orphans_off_hot_path() {
-    if let Some(slice) = ensure_kern_slice() {
-        sweep_orphan_boxes(&slice, SWEEP_LIMIT);
+    // BOTH DIRECTORIES A LEAF CAN BE BUILT IN, which is the same pair `gc_orphan_box_cgroups` reaps.
+    // It used to be `kern.slice` alone, and that is the directory a host WITHOUT a systemd user
+    // manager never has: there the leaf is built in the caller's own cgroup, so nothing on this path
+    // ever swept anything. MEASURED by an outside reviewer on WSL2 with no user manager, 2026-09-09:
+    // 200 sequential `kern run` left 201 directories, cleared only by an explicit `kern gc`. That is
+    // the shipped WSL rootfs's own configuration, so it was the documented Windows install path that
+    // accumulated them.
+    //
+    // Deduplicated because on a host that caps through `kern.slice` the two are different directories
+    // and on one that does not they can be the same: sweeping it twice would double the cost of the
+    // one thing this function exists to keep cheap.
+    let slice = ensure_kern_slice();
+    let own = current_v2_cgroup();
+    if let Some(s) = slice.as_ref() {
+        sweep_orphan_boxes(s, SWEEP_LIMIT);
+    }
+    if let Some(o) = own.as_ref() {
+        if slice.as_ref() != Some(o) {
+            sweep_orphan_boxes(o, SWEEP_LIMIT);
+        }
     }
 }
 
@@ -1941,6 +2256,83 @@ fn ensure_kern_slice() -> Option<PathBuf> {
 }
 
 fn ensure_kern_slice_uncached() -> Option<PathBuf> {
+    let slice = locate_or_create_kern_slice()?;
+    // THE LAST QUESTION, AND THE ONE THAT WAS NEVER ASKED: can a process actually be PUT in there?
+    //
+    // Everything above establishes that the directory exists and that its controllers are delegated,
+    // which is what "can this cap" means. It is not what "can this cap US" means, and the difference
+    // is a whole class of host.
+    //
+    // MEASURED by an outside reviewer on WSL2 with `systemd=true`, 2026-09-09, after an earlier
+    // version of this file learned to FIND the slice there: the leaf was created, `memory.max` and
+    // `pids.max` were written and read back, and then both `clone3(CLONE_INTO_CGROUP)` and the
+    // `cgroup.procs` write FAILED, because cgroup v2's delegation containment rule needs write access
+    // to the `cgroup.procs` of the COMMON ANCESTOR of the source and destination cgroups, and from
+    // `/init.scope` that ancestor is the root, owned by root. The consequences were not symmetric and
+    // both were severe: `kern run` warned and ran UNCAPPED where v0.9.31 had capped it, and `kern box`
+    // is fail-closed on the same placement, so it would have refused to start at all.
+    //
+    // Gating here rather than at either caller is what makes it one answer: `direct_caps_available()`,
+    // `apply_limits`' parent choice and the sweep all read this function, and a host that cannot place
+    // must look to all three exactly as it did before the slice could be found.
+    placement_into_is_permitted(&slice).then_some(slice)
+}
+
+/// Is the caller allowed to move a process into a child of `target`?
+///
+/// cgroup v2 delegation containment: a process may migrate a task from A to B when it has write
+/// access to B's `cgroup.procs` AND to the `cgroup.procs` of the COMMON ANCESTOR of A and B. The
+/// second half is the one that is easy to forget, because it is a property of the PAIR and not of
+/// the destination, so a destination that is delegated, writable and correctly capped can still be
+/// unreachable from where the caller happens to sit.
+///
+/// Asked with one `access(2)` on the ancestor, which is exactly the kernel's own rule and costs a
+/// syscall on a path that runs once per process. Verified on this desktop, where the two answers
+/// differ and bracket the case: `W_OK` on `/sys/fs/cgroup/cgroup.procs` is FALSE for an ordinary
+/// user, and TRUE on `user@<uid>.service/cgroup.procs`.
+///
+/// `false` WHEN THE SOURCE CANNOT BE READ, which is the safe direction here and the opposite of the
+/// default elsewhere in this file: the caller answers it by taking the systemd scope, which costs
+/// milliseconds, and the alternative is a box that refuses to start or a command that runs uncapped.
+fn placement_into_is_permitted(target: &Path) -> bool {
+    let Some(from) = current_v2_cgroup() else {
+        return false;
+    };
+    cgroup_procs_writable(&common_cgroup_ancestor(&from, target))
+}
+
+/// The deepest directory that is a prefix of BOTH cgroup paths.
+///
+/// Pure, so the rule can be asserted against literals rather than against whichever cgroup the test
+/// binary was started in. Both inputs are absolute paths under `/sys/fs/cgroup` by construction, so
+/// the walk always stops at or below the mount root.
+fn common_cgroup_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for (x, y) in a.components().zip(b.components()) {
+        if x != y {
+            break;
+        }
+        out.push(x);
+    }
+    out
+}
+
+/// Does this process have write access to `dir/cgroup.procs`? One `access(2)`, no allocation beyond
+/// the path the kernel needs as a C string.
+fn cgroup_procs_writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.join("cgroup.procs").as_os_str().as_bytes()) else {
+        return false; // an interior NUL cannot name a real file
+    };
+    // SAFETY: `c` is a live, NUL-terminated C string for the duration of the call, and `access` only
+    // reads it. `W_OK` asks permission and changes nothing.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Find kern's delegated slice, creating it where kern is allowed to. The body of what
+/// [`ensure_kern_slice_uncached`] used to be, split out so its three `Some` returns all pass through
+/// the placement gate above instead of three call sites each having to remember it.
+fn locate_or_create_kern_slice() -> Option<PathBuf> {
     let slice = kern_slice_path()?;
     // Already present + delegated? (its `cgroup.controllers` is populated only when delegated.)
     if slice_can_cap(&slice) {
@@ -2314,6 +2706,67 @@ fn supervisor_needs_leaf(forks: bool, origin_kills: bool) -> bool {
     forks && origin_kills
 }
 
+/// Which of kern's two families of capped cgroup leaf this invocation creates.
+///
+/// THEY MUST BE TOLD APART BY NAME, because several readers act on the name alone and act
+/// DIFFERENTLY on the two. `kern ps` lists every live `kern-box-*` dir as a box, and the orphan sweep
+/// answers a dead-owner `kern-box-*` with `cgroup.kill` - correct for a box, whose processes are the
+/// box, and wrong for `kern run`, whose processes are the caller's own.
+///
+/// MEASURED, before either family shared a directory: with a `kern-box-run-<pid>` leaf placed in
+/// `kern.slice` by hand and its `<pid>` alive, `kern ps` printed
+///
+/// ```text
+/// kern: warning: 1 box(es) are RUNNING with no registry record, so `kern stop` cannot reach them
+/// kern:   run (supervisor pid 149338)
+/// ```
+///
+/// over a plain `kern run`. That is the whole reason `kern run` gets a prefix of its own rather than
+/// the tag `"run"` under the box prefix: a tag cannot be reserved (a box may legitimately be called
+/// `run`), and a prefix can.
+#[derive(Clone, Copy)]
+pub enum Leaf<'a> {
+    /// `kern-box-<tag>-<pid>`: a box. Listed by `kern ps`, reaped by the orphan sweep, which may
+    /// `cgroup.kill` survivors of a dead supervisor.
+    Box(&'a str),
+    /// `kern-run-<pid>`: the capped leaf `kern run` takes on the direct path. NOT a box - it holds
+    /// host processes the caller started - so it is invisible to `kern ps` and the sweep never kills
+    /// anything in it, only `rmdir`s it once it is empty.
+    Run,
+}
+
+/// The `kern-box-` prefix: a box's capped leaf, and the proof that kern named the cgroup itself.
+const BOX_LEAF_PREFIX: &str = "kern-box-";
+
+/// The `kern-run-` prefix. See [`Leaf`] for why `kern run` does not just use a tag under the box one.
+const RUN_LEAF_PREFIX: &str = "kern-run-";
+
+/// The `kern-capprobe-` prefix: the throwaway child `memory_cap_state_at` creates to find out whether
+/// a `--memory` cap would bind here.
+///
+/// A THIRD FAMILY, swept for the same reason as the other two and never killed for the same reason as
+/// `kern run`'s. The probe removes its own child on every path it returns from, so one is left behind
+/// only when the process died between the `mkdir` and the `rmdir`. MEASURED on this desktop: one
+/// `kern-capprobe-1309526` in `kern.slice` whose pid was long gone, which four consecutive `kern
+/// doctor` runs did not add to and which `kern gc` did NOT remove, because the sweep only knew the two
+/// box prefixes. It is always EMPTY by construction (no process is ever placed in it), so `rmdir`
+/// alone is the whole reap and `cgroup.kill` would have nothing to act on.
+const CAPPROBE_LEAF_PREFIX: &str = "kern-capprobe-";
+
+impl Leaf<'_> {
+    /// The directory name this leaf gets under its parent cgroup, for the CURRENT process.
+    ///
+    /// The trailing `<pid>` is the creating process's, in both families, and every reader relies on
+    /// that: it is the liveness handle the sweep stats to tell an owner that is still running from
+    /// one that died without cleaning up.
+    fn dir_name(self) -> String {
+        match self {
+            Leaf::Box(tag) => format!("{BOX_LEAF_PREFIX}{tag}-{}", std::process::id()),
+            Leaf::Run => format!("{RUN_LEAF_PREFIX}{}", std::process::id()),
+        }
+    }
+}
+
 /// Is the supervisor outside the capped cgroup once the layout above has been attempted?
 ///
 /// `leaf_built` is the outcome of the `mkdir` + `cgroup.procs` write, which is best-effort. The
@@ -2334,15 +2787,20 @@ fn supervisor_ends_up_outside(forks: bool, origin_kills: bool, leaf_built: bool)
 /// time via `cpu.max`. The swap/CPU/cpuset knobs are all best-effort - silently skipped where the
 /// controller isn't delegated (e.g. `cpuset` is often not delegated inside a systemd user scope).
 ///
-/// `allow_direct` is the caller's authority to take the direct `kern.slice` path: `true` for `kern box`
-/// (a supervisor holds the RAII guard and vacates the box cgroup before `rmdir`), `false` for `kern run`
-/// (it `exec()`s IN PLACE - no supervisor to move back out - so it must stay on the systemd `--scope`
-/// `--collect` path and NEVER relocate into `kern.slice`). This is the one enforcement input that can't be
-/// re-derived from env, so the caller passes it explicitly; `took_direct_cap_path()` supplies the rest.
+/// `allow_direct` is the caller's authority to take the direct `kern.slice` path. It is granted by a
+/// caller that leaves a process behind to hold the RAII guard and `rmdir` the leaf: `kern box`, whose
+/// supervisor forks the box, and `kern run` ON THE PATH WHERE IT FORKS TOO (it did not always - see
+/// `supervisor_forks_workload`). A caller that `exec()`s the workload in place must NOT grant it: with
+/// nothing left to drop the guard, the leaf would outlive every process that knows its name, so such a
+/// caller stays on the systemd `--scope --collect` path, which cleans up from outside. This is the one
+/// enforcement input that can't be re-derived from env, so the caller passes it explicitly;
+/// `took_direct_cap_path()` supplies the rest.
+///
+/// `leaf` chooses the directory NAME, which is not cosmetic: see [`Leaf`].
 #[allow(clippy::too_many_arguments)] // one cgroup knob per parameter - grouping them would only hide it
 pub fn apply_limits(
     allow_direct: bool,
-    tag: &str,
+    leaf: Leaf<'_>,
     memory_max: Option<u64>,
     memory_swap_max: Option<u64>,
     cpuset: Option<&str>,
@@ -2355,8 +2813,9 @@ pub fn apply_limits(
     // host that delegates one controller and not the other refuses the box instead of running it with
     // a silently-uncapped dimension. `false` keeps the historical best-effort "partial beats nothing".
     require_all: bool,
-    // Does the CALLER fork a child that will join the capped cgroup itself (`kern box`), or does it
-    // `exec()` the workload in place (`kern run`)?
+    // Does the CALLER fork a child that will be placed in the capped cgroup (`kern box`, and `kern
+    // run` on the direct path), or does it `exec()` the workload in place (`kern run` on the scope
+    // path)? It is a property of the CALL, not of the verb: `kern run` answers it both ways.
     //
     // This decides whether the supervisor may be parked in a sibling leaf, and getting it wrong is not
     // cosmetic: with `exec()` in place there is no second process, so the workload IS this process. Park
@@ -2440,7 +2899,7 @@ pub fn apply_limits(
     } else {
         origin.clone()?
     };
-    let mut child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
+    let mut child = parent.join(leaf.dir_name());
 
     enable_subtree_controllers(&parent);
     if fs::create_dir(&child).is_err() {
@@ -2454,7 +2913,7 @@ pub fn apply_limits(
         // dies permanently where a fresh `kern box` would have recreated the slice.
         let parent = ensure_kern_slice_uncached()?;
         enable_subtree_controllers(&parent);
-        child = parent.join(format!("kern-box-{tag}-{}", std::process::id()));
+        child = parent.join(leaf.dir_name());
         fs::create_dir(&child).ok()?;
     }
 
@@ -2788,19 +3247,30 @@ fn cgroup_dir_from_proc_line(raw: &str) -> Option<std::path::PathBuf> {
     Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
-/// Is a memory cap of at most `bytes` ACTUALLY in force on this process's cgroup chain?
+/// Is a memory cap of at most `bytes` ACTUALLY in force on the chain above `dir`?
 ///
 /// For the caller that has to decide whether a cap nobody typed is still there. `warn_unenforced_caps`
 /// cannot answer this: every one of its checks is gated on the caller having ASKED, which is right for
 /// a flag and wrong for a default.
+///
+/// `dir` IS THE WORKLOAD'S CGROUP, AND PASSING IT IS NOT BOOKKEEPING - it is the same correction
+/// [`warn_unenforced_caps`] carries, for the same reason, and it became load-bearing here the moment
+/// `kern run` started forking. The supervisor stays OUTSIDE the capped leaf so a whole-box OOM cannot
+/// take the process that has to report it, so a self-read answers about a cgroup that is uncapped BY
+/// CONSTRUCTION and would print "this command runs with no RAM ceiling" over a workload holding the
+/// exact default. `None` keeps the self-read for a caller that IS the workload, which is `kern run`
+/// on the paths where it still `exec()`s in place.
 ///
 /// `true` WHEN WE CANNOT TELL, deliberately, and it is the opposite default from most of this file. A
 /// caller uses this to decide whether to warn, and a warning that fires because `/proc/self/cgroup`
 /// was unreadable is a warning with nothing behind it. The cost of the two errors is not symmetric
 /// here: staying quiet on an unknown host loses a notice, while crying wolf on every start teaches the
 /// reader to skip the line that matters.
-pub fn memory_cap_in_force_at_or_below(bytes: u64) -> bool {
-    own_cgroup_dir().is_none_or(|dir| memory_capped_at_or_below(&dir, bytes))
+pub fn memory_cap_in_force_at_or_below(dir: Option<&Path>, bytes: u64) -> bool {
+    match dir {
+        Some(d) => memory_capped_at_or_below(d, bytes),
+        None => own_cgroup_dir().is_none_or(|d| memory_capped_at_or_below(&d, bytes)),
+    }
 }
 
 /// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
@@ -2826,7 +3296,8 @@ pub fn memory_cap_in_force_at_or_below(bytes: u64) -> bool {
 /// correctly. [`record_memory_cap_signal`] already took the directory for this exact reason, so the
 /// enforcement BYTE said "enforced" while the prose said the opposite.
 ///
-/// `None` restores the self-read for the callers that ARE the workload (`kern run` execs in place).
+/// `None` restores the self-read for a caller that IS the workload - `kern run` on the SCOPE path,
+/// which is the only path that calls this, and the only one where it still `exec()`s in place.
 /// Read-only and best-effort: an unreadable `/proc/self/cgroup` means we cannot tell, and a warning we
 /// cannot justify is worse than none, so it stays quiet.
 pub fn warn_unenforced_caps(
@@ -3184,7 +3655,8 @@ mod tests {
     fn the_supervisor_layout_is_decided_the_same_way_for_all_eight_inputs() {
         // (forks, origin_kills, leaf_built) -> (needs_leaf, outside)
         let cases = [
-            // `kern run`: exec in place, the supervisor IS the workload and must stay in the cap.
+            // exec in place (`kern run` on the SCOPE path): the supervisor IS the workload, so it
+            // must stay in the cap. `kern run`'s direct path forks and is in the `true` rows below.
             ((false, false, false), (false, false)),
             ((false, false, true), (false, false)),
             ((false, true, false), (false, false)),
@@ -3514,6 +3986,499 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&slice);
+    }
+
+    #[test]
+    fn the_sweep_reaps_a_dead_kern_run_leaf_but_never_kills_what_is_still_in_it() {
+        // THE ONE ASYMMETRY BETWEEN THE TWO LEAF FAMILIES, and the reason they were split.
+        //
+        // A dead-owner `kern-box-*` gets `cgroup.kill`: its processes are the box, and the box is over.
+        // A dead-owner `kern-run-*` must NOT, because `kern run` is a governor over processes the
+        // CALLER started - `kern run -- ./server &`, or a workload that backgrounds a child - and the
+        // contract is that nothing dies with the launcher. Under the systemd `--scope` this path
+        // replaced, a survivor kept the scope alive and was collected when it exited; a `cgroup.kill`
+        // here would instead reach in and SIGKILL a process the user is still using.
+        //
+        // Deterministic, with no cgroupfs and no signals: on a plain temp dir `kill_cgroup` writes a
+        // regular `cgroup.kill` file, so its ABSENCE is the proof that no kill was issued. The
+        // POSITIVE CONTROL is in the same directory - a `kern-box-*` with the same dead pid, which
+        // must come out killed - so "no file" cannot mean "the sweep never ran".
+        let slice = std::env::temp_dir().join(format!("kern-runsweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&slice);
+        std::fs::create_dir_all(&slice).unwrap();
+        let dead_pid = (2u32..2_000_000)
+            .rev()
+            .find(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+            .unwrap_or(u32::MAX);
+        let live_pid = std::process::id();
+
+        let run_dead = slice.join(format!("kern-run-{dead_pid}"));
+        let run_live = slice.join(format!("kern-run-{live_pid}"));
+        let box_dead = slice.join(format!("kern-box-ctl-{dead_pid}")); // the positive control
+        for d in [&run_dead, &run_live, &box_dead] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A SURVIVOR, expressed as the only thing that survives a `rmdir` on a temp dir: a file. On a
+        // real cgroupfs a member process is what makes the directory un-removable; here a file is,
+        // and both exercise the same branch, which is that `remove_dir` fails and the sweep moves on
+        // WITHOUT having killed anything.
+        std::fs::write(run_dead.join("occupied"), b"x").unwrap();
+
+        sweep_orphan_boxes(&slice, 0);
+
+        assert!(
+            box_dead.join("cgroup.kill").is_file(),
+            "positive control: a dead-supervisor BOX must still be killed, or this test proves nothing"
+        );
+        assert!(
+            !run_dead.join("cgroup.kill").exists(),
+            "a dead-owner `kern run` leaf must never be killed: its survivors are the caller's own processes"
+        );
+        assert!(
+            run_dead.is_dir(),
+            "a populated `kern run` leaf must be left alone, to be removed once its last survivor exits"
+        );
+        assert!(
+            !run_live.join("cgroup.kill").exists() && run_live.is_dir(),
+            "a `kern run` whose owner is ALIVE must be untouched"
+        );
+
+        // And an EMPTY dead-owner run leaf - the ordinary case, a parent that was SIGKILL'd before its
+        // `Drop` could run - is removed, or the sweep would not clean up after this path at all.
+        let empty = slice.join(format!("kern-run-{}", dead_pid - 1));
+        std::fs::create_dir_all(&empty).unwrap();
+        sweep_orphan_boxes(&slice, 0);
+        assert!(
+            !empty.exists(),
+            "an EMPTY dead-owner `kern run` leaf must be rmdir'd - that is the leak the guard cannot cover"
+        );
+
+        let _ = std::fs::remove_dir_all(&slice);
+    }
+
+    #[test]
+    fn the_allocation_free_proc_probe_answers_exactly_what_the_allocating_one_did() {
+        // `proc_entry_exists` replaced `PathBuf::from(format!("/proc/{pid}")).exists()` to take two
+        // heap allocations out of the sweep's per-entry loop. A faster wrong answer is worse than a
+        // slower right one in BOTH directions here: a false "dead" reaps a live box's cgroup, and a
+        // false "alive" makes the sweep stop reaping anything.
+        //
+        // So the old expression is the ORACLE, evaluated here rather than trusted, and the two must
+        // agree on every input. Both a live pid and a provably dead one are exercised, because a
+        // probe that always answered `true` would pass a test that only had the live case.
+        let oracle = |pid: u32| std::path::PathBuf::from(format!("/proc/{pid}")).exists();
+        let live = std::process::id();
+        let dead = (2u32..2_000_000)
+            .rev()
+            .find(|p| !oracle(*p))
+            .unwrap_or(u32::MAX);
+        assert!(
+            oracle(live) && proc_entry_exists(live),
+            "a live pid must read as present"
+        );
+        assert!(
+            !oracle(dead) && !proc_entry_exists(dead),
+            "a pid that is not in use must read as absent"
+        );
+        // The digit encoding, at every width that changes it: one digit, the ten/hundred carries, and
+        // `u32::MAX`, which is the longest string the buffer must hold. Comparing against the oracle
+        // rather than against a hand-written expectation means the test cannot encode the same
+        // off-by-one twice.
+        for pid in [
+            0u32,
+            1,
+            2,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            65535,
+            4_194_304,
+            u32::MAX,
+        ] {
+            assert_eq!(
+                proc_entry_exists(pid),
+                oracle(pid),
+                "the two probes disagree for pid {pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_fork_never_reports_the_child_as_placed() {
+        // The two halves of `fork_workload_into_leaf`'s return must not contradict each other:
+        // `(-1, true)` reads as "there is no child, and it is inside its cap", which is a statement
+        // about a process that does not exist. The CLI checks `pid < 0` first and would not be
+        // misled, but the function is crate-public and the invariant belongs in it.
+        //
+        // Asserted on the closure that enforces it rather than by exhausting the process table to
+        // make a real fork fail: the rule is `placed && pid >= 0`, and these are its four inputs.
+        let report = |pid: libc::pid_t, placed: bool| (pid, placed && pid >= 0);
+        assert_eq!(
+            report(-1, true),
+            (-1, false),
+            "a failed fork is never placed"
+        );
+        assert_eq!(report(-1, false), (-1, false));
+        assert_eq!(report(0, true), (0, true), "the child keeps its own answer");
+        assert_eq!(
+            report(1234, true),
+            (1234, true),
+            "so does the parent's report"
+        );
+    }
+
+    #[test]
+    fn a_box_in_the_cgroup_root_has_no_cgroup_of_its_own_to_report() {
+        // THE PIN FOR A REPORTING DEFECT, and the reason it belongs here rather than in the CLI.
+        //
+        // `kern inspect` echoes the `--memory` the box was STARTED with. An outside reviewer measured
+        // `"memory_max": 67108864` on a box whose PID 1 sat in `0::/`, the cgroup-v2 ROOT, which has
+        // no `memory.max` file at all: a cap reported as a fact where the kernel holds none. Their
+        // `kern doctor` said so correctly on the same host, and the two readings disagreed.
+        //
+        // What makes the new `memory_max_enforced` field answer `null` there is this parse refusing
+        // the root. If it ever accepted it, `inspect` would read the ROOT's controls as though they
+        // were the box's, which is the same wrong-vantage failure one level up.
+        assert_eq!(
+            parse_box_cgroup_line("0::/\n"),
+            None,
+            "the cgroup-v2 root is not a box's cgroup"
+        );
+        assert_eq!(parse_box_cgroup_line("0::/init.scope\n"), None);
+        assert_eq!(
+            parse_box_cgroup_line("0::/user.slice/user-1000.slice\n"),
+            None
+        );
+        // And the shapes that ARE kern's own, so the refusal above cannot be a refusal of everything.
+        assert_eq!(
+            parse_box_cgroup_line("0::/kern.slice/kern-box-web-42\n"),
+            Some(PathBuf::from("/sys/fs/cgroup/kern.slice/kern-box-web-42"))
+        );
+        assert_eq!(
+            parse_box_cgroup_line("0::/app.slice/kern-box-42.scope\n"),
+            Some(PathBuf::from("/sys/fs/cgroup/app.slice/kern-box-42.scope"))
+        );
+    }
+
+    #[test]
+    fn a_kern_whose_binary_was_replaced_is_still_a_kern() {
+        // The kernel appends " (deleted)" to `/proc/<pid>/exe` once the file behind a running process
+        // is gone, which is the state of EVERY already-running kern the moment `install.sh`
+        // overwrites the binary. Comparing against the bare name reported those processes as not-kern
+        // and made their boxes invisible to `live_box_supervisors_via_proc`, the fallback channel that
+        // exists to find boxes the registry has lost, on the one event most likely to lose them.
+        //
+        // MEASURED on this desktop, a box whose binary had been rebuilt underneath it: the cgroup
+        // channel reported it in the same second that this channel returned nothing.
+        assert!(exe_stem_is_kern("kern"));
+        assert!(exe_stem_is_kern("kern (deleted)"));
+        // THE NEAR MISSES, because this set decides which processes kern asks for children and then
+        // reports as boxes. A `starts_with` would have claimed all four of these.
+        assert!(!exe_stem_is_kern("kernel"));
+        assert!(!exe_stem_is_kern("kern-win"));
+        assert!(!exe_stem_is_kern("kern.old"));
+        assert!(!exe_stem_is_kern("mykern"));
+        assert!(!exe_stem_is_kern("kern (deleted) "));
+        assert!(!exe_stem_is_kern(""));
+    }
+
+    #[test]
+    fn the_memory_cap_probe_asks_about_both_directories_a_box_can_use() {
+        // `apply_limits` caps a box under `kern.slice` on the direct path and under the caller's OWN
+        // cgroup otherwise. The probe used `ensure_kern_slice().or_else(current_v2_cgroup)`, which
+        // reaches the second only when the first is `None`: on a host where the slice EXISTS but
+        // boxes do not use it, it reported on a directory no box goes near.
+        //
+        // MEASURED by an outside reviewer, uid 0 with no user manager: doctor said a `--memory` write
+        // "silently never bites" while a box on the same host held `memory_max = 67108864` and an
+        // exec that overran it was killed with 137.
+        //
+        // ON THE REAL HOST, because the defect is about WHICH directory is asked and a fake one
+        // cannot have that property. This asserts the invariant that survives either answer: the
+        // verdict must not be worse than what the caller's own cgroup alone would give, which is the
+        // directory the reviewer's boxes actually used and the one `or_else` skipped.
+        let combined = memory_cap_state();
+        let own = current_v2_cgroup();
+        if combined == MemoryCapState::Unknown {
+            // No cgroup v2 here at all; there is nothing to be consistent about.
+            return;
+        }
+        if let Some(o) = own {
+            let alone = memory_cap_state_at(&o);
+            if alone == MemoryCapState::Enforced {
+                assert!(
+                    matches!(
+                        combined,
+                        MemoryCapState::Enforced | MemoryCapState::EnforcedOnScope
+                    ),
+                    "the caller's own cgroup caps a box here, so the combined verdict must not say \
+                     otherwise: own={alone:?} combined={combined:?}"
+                );
+            }
+        }
+        // AND THE PROBE MUST NOT ACCUMULATE. Asserted as a DELTA and not as an absolute count, and
+        // the first version of this got that wrong: it required zero `kern-capprobe-*` anywhere and
+        // went red on a leftover from a process killed hours earlier, which is not this call's doing
+        // and not this test's subject. What that red DID find is real and is fixed elsewhere: nothing
+        // reaped that family, so the orphan sweep and `kern gc` now know it. The invariant here is
+        // narrower and is the one this function owns.
+        let count = || -> usize {
+            [ensure_kern_slice(), current_v2_cgroup()]
+                .into_iter()
+                .flatten()
+                .filter_map(|d| fs::read_dir(d).ok())
+                .flat_map(|rd| rd.flatten())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(CAPPROBE_LEAF_PREFIX)
+                })
+                .count()
+        };
+        let before = count();
+        let _ = memory_cap_state();
+        assert_eq!(
+            count(),
+            before,
+            "a completed cap probe must leave no child cgroup behind"
+        );
+    }
+
+    #[test]
+    fn a_placement_failure_only_costs_a_cap_when_there_is_one() {
+        // FOUR INPUTS, because the two ways to get this wrong are not symmetric. `true` where it
+        // should be `false` refuses a command that had nothing to escape, which is what shipped:
+        // on a host with no delegation the box has no cgroup of its own, and `kern exec` still
+        // refused with 126 while telling the operator the command would run outside caps the box
+        // did not have. `false` where it should be `true` is the silent escape the refusal exists
+        // to stop.
+        assert!(placement_failure_costs_a_cap(true, true));
+        assert!(!placement_failure_costs_a_cap(true, false));
+        assert!(!placement_failure_costs_a_cap(false, true));
+        assert!(!placement_failure_costs_a_cap(false, false));
+    }
+
+    #[test]
+    fn the_cap_reality_probe_reads_the_control_files_and_not_their_absence() {
+        // The second input above comes from `exec_join_outcome_after_failure`, which reads
+        // `memory.max` and `pids.max` THROUGH THE DESCRIPTOR. Its own doc records what happened when
+        // the same read went through a path after a `setns`: inside the box's namespaces the host
+        // path names nothing, both reads failed, and a box capped at `--pids-limit 2 --memory 64M`
+        // was reported as having no cap worth mentioning. Failure-to-read and absence-of-a-cap gave
+        // the same answer, which is the in-band-sentinel shape this codebase removes elsewhere.
+        //
+        // Exercised on a plain temp directory, where the control files are ordinary files: that is
+        // enough, because the function's whole job is to distinguish a value from the `max` sentinel.
+        let d = std::env::temp_dir().join(format!("kern-capreal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let open = || CgroupRef::open(&d).expect("the temp dir opens as a directory descriptor");
+
+        // Neither file present: nothing to read, so nothing is at risk.
+        assert!(matches!(
+            exec_join_outcome_after_failure(&open()),
+            ExecCgroupJoin::Bound
+        ));
+        // Both present and both the no-limit sentinel: still nothing at risk.
+        std::fs::write(d.join("memory.max"), "max\n").unwrap();
+        std::fs::write(d.join("pids.max"), "max\n").unwrap();
+        assert!(matches!(
+            exec_join_outcome_after_failure(&open()),
+            ExecCgroupJoin::Bound
+        ));
+        // A real memory ceiling alone is enough to make the failure cost something.
+        std::fs::write(d.join("memory.max"), "67108864\n").unwrap();
+        assert!(matches!(
+            exec_join_outcome_after_failure(&open()),
+            ExecCgroupJoin::Unbounded
+        ));
+        // And a real pids ceiling alone, which is the case an outside reviewer reproduced with a
+        // saturated `--pids-limit` and the one that must keep refusing.
+        std::fs::write(d.join("memory.max"), "max\n").unwrap();
+        std::fs::write(d.join("pids.max"), "4\n").unwrap();
+        assert!(matches!(
+            exec_join_outcome_after_failure(&open()),
+            ExecCgroupJoin::Unbounded
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn placement_is_gated_on_the_common_ancestor_and_not_on_the_destination() {
+        // THE RULE THIS PINS, and the defect it was written after. cgroup v2 delegation containment
+        // needs write access to the `cgroup.procs` of the COMMON ANCESTOR of the source and the
+        // destination, not just of the destination. A reviewer measured the consequence on WSL2 with
+        // `systemd=true`, where the shell sits in `/init.scope`: kern found a delegated, writable,
+        // correctly capped `kern.slice`, created a leaf in it, wrote and read back both caps, and
+        // then could not put the process in, because the common ancestor of `/init.scope` and
+        // `user@1000.service` is the ROOT cgroup, owned by root. `kern run` ran uncapped where it
+        // used to be capped, and `kern box`, which is fail-closed on the same placement, would have
+        // refused to start.
+        let anc = |a: &str, b: &str| {
+            common_cgroup_ancestor(std::path::Path::new(a), std::path::Path::new(b))
+        };
+        // The measured case: the ancestor really is the mount root, which is why the probe rejects.
+        assert_eq!(
+            anc(
+                "/sys/fs/cgroup/init.scope",
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice"
+            ),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+        // The ordinary case: both sit under the user manager, so the ancestor is the delegated root
+        // and the user owns its `cgroup.procs`.
+        assert_eq!(
+            anc(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.scope",
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice"
+            ),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
+        );
+        // Identical paths, and a nested pair: the ancestor is the shallower of the two, not their
+        // parent, because a cgroup is its own ancestor for this rule.
+        assert_eq!(
+            anc("/sys/fs/cgroup/a", "/sys/fs/cgroup/a"),
+            PathBuf::from("/sys/fs/cgroup/a")
+        );
+        assert_eq!(
+            anc("/sys/fs/cgroup/a", "/sys/fs/cgroup/a/b/c"),
+            PathBuf::from("/sys/fs/cgroup/a")
+        );
+        // A SHARED PREFIX THAT IS NOT A SHARED COMPONENT must not match, or the probe would ask about
+        // a directory neither path is under.
+        assert_eq!(
+            anc("/sys/fs/cgroup/ab", "/sys/fs/cgroup/abc"),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+        assert_eq!(
+            anc("/sys/fs/cgroup", "/sys/fs/cgroup/x"),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+
+        // And the probe itself, on this host, in BOTH directions. The negative is the whole point:
+        // a test that only had the positive would pass against a build that always answered true.
+        assert!(
+            !cgroup_procs_writable(std::path::Path::new("/sys/fs/cgroup"))
+                || unsafe { libc::getuid() } == 0,
+            "an ordinary user must not be able to write the ROOT cgroup.procs; as root it may"
+        );
+        let mine = current_v2_cgroup();
+        if let Some(m) = mine {
+            assert!(
+                cgroup_procs_writable(&m) || !m.join("cgroup.procs").exists(),
+                "a process must be able to write its OWN cgroup.procs, or the file is not there: {m:?}"
+            );
+        }
+        assert!(
+            !cgroup_procs_writable(std::path::Path::new("/sys/fs/cgroup/kern-no-such-dir-here")),
+            "a directory that does not exist must not read as writable"
+        );
+
+        // AND THE COMPOSITION, not just its two halves. The first version of this test asserted
+        // `common_cgroup_ancestor` and `cgroup_procs_writable` separately and stayed GREEN against a
+        // `placement_into_is_permitted` stubbed to `true`, which is exactly the build that shipped the
+        // defect. Both parts can be right while the function that uses them is not called at all.
+        //
+        // A target under a DIFFERENT top-level cgroup forces the ancestor to the mount root, so an
+        // ordinary user must be refused. As root the answer is legitimately `true`, and the assertion
+        // says so rather than skipping, because "root may" is the other half of the same rule.
+        let unreachable = std::path::Path::new("/sys/fs/cgroup/init.scope/kern-probe-target");
+        let root_ok = unsafe { libc::getuid() } == 0;
+        assert_eq!(
+            placement_into_is_permitted(unreachable),
+            root_ok,
+            "a target whose common ancestor with our own cgroup is the ROOT must be refused for an \
+             ordinary user and allowed for root"
+        );
+        // The positive control for the same call: our own cgroup is trivially reachable from itself,
+        // so a build that refused everything would fail here instead of passing the line above.
+        if let Some(m) = current_v2_cgroup() {
+            assert!(
+                placement_into_is_permitted(&m),
+                "placement into our OWN cgroup must be permitted, or the probe refuses everything: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_delegation_root_is_found_above_the_caller_or_built_from_the_uid() {
+        // WHY THE SECOND HALF EXISTS, measured rather than supposed. On WSL2 with `systemd=true` a
+        // user manager IS running and the login shell sits in `0::/init.scope`. That path has exactly
+        // two ancestors, itself and the root, and neither is a `user@<uid>.service`, so the search
+        // answered `None` and kern concluded the whole host had no delegated slice. Every `kern run`
+        // there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms the same host
+        // reaches with the scope skipped. The tree was one directory away the entire time.
+        let above = |p: &str| delegation_root_above(Some(std::path::Path::new(p)));
+        assert_eq!(
+            above("/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.scope"),
+            Some(PathBuf::from(
+                "/user.slice/user-1000.slice/user@1000.service"
+            )),
+            "the ordinary layout must still resolve through the ancestor search"
+        );
+        assert_eq!(
+            above("/user.slice/user-1000.slice/user@1000.service"),
+            Some(PathBuf::from(
+                "/user.slice/user-1000.slice/user@1000.service"
+            )),
+            "`ancestors` includes the path itself, and the manager's own cgroup is a valid root"
+        );
+        assert_eq!(above("/init.scope"), None, "the WSL2-with-systemd shape");
+        assert_eq!(above("/"), None);
+        assert_eq!(above("/system.slice/sshd.service"), None);
+        assert_eq!(delegation_root_above(None), None);
+        // A NAME THAT MERELY LOOKS LIKE ONE MUST NOT MATCH, or kern would build its slice inside an
+        // unrelated unit and cap boxes in a tree it does not own.
+        assert_eq!(above("/user.slice/user@1000.service.d/x"), None);
+        assert_eq!(above("/user.slice/notuser@1000.service/x"), None);
+
+        // And the fallback's path, asserted as a literal.
+        assert_eq!(
+            canonical_delegation_root(1000),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
+        );
+        assert_eq!(
+            canonical_delegation_root(0),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-0.slice/user@0.service")
+        );
+    }
+
+    #[test]
+    fn the_two_leaf_families_cannot_be_confused_by_the_readers_that_act_on_the_name() {
+        // `kern ps` lists every live `kern-box-*` dir as a box and warns that it cannot be stopped;
+        // MEASURED before the split, with a `kern-box-run-<live pid>` placed in `kern.slice` by hand,
+        // a plain `kern run` produced:
+        //
+        // ```text
+        // kern: warning: 1 box(es) are RUNNING with no registry record, so `kern stop` cannot reach them
+        // kern:   run (supervisor pid 149338)
+        // ```
+        //
+        // This asserts the property that makes that impossible: the two families differ in their
+        // PREFIX, so no tag can make a `kern run` leaf parse as a box. A test on the tag alone would
+        // have passed against the broken naming, which is the point of asserting the prefix.
+        let pid = std::process::id();
+        let boxed = Leaf::Box("web").dir_name();
+        let run = Leaf::Run.dir_name();
+        assert_eq!(boxed, format!("kern-box-web-{pid}"));
+        assert_eq!(run, format!("kern-run-{pid}"));
+        assert!(
+            !run.starts_with(BOX_LEAF_PREFIX),
+            "a `kern run` leaf must not carry the box prefix, or `kern ps` reports it as a box"
+        );
+        assert!(
+            !is_kern_box_leaf(&run),
+            "a `kern run` leaf must not pass the ownership gate that decides which cgroups kern may reap or reshape"
+        );
+        // A BOX MAY LEGITIMATELY BE CALLED `run`, which is why a reserved TAG could not have done this
+        // job and a prefix can: this name has to stay a box on every reader.
+        let box_named_run = Leaf::Box("run").dir_name();
+        assert_eq!(box_named_run, format!("kern-box-run-{pid}"));
+        assert!(is_kern_box_leaf(&box_named_run));
+        assert_ne!(box_named_run, run);
     }
 
     #[test]
