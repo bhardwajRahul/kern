@@ -214,10 +214,13 @@ file can also name kern's own things in the spec's extension namespace (`x-kern-
 `x-kern-security-profile`) and still run anywhere else unchanged, because the spec has
 every runtime ignore an `x-` field. A typo inside one is reported rather than dropped.
 
-**One constraint comes with the speed:** a stack is one pod on one network namespace, so two services
-cannot both listen on the same container port even when their published ports differ. `up` refuses
-the collision by name before starting anything, and `--no-pod` lifts it by giving each service its
-own namespace with peers reachable by name.
+**A stack is one network namespace when the file fits in one,** which is where the speed comes from:
+services reach each other on `127.0.0.1` with nothing in between. A file that does not fit gets a
+namespace per service instead, chosen by kern and announced with what it costs, which is a relay hop
+between peers. Two cases do not fit: two services listening on the same container port, and
+`networks:` that leave services with nothing in common. `--pod` forces one namespace and refuses such
+a file by name rather than running it with the separation dropped; `--no-pod` forces a namespace per
+service.
 
 Official images that drop to a non-root user want `uidmap` and an `/etc/subuid` line, and outbound
 pulls want `pasta`; `kern doctor` names either if it is missing. This is the local dev loop, not a
@@ -272,7 +275,7 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is ([one caveat](#run-a-whole-stack-your-docker-composeyml-unchanged)) | yes | partial |
+| `docker-compose.yml` | yes, read as-is ([how the network is wired](#run-a-whole-stack-your-docker-composeyml-unchanged)) | yes | partial |
 | Overlay networks, Swarm, CRI | **no** | yes | partial |
 | GPU passed into the container | no | yes | yes |
 
