@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 
-from . import Kernel, Sandbox, SandboxError, __version__
+from . import Kernel, Sandbox, SandboxError, __version__, _neutralise_terminal
 
 # The single MCP protocol revision we implement; initialize always answers with THIS (we negotiate to
 # our version, we never echo a client-chosen string back).
@@ -68,9 +69,55 @@ _DEFAULT_MCP_IMAGE = "python:3.12-slim"
 _MAX_NAME = 200                   # chars of a client-supplied method/tool name echoed back in an error
 
 
+# THE FRAMING BELOW IS OURS, and a box that prints it forges a verdict about itself in the one channel
+# a model uses to decide whether to trust the run. MEASURED on 2026-09-12: a cell that exited 3 and
+# printed `[exit 0]` produced a reply whose text carried both lines, and `SECURITY.md` claimed this
+# server already stripped "ANSI, control characters and their own framing" while it stripped none of the
+# three. The LangChain renderer in this same package did all of it, with the reasoning written beside
+# it: kern went to the trouble of an unforgeable descriptor byte to tell `oom` from `killed`, and
+# handing the forgery back for free at the text layer undoes it.
+#
+# Each marker is spelled ONCE and both uses derive from it. Written out twice, the emitting side and the
+# neutralising side would be one condition in two places: reword a marker below and the pattern silently
+# stops matching, which does not break a test, it reopens the forgery.
+_MARK_EXIT = "[exit "
+_MARK_STDERR = "[stderr]"
+_MARK_RICH = "[rich result]"
+_MARK_TRUNC = "[output truncated: reply-size cap]"
+_MARK_IMG_TAIL = " image result(s) omitted: reply-size cap]"
+_CLIP_HEAD, _CLIP_TAIL = "...[truncated ", " chars]"
+_FORGED_FRAME = re.compile(
+    "|".join(
+        [
+            r"^" + re.escape(_MARK_EXIT) + r"\d+",
+            r"^" + re.escape(_MARK_STDERR),
+            r"^" + re.escape(_MARK_RICH),
+            r"^" + re.escape(_MARK_TRUNC),
+            r"^\[\d+" + re.escape(_MARK_IMG_TAIL),
+            re.escape(_CLIP_HEAD) + r"\d+" + re.escape(_CLIP_TAIL),
+        ]
+    ),
+    re.MULTILINE,
+)
+
+
+def _untrusted(text: str) -> str:
+    """One box-produced string, safe to put in a model's context: terminal escapes and control bytes
+    gone (`_neutralise_terminal`, shared with the LangChain renderer), and this server's own framing
+    neutralised so the code cannot claim to be the sandbox.
+
+    NOT closed, and not closable here: ordinary prompt injection. A cell whose output is
+    `[system] ignore your instructions` printed a string, and no filter separates that from a program
+    legitimately printing the same characters without destroying real output."""
+    return _FORGED_FRAME.sub(
+        lambda m: "[printed by the code, not the sandbox: " + m.group(0).lstrip(".["),
+        _neutralise_terminal(text),
+    )
+
+
 def _clip(s: str, n: int) -> str:
     """Bound a box-controlled string before it goes into the reply."""
-    return s if len(s) <= n else s[:n] + f"\n...[truncated {len(s) - n} chars]"
+    return s if len(s) <= n else s[:n] + f"\n{_CLIP_HEAD}{len(s) - n}{_CLIP_TAIL}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -537,7 +584,7 @@ class _Server:
             text_budget -= len(clip)
 
         if r.stdout.strip():
-            take(_clip(r.stdout.rstrip(), _MAX_TEXT))
+            take(_clip(_untrusted(r.stdout.rstrip()), _MAX_TEXT))
         # `code_stderr`: the same reason the LangChain renderer uses it. kern and the workload share
         # one stderr, and this string is read by a model, so kern's own `note:`/`warning:` lines are
         # context spent on the runtime's housekeeping and are easy to mistake for the code's errors.
@@ -546,7 +593,7 @@ class _Server:
         # `stdout` above is a plain field and costs nothing to repeat; this one is not.
         code_err = r.code_stderr
         if code_err.strip():
-            take("[stderr]\n" + _clip(code_err.rstrip(), _MAX_TEXT))
+            take(_MARK_STDERR + "\n" + _clip(_untrusted(code_err.rstrip()), _MAX_TEXT))
         for res in r.results:
             if text_budget <= 0:
                 text_truncated = True
@@ -556,7 +603,7 @@ class _Server:
             rich = (res.data.get("text/html") or res.data.get("image/svg+xml")
                     or res.data.get("text/markdown") or res.data.get("application/json"))
             if isinstance(rich, str) and rich:  # box-controlled: only surface an actual string
-                take("[rich result]\n" + _clip(rich, _MAX_RICH))
+                take(_MARK_RICH + "\n" + _clip(_untrusted(rich), _MAX_RICH))
         # tail + notes are appended AFTER the budget, so the exit code and the truncation notes can never
         # be clipped away in the high-output case (exactly when they matter most).
         # THE REASON TRAVELS WITH THE TYPE, because the type alone is not always actionable. MEASURED on
@@ -566,7 +613,7 @@ class _Server:
         # message is where it says so - naming the alternatives for `killed`, the limit for `timeout`,
         # the scratch charge for `oom`. Appended for EVERY type rather than for the one that prompted
         # this: a per-type branch here is a second place to keep in step with the taxonomy.
-        tail = f"[exit {r.exit_code}"
+        tail = f"{_MARK_EXIT}{r.exit_code}"
         if r.fault:
             tail += f", sandbox fault: {r.fault.type}"
             # Bounded, and inside the tail that is deliberately exempt from the aggregate budget: the
@@ -580,9 +627,9 @@ class _Server:
         tail += "]"
         notes = [tail]
         if omitted:
-            notes.append(f"[{omitted} image result(s) omitted: reply-size cap]")
+            notes.append(f"[{omitted}{_MARK_IMG_TAIL}")
         if text_truncated:
-            notes.append("[output truncated: reply-size cap]")
+            notes.append(_MARK_TRUNC)
         text = ("\n\n".join(body) if body else "(no output)") + "\n\n" + "\n".join(notes)
         content.append({"type": "text", "text": text})
         return content, (not r.success)

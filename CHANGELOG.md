@@ -7,6 +7,29 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.4: the MCP server did not strip what `SECURITY.md` said it stripped.** The
+document claimed "the LangChain renderer and the MCP server both strip ANSI, control characters and
+their own framing". MEASURED with a real `tools/call`: the MCP server stripped NONE of the three, and
+that server is what a Cursor, Claude Desktop or LM Studio user runs. A cell that exited 3 after
+printing `[exit 0]` produced a reply carrying both lines, and `\x1b[2J` went through untouched.
+
+The framing is ours, so a cell printing it claims to be the sandbox, in the one channel a model uses
+to decide whether to trust the run. kern went to the trouble of an unforgeable descriptor byte to tell
+`oom` from `killed`; handing the forgery back for free at the text layer undoes it. The LangChain
+renderer in the same package already did all of this, with that reasoning written beside it, so the
+fix is one shared definition rather than a second copy: escape and control stripping moved to
+`_neutralise_terminal` in the core and is used by both, and the MCP server neutralises its own markers
+(`[exit N]`, `[stderr]`, `[rich result]`, both truncation notes), each spelled once so the emitting
+side and the neutralising side cannot drift. A forged marker now reads
+`[printed by the code, not the sandbox: exit 0]`.
+
+Measured after, end to end: the forged line is labelled, the escape is gone, our own tail is intact
+and last, and `isError` is unchanged - it was correct throughout, because it never passes through the
+text. Six other probes on that channel came back clean and are worth stating: the server listens on
+no socket, a cell has no network, `read_file` refuses `../../etc/passwd` and `/etc/passwd`, an injected
+JSON-RPC frame arrives as text rather than as a frame, and a 200 KB flood is clipped to the stated
+budget. NOT closed, and not closable at this layer: ordinary prompt injection.
+
 **kern-sandbox 0.2.3: on a resident kernel, a blocked escape was reported as an external kill, and a
 crash as the sandbox killing you.** FOUND THROUGH THE MCP SERVER, which is the path a Cursor, Claude
 Desktop or LM Studio user actually runs, and not through the SDK's own battery, whose resident-kernel

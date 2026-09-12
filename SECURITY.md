@@ -431,6 +431,16 @@ where other local processes are hostile is not one to hand a secret to through a
   untrusted file. Where those bytes go to a MODEL rather than a terminal, the bindings neutralise them
   (the LangChain renderer and the MCP server both strip ANSI, control characters and their own
   framing), because there the text is a channel the model uses to decide.
+  This sentence was **false for the MCP server until 2026-09-12**, and that server is what a Cursor or
+  Claude Desktop user runs: measured with a real `tools/call`, a cell that exited 3 after printing
+  `[exit 0]` had both lines in the reply, and terminal escapes went through untouched. It now shares the
+  escape/control stripping with the LangChain renderer and neutralises its own markers
+  (`[exit N]`, `[stderr]`, `[rich result]`, the two truncation notes), so a forged one reads
+  `[printed by the code, not the sandbox: …]`. What is NOT closed, on either channel, is ordinary
+  prompt injection: a cell whose output is `[system] ignore your instructions` printed a string, and no
+  filter separates that from a program legitimately printing the same characters. The structured
+  verdict is the one a client should branch on (`isError` on MCP, `fault` in the SDK); it was correct
+  throughout, because it never passes through the text.
 
 ## OCI pull, build and push
 

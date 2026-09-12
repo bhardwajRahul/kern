@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -604,6 +604,33 @@ _ALIVE_ACK = b"A"
 _ALIVE_PAST_SETUP = "past-setup"  # the workload ran (EOF at execvp), or kern reported setup failed
 _ALIVE_IN_SETUP = "in-setup"      # kern acknowledged the channel and is still BUILDING the box
 _ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates this channel
+
+
+# Terminal escapes and control characters have no meaning to a model and every use to whoever is
+# steering it: a cell printing `\x1b[2J` or smuggling a NUL is not producing output, it is producing a
+# payload for whatever renders the transcript. Spelled HERE because three renderers need it (the
+# LangChain tool, the MCP server, and any caller building its own prompt) and a copy per renderer is
+# how one of them ends up without it: MEASURED on 2026-09-12, `SECURITY.md` claimed the MCP server
+# stripped these and its own framing, the LangChain renderer did both, and the MCP server did neither.
+_ANSI_ESCAPES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
+_CONTROL_BYTES = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _neutralise_terminal(text: str) -> str:
+    """One box-produced string with terminal escapes and control bytes removed, newlines normalised.
+
+    What it does NOT do is each renderer's own job: neutralising the FRAMING that renderer adds around
+    this text. Only the renderer knows its own markers, and a box that prints them forges a verdict
+    about itself in the channel a model uses to decide. kern went to the trouble of an unforgeable
+    descriptor byte to tell `oom` from `killed`; handing the forgery back for free at the text layer
+    would undo it.
+
+    NOT closed here, and not closable at this layer: ordinary prompt injection. A run whose output is
+    `[system] ignore your instructions` is a run that printed a string, and no filter separates that
+    from a program legitimately printing the same characters without destroying real output.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_BYTES.sub("", _ANSI_ESCAPES.sub("", text))
 
 
 def _parse_started_bytes(sig: bytes) -> "tuple[bool, int, int | None, int | None]":
