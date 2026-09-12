@@ -35,6 +35,21 @@ shows the boundaries holding.
 [`essentials-mount.sh`](essentials-mount.sh) (your own code mounted in) and
 [`essentials-limits.sh`](essentials-limits.sh) (hard CPU and memory caps).
 
+**The rest is in eight folders**, because a hundred files in one directory is a wall rather than a
+library. Every one of them is also a row in the tables below, which are organised by task rather than
+by folder:
+
+| folder | scripts | what is in it |
+|---|---:|---|
+| [`basics/`](basics/) | 19 | one box, mounts, logs, `ps`/`top`, pause, gc |
+| [`agents/`](agents/) | 12 | the code-execution tool an LLM calls, warm kernels, embedding this in Python/Node/Rust |
+| [`compose/`](compose/) | 12 | multi-box stacks, pods, named volumes, rolling and canary deploys |
+| [`build/`](build/) | 11 | `kern build`, Dockerfiles, multi-stage, language toolchains, save/load, registries |
+| [`ci/`](ci/) | 8 | the same steps locally and in GitHub Actions, air-gapped, pre-commit |
+| [`edge/`](edge/) | 13 | services with a published port, data pipelines, a database box, a watchdog |
+| [`resources/`](resources/) | 10 | CPU/memory caps, `vcpu:`/`vdisk:` profiles, fan-out, and the comparisons |
+| [`security/`](security/) | 7 | second uid, nesting, device grants, secrets, the docker-socket shim |
+
 | Example | What it shows |
 |---|---|
 | [run-an-image.sh](basics/run-an-image.sh) | Pull a real OCI image and run a command in an isolated, writable box |
