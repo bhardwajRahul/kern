@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.2";
+const VERSION = "0.2.3";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -421,6 +421,12 @@ const EXIT_SIGTERM = 143; // SIGTERM: kern's --timeout backstop reaping the box
 const SIG_KILL = 9;
 const SIG_TERM = 15;
 const SIG_SYS = 31;
+// The fatal signals that mean THE CODE went wrong, not that the sandbox acted. NAMED, not "everything
+// else": an unknown signal stays an honest `killed`. SIGKILL and SIGTERM are absent (the kill and the
+// reap have their own branches) and SIGSYS is absent because it IS the sandbox acting.
+// SIGILL 4, SIGABRT 6, SIGBUS 7, SIGFPE 8, SIGSEGV 11. Mirrors `_CRASH_SIGNALS`.
+const CRASH_SIGNALS = new Set([4, 6, 7, 8, 11]);
+const SIGNAL_NAMES = { 4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 11: "SIGSEGV" };
 
 // Per-call kwargs that DEFAULT to the Sandbox value: UNSET means "inherit the constructor's", whereas
 // an explicit `null` means "disable" (used for onStdout/onStderr overrides).
@@ -2544,8 +2550,8 @@ class Kernel {
       return this._teardownResult("killed", `the kernel reply exceeded the ${this._cap}-byte cap`, started);
     if (reply === null) {
       const err = this._stderr.toString("utf8");
-      const [kind, dflt] = this._kernelDeathFault(err, ...(await this._readCapSignal()));
-      return this._teardownResult(kind, err.trim() || dflt, started);
+      const [kind, dflt, rc] = this._kernelDeathFault(err, ...(await this._readCapSignal()));
+      return this._teardownResult(kind, err.trim() || dflt, started, rc);
     }
     return this._resultFromReply(reply, started);
   }
@@ -2604,20 +2610,54 @@ class Kernel {
    * `capSignal` is kern's unforgeable enforcement byte (0 = old kern / undetermined, 1 = cap enforced, 2 =
    * requested but NOT enforced). It no longer decides the TYPE, and a 2 still earns a sentence, because
    * "your cap was not in force here" is the one thing the caller cannot find out for itself. */
-  _kernelDeathFault(err, capSignal = 0, oomSignal = null, kernWrotePayload = false) {
-    if (oomVerdict(oomSignal, err, kernWrotePayload)) return ["oom", "the kernel box exceeded its memory cap and was OOM-killed"];
-    if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start"];
+  _kernelDeathFault(err, capSignal = 0, oomSignal = null, kernWrotePayload = false, workloadSignal = null) {
+    // THE EXIT CODE COMES FROM THE FOURTH BYTE, so both paths report one event the same way: this used to
+    // be a flat -1 while the one-shot path said 137 for a kill, 159 for a blocked escape, 139 for a
+    // segfault. -1 stays for the cases where no signal is known. Mirrors `_kernel_death_fault`.
+    const rc = workloadSignal !== null && workloadSignal !== undefined && workloadSignal !== 0
+      ? 128 + workloadSignal
+      : -1;
+    if (oomVerdict(oomSignal, err, kernWrotePayload)) return ["oom", "the kernel box exceeded its memory cap and was OOM-killed", rc];
+    // A BLOCKED ESCAPE, BEFORE ANY STDERR HEURISTIC, and this path could not say it at all. MEASURED
+    // through the MCP server, which is the path a Cursor or Claude Desktop user actually runs: a cell
+    // calling a blocked syscall came back `killed` with the message "an external kill". kern's seccomp
+    // filter had killed the box and the caller was told somebody stopped it. The one-shot path answers
+    // this from the exit code (159); a resident kernel has no per-cell exit code, so it needs the fourth
+    // byte, which was arriving unused. Before `looksLikeStartupFailure` because that heuristic matches
+    // text the workload can print, and a cell must not be able to hide a blocked escape behind it. The
+    // signal must have killed the box's PID 1, and a pidns init does not receive an unhandled fatal
+    // signal from inside, so a cell cannot forge it. Mirrors `_kernel_death_fault`.
+    if (workloadSignal === SIG_SYS)
+      return [
+        "escape_blocked",
+        "the kernel box was killed by SIGSYS: kern's seccomp filter refused a syscall the code attempted, which is a blocked escape and not a kill from outside",
+        rc,
+      ];
+    // A CRASH IS NOT A SANDBOX FAULT, and this path called it `killed` with that same false sentence
+    // about an external kill. MEASURED: a segfaulting cell IS the box's PID 1, so the box dies, and the
+    // one-shot path reports the identical event as `fault=null, exitCode=139`. Two paths disagreeing about
+    // one event costs a loop: an agent reading `killed` retries the sandbox instead of fixing its code.
+    // The lost session state is already reported, by the next call throwing "kernel is dead".
+    if (CRASH_SIGNALS.has(workloadSignal))
+      return [
+        null,
+        `the code crashed: the cell died on signal ${workloadSignal} (${SIGNAL_NAMES[workloadSignal]}), which took the kernel box with it because the interpreter is its PID 1. The sandbox did not act; the next call reopens a kernel`,
+        rc,
+      ];
+    if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start", rc];
     if (capSignal === 2)
       return [
         "killed",
         "the kernel box was killed, and its memory cap was not enforced here (no cgroup delegation), so no memory limit was in force to attribute it to",
+        rc,
       ];
     if (this._sbx.memoryMb !== null)
       return [
         "killed",
         "the kernel box was killed and the kernel reported no OOM against its memory cap: an external kill (`kern stop`, a signal, or the host running out of memory), not the box exceeding its own memory",
+        rc,
       ];
-    return ["killed", "the kernel box exited"];
+    return ["killed", "the kernel box exited", rc];
   }
 
   /** kern's enforcement and OOM-outcome bytes for the resident box, read ONCE on kernel death, as
@@ -2628,7 +2668,7 @@ class Kernel {
    * falls back to kern's stderr sentence. */
   async _readCapSignal() {
     const ch = this._child && this._child.stdio && this._child.stdio[3];
-    if (!ch) return [0, null, false];
+    if (!ch) return [0, null, false, null];
     if (this._startedSig.length < 3 && !ch.destroyed) {
       await new Promise((res) => {
         const t = setTimeout(res, 1000);
@@ -2636,19 +2676,32 @@ class Kernel {
         ch.once("error", () => { clearTimeout(t); res(); });
       });
     }
-    const { boxStarted, capSignal, oomSignal } = parseStartedBytes(this._startedSig);
-    return [capSignal, oomSignal, boxStarted];
+    const { boxStarted, capSignal, oomSignal, workloadSignal } = parseStartedBytes(this._startedSig);
+    return [capSignal, oomSignal, boxStarted, workloadSignal];
   }
 
-  _teardownResult(type, message, started) {
+  _teardownResult(type, message, started, exitCode = -1) {
     this._kill();
     // Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) throws, it
     // does not return a hollow result. timeout/killed stay as data on the returned result.
     if (type === "startup_failed") throw new SandboxError(message || "the box failed to start");
+    // `type === null` is a real answer, not a missing one: the code CRASHED and the sandbox did not act,
+    // which is what the one-shot path reports for the same event. The message still travels on stderr.
+    if (type === null)
+      return new ExecutionResult({
+        stdout: "",
+        stderr: message,
+        exitCode,
+        durationMs: Date.now() - started,
+        fault: null,
+        files: [],
+        truncated: false,
+        results: [],
+      });
     return new ExecutionResult({
       stdout: "",
       stderr: "",
-      exitCode: -1,
+      exitCode,
       durationMs: Date.now() - started,
       fault: sandboxFault(type, message),
       files: [],

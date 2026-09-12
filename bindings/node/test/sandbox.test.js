@@ -1333,6 +1333,39 @@ test("a box still in setup at the deadline is not a timeout", () => {
   );
 });
 
+test("the kernel path names a blocked escape and does not call a crash a fault", () => {
+  // The two classes the resident path could not say, both answered by kern's FOURTH byte, and both found
+  // THROUGH THE MCP SERVER rather than here: the kernel-death tests covered the OOM, the external kill,
+  // the deadline and a user error and stopped. A blocked syscall came back `killed` with a message naming
+  // "an external kill", and a segfault came back `killed` where the one-shot path reports the same event as
+  // no fault at all with 139. SIGSYS is decided BEFORE the stderr heuristic, which a workload can write
+  // into. Mirrors the Python test of the same name.
+  const k = new kern.Kernel(new Sandbox({ memoryMb: 256 }), 5);
+  const [kind, msg, rc] = k._kernelDeathFault("", 0, null, true, 31);
+  assert.strictEqual(kind, "escape_blocked");
+  assert.strictEqual(rc, 159);
+  assert.match(msg, /seccomp/);
+  // It outranks the startup heuristic, which a cell can print.
+  assert.strictEqual(
+    k._kernelDeathFault("error: sandbox: could not map uid 1000\n", 0, null, true, 31)[0],
+    "escape_blocked",
+  );
+  // A CRASH IS THE CODE'S: no fault, and 128+signal, exactly as the one-shot path answers it.
+  for (const [sig, code, name] of [[11, 139, "SIGSEGV"], [6, 134, "SIGABRT"], [8, 136, "SIGFPE"],
+                                   [4, 132, "SIGILL"], [7, 135, "SIGBUS"]]) {
+    const [kind2, msg2, rc2] = k._kernelDeathFault("", 0, null, true, sig);
+    assert.strictEqual(kind2, null, `signal ${sig} must not be a sandbox fault`);
+    assert.strictEqual(rc2, code);
+    assert.ok(/crashed/.test(msg2) && msg2.includes(name));
+  }
+  // SIGKILL is a kill, and an unknown signal stays an honest `killed`.
+  assert.strictEqual(k._kernelDeathFault("", 0, null, true, 9)[0], "killed");
+  assert.strictEqual(k._kernelDeathFault("", 0, null, true, 10)[0], "killed");
+  // No signal reported, so no exit code can be claimed.
+  assert.strictEqual(k._kernelDeathFault("", 0, null, true, null)[2], -1);
+  assert.strictEqual(k._kernelDeathFault("", 0, null, true, 0)[2], -1);
+});
+
 test("a resident kernel's OOM is not read as a box that never started", () => {
   // A resident kernel that dies mid-cell has no per-cell exit code, so the whole verdict lives in
   // _kernelDeathFault. Same rule as the one-shot path, from the same shared predicate: only kern's OOM
