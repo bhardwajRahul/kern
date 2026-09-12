@@ -7,6 +7,20 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`kern ps` told the operator of getkern.dev to kill the box that serves it.** MEASURED on that VPS,
+from root's shell: "1 box(es) are RUNNING with no registry record, so `kern stop` cannot reach them
+(the runtime dir was cleared under them). Kill by pid, or `kern gc` once they exit", naming
+`getkern-web` - nginx, up for 38 hours, serving the site. The runtime dir had not been cleared. The
+box was started by a systemd unit that sets `XDG_RUNTIME_DIR=/run/kern`, and
+`XDG_RUNTIME_DIR=/run/kern kern ps` lists it cleanly. Two causes are possible, the message asserted
+one, and the advice attached to it takes a production service down.
+
+kern's own `compose systemd` writes that variable into the units it generates, so the tool creates the
+situation it then misdiagnoses. The warning now names the directory it actually looked in, gives both
+causes, says how to check the second one (`systemctl show <unit> -p Environment`), and puts the
+destructive advice last and conditional on the record really being gone. Same discipline as the `oom`
+verdict: a diagnosis that can have two causes must not name one of them as the cause.
+
 **Four verbs the parser accepts were in no help line.** MEASURED by asking the binary rather than
 reading the list: every one of the 51 verbs `kern --help` promises exists, every flag it names for
 `box` and `compose` is accepted in its real position, an unknown verb exits 1 with or without

@@ -7950,7 +7950,12 @@ fn a_box_whose_registry_record_vanished_is_still_reported_by_ps() {
     let _ = fs::remove_dir_all(&root);
 
     assert!(
-        err.contains(tag) && err.contains("no registry record"),
+        // THE WORDING MOVED AND THE CLAIM DID NOT. The warning used to assert one cause ("the runtime
+        // dir was cleared under them") and now names both, plus the dir it looked in, because MEASURED
+        // on the getkern.dev VPS the other cause was the true one: nginx started by a systemd unit that
+        // sets its own XDG_RUNTIME_DIR. What this test is about is that the box is NAMED and the reader
+        // is told `kern stop` cannot reach it, so it asserts those two and not the sentence around them.
+        err.contains(tag) && err.contains("no record in") && err.contains("cannot reach them"),
         "a running box with no registry record must be named on stderr, or it is invisible AND \
          unstoppable; got {err:?}"
     );

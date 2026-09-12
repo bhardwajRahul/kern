@@ -1038,6 +1038,23 @@ fn existing_runtime_subdir(leaf: &str) -> Option<PathBuf> {
         .find(|d| d.exists())
 }
 
+/// WHERE THIS PROCESS LOOKED for box records, for a message that has to be checkable.
+///
+/// Non-creating, and it names the first candidate when none exists yet. It exists because the orphan
+/// warning in `kern ps` used to assert that a runtime dir had been cleared, and MEASURED on the
+/// getkern.dev VPS the cause was the other one: nginx running as `getkern-web` from a systemd unit
+/// that sets `XDG_RUNTIME_DIR=/run/kern`, with a good record there and none in root's default dir. A
+/// reader cannot tell those two apart without knowing which directory the answer came from, and the
+/// advice attached to that warning is to kill the process.
+pub(crate) fn instances_dir_for_display() -> String {
+    existing_runtime_subdir("instances")
+        .or_else(|| runtime_subdir_candidates("instances").into_iter().next())
+        .map_or_else(
+            || "the runtime dir".to_string(),
+            |p| p.display().to_string(),
+        )
+}
+
 /// The cgroup v2 directory of `pid` under `/sys/fs/cgroup`, from `/proc/<pid>/cgroup`.
 fn cgroup_of(pid: i32) -> Option<PathBuf> {
     let s = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
@@ -2658,6 +2675,45 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The orphan warning has to name WHERE it looked, because that is what separates its two causes.
+    ///
+    /// MEASURED on the getkern.dev VPS: `kern ps` from root's shell said "1 box(es) are RUNNING with no
+    /// registry record ... (the runtime dir was cleared under them). Kill by pid, or `kern gc` once they
+    /// exit", and the box was `getkern-web` - nginx serving the site, started by a systemd unit that
+    /// sets `XDG_RUNTIME_DIR=/run/kern`, with a perfectly good record there. One cause asserted, the
+    /// other one true, and the advice attached to it takes the site down. kern's own `compose systemd`
+    /// writes that variable into the units it generates, so the tool creates the situation itself.
+    #[test]
+    fn the_instances_dir_for_a_message_names_a_path_and_follows_xdg_runtime_dir() {
+        let base = std::env::temp_dir().join(format!("kern-idisp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("kern/instances")).expect("make a runtime dir");
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: single-threaded test scope; restored below.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &base) };
+        let shown = instances_dir_for_display();
+        assert_eq!(
+            shown,
+            base.join("kern/instances").display().to_string(),
+            "the message must name the dir this process actually looked in"
+        );
+        // AND WITH NO CANDIDATE ON DISK it still names one rather than saying nothing: a reader who is
+        // told a record is missing has to be able to go and look.
+        let empty = base.join("gone");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &empty) };
+        let shown = instances_dir_for_display();
+        assert!(
+            shown.starts_with('/') && shown.ends_with("instances"),
+            "a path was expected even with nothing on disk, got {shown:?}"
+        );
+        match prev {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
 
     /// A memoised runtime path must stop being returned once the directory it names is gone.
     ///
