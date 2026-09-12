@@ -3295,9 +3295,9 @@ fn watch_and_abort(
     // KEEPING THE EXIT RECORDS, because the status being adopted may be one this very teardown is
     // about to produce: `--exit-code-from db`, where `db` never exits on its own, reports the 137
     // the stop leaves behind. Reaping inside the teardown made every one of these exit 0.
-    let ((stopped, _pod_existed), names) =
+    let ((stopped, pod_existed), names) =
         crate::commands::tear_down_stack_keeping(all, &selected, pod, false);
-    println!("compose down: {stopped} box(es) stopped");
+    crate::commands::print_down_summary(stopped, pod_existed, pod);
 
     // The status: the NAMED service's if one was named (137 when the teardown is what ended it),
     // otherwise the one that exited first.
@@ -3466,11 +3466,7 @@ fn attach_to_stack(
     println!("\ncompose up: stopping the stack");
     let selected: Vec<String> = mine.iter().map(|b| b.name.clone()).collect();
     let (stopped, pod_existed) = crate::commands::tear_down_stack(all, &selected, pod);
-    if pod_existed {
-        println!("compose down: {stopped} box(es) stopped, pod '{pod}' removed");
-    } else {
-        println!("compose down: {stopped} box(es) stopped");
-    }
+    crate::commands::print_down_summary(stopped, pod_existed, pod);
     Ok(())
 }
 

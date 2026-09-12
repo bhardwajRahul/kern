@@ -9532,6 +9532,100 @@ fn run_landlock_rw_rejects_an_empty_or_missing_value() {
     }
 }
 
+/// `down` COUNTS WHAT IT STOPPED, NOT WHAT IT WAS ASKED TO STOP.
+///
+/// MEASURED before the fix: `compose down` on a stack that had never been started printed
+/// `compose down: 1 box(es) stopped`, and a second `down` printed it again. The count was the length
+/// of the SELECTION - the services in the file - because `stop_stack` returned the names it was given
+/// and each `stop`'s result was discarded. A teardown script or a human reading that line believes
+/// something was running, which is the same class of defect as a resource cap that is accepted and not
+/// enforced: the output describes an intent rather than an outcome.
+///
+/// ASSERTED ON THE SENTENCE, because the sentence is the interface here: this is a summary line a
+/// script greps. The zero case gets its own words ("nothing was running") since "0 box(es) stopped" is
+/// honest arithmetic and a poor answer to what the reader is asking.
+#[test]
+fn compose_down_counts_what_it_actually_stopped() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "downcount");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-dcount-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let toml = std::env::temp_dir().join(format!("kern-dcount-{}.toml", std::process::id()));
+    fs::write(
+        &toml,
+        format!(
+            "[box.a]\nrootfs = \"{rootfs}\"\n\
+             command = [\"/bin/busybox\", \"sleep\", \"300\"]\n"
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut v = vec!["compose", toml.to_str().unwrap()];
+        v.extend_from_slice(args);
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+
+    // NEVER STARTED: nothing to stop, and the line must not claim one.
+    let cold = run(&["down"]);
+    assert!(
+        cold.contains("nothing was running"),
+        "a down before any up must say nothing was running. got: {cold:?}"
+    );
+    assert!(
+        !cold.contains("1 box(es) stopped"),
+        "a down before any up must not claim a box was stopped. got: {cold:?}"
+    );
+
+    let up = run(&["up", "-d"]);
+    if !up.contains("box(es) started") {
+        run(&["down"]);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&toml);
+        eprintln!(
+            "skip: the stack did not start here: {}",
+            up.lines().next().unwrap_or("")
+        );
+        return;
+    }
+
+    // THE POSITIVE CONTROL, or every assertion here would pass on a `down` that counts nothing ever.
+    let warm = run(&["down"]);
+    assert!(
+        warm.contains("1 box(es) stopped"),
+        "a down on a running stack must count it. got: {warm:?}"
+    );
+
+    // AND AGAIN: the same file, nothing left running.
+    let again = run(&["down"]);
+    assert!(
+        again.contains("nothing was running"),
+        "a second down must not repeat the count. got: {again:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_file(&toml);
+}
+
 /// A SERVICE SELECTOR NARROWS `stop`, `start` AND `restart` INSTEAD OF BEING IGNORED.
 ///
 /// `[service...]` is in the CLI surface and was validated on the way in, then dropped: on an a/b/c

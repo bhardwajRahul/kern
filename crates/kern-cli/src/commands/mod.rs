@@ -4491,7 +4491,45 @@ impl ComposeAction {
 /// One race remains for pure name-scoping: `down A` stops A's `migrate`, a concurrent `up B`
 /// re-creates a `migrate` box, then A's reap would delete B's fresh sidecar. Closed BY CONSTRUCTION:
 /// a box's sidecars are reaped ONLY if that box is no longer alive.
-fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &str) -> Vec<String> {
+/// The one sentence `compose down` ends with, so its two call sites cannot drift.
+///
+/// ZERO IS A DIFFERENT FACT AND GETS DIFFERENT WORDS. "0 box(es) stopped" is honest arithmetic and a
+/// poor answer: what the reader wants to know is that nothing was running, which is also the state a
+/// second `down` finds. The count itself was wrong until 2026-09-12 (it was the length of the
+/// SELECTION, so a stack that never started reported one box stopped); with that fixed, the zero case
+/// became reachable and worth saying out loud.
+pub(crate) fn print_down_summary(stopped: usize, pod_existed: bool, pod: &str) {
+    let pod_note = if pod_existed {
+        format!(", pod '{pod}' removed")
+    } else {
+        String::new()
+    };
+    if stopped == 0 {
+        println!("compose down: nothing was running{pod_note}");
+    } else {
+        println!("compose down: {stopped} box(es) stopped{pod_note}");
+    }
+}
+
+/// What a teardown was ASKED to stop, and what it ACTUALLY stopped.
+///
+/// A NAMED STRUCT AND NOT A `Vec`, because one list was doing two jobs and only one of them
+/// honestly. MEASURED: `compose down` on a stack that was never started printed
+/// `compose down: 1 box(es) stopped`, and a second `down` printed it again, because the count was the
+/// length of the SELECTION - the services in the file - and the result of each `stop` was discarded.
+/// A teardown script reading that line believes something was running. The reap still needs every
+/// name (it must clear the sidecar of a service that had ALREADY exited, which a live-only capture
+/// would miss), so the two uses are now two fields instead of one list read two ways.
+pub(crate) struct Stopped {
+    /// Every name in the selection: what the sidecar reap must cover.
+    pub(crate) asked: Vec<String>,
+    /// The names that were ALIVE when the teardown began and are gone now. This is what a message may
+    /// claim was stopped. A box that died on its own in that window counts here, and that is right:
+    /// it was running when the teardown started and it is not now.
+    pub(crate) stopped: Vec<String>,
+}
+
+fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &str) -> Stopped {
     // DEPENDENTS FIRST, AND ONE LEVEL AT A TIME. Docker stops a service before the services it
     // depends on, and waits for a level to exit (or exhaust its grace) before signalling the next.
     //
@@ -4511,6 +4549,10 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &s
     // service, and the level it belongs to is still decided by every edge in the file: intersecting
     // afterwards keeps one rule instead of two.
     let names: Vec<String> = selected.to_vec();
+    // OBSERVED BEFORE, not inferred after: `stop` is best-effort over a batch and returns `NotRunning`
+    // for a box that was already gone, so the only way to say what this teardown stopped is to know
+    // what was alive when it began.
+    let was_alive: Vec<String> = names.iter().filter(|n| is_box_alive(n)).cloned().collect();
     for batch in stop_batches(boxes, &names) {
         let _ = stop(&batch, false);
     }
@@ -4519,7 +4561,11 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &s
             registry::clear_exit_matching(&exit_key_prefix(pod), &format!("-{n}"));
         }
     }
-    names
+    let stopped = was_alive.into_iter().filter(|n| !is_box_alive(n)).collect();
+    Stopped {
+        asked: names,
+        stopped,
+    }
 }
 
 /// The batches a teardown signals, in the order it signals them: dependents first, one dependency
@@ -6272,7 +6318,8 @@ pub(crate) fn tear_down_stack_keeping(
             crate::network::leave(net, box_name);
         }
     }
-    let names = stop_stack(boxes, selected, pod);
+    let outcome = stop_stack(boxes, selected, pod);
+    let names = outcome.asked;
     // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
     // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
     // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
@@ -6284,7 +6331,7 @@ pub(crate) fn tear_down_stack_keeping(
     // running" note would contradict this). Only claim it was removed if one existed - a `--no-pod`
     // stack has none.
     let (pod_existed, _) = crate::pod::teardown(pod);
-    ((names.len(), pod_existed), names)
+    ((outcome.stopped.len(), pod_existed), names)
 }
 
 /// Every mapping seen so far for ONE `(host port, protocol)` pair - the bucket that makes the
@@ -7103,11 +7150,7 @@ fn run_terminal_verb(
             };
             let all: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
             let (stopped, pod_existed) = tear_down_stack(boxes, &all, pod);
-            if pod_existed {
-                println!("compose down: {stopped} box(es) stopped, pod '{pod}' removed");
-            } else {
-                println!("compose down: {stopped} box(es) stopped");
-            }
+            print_down_summary(stopped, pod_existed, pod);
             if !orphans.is_empty() {
                 println!(
                     "compose down: {} orphan(s) stopped: {}",
@@ -7152,7 +7195,7 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.clone())
                 .collect();
-            let names = stop_stack(boxes, &chosen, pod);
+            let names = stop_stack(boxes, &chosen, pod).stopped;
             if was_no_pod {
                 // No pod is named, because none exists. `start` is still the way back, and it carries
                 // the mode forward on its own.
@@ -7185,7 +7228,7 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.clone())
                 .collect();
-            let names = stop_stack(boxes, &chosen, pod);
+            let names = stop_stack(boxes, &chosen, pod).stopped;
             println!(
                 "compose restart: {} box(es) stopped, restarting",
                 names.len()
