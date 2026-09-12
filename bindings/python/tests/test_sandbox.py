@@ -1917,6 +1917,46 @@ def test_kernel_death_is_oom_only_when_kern_reported_the_oom():
     assert capped._kernel_death_fault(marker, cap_signal=2)[0] == "startup_failed"
 
 
+def test_the_kernel_path_names_a_blocked_escape_and_does_not_call_a_crash_a_fault():
+    """The two classes the resident path could not say, both answered by kern's FOURTH byte.
+
+    FOUND THROUGH THE MCP SERVER, not here, which is the point: this file's kernel-death tests covered the
+    OOM, the external kill, the deadline and a user error, and stopped. A cell calling a blocked syscall
+    came back `fault=killed` with a message naming "an external kill (`kern stop`, a signal, or the host
+    running out of memory)" - kern's seccomp filter had refused a syscall, and the caller was told somebody
+    stopped the box. A segfaulting cell came back `killed` too, where the one-shot path reports the same
+    event as no fault at all with exit 139.
+
+    A resident kernel has no per-cell exit code, so both answers have to come from the signal byte. SIGSYS
+    is decided BEFORE the stderr heuristic for the same reason the one-shot path does: that heuristic
+    matches text a workload can print, and a cell must not be able to hide a blocked escape behind "the box
+    failed to start".
+    """
+    k = Kernel(_cfg(memory_mb=256), timeout_s=5)
+    kind, msg, rc = k._kernel_death_fault("", 0, None, signal.SIGSYS, True)
+    assert kind == "escape_blocked"
+    assert rc == 159, "the same code the one-shot path reports for SIGSYS"
+    assert "seccomp" in msg
+    # And it outranks the stderr heuristic, which a cell can write into.
+    forged = "error: sandbox: could not map uid 1000\n"
+    assert k._kernel_death_fault(forged, 0, None, signal.SIGSYS, True)[0] == "escape_blocked"
+    # A CRASH IS THE CODE'S, NOT THE SANDBOX'S: every one of these is `fault is None` with 128+signal,
+    # exactly as `_classify` answers the identical event on the one-shot path.
+    for sig, code in ((signal.SIGSEGV, 139), (signal.SIGABRT, 134), (signal.SIGFPE, 136),
+                      (signal.SIGILL, 132), (signal.SIGBUS, 135)):
+        kind, msg, rc = k._kernel_death_fault("", 0, None, sig, True)
+        assert kind is None, f"signal {sig} must not be a sandbox fault"
+        assert rc == code
+        assert "crashed" in msg and signal.Signals(sig).name in msg
+    # THE SIGNALS THAT ARE NOT CRASHES keep their own branches: SIGKILL is a kill, and an unknown signal
+    # stays an honest `killed` rather than being quietly called a crash.
+    assert k._kernel_death_fault("", 0, None, signal.SIGKILL, True)[0] == "killed"
+    assert k._kernel_death_fault("", 0, None, signal.SIGUSR1, True)[0] == "killed"
+    # A kern that does not report the signal cannot have an exit code claimed for it.
+    assert k._kernel_death_fault("", 0, None, None, True)[2] == -1
+    assert k._kernel_death_fault("", 0, None, 0, True)[2] == -1
+
+
 def test_kernel_oom_is_not_read_as_a_box_that_never_started():
     # REGRESSION, measured against kern 0.9.32-37-g02ecedf: kern's OOM sentence carries the `kern:`
     # prefix that `_looks_like_startup_failure` matches on, and `_kernel_death_fault` asked about the
@@ -3268,15 +3308,18 @@ def test_a_kernel_killed_by_its_spawning_thread_says_so():
     dead.start()
     dead.join()
     k._spawn_thread = dead
-    kind, msg = k._kernel_death_fault("")
+    # THREE values now: the exit code comes from the fourth byte, so the resident path reports 137/159/139
+    # where it used to report a flat -1 and disagree with the one-shot path about the same event.
+    kind, msg, rc = k._kernel_death_fault("")
     assert kind == "killed"
+    assert rc == -1, "no signal byte, so no exit code can be claimed"
     assert "thread that started it has exited" in msg
     assert "PDEATHSIG" in msg, f"the message must name the mechanism, or it cannot be acted on: {msg}"
     assert "main thread" in msg, f"and the remedy: {msg}"
     # POSITIVE CONTROL: with a LIVE spawning thread the same death keeps the honest general message, or
     # this would blame the thread for every kill in the world.
     k._spawn_thread = threading.current_thread()
-    kind, msg = k._kernel_death_fault("")
+    kind, msg, _ = k._kernel_death_fault("")
     assert kind == "killed"
     assert "thread" not in msg, f"a live thread must not be blamed: {msg}"
     assert "external kill" in msg

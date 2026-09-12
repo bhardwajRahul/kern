@@ -7,6 +7,37 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.3: on a resident kernel, a blocked escape was reported as an external kill, and a
+crash as the sandbox killing you.** FOUND THROUGH THE MCP SERVER, which is the path a Cursor, Claude
+Desktop or LM Studio user actually runs, and not through the SDK's own battery, whose resident-kernel
+section covered the OOM, the external kill, the deadline and a user error and stopped there.
+
+MEASURED, through a real MCP `tools/call`: a cell calling `ctypes.CDLL(None).mount(...)` came back
+`fault=killed`, with a message naming "an external kill (`kern stop`, a signal, or the host running out
+of memory)". kern's seccomp filter had killed the box for attempting a blocked syscall, so the one
+class in the taxonomy that is a security event arrived as somebody stopping the box. A segfaulting cell
+came back `killed` too, where the one-shot path reports the identical event as `fault=None,
+exit_code=139`: the code crashed and the sandbox did nothing.
+
+A resident kernel has no per-cell exit status, so both answers had to come from kern's fourth
+`KERN_STARTED_FD` byte, which was already arriving there unused. SIGSYS is now `escape_blocked`,
+decided BEFORE the stderr heuristic for the same reason the one-shot path decides it before reading
+stderr at all: that heuristic matches text a workload can print, and a cell must not be able to hide a
+blocked escape behind "the box failed to start". A cell cannot forge the byte either, because the
+signal must have killed the box's PID 1 and the kernel does not deliver an unhandled fatal signal to a
+pidns init from inside: measured, `os.kill(os.getpid(), SIGSYS)` in a cell exits 0 with no fault.
+
+The five fatal signals that mean the CODE went wrong (SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL) are
+now no fault at all, with `128 + signal` as the exit code, which is what the one-shot path has always
+reported. They are named one by one rather than as "everything else", so an unknown signal stays an
+honest `killed`. The lost session state is already reported: the next call raises "kernel is dead".
+
+And the exit code on that path is no longer a flat `-1`. It comes from the same byte, so the two paths
+report one event identically: 137 for a kill, 159 for a blocked escape, 139 for a segfault, `-1` only
+where no signal is known. Measured after, through the MCP server: all five classes arrive correctly,
+including `[exit 159, sandbox fault: escape_blocked]` and `[exit 139]` with no fault. The battery
+carries all four new cases on the resident-kernel path and reports 27 ok, 0 failed, 0 skipped.
+
 **kern-sandbox 0.2.2: the refusal message named a version the binary no longer had.** FOUND BY AN
 EXTERNAL REVIEWER attacking the identity memo: he overwrote the verified binary IN PLACE with
 `/bin/true` while a Sandbox was open. The verdict held, which is the part that matters, and he could

@@ -361,6 +361,28 @@ def main() -> int:
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=3) as s:
         with s.kernel() as k:
             result("our deadline", "timeout", fault_of(k.run_code(SLEEP)))
+    # THE TWO CLASSES THIS PATH COULD NOT SAY, and the gap was found through the MCP server rather than
+    # here, because this section tested OOM, the external kill, the deadline and a user error and stopped.
+    # A resident kernel has no per-cell exit code, so both answers come from kern's fourth byte: SIGSYS is
+    # kern's own seccomp filter refusing a syscall (a blocked escape, not a kill from outside), and a fatal
+    # crash signal is the CODE going wrong, which the one-shot path has always reported as no fault at all
+    # with 139. Two paths disagreeing about one event is the defect a caller pays for.
+    with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
+        with s.kernel() as k:
+            try:
+                r = k.run_code("import ctypes; ctypes.CDLL(None).mount(b'x',b'/mnt',b'tmpfs',0,None)")
+                result("blocked syscall", "escape_blocked", fault_of(r))
+                result("blocked syscall carries 159", 159, r.exit_code)
+            except SandboxError as e:
+                result("blocked syscall", "escape_blocked", f"RAISED {str(e)[:70]}")
+    with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
+        with s.kernel() as k:
+            try:
+                r = k.run_code("import ctypes; ctypes.string_at(0)")
+                result("a crash is not a sandbox fault", None, fault_of(r))
+                result("a crash carries its signal in the code", 139, r.exit_code)
+            except SandboxError as e:
+                result("a crash is not a sandbox fault", None, f"RAISED {str(e)[:70]}")
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
         with s.kernel() as k:
             result("user error is not a fault", None, fault_of(k.run_code("raise ValueError('mine')")))

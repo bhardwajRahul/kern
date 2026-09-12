@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1420,6 +1420,11 @@ def _validate_apparmor(name: str) -> str:
 # Signal-derived exit codes (128 + signum) we classify.
 _EXIT_SIGKILL = 137  # 128 + 9  - SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 _EXIT_SIGSYS = 159  # 128 + 31 - SIGSYS: a seccomp-denied syscall = a blocked escape attempt
+# The fatal signals that mean THE CODE went wrong, not that the sandbox acted. NAMED, not "everything
+# else": an unknown signal stays an honest `killed` rather than being quietly called a crash. SIGKILL and
+# SIGTERM are absent on purpose - those are the kill and the reap, decided by their own branches - and
+# SIGSYS is absent because it is kern's seccomp filter, which IS the sandbox acting.
+_CRASH_SIGNALS = frozenset({signal.SIGILL, signal.SIGABRT, signal.SIGBUS, signal.SIGFPE, signal.SIGSEGV})
 _EXIT_SIGTERM = 143  # 128 + 15 - SIGTERM: kern's --timeout backstop reaping the box (SIGTERM→SIGKILL)
 
 
@@ -2928,8 +2933,8 @@ class Kernel:
         except (BrokenPipeError, OSError):
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
             wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
-            return self._teardown_result(fault, err.strip() or default, started)
+            fault, default, rc = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
+            return self._teardown_result(fault, err.strip() or default, started, rc)
         try:
             reply = self._q.get(timeout=eff)
         except queue.Empty:
@@ -2941,8 +2946,8 @@ class Kernel:
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
             wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
-            return self._teardown_result(fault, err.strip() or default, started)
+            fault, default, rc = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
+            return self._teardown_result(fault, err.strip() or default, started, rc)
         return self._result_from_reply(reply, started)
 
     def _read_cap_signal(self) -> "tuple[bool, int, int | None, int | None]":
@@ -2955,10 +2960,17 @@ class Kernel:
     def _kernel_death_fault(
         self, err: str, cap_signal: int = 0, oom_signal: "int | None" = None,
         workload_signal: "int | None" = None, kern_wrote_payload: bool = False,
-    ) -> "tuple[str, str]":
-        """Why the resident kernel box died mid-cell, and a default message. The ``run_code`` counterpart
-        of the one-shot :meth:`_classify` SIGKILL branch: a kernel death has no per-cell exit code, so the
-        whole verdict is made here from what kern wrote.
+    ) -> "tuple[str | None, str, int]":
+        """Why the resident kernel box died mid-cell, as ``(fault type or None, message, exit code)``.
+
+        The ``run_code`` counterpart of the one-shot :meth:`_classify`: a kernel death has no per-cell exit
+        status of its own, so the whole verdict is made here from what kern wrote.
+
+        THE EXIT CODE COMES FROM THE FOURTH BYTE, so the two paths report one event the same way. It used
+        to be a flat ``-1`` here while the one-shot path reported 137 for a kill, 159 for a blocked escape
+        and 139 for a segfault. `128 + signal` is the shell's convention and the one `_classify` already
+        speaks; ``-1`` remains for the cases where no signal is known (an older kern, or a box that exited
+        on its own).
 
         ORDER, and it was measured wrong before: the OOM is asked about FIRST, because kern's sentence is
         `kern:`-prefixed and so was also matching the box-did-not-start heuristic below. A real OOM on a
@@ -2973,10 +2985,48 @@ class Kernel:
         SIGKILL on a capped box is not evidence of an OOM, whatever the byte says - but a 2 still earns a
         sentence, because "your cap was not in force here" is the one thing the caller cannot find out for
         itself."""
+        rc = 128 + int(workload_signal) if workload_signal not in (None, 0) else -1
         if _oom_verdict(oom_signal, err, kern_wrote_payload=kern_wrote_payload):
-            return "oom", "the kernel box exceeded its memory cap and was OOM-killed"
+            return "oom", "the kernel box exceeded its memory cap and was OOM-killed", rc
+        # A BLOCKED ESCAPE, BEFORE ANY STDERR HEURISTIC, and this path could not say it at all. MEASURED
+        # through the MCP server, which is the path a Cursor or Claude Desktop user actually runs:
+        # `ctypes.CDLL(None).mount(...)` in a cell came back `fault=killed`, with a message naming "an
+        # external kill (`kern stop`, a signal, or the host running out of memory)". kern's seccomp filter
+        # had killed the box for attempting a blocked syscall, and the caller was told somebody stopped
+        # it. The one-shot path has always answered this from the exit code (159); a resident kernel has
+        # no per-cell exit code, so it needs the fourth byte, which was arriving here unused.
+        #
+        # BEFORE `_looks_like_startup_failure` for the same reason the one-shot path decides SIGSYS before
+        # reading stderr at all: that heuristic matches a pattern the workload can print, so checking it
+        # first would let a cell hide a blocked escape behind "the box failed to start".
+        #
+        # A cell cannot forge it: the signal must have killed the box's PID 1, and the kernel does not
+        # deliver an unhandled fatal signal to a pidns init from inside. Measured, a cell calling
+        # `os.kill(os.getpid(), SIGSYS)` here exits 0 with no fault.
+        if workload_signal == signal.SIGSYS:
+            return (
+                "escape_blocked",
+                "the kernel box was killed by SIGSYS: kern's seccomp filter refused a syscall the code "
+                "attempted, which is a blocked escape and not a kill from outside",
+                rc,
+            )
+        # A CRASH IS NOT A SANDBOX FAULT, and this path called it `killed` with that same false sentence
+        # about an external kill. MEASURED: `ctypes.string_at(0)` segfaults the interpreter, which IS the
+        # box's PID 1, so the box dies - and the one-shot path reports the identical event as
+        # `fault=None, exit_code=139`, because the code crashed and the sandbox did nothing. Two paths
+        # disagreeing about one event is the defect, and the disagreement costs a loop: an agent reading
+        # `killed` retries the sandbox instead of fixing a null dereference. The lost session state is
+        # already reported, by the NEXT call raising "kernel is dead".
+        if workload_signal in _CRASH_SIGNALS:
+            return (
+                None,
+                f"the code crashed: the cell died on signal {int(workload_signal)} "
+                f"({signal.Signals(workload_signal).name}), which took the kernel box with it because the "
+                f"interpreter is its PID 1. The sandbox did not act; the next call reopens a kernel",
+                rc,
+            )
         if _looks_like_startup_failure(err):
-            return "startup_failed", "the kernel box failed to start"
+            return "startup_failed", "the kernel box failed to start", rc
         # THE ONE CAUSE THIS PATH CAN NAME EXACTLY, before the honest-but-vague ones below. kern arms
         # PDEATHSIG on a foreground box, that signal fires on the death of the creating THREAD on Linux,
         # and a kernel started inside a short-lived thread is therefore SIGKILLed when that thread
@@ -2989,12 +3039,14 @@ class Kernel:
                 "PR_SET_PDEATHSIG on the box, and on Linux that signal fires when the CREATING THREAD "
                 "dies, not when the process does. Start the kernel from the main thread, or from a "
                 "thread that lives at least as long as the session",
+                rc,
             )
         if cap_signal == 2:
             return (
                 "killed",
                 "the kernel box was killed, and its memory cap was not enforced here (no cgroup "
                 "delegation), so no memory limit was in force to attribute it to",
+                rc,
             )
         if self._sbx.memory_mb is not None:
             return (
@@ -3002,6 +3054,7 @@ class Kernel:
                 "the kernel box was killed and the kernel reported no OOM against its memory cap: an "
                 "external kill (`kern stop`, a signal, or the host running out of memory), not the box "
                 "exceeding its own memory",
+                rc,
             )
         # NOBODY KILLED IT, and kern's fourth byte is what allows saying so. A resident kernel whose
         # driver exits on its own (it crashed, or something inside the box killed it) is not an external
@@ -3013,8 +3066,9 @@ class Kernel:
                 "killed",
                 "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
                 "crash inside the box, or something in the box ending PID 1",
+                rc,
             )
-        return "killed", "the kernel box exited"
+        return "killed", "the kernel box exited", rc
 
     def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:
         """Turn one kernel reply into an :class:`ExecutionResult`.
@@ -3060,16 +3114,33 @@ class Kernel:
             results=results,
         )
 
-    def _teardown_result(self, kind: str, msg: str, started: float) -> ExecutionResult:
+    def _teardown_result(
+        self, kind: "str | None", msg: str, started: float, exit_code: int = -1
+    ) -> ExecutionResult:
         self._kill()
         # Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) raises,
         # it does not return a hollow result. timeout/killed stay as data.
         if kind == "startup_failed":
             raise SandboxError(msg or "the box failed to start")
+        # `kind is None` is a real answer here, not a missing one: the code CRASHED and the sandbox did
+        # not act, which is what the one-shot path reports for the same event. The message still travels,
+        # on stderr, because "your cell segfaulted and took the kernel with it" is worth saying even
+        # though it is not a fault.
+        if kind is None:
+            return ExecutionResult(
+                stdout="",
+                stderr=msg,
+                exit_code=exit_code,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                fault=None,
+                files=[],
+                truncated=False,
+                results=[],
+            )
         return ExecutionResult(
             stdout="",
             stderr="",
-            exit_code=-1,
+            exit_code=exit_code,
             duration_ms=int((time.monotonic() - started) * 1000),
             fault=SandboxFault(type=kind, message=msg),  # type: ignore[arg-type]
             files=[],
