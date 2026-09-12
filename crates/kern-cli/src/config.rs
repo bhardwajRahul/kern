@@ -1161,7 +1161,9 @@ pub fn resolve_vgpio(cfg: &KernConfig, name: &str) -> Result<ResolvedVgpio, Stri
     }
     for led in &e.leds {
         // A LED is a simple name under /sys/class/leds - never a path (no traversal into the host).
-        if led.is_empty() || led.contains('/') || led.contains("..") {
+        // The same predicate `profile_line` refuses at SAVE: here it only SKIPS, because a file that is
+        // already on disk must not make this host unable to start a box. See `is_simple_led_name`.
+        if !is_simple_led_name(led) {
             eprintln!("kern: vgpio led '{led}' is not a simple name - skipped");
             continue;
         }
@@ -1263,6 +1265,21 @@ pub(crate) fn canon_i2c_bus(s: &str) -> Option<String> {
     }
     let n = s.strip_prefix("i2c-").unwrap_or(s);
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("/dev/i2c-{n}"))
+}
+
+/// Is this a LED as `/sys/class/leds` names one: a simple name, never a path?
+///
+/// ONE PREDICATE, TWO POLICIES, and the second one is why this exists. The resolver has always
+/// skipped a malformed LED with a warning at box start, which is right for a file that is already on
+/// disk: one bad entry must not make a host unable to start boxes. But `kern config add vgpio:x --leds
+/// /sys/class/leds/ACT` ACCEPTED that path and wrote it, so the mistake surfaced later, as a warning
+/// about a grant that silently did nothing. MEASURED on a Raspberry Pi 5: the profile was written, the
+/// box started, `/sys/class/leds` inside it was empty, and the only clue was one line on stderr.
+///
+/// `extra` and `i2c` already refuse a malformed value at SAVE for exactly this reason, with that
+/// reasoning written next to them; `leds` was the third field of the same shape and did not.
+pub(crate) fn is_simple_led_name(led: &str) -> bool {
+    !led.is_empty() && !led.contains('/') && !led.contains("..")
 }
 
 /// The canonical `/dev` path of an SPI device reference. `"0.0"` or `"spidev0.0"` →
@@ -1862,6 +1879,18 @@ pub(crate) fn profile_line(key: &str, raw: &str) -> Result<Option<String>, Strin
                 if canon_i2c_bus(t).is_none() && !is_dev_path(t) {
                     return Err(format!(
                         "i2c: {t:?} - a bus number (e.g. 1, i2c-1) or a /dev/… path"
+                    ));
+                }
+            }
+        }
+        // `leds` is a simple name under /sys/class/leds (`ACT`), never a path: refuse at SAVE for the
+        // same reason as `extra` and `i2c` above, because the resolver can only skip it later and a
+        // skipped grant looks like a working one until someone reads stderr.
+        if key == "leds" {
+            for t in &trimmed {
+                if !is_simple_led_name(t) {
+                    return Err(format!(
+                        "leds: {t:?} - a name under /sys/class/leds (e.g. ACT), not a path"
                     ));
                 }
             }
@@ -3254,6 +3283,21 @@ mod tests {
         assert!(profile_line("cpus", "abc").is_err());
         assert!(profile_line("pins", "70000").is_err()); // out of GPIO range
         assert!(profile_line("size", "wat").is_err());
+        // A LED IS A NAME, NOT A PATH, and this was the third field of the shape `extra` and `i2c`
+        // already guarded. MEASURED on a Raspberry Pi 5: `config add vgpio:x --leds
+        // /sys/class/leds/ACT` was accepted and written, the box then started with an EMPTY
+        // /sys/class/leds and one warning line on stderr, so a grant that did nothing looked like one
+        // that worked. Refused here, at the point the mistake is made.
+        assert_eq!(
+            profile_line("leds", "ACT").unwrap().unwrap(),
+            r#"leds = ["ACT"]"#
+        );
+        assert!(profile_line("leds", "/sys/class/leds/ACT").is_err());
+        assert!(profile_line("leds", "../../etc/shadow").is_err());
+        // And the resolver's predicate is the same one, so the two cannot drift.
+        assert!(is_simple_led_name("ACT"));
+        assert!(!is_simple_led_name("/sys/class/leds/ACT"));
+        assert!(!is_simple_led_name(""));
         assert!(profile_line("backend", "  ").unwrap().is_none()); // empty optional → skipped
     }
 
