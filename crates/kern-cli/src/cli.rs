@@ -807,8 +807,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             //
             // BUT A VERB THAT DOES NOT EXIST IS STILL AN ERROR. `kern frobnicate --help` used to
             // print that same full page and exit 0, so a typo was indistinguishable from a real
-            // verb with no section of its own, and `install` and `docker` are two such verbs, which
-            // is why "found no lines" cannot be the test. `kern frobnicate` without `--help` has
+            // verb with no section of its own, which is why "found no lines" cannot be the test.
+            // (This named `install` and `docker` as two such verbs, and MEASURED on 2026-09-12 neither
+            // is a verb at all: both answer `unknown command`. A comment that names a CLI surface has
+            // to be checked like any other claim about it.) `kern frobnicate` without `--help` has
             // always said `unknown command`; asking for help about it should not be the one spelling
             // that hides the typo.
             //

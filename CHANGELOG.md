@@ -7,6 +7,21 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Four verbs the parser accepts were in no help line.** MEASURED by asking the binary rather than
+reading the list: every one of the 51 verbs `kern --help` promises exists, every flag it names for
+`box` and `compose` is accepted in its real position, an unknown verb exits 1 with or without
+`--help`, and `--help` exits 0. But `cfg`, `example`, `net` and `vol` all run and appeared nowhere,
+while `killall` is named on its line as an alias of `stop`. The criterion already existed and four
+aliases did not follow it, which is the same shape as a capability that ships without the word a user
+would search for. They are now named where their full verb is listed, in that same compact form, and
+the snapshot the CLI-surface freeze compares against was regenerated: this documents a surface that
+already existed, so nothing about it changes for a caller.
+
+Also measured, and corrected: a comment in `cli.rs` named `install` and `docker` as "two such verbs"
+with no help section of their own. Neither is a verb at all; both answer `unknown command`. A comment
+that describes a CLI surface is a claim about it, and gets checked like one. And one help line's
+description column was one character short of the other 55.
+
 **kern-sandbox 0.2.4: the MCP server did not strip what `SECURITY.md` said it stripped.** The
 document claimed "the LangChain renderer and the MCP server both strip ANSI, control characters and
 their own framing". MEASURED with a real `tools/call`: the MCP server stripped NONE of the three, and

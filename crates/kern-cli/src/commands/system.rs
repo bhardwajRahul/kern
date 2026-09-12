@@ -106,16 +106,16 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
     {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
                                                                      compose file names with `external: true`. Services of
-                                                                     DIFFERENT files on one resolve and reach each other by name
+                                                                     DIFFERENT files on one resolve and reach each other by name (alias: net)
 
   {d}Config & storage{z}
-    {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
+    {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml (alias: cfg)
     {c}config add{z} <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     {c}config rm{z} <kind:name>                                          Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
-    {c}examples{z}                                                       Print an example kern.toml
-    {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes
+    {c}examples{z}                                                       Print an example kern.toml (alias: example)
+    {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)
     {c}login{z} [registry] [--username U] / {c}logout{z} [registry]            Registry credentials (private pulls)
 
   {d}Diagnostics{z}

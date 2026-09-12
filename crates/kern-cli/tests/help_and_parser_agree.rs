@@ -428,6 +428,19 @@ fn the_completions_and_the_reference_agree() {
         .map_or(help.len(), |o| start + o);
     let mut documented: Vec<&str> = Vec::new();
     for line in help[start..end].lines().skip(1) {
+        // A VERB LINE IS INDENTED EXACTLY FOUR, which is the reference's own shape: two for a section
+        // heading, four for a verb, and the description column for a wrapped continuation. Reading
+        // every line's first word instead made a continuation line's first word a "documented verb":
+        // MEASURED on 2026-09-12, rewrapping one description so its second line began "what a compose
+        // file names ..." failed this test with `documented but not tab-completable: ["what", "of"]`.
+        // The old text survived by accident - its continuations happened to begin with "compose",
+        // which IS a verb, and with an uppercase word, which the filter below skips. An assertion that
+        // depends on the accidental first word of a wrapped line is a landmine for whoever edits the
+        // help next, and it fires as a claim about the SHELL COMPLETION, which is not where the
+        // mistake is.
+        if !line.starts_with("    ") || line.starts_with("     ") {
+            continue;
+        }
         // Verb tokens are the words that start a line or follow `|` or `/` on it. Colour codes are
         // already gone from a captured stdout when it is not a tty.
         for tok in line.split(|c: char| !(c.is_ascii_lowercase() || c == '-')) {

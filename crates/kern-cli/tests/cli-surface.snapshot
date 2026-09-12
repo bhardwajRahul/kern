@@ -69,16 +69,16 @@ COMMANDS:
     pod ls [--json] | pod rm <name>                                List pods, or remove one
     network create <name> | network ls [--json] | network rm <name>  A network shared BETWEEN projects, which is what a
                                                                      compose file names with `external: true`. Services of
-                                                                     DIFFERENT files on one resolve and reach each other by name
+                                                                     DIFFERENT files on one resolve and reach each other by name (alias: net)
 
   Config & storage
-    config [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
+    config [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml (alias: cfg)
     config add <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
     config rm <kind:name>                                          Delete a profile
     validate [path]                                                Check a kern.toml
     uninstall [--yes] [--keep-images]                              Remove everything kern created (lists it first)
-    examples                                                       Print an example kern.toml
-    volume <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes
+    examples                                                       Print an example kern.toml (alias: example)
+    volume <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)
     login [registry] [--username U] / logout [registry]            Registry credentials (private pulls)
 
   Diagnostics
