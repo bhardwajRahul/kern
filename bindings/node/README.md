@@ -28,11 +28,8 @@ const r = await kern.runCode("print(sum(range(100)))");
 console.log(r.stdout, r.success); // "4950\n" true
 ```
 
-TypeScript types ship in the box. `Buffer` appears in the public surface **because we typed it that
-way**, so a TypeScript consumer also needs `@types/node`; without it `tsc` reports `Cannot find name
-'Buffer'` against this package's `.d.ts` and tells you what to install. Typing that surface as
-`Uint8Array` would remove the requirement (a `Buffer` is one), and that is a change to the published
-surface rather than a fix, so it is not in this release.
+TypeScript types ship in the package. `Buffer` is in the public surface, so a TypeScript consumer also
+needs `@types/node`; without it `tsc` reports `Cannot find name 'Buffer'` and says what to install.
 
 ```ts
 import { runCode, withSandbox, Sandbox } from "kern-sandbox";
@@ -120,41 +117,30 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 | `truncated` | output hit the cap and overflow was discarded |
 
 A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it is a normal result.
-
-`stderr` is one stream shared by kern and your code, so a note about overlayfs or an undelegated
-cgroup arrives interleaved with the program's own output. That is right for a human reading a
-terminal and wrong for anything that puts `stderr` into a prompt, where it spends context on the
-runtime's housekeeping and reads like an error the code produced. `codeStderr` is the same string
-without those lines, and nothing is hidden: `runtimeNotes` holds exactly what was taken out. The
-LangChain tool and the MCP server already use it.
 `fault` is only set when the **sandbox** acted:
 
 | `fault.type` | when |
 |---|---|
 | `timeout` | the call exceeded `timeoutS`; the binding killed the box |
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
-| `oom` | kern reported that the kernel's OOM killer took the box against its own memory cap: a breached `memory.max` takes the whole box, since kern sets `memory.oom.group=1`. Reported on a channel the code in the box cannot write (a third byte on kern's own descriptor), so it is an observation of the kernel's counter rather than a guess from the exit code |
-| `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here (no cgroup delegation, which the message names). A `memoryMb` cap being set is not, by itself, evidence that memory is what killed the box |
-| `exec_failed` | the box started but the command did not exist inside it. `runCode(code, {language:"node"})` on an image with no `node` is the ordinary way to reach it; the message names the binary AND the image, because the remedy is a different `language` or a different `image`. The `language` enum is a convenience, not a promise about the image: the default `python:3.12-slim` carries `python` and `bash`. A shell's own `command not found` inside your script stays an ordinary non-zero exit |
-| `startup_failed` | returned as data, not thrown, in one case: your `timeoutS` fired while kern was still BUILDING the box, so the code never ran. kern reports on a separate descriptor whether it reached your workload, which is what tells this from a slow cell. A host path that blocks does it: a bind source on a dead NFS export, a FUSE mount whose daemon is gone. A longer timeout does not help |
-
-**An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
-`fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success:
-true` and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is
-allowed to handle, unlike a SIGKILL it cannot; labelling it a sandbox fault would misreport a process
-that exited cleanly. Code that does **not** catch it dies naming "Resource temporarily unavailable".
-The cap itself is enforced: on WSL2, `pids: 32` blocked at 29 forks while `pids: 256` let 120 through,
-same code and same image.
-
-A box that fails to **start** (kern exits 125: a mount refused at runtime, an unmappable `--user`, a
-seccomp/AppArmor/cgroup setup error, or a pull/image error) is **thrown** as a `SandboxError`, not
-returned as a fault, because the code never ran.
+| `oom` | the kernel's OOM killer took the box against its own memory cap. Read from a descriptor the code in the box cannot write, so it is an observation and not a guess from the exit code |
+| `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here, which the message names |
+| `exec_failed` | the box started, the command did not exist inside it. `{language:"node"}` on an image with no `node` is the ordinary way there; the message names the binary AND the image |
+| `startup_failed` | your `timeoutS` fired while kern was still BUILDING the box, so the code never ran. A longer timeout does not help: a bind source on a dead NFS export does this |
 
 ```js
 const r = await kern.runCode("while True: pass", { timeoutS: 5 });
 r.success;      // false
 r.fault.type;   // "timeout"
 ```
+
+A box that fails to **start** is **thrown** as a `SandboxError`, not returned as a fault, because the
+code never ran.
+
+`stderr` is one stream shared by kern and your code, so a note about an undelegated cgroup arrives
+interleaved with the program's own output. Right for a human at a terminal, wrong for anything that puts
+`stderr` into a prompt. `codeStderr` is the same string without kern's own lines, and nothing is hidden:
+`runtimeNotes` holds exactly what was taken out.
 
 ## Safe by default
 
@@ -169,13 +155,9 @@ Every relaxing option says so in its name or docs:
   line, so a credential in `env` does not leak into `ps`.
 - **mounts refused**: sensitive host sources (`/`, `/etc`, `/root`, `/proc`, `/sys`, `/dev`, the docker
   socket, `$HOME`) and escaping targets are refused even when asked.
-- **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes and open the final component
-  `O_NOFOLLOW`, so a symlink the box plants cannot redirect host I/O outside the workspace. They also
-  open `O_NONBLOCK` and refuse a descriptor that is not a REGULAR file. A symlink is not the only thing
-  a box can leave at a name: `mkfifo out.png` used to make `readFile("out.png")` wait for a writer that
-  never comes, with no timeout, so the box chose how long the host's call took. The flag alone would be
-  worse than the hang, because a non-blocking read of a writer-less FIFO returns zero bytes and the
-  call would report an EMPTY FILE. Both halves ship: it returns promptly, and it refuses.
+- **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes, open the final component
+  `O_NOFOLLOW` so a symlink the box plants cannot redirect host I/O, and refuse anything that is not a
+  REGULAR file (see the notes for the FIFO that made a read hang).
 
 ### Options
 
@@ -238,31 +220,25 @@ you did not read.
 ## Prewarming: a box ready before the call arrives
 
 `prewarm: N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,
-so a `runCode` claims one instead of paying for a box start plus an interpreter boot. Measured on
-`python:3.12-slim`, six calls each: **14.2 ms p50 by default against 0.8 ms with `prewarm: 4`**, and
-30.9 ms against 0.9 for the first call.
+and refills in the background while your agent thinks. Measured on `python:3.12-slim`:
 
-**The pool also fills on that worker thread, so the first call is fast only once it HAS filled.**
-Measured: constructing with `prewarm: 4` and calling immediately gives 13.7 ms five times over,
-while half a second later the same burst reads 0.8, 0.6, 0.5, 0.6 for the first four and then
-32.7 for the fifth, the pool empty. The table is the steady state, not the first moment.
+| | first call | p50 within the burst |
+|---|---:|---:|
+| default | 30.9 ms | 14.2 ms |
+| `prewarm: 4` | 0.9 ms | **0.8 ms** |
 
-The refill runs while your agent thinks, so it is off the caller's clock. That also says when it buys
-nothing: if calls arrive faster than the pool refills, the pool empties and you are back to the
-default cost. N is the burst you want covered, not a throughput knob.
+**The pool covers a burst, not a rate**, and it refills in the background: past N the cost returns to
+the default, and a call made immediately after construction pays the default until the boxes exist.
 
-Each prewarmed box serves ONE call and is discarded, so the isolation is unchanged: a fresh box per
-call, network off, the same caps. Only the moment of creation moves. That is the difference from
-`kernel()`, which deliberately shares one process across cells.
+Each prewarmed box still serves ONE call and is thrown away, so the isolation is unchanged: only the
+moment of creation moves. The pool key includes the image, the caps and the profiles, so a session never
+receives a box built for another one.
 
 ```js
-await withSandbox({ image: "python:3.12-slim", prewarm: 4 }, async (sbx) => {
+await kern.withSandbox({ image: "python:3.12-slim", prewarm: 4 }, async (sbx) => {
   const r = await sbx.runCode("print(1)");   // served from the pool
 });
 ```
-
-The pool key includes the image, the caps and the profiles, so a session with different settings never
-receives a box built for another one.
 
 ## Run pi's coding tools in a box
 

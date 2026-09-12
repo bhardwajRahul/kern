@@ -52,3 +52,25 @@ explicit flags that **override** a profile's values (and the `memoryMb` default 
 `memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
 Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
+**An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
+`fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success: true`
+and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is allowed
+to handle, unlike a SIGKILL it cannot, and labelling it a sandbox fault would misreport a process that
+exited cleanly. Code that does not catch it dies naming "Resource temporarily unavailable". The cap
+itself is enforced: on WSL2, `pids: 32` blocked at 29 forks while `pids: 256` let 120 through, same code
+and same image.
+
+**The `language` enum is a convenience, not a promise about the image.** The default
+`python:3.12-slim` carries `python` and `bash`; `{language:"node"}` there is `exec_failed`, and the
+message names the binary and the image because the remedy is one or the other. A shell's own
+`command not found` inside your script stays an ordinary non-zero exit.
+
+**A box that fails to start throws, and kern exits 125 for it**: a mount refused at runtime, an
+unmappable `--user`, a seccomp/AppArmor/cgroup setup error, or a pull/image error.
+
+**Why `readFile` refuses a non-regular file, and why the flag alone was not enough.** A symlink is not
+the only thing a box can leave at a name: `mkfifo out.png` used to make `readFile("out.png")` wait for a
+writer that never comes, with no timeout, so the box chose how long the host's call took. Opening
+`O_NONBLOCK` on its own would have been worse than the hang, because a non-blocking read of a
+writer-less FIFO returns zero bytes and the call would report an EMPTY FILE. Both halves ship: it
+returns promptly, and it refuses.

@@ -7,6 +7,27 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.5: the two package pages were the launch's first screen and read like a manual.**
+The registry page is what a reader sees before they install anything, and both were long enough that
+the functional part - what you call, what comes back, what it refuses - competed with its own
+rationale. Measured before: the Python README 24414 bytes with ONE section at 7069 (29% of the page),
+the Node one 18581 with two sections at 4311 and 4070.
+
+And the Python page said two things twice: "Not capped: the workspace on disk" and "Resource profiles"
+appeared as two paragraph pairs in the same section, with different wording, inside the section that
+was already the longest.
+
+Nothing measured was deleted. The deep rationale moved to the `SANDBOX-NOTES.md` that already sits
+beside each binding for exactly this, where a reader goes when they hit the thing: the bytecode route
+`deps_readonly` closes, the mountpoint-cover relation that refuses a `tmpfs` over a bind, the unit rule
+`tmpfs=` enforces, `/dev/shm` being unbounded, the FIFO that made a `readFile` hang, and why an
+enforced `pids` cap produces no fault. What stays on the page is the option table, the fault table, the
+posture, and one example per thing.
+
+After: Python 19228 bytes (-21%), Node 15486 (-17%), with no section dominating either page. Both
+render (`twine check` against a `readme_renderer` that really can render markdown, with the empty
+string as the negative control), and the npm tarball's README is 15.5 kB rather than 18.6.
+
 **`kern ps` told the operator of getkern.dev to kill the box that serves it.** MEASURED on that VPS,
 from root's shell: "1 box(es) are RUNNING with no registry record, so `kern stop` cannot reach them
 (the runtime dir was cleared under them). Kill by pid, or `kern gc` once they exit", naming

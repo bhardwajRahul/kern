@@ -27,14 +27,14 @@ print(r.stdout, r.success)
 
 Network off, memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp
 allowlist, and a wall-clock deadline applied from **outside** the box, so code that hangs cannot
-outlive it. Node and TypeScript get the same package on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
+outlive it. Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
+(the MCP server below is this package's).
 
 ## Your loop reads a field, not a stack trace
 
-This is the part that matters in an agent loop. A timeout, an OOM-kill, a blocked syscall or a
-missing interpreter each arrive as a **typed field on the result**, beside stdout and the exit code.
-The agent branches on a value and keeps going, instead of parsing a traceback to work out whether the
-sandbox stopped the run or the code did.
+A timeout, an OOM-kill, a blocked syscall or a missing interpreter each arrive as a **typed field on
+the result**, beside stdout and the exit code. The agent branches on a value instead of parsing a
+traceback to work out whether the sandbox stopped the run or the code did.
 
 ```python
 r = kern.run_code("while True: pass", timeout_s=5)
@@ -60,13 +60,6 @@ class ExecutionResult:
     runtime_notes: list[str]     # the complement: the lines kern wrote about itself
 ```
 
-`stderr` is one stream shared by kern and your code, so a note about overlayfs or an undelegated
-cgroup arrives interleaved with the program's own output. That is right for a human reading a
-terminal and wrong for anything that puts `stderr` into a prompt, where it spends context on the
-runtime's housekeeping and reads like an error the code produced. `code_stderr` is the same string
-without those lines, and nothing is hidden: `runtime_notes` holds exactly what was taken out, and
-`stderr` still holds both in their original order. The LangChain tool and the MCP server use it.
-
 **A Python exception in the code is NOT a fault.** That is `exit_code != 0`, a traceback in `stderr`,
 and `fault is None`, because the code ran and the sandbox did nothing. `fault` is set only when the
 sandbox acted:
@@ -74,25 +67,29 @@ sandbox acted:
 | `fault.type` | what happened |
 |---|---|
 | `timeout` | the call exceeded `timeout_s`; the binding owns that deadline |
-| `oom` | kern reported that the kernel's OOM killer took the box against its own memory cap, on a channel the code in the box cannot write (a third byte on kern's own descriptor). An observation of the kernel's counter, not a guess from the exit code |
-| `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here. A memory cap being set is not, by itself, evidence that memory is what killed the box |
+| `oom` | the kernel's OOM killer took the box against its own memory cap. Read from a descriptor the code in the box cannot write, so it is an observation and not a guess from the exit code |
+| `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here. A cap being set is not evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
-| `exec_failed` | the box started, the command did not exist in the image; the message names both the binary and the image |
-| `startup_failed` | returned, not raised, in one case: your `timeout_s` fired while kern was still BUILDING the box, so the code never ran. kern reports on a separate descriptor whether it reached your workload, which is what tells this from a slow cell. A host path that blocks does it: a bind source on a dead NFS export, a FUSE mount whose daemon is gone. A longer timeout does not help |
+| `exec_failed` | the box started, the command did not exist in the image; the message names both |
+| `startup_failed` | your `timeout_s` fired while kern was still BUILDING the box, so the code never ran. A longer timeout does not help: a bind source on a dead NFS export does this |
 
 A box that fails to **start** raises `SandboxError` instead, because the code never ran.
+
+`stderr` is one stream shared by kern and your code, so a note about an undelegated cgroup arrives
+interleaved with the program's own output. Right for a human at a terminal, wrong for anything that
+puts `stderr` into a prompt. `code_stderr` is the same string without kern's own lines, `runtime_notes`
+holds exactly what was taken out, and `stderr` still holds both in order. The LangChain tool and the
+MCP server use `code_stderr`.
 
 ## Use it from an MCP client (Cursor, Claude Desktop, anything that speaks MCP)
 
 The package ships **`kern-mcp`**, a dependency-free
-[Model Context Protocol](https://modelcontextprotocol.io) stdio server that gives the model a local
-code interpreter: it writes code, kern runs it on your machine, and charts come back as images the
-model can see.
+[Model Context Protocol](https://modelcontextprotocol.io) stdio server: the model writes code, kern
+runs it on your machine, and charts come back as images it can see.
 
-**Where it runs matters, because kern is Linux-only.** MCP's stdio transport spawns the server where
-the CLIENT runs, so the config below works when your client is on Linux. From macOS or Windows the
-same server is one hop away and the config is still one line: `"command": "wsl"` on Windows,
-`"command": "ssh"` to a Linux VM or a board. Both forms, with what the hop costs, are in
+**Where it runs matters, because kern is Linux-only.** The stdio transport spawns the server where the
+CLIENT runs, so the config below is for a Linux client. From Windows or macOS it is one hop and still
+one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board), both in
 [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
 
 ```json
@@ -123,9 +120,8 @@ that from the enum.
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes |
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap; `0` removes it and puts `/tmp` back inside the read-only root |
 
-**Why local rather than hosted.** E2B, Modal and Daytona need an account, an API key and a network
-round-trip, and the model's code runs on someone else's machine. This runs on yours: no account, no
-egress, works air-gapped, same shape. Full reference:
+**Why local rather than hosted.** No account, no API key, no round-trip: the model's code runs on
+your machine, and it works air-gapped. Full reference:
 [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
 
 ## The model: file state persists, processes do not
@@ -158,21 +154,14 @@ and refills on a worker thread while your agent thinks. Measured on `python:3.12
 | default | 30.9 ms | 14.2 ms |
 | `prewarm=4` | 0.9 ms | **0.8 ms** |
 
-That column is the p50 **inside** a burst of N, and outside one there is no gain to report: measured
-back-to-back on `python:3.12-slim`, four calls with `prewarm=4` read a p50 of 0.6 ms and twenty calls
-read 13.6 ms, which is the default. The pool covers a burst, not a rate.
-
-**The pool also fills on that worker thread, so the first call is fast only once it HAS filled.**
-Measured on `python:3.12-slim`: constructing with `prewarm=4` and calling immediately gives 13.7 ms
-five times over and 0.5 ms on the sixth, because the boxes were still starting. Given half a second
-the same burst reads 0.8, 0.6, 0.5, 0.6 for the first four and then 32.7 for the fifth, which is the
-pool empty. The table above is the steady state, not the first moment after construction.
+**The pool covers a burst, not a rate**, and it fills on that worker thread: measured, four calls with
+`prewarm=4` read a p50 of 0.6 ms and twenty read 13.6 ms, which is the default. Constructing and calling
+immediately reads 13.7 ms until the boxes have started.
 
 Each prewarmed box still serves ONE call and is thrown away, so the isolation is unchanged: only the
-moment of creation moves. That is the difference from `kernel()`, which shares one process across
-cells and says so. If calls arrive faster than the pool refills you are back to the default cost, so N
-is the burst you want covered, not a throughput setting. The pool key includes the image, the caps and
-the profiles, so a session never receives a box built for another one.
+moment of creation moves. That is the difference from `kernel()`, which shares one process across cells
+and says so. The pool key includes the image, the caps and the profiles, so a session never receives a
+box built for another one.
 
 ```python
 with kern.Sandbox(image="python:3.12-slim", prewarm=4) as sbx:
@@ -187,10 +176,10 @@ with kern.Sandbox(image="python:3.12-slim", prewarm=4) as sbx:
 `/workspace`, so edits write through to the host and everything else a command touches dies with the
 box. pi's default posture is no sandbox at all: it runs as the user who launched it.
 
-The two halves are not confined by the same thing, and the extension's README states which is which:
-`bash` runs INSIDE the box (namespaces, seccomp allowlist, cgroup caps), while `read` and the staging
-half of `write` are host filesystem calls guarded by this SDK's `O_NOFOLLOW` plus the `/proc/self/fd`
-containment check. Needs Linux, the `kern` binary, and Node 22 or newer.
+The two halves are not confined by the same thing, and the extension's README says which is which:
+`bash` runs INSIDE the box, while `read` and the staging half of `write` are host filesystem calls
+guarded by `O_NOFOLLOW` plus a `/proc/self/fd` containment check. Needs Linux, the `kern` binary, and
+Node 22 or newer.
 
 ## Charts and rich results, without a Jupyter kernel
 
@@ -235,64 +224,27 @@ Sandbox(
 )
 ```
 
-Mounts over sensitive sources (`/`, `/etc`, `$HOME`, the docker socket) are **refused even if you ask
-for them**, and so is a `tmpfs` that would COVER a `mounts` bind, since the bind's files would then be
-on the host and invisible in the box. "Cover" is the mountpoint relation, not a string compare. The
-other direction is legal: a bind at `/tmp` with `tmpfs={"/tmp/scratch": "8m"}` gives a persistent
-`/tmp` with a bounded ephemeral subtree, and both halves work.
+**Mounts over sensitive sources** (`/`, `/etc`, `$HOME`, the docker socket) are refused even if you ask
+for them, and so is a `tmpfs` that would cover a `mounts` bind.
 
-**`setup=` output is read-only to your code, by default.** `run_code` mounts `.deps` read-only, so a
-cell cannot change what the next cell imports. The route it closes is bytecode: a `.pyc` is validated
-on the source's timestamp and size, so a cell could rewrite a dependency's bytecode, leave the `.py`
-untouched, and the next `import` would run it, invisibly to `result.files` and `list_files()`. The
-setup box compiles before the mount closes, so the default costs nothing. `deps_readonly=False`
-reopens it; a write then gets `EROFS` rather than failing silently.
+**`setup=` output is read-only to your code.** A cell cannot change what the next cell imports.
+`deps_readonly=False` reopens it, and a write then gets `EROFS` rather than failing silently.
 
-**`egress_allow` is the middle setting, and the one an agent usually wants.** `network=False` gives
-the run phase no network and `network=True` gives it the host's; an allowlist gives it a named few:
+**`egress_allow` is the middle setting, and the one an agent usually wants.** `network=False` gives the
+run phase no network, `network=True` gives it the host's, and an allowlist gives it a named few:
 
 ```python
 kern.Sandbox(egress_allow=["pypi.org", "files.pythonhosted.org"])
 ```
 
 The box stays in its own network namespace and reaches the internet only through kern's filtering
-proxy, so a workload can fetch from an index you chose and cannot exfiltrate elsewhere. Mutually
-exclusive with `network=True`.
+proxy. Mutually exclusive with `network=True`. Otherwise the network is on **only** during `setup=`, in
+a separate box that dies when setup ends.
 
-**Network policy:** the network is on **only** during `setup=`, in a separate box that dies when
-setup ends. There is no per-call override; `network=True` is a session-level, explicit choice.
-
-**Resource profiles** attach slices defined once in `~/.config/kern/kern.toml`: `vcpu:` (CPU and
-memory), `vdisk:` (a size-capped scratch disk), `vgpio:` (a specific device set, the **only** way to
-give a box hardware). A `vcpu:` profile can carry `memory=`, but `memory_mb` defaults to `512` and an
-explicit flag beats a profile, so pass `memory_mb=None` to let the profile's own value apply.
-
-**Not capped: the workspace on disk.** It is a host directory, and file state persisting is the
-point. A cell writing in chunks put 400 MB on the host under `memory_mb=128`, because a memory cap
-only stops the version that builds the payload in RAM first. Where that matters, point `workspace=`
-at a filesystem you have already bounded.
-
-**Writable paths: `/workspace`, `/tmp` and `/dev/shm`.** The box root is read-only, so `/tmp` is a
-64 MiB tmpfs the binding mounts for you. Without it two things break quietly: a write naming `/tmp`
-fails with `EROFS`, and `tempfile` falls back to the current directory, putting scratch into your
-persistent workspace. The bytes are charged to the box's own memory cgroup, so filling `/tmp` OOMs the
-box and never the host disk. Resize with `tmpfs={"/tmp": "512m"}`, remove with `tmpfs={}`, or bind
-your own directory at `/tmp`. Name the REAL mountpoint: `/var/run` is a symlink to `/run` on Alpine,
-and a tmpfs at the alias leaves the path the program opens untouched.
-
-**The unit is required and the target may not contain a `:`.** kern's CLI takes both spellings and
-means the opposite of what you do: a bare `"64"` is 64 BYTES, `"0"` is UNLIMITED, and `["/scratch:9g"]`
-mounts a size rather than a directory. All three are refused here, with the reason. A size larger than
-`memory_mb` is refused too, because `df` would report it to a program that preflights against it.
-
-**`memory_mb` bounds the cgroup, not the workload's usable memory.** The cap is shared with
-memory-backed filesystems in the same box, and `/dev/shm` is not bounded at all: measured, 200 MiB
-written there under `memory_mb=128` OOM-kills the box, while the same 200 MiB to `/tmp` returns
-ENOSPC and the box lives. `/dev/shm` is a tmpfs with no size, its apparent size describes the HOST,
-and `tmpfs={"/dev/shm": ...}` is refused because it would shadow the hardened `/dev`. Python's
-`multiprocessing` uses it by default, so this is not a corner. `mounts={host_dir: "/dev/shm"}` is
-accepted and works, at two costs: a plain directory swaps an unbounded RAM path for an unbounded DISK
-one, and a file written there is **still on the host after the box dies**.
+**`memory_mb` bounds the cgroup, not the workload's usable memory**, and `/dev/shm` is not bounded at
+all: measured, 200 MiB written there under `memory_mb=128` OOM-kills the box, while the same 200 MiB to
+`/tmp` returns `ENOSPC` and the box lives. Python's `multiprocessing` uses `/dev/shm` by default, so
+this is not a corner.
 
 **Not capped: the workspace on disk.** It is a host directory, and file state persisting is the point.
 A cell writing in chunks put 400 MB on the host under `memory_mb=128`, because a memory cap only stops
@@ -303,11 +255,11 @@ memory), `vdisk:` (a size-capped scratch disk), `vgpio:` (a device set, the **on
 hardware). An explicit flag beats a profile, so pass `memory_mb=None` to let a `vcpu:` profile's own
 `memory=` apply.
 
-**The rest of the sharp edges are in [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md):**
-scratch that does not survive a call, toolchains that need `HOME`, a `df` and an `nproc` that describe
-the host, output discarded past the cap while the job keeps running, `track_files` seeing only the
-workspace, matplotlib rendering and complaining anyway, and the three things a server image asks for.
-Each one is a measured surprise, and none is needed for a first call.
+**The rest is in [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md)**,
+where every entry is a measured surprise and none is needed for a first call: which paths are writable
+and why `/tmp` is one of them, the bytecode route `deps_readonly` closes, the size rules `tmpfs=` and
+`mounts=` enforce, scratch that does not survive a call, toolchains that need `HOME`, a `df` that
+describes the host, and the three things a server image asks for.
 
 ## API
 
@@ -344,9 +296,8 @@ agent = create_agent(model, [tool])
 
 One session, so a file written by one call is there for the next, and each call still runs in a fresh
 box. What comes back is written for a model to act on: stdout, the value of a trailing expression, and
-**the traceback when the code raises**. A sandbox fault is labelled (`[sandbox: timeout]`, `oom`,
-`escape_blocked`) so the model does not debug code that was killed for asking for 4 GB, and the
-rendering uses `code_stderr`, so kern's own notes never reach the context.
+the traceback when the code raises. A sandbox fault is labelled (`[sandbox: timeout]`, `oom`,
+`escape_blocked`) so the model does not debug code that was killed for asking for 4 GB.
 
 Everything a box prints is untrusted text on its way into a context window, so the rendering strips
 terminal escapes and neutralises that framing wherever the **code** produced it: a cell printing
@@ -354,9 +305,7 @@ terminal escapes and neutralises that framing wherever the **code** produced it:
 injection is **not** filtered and cannot be at this layer.
 
 There is also a **shell execution policy** for LangChain's shell middleware, the long-lived-session
-shape rather than one box per call, and a peer of the Docker policy rather than a wrapper beside it.
-It takes both vocabularies (`timeout_s` or `command_timeout`, `memory_mb` or `memory_bytes`) and has
-its own page, including two behaviours worth knowing before an agent runs for hours:
+shape rather than one box per call, with its own page:
 [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
 
 ## Performance
@@ -369,9 +318,8 @@ One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `pytho
 | `run(["true"])`, bare box | **3.9 ms** | |
 | `run_code("print(1)")`, plus the CPython start | **14.3 ms** | ~290 ms |
 
-`run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost,
-not kern's, and it is why 14.3 rather than 3.9. The number quoted is the one `run_code` gives you,
-never the bare-box best case dressed up as the code-execution figure.
+`run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost, not
+kern's, and it is why 14.3 rather than 3.9.
 
 **The host and the image are part of the claim.** The same call reads ~40 ms on WSL2 and ~17 ms on
 `python:3.12-alpine`, whose interpreter starts slower. Quote the row that matches yours.
@@ -379,9 +327,7 @@ never the bare-box best case dressed up as the code-execution figure.
 **Concurrency:** 100 concurrent `run_code` calls on one `Sandbox` finish in **0.30 s** wall clock,
 100/100, no leaked boxes. The 211 ms per-call p50 in that run is queueing, not latency.
 
-**`enforce_limits=False` is not a speed knob.** It skips the per-box cgroup scope, worth **0.19 ms**
-now that kern applies caps in its own delegated slice, against giving up hard memory and PID
-enforcement. Leave it on. Method and other runtimes:
+Method, the other runtimes, and why `enforce_limits=False` is not a speed knob:
 [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
 
 ## Threat model (honest)

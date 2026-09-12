@@ -2686,33 +2686,47 @@ mod tests {
     /// writes that variable into the units it generates, so the tool creates the situation itself.
     #[test]
     fn the_instances_dir_for_a_message_names_a_path_and_follows_xdg_runtime_dir() {
+        // `TEST_ENV_LOCK` FIRST, and the first version of this test did not take it. `XDG_RUNTIME_DIR`
+        // is process-global and cargo runs these in threads, so two neighbours failed on the tree that
+        // introduced this test - `only_an_empty_named_volume_at_a_real_path_is_seeded` and
+        // `a_volume_source_that_resolves_onto_the_registry_is_refused_in_every_form` - both resolving a
+        // registry path while this one had pointed the variable at a temp dir. The lock is what the
+        // memo test beside it uses, for exactly this reason.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("kern-idisp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("kern/instances")).expect("make a runtime dir");
         let prev = std::env::var_os("XDG_RUNTIME_DIR");
-        // SAFETY: single-threaded test scope; restored below.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &base) };
-        let shown = instances_dir_for_display();
+        // RESTORED BY DROP, not at the end of the body: an assertion that fails must not leave the
+        // variable pointing at a temp dir for whatever runs next.
+        struct Restore(Option<std::ffi::OsString>, PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(prev, base.clone());
+
+        std::env::set_var("XDG_RUNTIME_DIR", &base);
         assert_eq!(
-            shown,
+            instances_dir_for_display(),
             base.join("kern/instances").display().to_string(),
             "the message must name the dir this process actually looked in"
         );
         // AND WITH NO CANDIDATE ON DISK it still names one rather than saying nothing: a reader who is
         // told a record is missing has to be able to go and look.
-        let empty = base.join("gone");
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &empty) };
+        std::env::set_var("XDG_RUNTIME_DIR", base.join("gone"));
         let shown = instances_dir_for_display();
         assert!(
             shown.starts_with('/') && shown.ends_with("instances"),
             "a path was expected even with nothing on disk, got {shown:?}"
         );
-        match prev {
-            // SAFETY: as above.
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A memoised runtime path must stop being returned once the directory it names is gone.

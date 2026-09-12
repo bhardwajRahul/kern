@@ -103,3 +103,34 @@ program is allowed to catch and exit 0 on, so a contained fork bomb reads as a s
 Labelling that a sandbox fault would misreport a process that exited cleanly. The cap is still
 enforced: on WSL2, `pids=32` blocked at 29 forks while `pids=256` let 120 through.
 
+## Moved here from the README, because a first call does not need them
+
+**Writable paths: `/workspace`, `/tmp` and `/dev/shm`.** The box root is read-only, so `/tmp` is a
+64 MiB tmpfs the binding mounts for you. Without it two things break quietly: a write naming `/tmp`
+fails with `EROFS`, and `tempfile` falls back to the current directory, putting scratch into your
+persistent workspace. The bytes are charged to the box's own memory cgroup, so filling `/tmp` OOMs the
+box and never the host disk. Resize with `tmpfs={"/tmp": "512m"}`, remove with `tmpfs={}`, or bind your
+own directory at `/tmp`. Name the REAL mountpoint: `/var/run` is a symlink to `/run` on Alpine, and a
+tmpfs at the alias leaves the path the program opens untouched.
+
+**The bytecode route `deps_readonly` closes.** `run_code` mounts `.deps` read-only, so a cell cannot
+change what the next cell imports. A `.pyc` is validated on the source's timestamp and size, so a cell
+could rewrite a dependency's bytecode, leave the `.py` untouched, and the next `import` would run it -
+invisibly to `result.files` and `list_files()`. The setup box compiles before the mount closes, so the
+default costs nothing.
+
+**A `tmpfs` that would COVER a `mounts` bind is refused**, since the bind's files would then be on the
+host and invisible in the box. "Cover" is the mountpoint relation, not a string compare. The other
+direction is legal: a bind at `/tmp` with `tmpfs={"/tmp/scratch": "8m"}` gives a persistent `/tmp` with
+a bounded ephemeral subtree, and both halves work.
+
+**The unit is required and a `tmpfs` target may not contain a `:`.** kern's CLI takes both spellings and
+means the opposite of what you do: a bare `"64"` is 64 BYTES, `"0"` is UNLIMITED, and `["/scratch:9g"]`
+mounts a size rather than a directory. All three are refused here, with the reason. A size larger than
+`memory_mb` is refused too, because `df` would report it to a program that preflights against it.
+
+**`/dev/shm` cannot be resized and can be replaced.** `tmpfs={"/dev/shm": ...}` is refused because it
+would shadow the hardened `/dev`; its apparent size describes the HOST.
+`mounts={host_dir: "/dev/shm"}` is accepted and works, at two costs: a plain directory swaps an
+unbounded RAM path for an unbounded DISK one, and a file written there is still on the host after the
+box dies.
