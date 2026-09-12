@@ -178,10 +178,25 @@ pub fn ps(
                 .collect();
         }
         if !lost.is_empty() {
+            // TWO CAUSES, AND THE ADVICE USED TO REST ON ONE OF THEM. This said "the runtime dir was
+            // cleared under them. Kill by pid, or `kern gc` once they exit", and MEASURED on the
+            // getkern.dev VPS the cause was the other one: the box is `getkern-web`, nginx serving the
+            // site, started by a systemd unit that sets `XDG_RUNTIME_DIR=/run/kern`, and it has a
+            // perfectly good record THERE. From root's default runtime dir it looks orphaned, and a
+            // reader who follows the advice kills the box that serves the site.
+            //
+            // kern's own `compose systemd` writes that variable into the units it generates, so the
+            // tool creates this situation itself: naming one cause when the commonest one is the other
+            // is the same defect as a diagnosis that says `oom` for every kill. The directory we looked
+            // in is now part of the message, because it is what makes the second cause checkable.
+            let dir = crate::registry::instances_dir_for_display();
             eprintln!(
-                "kern: warning: {} box(es) are RUNNING with no registry record, so `kern stop` cannot \
-                 reach them (the runtime dir was cleared under them). Kill by pid, or `kern gc` once \
-                 they exit:",
+                "kern: warning: {} box(es) are RUNNING and have no record in {dir}, so `kern stop` \
+                 cannot reach them from here. EITHER that runtime dir was cleared under them, OR they \
+                 were started with a different XDG_RUNTIME_DIR - a systemd unit written by \
+                 `kern compose systemd` sets one, and `systemctl show <unit> -p Environment` says \
+                 which. Check there before killing anything; if the record really is gone, kill by pid \
+                 or `kern gc` once they exit:",
                 lost.len()
             );
             for (tag, pid) in &lost {
