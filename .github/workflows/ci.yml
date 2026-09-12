@@ -54,6 +54,13 @@ jobs:
           # in `--help`, where someone evaluating kern before installing cannot look. A "no" is a fine
           # answer; a word that leads nowhere is not.
           python3 scripts/docker-vocabulary.py
+          # AND THE DESTINATIONS, which is the same trade applied to navigation: a renamed heading
+          # breaks every link that names it and nothing says so. Found twice in one audit - the examples
+          # index pointed at the MCP section by its old title, and INSTALL.md sent its macOS row to an
+          # anchor that is a bold paragraph, not a heading. Relative links and anchors only: external
+          # ones need the network and npmjs.com answers 403 to a runner, and a gate that fails on
+          # someone else's bot filter teaches people to ignore it.
+          python3 scripts/md-links.py
           # Every child under the runtime registry root must be CLASSIFIED (authoritative dir / box-data
           # dir / sibling tree / cosmetic file) at COMPILE time, not just when a constructor is exercised
           # at runtime: `runstats` builds `<runtime>/kern/runstats` WITHOUT the runtime chokepoint, the
