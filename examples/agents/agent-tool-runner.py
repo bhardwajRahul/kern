@@ -15,7 +15,7 @@ Why faults-as-data (not exceptions) is the whole point here:
   agent loop stays a straight line: run -> serialize result -> next turn. The model reads "timeout" and
   can decide to add a break condition, exactly like a human reading an error.
 
-    KERN_BIN=./target/release/kern python3 examples/agent-tool-runner.py
+    KERN_BIN=./target/release/kern python3 examples/agents/agent-tool-runner.py
 
 This tool runs model code under `security_profile="untrusted"`: kern's strongest bundle - a seccomp
 ALLOWLIST (deny-by-default with ENOSYS), every capability dropped, and a read-only root (run_code's own

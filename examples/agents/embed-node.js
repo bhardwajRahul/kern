@@ -13,7 +13,7 @@
  * (timeout / blocked-escape / OOM-kill) come back as DATA on `result.fault`, never as an exception -
  * so running untrusted code doesn't force a try/catch for normal outcomes.
  *
- *     KERN_BIN=./target/release/kern node examples/embed-node.js
+ *     KERN_BIN=./target/release/kern node examples/agents/embed-node.js
  *
  * Honest threat model: this is a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is
  * a deny-by-default allowlist - good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant

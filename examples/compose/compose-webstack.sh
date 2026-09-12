@@ -17,7 +17,7 @@ kern="${KERN:-kern}"
 printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --version 2>&1 | head -1)" >&2
 
 
-# Mirror kern's own precondition (the same check `multi-uid.sh` narrates): the official redis and nginx images drops privilege
+# Mirror kern's own precondition (the same check `security/multi-uid.sh` narrates): the official redis and nginx images drops privilege
 # in its entrypoint, which needs a subordinate uid RANGE, which needs the setuid `newuidmap` /
 # `newgidmap` helpers plus an /etc/subuid allocation. Without them kern warns and falls back to a
 # single-uid map, where that entrypoint fails on its own `chown` - not a kern defect and not

@@ -5,7 +5,7 @@
 #   -v <name>:/dest[:ro]                    mount it in a box (auto-created on first use, Docker-style)
 #   kern volume ls | inspect | rm           manage them
 #
-# Unlike a `-v /host/path:/dest` bind (see mounts-and-exec.sh) a named volume is kern-managed storage
+# Unlike a `-v /host/path:/dest` bind (see basics/mounts-and-exec.sh) a named volume is kern-managed storage
 # under ~/.local/share/kern/volumes/<name>/ - you never pick a host path. It OUTLIVES the box, so
 # box A can write data that box B reads later. Fully rootless: the volume is a directory kern
 # bind-mounts.
@@ -46,7 +46,7 @@ echo "==> 4. the --size quota:"
 # loop image - a plain foreground box run as root or in the `disk` group. Rootless (this script), kern
 # mounts the plain data directory and tells you the quota is NOT enforced. `kern volume inspect`
 # reports the recorded cap either way. For an ENFORCED size cap that works fully rootless, use a
-# `vdisk:` scratch disk instead - see vdisk-scratch.sh (a size-capped tmpfs).
+# `vdisk:` scratch disk instead - see resources/vdisk-scratch.sh (a size-capped tmpfs).
 "$kern" volume inspect "$vol" | grep -i quota | sed 's/^/   /'
 echo "   (rootless: recorded but not enforced; root/disk-group upgrades it to an ext4-loop quota)"
 

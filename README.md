@@ -350,7 +350,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model (structured, then per-mechanism), and why a userspace VRAM cap is not a boundary |
 | [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
 | [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
-| [examples/](examples/) · [blog/](blog/) | 92 runnable scripts, and longer write-ups |
+| [examples/](examples/) · [blog/](blog/) | 94 runnable scripts in eight folders, and longer write-ups |
 | [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |
 
 ## Status

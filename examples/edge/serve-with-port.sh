@@ -15,7 +15,7 @@ printf '# using %s (%s)\n' "$(command -v "$kern" || echo "$kern")" "$("$kern" --
 
 name=web
 # The host port is overridable because this repo has several examples that publish one, and a box
-# left running by an earlier one holds it: `PORT=8081 sh examples/serve-with-port.sh` then works
+# left running by an earlier one holds it: `PORT=8081 sh examples/edge/serve-with-port.sh` then works
 # instead of failing on a bind kern is right to refuse.
 port="${PORT:-8080}"
 

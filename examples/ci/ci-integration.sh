@@ -1,5 +1,5 @@
 #!/bin/sh
-# Reproduce your CI locally: the exact steps from examples/github-actions.yml, run on your laptop.
+# Reproduce your CI locally: the exact steps from examples/ci/github-actions.yml, run on your laptop.
 #
 # The whole point of running CI in a kern box is that "works in CI" and "works on my machine" become
 # the same isolated sandbox - same image, same read-only repo mount, same memory cap, same exit-code

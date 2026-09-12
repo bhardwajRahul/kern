@@ -358,7 +358,7 @@ kern box app --image python:3.12-slim --add-host host.docker.internal:host-gatew
 `host-gateway` is the keyword, resolved to the address the box reaches the host on; the NAME beside it
 is yours, so `host.docker.internal`, `dockerhost` and `gateway` all work and all mean the same thing.
 Three spellings are accepted for the compose key (`extra_hosts`, and the `--add-host` flag, and
-`add_host = [...]` in a `kern.toml`), and [examples/add-host.sh](../examples/add-host.sh) runs it.
+`add_host = [...]` in a `kern.toml`), and [examples/edge/add-host.sh](../examples/edge/add-host.sh) runs it.
 
 **A box is on its own network namespace by default**, so nothing reaches the host until you say so:
 that mapping IS the saying so.

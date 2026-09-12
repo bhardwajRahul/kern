@@ -7,6 +7,27 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`examples/` was 103 files in one flat directory.** GitHub renders the file listing above the README,
+so the first thing a reader met was a wall they scroll past, and the index below it was a 100-row table.
+The examples are the asset; the layout was the problem.
+
+They are grouped now, and nothing was deleted: `agents/` (12), `basics/` (19), `build/` (11), `ci/` (8),
+`compose/` (12), `edge/` (13), `resources/` (10), `security/` (7). What stays at the top is what a reader
+is sent to first - `showcase.sh`, `hardening.sh`, the four `essentials-*`, and `benchmark.py`, which
+getkern.dev links by path. Measured before moving anything: 32 references from outside `examples/`, one
+link from the site, none from the blog.
+
+`stale-numbers` then failed, correctly and for the wrong reason: "README says 92 runnable scripts,
+examples/ holds 7". It counted the top level, so it was measuring the layout instead of the claim. It
+counts recursively now, which also showed the old figure was two short - the two files inside
+`stack-python-postgres/` were never counted - so the README says 94.
+
+One thing worth recording, because it was mine: the first pass at fixing the cross-references replaced
+every mention of a moved file's basename, and `stack-python-postgres/Dockerfile` is a tracked file, so
+three lines of prose about Dockerfiles in general became "stack-python-postgres/Dockerfile". Reverted and
+redone narrowly (repo-root paths, backticked names, and `see <name>`), with the scripts' syntax checked
+and a moved example run end to end afterwards.
+
 **kern-sandbox 0.2.5: the two package pages were the launch's first screen and read like a manual.**
 The registry page is what a reader sees before they install anything, and both were long enough that
 the functional part - what you call, what comes back, what it refuses - competed with its own

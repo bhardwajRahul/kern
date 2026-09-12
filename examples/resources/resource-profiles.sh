@@ -58,6 +58,6 @@ echo "   (the 32m cap is a tmpfs here - rootless; kern upgrades it to ext4-on-lo
 echo
 echo "NOTE on enforcement: --show-config prints the resolved INTENT. Hard CPU/memory caps need a"
 echo "cgroup v2 delegation (e.g. a systemd user slice) to be kernel-enforced - see governed-run.sh"
-echo "and SECURITY.md. The vgpio:leds profile is device-dependent; see device-isolation.sh."
+echo "and SECURITY.md. The vgpio:leds profile is device-dependent; see security/device-isolation.sh."
 echo
 echo "done - profiles defined once, reused by name; the boxes and their tmpfs are gone."

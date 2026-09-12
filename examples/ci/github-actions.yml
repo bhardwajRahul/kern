@@ -4,7 +4,7 @@
 # install line - no Docker socket, no privileged service container. The build runs in an isolated
 # sandbox (repo bound read-only, memory-capped), and the box's exit code fails the job on error.
 #
-# Copy this to .github/workflows/ci.yml. `examples/ci-integration.sh` runs the SAME steps locally
+# Copy this to .github/workflows/ci.yml. `examples/ci/ci-integration.sh` runs the SAME steps locally
 # so you can reproduce a CI failure on your laptop.
 name: kern-ci
 

@@ -82,10 +82,10 @@ are published yet, so build from source on the board (or cross-compile and copy 
 
 ## Edge-shaped examples
 
-- [examples/edge-many-services.sh](examples/edge-many-services.sh), many isolated services on
+- [examples/compose/edge-many-services.sh](examples/compose/edge-many-services.sh), many isolated services on
   one small board; `kern stats` shows the few-MB footprint vs a 154 to 160 MB daemon.
-- [examples/data-pipeline.sh](examples/data-pipeline.sh), a per-job pipeline (read-only input →
+- [examples/edge/data-pipeline.sh](examples/edge/data-pipeline.sh), a per-job pipeline (read-only input →
   isolated processing → output volume), one box per sensor/file/tenant.
-- [examples/ci-in-a-box.sh](examples/ci-in-a-box.sh), build/test in a clean box **on the device**.
-- [examples/parallel-matrix.sh](examples/parallel-matrix.sh), fan out isolated jobs with no
+- [examples/ci/ci-in-a-box.sh](examples/ci/ci-in-a-box.sh), build/test in a clean box **on the device**.
+- [examples/resources/parallel-matrix.sh](examples/resources/parallel-matrix.sh), fan out isolated jobs with no
   daemon to serialize them.
