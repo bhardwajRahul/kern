@@ -7,13 +7,15 @@ differences bite.
 Every FIGURE on this page is measured, and the measurement is named where it matters. Statements
 about what Docker does are measured against **Docker 29.6.2** on a real daemon (a Jetson Orin Nano,
 aarch64) and against **podman 4.9.3** rootless on the development host; where a question was not put
-to a daemon, the line says so. docs/RUNTIME-PARITY.md carries those measurements one by one.
+to a daemon, the line says so. [RUNTIME-PARITY.md](RUNTIME-PARITY.md) carries those measurements one
+by one.
 
 
 ## What "compose compatibility" means here, in three numbers
 
 Three different questions, three different numbers. Quoting one under another's definition is the
-mistake this project already made once and corrected (see the v0.9.32 errata in CHANGELOG.md), so
+mistake this project already made once and corrected (see the v0.9.32 errata in
+[CHANGELOG.md](../CHANGELOG.md)), so
 each one carries its definition and its denominator.
 
 Corpus: 259 real compose files, one per repository, sampled across 733 repositories, listed one per
@@ -78,7 +80,7 @@ kern is a substitute for `docker compose` on files that do not need:
   * `--pod`, where a service that binds `127.0.0.1` does not keep it private from its peers. It is
     no longer the default and it is no longer where a stack lands without asking; the census that
     measured it (22 stacks read from inside, 2 with a loopback-only listener, both of them nominal)
-    is in docs/RUNTIME-PARITY.md,
+    is in [RUNTIME-PARITY.md](RUNTIME-PARITY.md),
   * UDP between peers under the `--no-pod` relay wiring,
   * files on a bind mount owned by the uid the service runs as: rootless maps them through the
     subuid range, so a service running as 1000 writes files the host sees as 100999 (section 38),

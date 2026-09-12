@@ -18,4 +18,4 @@ be absent from this list and a contributor could tick every line and still be re
 - [ ] Sandbox/OCI change? characterization stays green + real-syscall test added/kept
 - [ ] Security fixtures are synthetic, minimal, self-contained (no private paths/payloads)
 - [ ] CHANGELOG updated
-- [ ] I agree to the CLA (CLA.md)
+- [ ] I agree to the CLA ([CLA.md](../CLA.md))
