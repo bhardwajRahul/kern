@@ -375,7 +375,12 @@ def example_count_agrees() -> list[str]:
     ex = pathlib.Path("examples")
     if not ex.is_dir():
         return []
-    n = len([f for f in ex.iterdir() if f.is_file() and f.suffix in (".sh", ".py")])
+    # RECURSIVE, because the examples moved into folders on 2026-09-12 and the count did not change:
+    # 103 flat files made `examples/` on GitHub a wall a reader scrolls past, so they are grouped
+    # (agents, basics, build, ci, compose, edge, resources, security) with the entry points left on
+    # top. This gate read the top level only and reported "README says 92, examples/ holds 7", which
+    # is the gate measuring the layout instead of the claim. `rglob` counts what the sentence counts.
+    n = len([f for f in ex.rglob("*") if f.is_file() and f.suffix in (".sh", ".py")])
     out = []
     readme = pathlib.Path("README.md")
     if readme.exists():

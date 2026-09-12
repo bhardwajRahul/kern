@@ -88,7 +88,7 @@ what the host has to slice), `kern examples` (print a sample) and `kern validate
 `--config ./kern.toml` for a per-project file, or `KERN_CONFIG` to make that the file every command
 reads and writes. The full schema, every field, the 7-layer precedence and `extends` are in
 **[CONFIG.md](CONFIG.md)**; a runnable walk-through is
-[resource-profiles.sh](../examples/resource-profiles.sh).
+[resource-profiles.sh](../examples/resources/resource-profiles.sh).
 
 ## The model, in two verbs
 

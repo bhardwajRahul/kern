@@ -33,7 +33,7 @@ fn main() {
 EOF
 
 echo "==> 1. BUILD: compile with rustc inside a rust box, capped at 512M RAM / 1 core:"
-# --memory / --cpus are hard cgroup caps on the build box (see governed-run.sh). A build that exceeds
+# --memory / --cpus are hard cgroup caps on the build box (see resources/governed-run.sh). A build that exceeds
 # the memory cap is OOM-killed by the kernel - governed builds, no runaway toolchain.
 "$kern" box rust_build --image rust --memory 512M --cpus 1.0 \
   -v "$work/src:/src:ro" -v "$work/out:/out" -w /src -- \

@@ -15,7 +15,7 @@ So the "notebook" rule is simple: if you need it next turn, WRITE IT TO DISK. Be
 right way (a file), and `setup=` installs a dependency ONCE (the only moment the network is on - a
 separate setup box that dies), so later turns can `import` it network-off.
 
-    KERN_BIN=./target/release/kern python3 examples/code-interpreter.py
+    KERN_BIN=./target/release/kern python3 examples/agents/code-interpreter.py
 
 Note: `setup="pip install ..."` reaches the network to fetch the package. If you're offline this line
 will fail at __enter__ (raised as SandboxError - a setup/config failure, not a normal run outcome).

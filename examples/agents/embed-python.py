@@ -10,7 +10,7 @@ Safe by default: no network, no host mounts, seccomp on, resource caps enforced.
 (timeout / blocked-escape / OOM-kill) come back as DATA in `result.fault`, never as an exception -
 so running untrusted code doesn't force a try/except for normal outcomes.
 
-    KERN_BIN=./target/release/kern python3 examples/embed-python.py
+    KERN_BIN=./target/release/kern python3 examples/agents/embed-python.py
 
 Honest threat model: this is a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is
 a deny-by-default allowlist - good for agent/CI code, NOT a hard boundary against deliberately hostile multi-tenant

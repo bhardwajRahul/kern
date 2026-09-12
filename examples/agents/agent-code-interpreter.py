@@ -10,7 +10,7 @@ What it shows, each an actual agent-harness need:
   5. Snapshot / restore  : checkpoint the workspace after an expensive step, resume it in a fresh session.
   6. Node language       : the same sandbox runs JavaScript, not just Python.
 
-Run:  KERN_BIN=/path/to/kern python3 examples/agent-code-interpreter.py
+Run:  KERN_BIN=/path/to/kern python3 examples/agents/agent-code-interpreter.py
       (or have `kern` on PATH). Needs outbound network for the one pip install.
 """
 

@@ -16,7 +16,7 @@ What it shows, each an actual agent/notebook need:
   5. Still sandboxed       : the network is off and a raw fd write cannot corrupt the control channel.
   6. Timeout tears it down : a runaway cell hits the deadline and the kernel is torn down as a fault.
 
-Run:  KERN_BIN=/path/to/kern python3 examples/warm-kernel.py
+Run:  KERN_BIN=/path/to/kern python3 examples/agents/warm-kernel.py
       (or have `kern` on PATH). Needs outbound network once, for the matplotlib install.
 """
 

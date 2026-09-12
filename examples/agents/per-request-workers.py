@@ -11,7 +11,7 @@ Because boxes start in milliseconds, "a fresh box per request" is cheap enough t
 over the batch with a stdlib thread pool - no external deps, runs anywhere python does. The pool is only
 concurrency; the ISOLATION is the box (a `kern.run_code` throwaway session per request).
 
-    KERN_BIN=./target/release/kern python3 examples/per-request-workers.py
+    KERN_BIN=./target/release/kern python3 examples/agents/per-request-workers.py
 
 Honest threat model: a KERNEL-boundary sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp is a
 deny-by-default allowlist, not a hard multi-tenant wall. See bindings/python/README.md.

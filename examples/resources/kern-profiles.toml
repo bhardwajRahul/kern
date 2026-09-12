@@ -49,7 +49,7 @@ size = "32m"
 
 # ── virtual GPIO / peripherals ([[vgpio]]) ────────────────────────────────────────────────────
 # Device exposure is host-dependent (real gpiochips / /dev nodes / sysfs). This profile is inert
-# on a host without the hardware; see device-isolation.sh for the device-binding angle. GPIO
+# on a host without the hardware; see security/device-isolation.sh for the device-binding angle. GPIO
 # isolation is chip-granular, not per-line - see SECURITY.md.
 [[vgpio]]
 name = "leds"

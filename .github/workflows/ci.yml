@@ -363,7 +363,7 @@ jobs:
         run: |
           # The gate stays BARE: piping into `tee` would hand the step tee's exit status and a failed
           # `compose up` would read as a pass. Capture first, show second, assert third.
-          ./target/debug/kern compose examples/compose-webstack.toml up > /tmp/up.log 2>&1 || {
+          ./target/debug/kern compose examples/compose/compose-webstack.toml up > /tmp/up.log 2>&1 || {
             cat /tmp/up.log >&2; exit 1
           }
           cat /tmp/up.log
@@ -422,7 +422,7 @@ jobs:
       - name: tear it down, and prove nothing is left
         if: always()
         run: |
-          ./target/debug/kern compose examples/compose-webstack.toml down
+          ./target/debug/kern compose examples/compose/compose-webstack.toml down
           left=$(./target/debug/kern ps -q | wc -l)
           test "$left" -eq 0 || { ./target/debug/kern ps; echo "$left box(es) survived down" >&2; exit 1; }
 

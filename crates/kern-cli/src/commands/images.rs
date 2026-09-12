@@ -159,7 +159,7 @@ pub fn search(query: &str, json: bool) -> Result<(), Error> {
 /// * every pull dropped an extracted rootfs wherever it ran. Two such directories were sitting
 ///   untracked in a working tree when this was found.
 /// * `kern images` did not list what had just been pulled, and `tag`/`push`/`save` could not see it.
-///   `examples/tag-and-push-local.sh` says "make sure we have a source image cached" above its
+///   `examples/build/tag-and-push-local.sh` says "make sure we have a source image cached" above its
 ///   `kern pull`, and then failed with "no such image" on a clean cache. It passed only when some
 ///   earlier command happened to have cached the ref.
 ///

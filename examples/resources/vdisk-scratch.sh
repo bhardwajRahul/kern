@@ -49,7 +49,7 @@ echo "==> 1. attach the vdisk profile (token BEFORE the command) and use the scr
 echo
 echo "==> 2. the size cap is ENFORCED - writing past 10 MiB fails with ENOSPC:"
 # This is a real kernel-enforced tmpfs quota (works fully rootless), unlike a named-volume --size
-# which needs root for its ext4-loop backend (see named-volumes.sh).
+# which needs root for its ext4-loop backend (see compose/named-volumes.sh).
 set +e
 "$kern" box overflow vdisk:scratch --config "$work/kern.toml" --image alpine \
   -- /bin/sh -c 'dd if=/dev/zero of=/vdisk/scratch/toobig bs=1M count=20 2>&1 | tail -n1 | sed "s/^/   /"'
