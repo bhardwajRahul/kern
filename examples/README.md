@@ -43,7 +43,7 @@ by folder:
 |---|---:|---|
 | [`basics/`](basics/) | 19 | one box, mounts, logs, `ps`/`top`, pause, gc |
 | [`agents/`](agents/) | 12 | the code-execution tool an LLM calls, warm kernels, embedding this in Python/Node/Rust |
-| [`compose/`](compose/) | 12 | multi-box stacks, pods, named volumes, rolling and canary deploys |
+| [`compose/`](compose/) | 13 | multi-box stacks, pods, named volumes, rolling and canary deploys |
 | [`build/`](build/) | 11 | `kern build`, Dockerfiles, multi-stage, language toolchains, save/load, registries |
 | [`ci/`](ci/) | 8 | the same steps locally and in GitHub Actions, air-gapped, pre-commit |
 | [`edge/`](edge/) | 13 | services with a published port, data pipelines, a database box, a watchdog |
@@ -159,6 +159,7 @@ by folder:
 | [reverse-proxy-pod.sh](compose/reverse-proxy-pod.sh) | An `nginx` box in front of an app box in one `--pod` (shared loopback, peer-by-name); only nginx's port is published, a host request reaches the app through the proxy |
 | [scheduled-job.sh](ci/scheduled-job.sh) | Daemonless cron-like pattern: a loop starting a fresh, capped, self-removing box each interval, honest that kern has no built-in scheduler (pair with host cron) |
 | [compose-webstack.sh](compose/compose-webstack.sh) + [compose-webstack.toml](compose/compose-webstack.toml) | A richer `kern compose` stack: a cache with a `--health-cmd` and a web front-end gated on `depends_healthy`, brought up in health order and torn down |
+| [docker-compose-file.sh](compose/docker-compose-file.sh) | **The file you already have**: a real `docker-compose.yml` with a health check, a `depends_on` that waits for it, a published port, a named volume and `extra_hosts: host.docker.internal`. Then the sequence a deploy script runs: `up -d --wait`, `ps --format json` (Docker's field names), `exec`, `cp`, `down -v` |
 | [compose-declared-ports.sh](compose/compose-declared-ports.sh) | One stack is one pod, so two services cannot both listen on the same internal port; kern refuses that stack up front instead of letting the loser die with `EADDRINUSE` in its own log. Walks `ports:` / `port:` / `expose:`, ranges, and `--no-pod` |
 | [compose-systemd-unit.sh](compose/compose-systemd-unit.sh) | Start a stack at boot on a daemonless runtime: `kern compose <file> systemd` prints a unit and installs nothing. Honest that it brings the stack up and down but does **not** supervise it |
 | [stack-python-postgres/run.sh](stack-python-postgres/run.sh) | A two-service stack end to end: a Python API and the official `postgres` in one pod, the API reaching the DB on `localhost:5432`, a note written over HTTP and read back out of the database |

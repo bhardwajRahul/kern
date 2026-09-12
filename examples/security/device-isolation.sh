@@ -80,5 +80,31 @@ echo
 '
 
 echo
-echo "The box saw one device and nothing else. Everything is discarded on exit."
+echo "The box saw one device and nothing else."
+
+# AND THE SAME GRANT FROM A COMPOSE FILE, which is refused by default and says why. A profile NAME
+# says nothing about which hardware it reaches: another machine's "sensor" may be something else
+# entirely, and unlike a cpu or a disk there is no sense in which the local grant is the smaller one.
+# So `up` stops, prints what the profile resolves to HERE, and waits for you to say you meant it.
+stack="$(dirname "$cfg")/stack.yml"
+cat > "$stack" <<YML
+services:
+  reader:
+    image: alpine
+    x-kern-vgpio: sensor
+    command: ["/bin/sh", "-c", "echo '  the service sees:' \$(ls /dev/i2c-* /dev/spidev* /dev/tty[UA]* 2>/dev/null | tr '\\n' ' ')\$(ls /sys/class/leds 2>/dev/null | tr '\\n' ' ')"]
+YML
+
+echo
+echo "==> compose, without saying you meant it:"
+KERN_CONFIG="$cfg" "$kern" compose "$stack" -p devdemo up 2>&1 | sed -n '1,3p' | sed 's/^/  /'
+
+echo
+echo "==> compose, with --allow-device-grants:"
+KERN_CONFIG="$cfg" "$kern" compose "$stack" -p devdemo up -d --allow-device-grants >/dev/null 2>&1 || true
+"$kern" logs devdemo-reader 2>/dev/null | sed 's/^/  /' | head -3
+KERN_CONFIG="$cfg" "$kern" compose "$stack" -p devdemo down >/dev/null 2>&1 || true
+
+echo
+echo "Everything is discarded on exit."
 rm -rf "$(dirname "$cfg")"
