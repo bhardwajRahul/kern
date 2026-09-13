@@ -1457,7 +1457,6 @@ def test_track_files_off_skips_diff_but_keeps_results():
     assert any(f.path == "y.txt" for f in r.files)
 
 
-@integration
 def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     """Mounting kern's control plane into a box kern started defeats the point of asking for a box.
 
@@ -1525,6 +1524,7 @@ def test_credential_directories_are_refused_as_a_mount_source(tmp_path):
     assert kern._validate_mount(str(lookalike), "/k")[1] == "/k"
 
 
+@integration
 def test_read_write_refuse_symlinked_dir_component():
     # SECURITY REGRESSION: a box plants a symlinked DIRECTORY component (`d/esc -> /etc`); host-side
     # read_file/write_file must NOT follow it out of the workspace (else read leaks arbitrary host files).
@@ -1736,14 +1736,15 @@ def test_setup_refuses_the_shape_a_reader_guesses_first():
     """
     for bad in (["pandas"], 42, ("pip install x",)):
         with pytest.raises(SandboxError) as e:
-            Sandbox(setup=bad)  # type: ignore[arg-type]
+            _cfg(setup=bad)  # type: ignore[arg-type]
         assert "shell command STRING" in str(e.value)
         assert 'setup="pip install' in str(e.value), "the message shows the shape that works"
     # A CONTROL, or this passes on a guard that refuses every setup: the documented shape constructs.
-    assert Sandbox(setup="pip install requests").setup == "pip install requests"
-    assert Sandbox().setup is None
+    assert _cfg(setup="pip install requests").setup == "pip install requests"
+    assert _cfg().setup is None
 
 
+@integration
 def test_an_absolute_path_is_refused_and_not_reinterpreted():
     """A host path handed to a workspace call is refused, and never resolved INSIDE the workspace.
 
