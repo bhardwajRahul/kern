@@ -2139,6 +2139,31 @@ def test_a_dead_kernel_names_what_ended_it_and_what_survived():
     assert k4._death == "the code crashed"
 
 
+def test_a_two_byte_kern_is_told_apart_from_an_external_kill_in_the_SENTENCE():
+    """The binary `install.sh` serves today writes 2 of the 4 teardown bytes, and the difference shows.
+
+    MEASURED against the RELEASED 0.9.32 with this SDK: a cell that SEGFAULTED and a cell whose syscall
+    the seccomp filter refused both came back `killed` with "an external kill (`kern stop`, a signal, or
+    the host running out of memory)". The verdict cannot improve without the signal byte; that sentence
+    was false for both, and a caller reading it goes looking for who killed their box.
+
+    So the fallback now names the bound. The four-byte case keeps the sentence it earned, because there
+    the byte says nobody killed it.
+    """
+    k = Kernel(_cfg(memory_mb=256), timeout_s=5)
+    kind, msg, _ = k._kernel_death_fault("", 0, None, None, True)   # payload written, no signal byte
+    assert kind == "killed", "the verdict is the best this binary supports"
+    assert "2 of the 4 teardown bytes" in msg, msg
+    assert "indistinguishable" in msg and "a newer kern separates them" in msg
+    assert "not the box exceeding its own memory" not in msg, "the old assertion must be gone"
+    # A FOUR-BYTE KERN THAT REPORTS AN ACTUAL KILL keeps the specific sentence: the byte earns it.
+    kind2, msg2, _ = k._kernel_death_fault("", 0, None, signal.SIGKILL, True)
+    assert kind2 == "killed" and "external kill" in msg2 and "teardown bytes" not in msg2
+    # AND NO PAYLOAD AT ALL is a third case, untouched by this: kern never reached teardown.
+    kind3, msg3, _ = k._kernel_death_fault("", 0, None, None, False)
+    assert kind3 == "killed" and "teardown bytes" not in msg3
+
+
 def test_kernel_oom_is_not_read_as_a_box_that_never_started():
     # REGRESSION, measured against kern 0.9.32-37-g02ecedf: kern's OOM sentence carries the `kern:`
     # prefix that `_looks_like_startup_failure` matches on, and `_kernel_death_fault` asked about the

@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.12"
+__version__ = "0.2.13"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -3266,6 +3266,23 @@ class Kernel:
                 rc,
             )
         if self._sbx.memory_mb is not None:
+            # A BINARY THAT DOES NOT REPORT THE SIGNAL CANNOT HAVE THIS SENTENCE PUT IN ITS MOUTH.
+            # MEASURED on the released 0.9.32, which is what `install.sh` serves today: it writes two of
+            # the four teardown bytes, so `workload_signal` is None, and a cell that SEGFAULTED and a cell
+            # whose syscall the seccomp filter refused both landed here and were told "an external kill",
+            # which is false for both. The verdict cannot improve without the byte; the sentence can say
+            # so, which is the difference between a bound and a lie. Same discipline as the `oom` verdict:
+            # a right verdict with a false sentence is a defect.
+            if kern_wrote_payload and workload_signal is None:
+                return (
+                    "killed",
+                    "the kernel box was killed and the kernel reported no OOM against its memory cap. "
+                    "THIS kern does not report which signal ended the box (it writes 2 of the 4 teardown "
+                    "bytes), so an external kill, a crash in your own code and a syscall the sandbox "
+                    "refused are indistinguishable from here: a newer kern separates them, and until "
+                    "then read the box's stderr before concluding it was killed from outside",
+                    rc,
+                )
             return (
                 "killed",
                 "the kernel box was killed and the kernel reported no OOM against its memory cap: an "
