@@ -151,6 +151,23 @@ def _env_cap(name: str, default: int) -> int | None:
         return None
     return _env_int(name, default)
 
+# THE ONE CLAIM A MODEL ACTS ON, so there is exactly one of it and it follows the mode this server is
+# actually running in. It used to be a sentence in the base description ("in-memory state does not persist
+# (each call is a fresh box)") with the kernel note APPENDED after it, so in kernel mode the description
+# said both, and the FALSE one came first. A model reading "each call is a fresh box ... state PERSISTS"
+# resolves the contradiction however it likes, which is the thing tool descriptions exist to prevent.
+_STATE_FRESH = (
+    "In-memory state does NOT persist: each call is a fresh box, so re-import and re-define what you "
+    "need, or write it to a file."
+)
+_STATE_RESIDENT = (
+    "In-memory state PERSISTS across calls in this session (variables and imports stay), because this "
+    "server runs one warm interpreter; a call that is killed (OOM, timeout) ends it and the next call "
+    "starts a fresh one, which the reply says when it happens."
+)
+_STATE_SENTENCE_PLACEHOLDER = _STATE_FRESH
+
+
 _TOOLS = [
     {
         "name": "run_code",
@@ -159,8 +176,9 @@ _TOOLS = [
             "the user's own machine and return stdout/stderr plus any rich results. A matplotlib figure, "
             "the last bare expression, and every display() call are captured; charts come back as "
             "images you can see. The network is OFF and a mandatory timeout applies. FILE state in the "
-            "workspace persists across calls (write a file, read it next call); in-memory state does "
-            "not (each call is a fresh box). Use this to compute, analyze data, plot, or test code."
+            "workspace persists across calls (write a file, read it next call). "
+            + _STATE_SENTENCE_PLACEHOLDER +
+            " Use this to compute, analyze data, plot, or test code."
         ),
         "inputSchema": {
             "type": "object",
@@ -427,10 +445,10 @@ class _Server:
             if t.get("name") != "run_code":
                 continue
             if self._use_kernel:
-                t["description"] += (
-                    " NOTE: this server runs a persistent WARM interpreter, so Python in-memory state"
-                    " (variables, imports) PERSISTS across run_code calls within this session."
-                )
+                # REPLACED, not appended: two claims about the same fact is a contradiction the model
+                # has to guess its way out of.
+                assert _STATE_FRESH in t["description"], "the state sentence moved; the swap below is stale"
+                t["description"] = t["description"].replace(_STATE_FRESH, _STATE_RESIDENT, 1)
             lang = t["inputSchema"]["properties"]["language"]
             # Only the DEFAULT image's contents are a fact we hold. For any other image, say which one
             # it is and stop: guessing its interpreters from the tag would be inventing a measurement.

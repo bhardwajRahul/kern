@@ -236,14 +236,29 @@ def test_arg_spec_matches_the_advertised_required_list():
         assert required == set(M._ARG_SPEC[t["name"]]), t["name"]
 
 
-def test_warm_kernel_mode_tells_the_client_state_persists(monkeypatch):
-    """In kernel mode python state PERSISTS, which contradicts the default description. A model told
-    "each call is a fresh box" would re-import and re-load data every cell."""
+def test_the_description_makes_ONE_claim_about_state_and_it_follows_the_mode(monkeypatch):
+    """A model told "each call is a fresh box" re-imports and re-loads data every cell; told the opposite
+    when it is not true, it reads variables that are gone. So there is exactly one such sentence.
+
+    THIS TEST USED TO ASSERT ONLY THE ADDITION ("PERSISTS" present in warm mode, absent in plain), and it
+    passed while the kernel-mode description said BOTH: the fresh-box sentence, then the persistent note
+    appended after it. MEASURED through `tools/list` at the time: 681 characters carrying two
+    contradictory claims about the same fact, the false one first. Asserting what a text ADDS is not the
+    same as asserting what it SAYS.
+    """
     plain = _one(_server(), _req("tools/list"), monkeypatch)["result"]["tools"]
     warm = _one(_server(KERN_MCP_KERNEL="1"), _req("tools/list"), monkeypatch)["result"]["tools"]
     p = next(t for t in plain if t["name"] == "run_code")["description"]
     w = next(t for t in warm if t["name"] == "run_code")["description"]
-    assert "PERSISTS" in w and "PERSISTS" not in p
+    assert M._STATE_FRESH in p and M._STATE_RESIDENT not in p
+    assert M._STATE_RESIDENT in w and M._STATE_FRESH not in w, "the swap must REPLACE, not append"
+    # Neither mode may carry the other's key phrase by any other route, which is what a reader collides
+    # with even if the exact sentences drift apart.
+    assert "does NOT persist" not in w and "fresh box" not in w
+    assert "PERSISTS across calls" not in p
+    # And the file half of the contract is the same in both, because it does not depend on the mode.
+    for d in (p, w):
+        assert "FILE state in the workspace persists across calls" in d
 
 
 def test_the_language_enum_says_which_image_it_is_talking_about(monkeypatch):

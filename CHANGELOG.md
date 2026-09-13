@@ -7,6 +7,34 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**In kernel mode the MCP tool description said both things about state, and the false one came first.**
+`KERN_MCP_KERNEL=1` routes every `run_code` through one warm interpreter, so in-memory state persists.
+The description was built by APPENDING that note to a base sentence which said the opposite: measured
+through `tools/list`, 681 characters carrying "in-memory state does not persist (each call is a fresh
+box)" and then "in-memory state ... PERSISTS across run_code calls". A tool description exists to stop a
+model guessing, and that one made it guess. The two sentences are now spelled once each and the mode
+picks one, the swap replaces rather than appends, and the prose in `docs/MCP.md` that repeated the
+fresh-box claim unconditionally says which mode it is about.
+
+The test that was supposed to cover this asserted only what kernel mode ADDS ("PERSISTS" present in warm,
+absent in plain), which is why it passed for as long as the contradiction existed. It now asserts what
+each mode SAYS, both directions, and goes red when the append comes back.
+
+**Six MCP questions measured and written into `docs/MCP.md`, none of which needed a code change.** The
+server's environment does not reach the box: with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`OPENAI_API_KEY` and `GITHUB_TOKEN` in the server process, a cell dumping its own environment saw ten
+variables, all from the image plus `MPLCONFIGDIR` and `PYTHONPATH`, and none of the four; there is no knob
+for passing any in either. There is no mount knob at all, so the workspace is the only host path in a box.
+Concurrent calls are serialised: three one-second `run_code` calls written back-to-back returned in 3.0 s,
+one reply per id, each seeing the previous one's files. Two clients get two workspaces (different inodes,
+neither able to read the other's file), both removed at exit, with no scaffolding accumulation across 12
+calls. `KERN_MCP_QUIET`, which is on by default, leaves the verdict alone: an OOM still came back
+`isError: true` with the same `[exit 137, sandbox fault: oom: ...]` line as with quiet off. And
+`KERN_MCP_SETUP` is paid once, at server start: 1294 ms on the first call that imported the package, 120 ms
+on the second.
+
+kern-sandbox **0.2.10** on PyPI (the Node package is unchanged: the MCP server ships in the Python one).
+
 **The mount refusal list was absolute paths, so it refused `$HOME` and allowed `$HOME/.ssh`.** MEASURED:
 a box opened with `mounts={"~/.ssh": "/x"}` listed `id_ed25519` and `authorized_keys` from inside. `/`,
 `/etc`, `/root`, `/proc`, `/sys`, `/dev`, the docker socket and the home directory ITSELF were all
