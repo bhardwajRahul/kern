@@ -2244,3 +2244,22 @@ test("a write lands inside the workspace even while a component is being swapped
     else process.env.KERN_BIN = prev;
   }
 });
+
+test("a two-byte kern is told apart from an external kill in the SENTENCE", () => {
+  // The binary `install.sh` serves today writes 2 of the 4 teardown bytes. MEASURED against the released
+  // 0.9.32 with this SDK: a cell that SEGFAULTED and a cell whose syscall the seccomp filter refused both
+  // came back `killed` with "an external kill (`kern stop`, a signal, or the host's own OOM killer)". The
+  // verdict cannot improve without the signal byte; that sentence was false for both, and a caller
+  // reading it goes looking for who killed their box. The fallback names the bound now.
+  const k = new kern.Kernel(new Sandbox({ memoryMb: 256 }), 5);
+  const [kind, msg] = k._kernelDeathFault("", 0, null, true, null); // payload written, no signal byte
+  assert.strictEqual(kind, "killed", "the verdict is the best this binary supports");
+  assert.match(msg, /2 of the 4 teardown bytes/);
+  assert.match(msg, /indistinguishable/);
+  assert.match(msg, /a newer kern separates them/);
+  assert.ok(!/not the box exceeding its own memory/.test(msg), "the old assertion must be gone");
+  // A FOUR-BYTE KERN THAT REPORTS AN ACTUAL KILL keeps the specific sentence: the byte earns it.
+  const [kind2, msg2] = k._kernelDeathFault("", 0, null, true, 9);
+  assert.strictEqual(kind2, "killed");
+  assert.ok(!/teardown bytes/.test(msg2), msg2);
+});

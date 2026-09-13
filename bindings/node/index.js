@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.12";
+const VERSION = "0.2.13";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -2812,12 +2812,28 @@ class Kernel {
         "the kernel box was killed, and its memory cap was not enforced here (no cgroup delegation), so no memory limit was in force to attribute it to",
         rc,
       ];
-    if (this._sbx.memoryMb !== null)
+    if (this._sbx.memoryMb !== null) {
+      // A BINARY THAT DOES NOT REPORT THE SIGNAL CANNOT HAVE THIS SENTENCE PUT IN ITS MOUTH. MEASURED on
+      // the released 0.9.32, which is what `install.sh` serves today: it writes two of the four teardown
+      // bytes, so `workloadSignal` is null, and a cell that SEGFAULTED and a cell whose syscall the
+      // seccomp filter refused both landed here and were told "an external kill", which is false for
+      // both. The verdict cannot improve without the byte; the sentence can say so.
+      if (kernWrotePayload && workloadSignal === null)
+        return [
+          "killed",
+          "the kernel box was killed and the kernel reported no OOM against its memory cap. THIS kern " +
+            "does not report which signal ended the box (it writes 2 of the 4 teardown bytes), so an " +
+            "external kill, a crash in your own code and a syscall the sandbox refused are " +
+            "indistinguishable from here: a newer kern separates them, and until then read the box's " +
+            "stderr before concluding it was killed from outside",
+          rc,
+        ];
       return [
         "killed",
         "the kernel box was killed and the kernel reported no OOM against its memory cap: an external kill (`kern stop`, a signal, or the host running out of memory), not the box exceeding its own memory",
         rc,
       ];
+    }
     return ["killed", "the kernel box exited", rc];
   }
 

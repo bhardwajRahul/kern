@@ -55,7 +55,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
   under a credential directory is also refused BEFORE it is created, rather than after.
 
-- Published 0.2.0 through 0.2.12 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
+- Published 0.2.0 through 0.2.13 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
   changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
   that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
   `KERN_BIN` that is not kern raises instead of reporting success.
@@ -81,6 +81,15 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - Both `SANDBOX-NOTES.md` pages carry what a box does that surprises people: the workspace is not
   capped, `df` and `nproc` report the host, a fault ends a `kernel()`, `network=True` shares the host's
   loopback, an image pinned by digest is reproducible and a tag is not.
+
+- **On the binary `install.sh` serves today, the fallback sentence asserted something it could not know.**
+  0.9.32 writes 2 of the 4 teardown bytes, so a resident `kernel()` cell that SEGFAULTED and one whose
+  syscall the seccomp filter refused both came back `killed` with "an external kill (`kern stop`, a
+  signal, or the host running out of memory)", which is false for both. The verdict cannot improve
+  without the byte; the sentence now names the bound and says a newer kern separates the three. The
+  taxonomy battery skips those two cases on a two-byte binary with the evidence, instead of failing an
+  SDK that has nothing to decide from: measured, the released pair is 20 ok / 0 failed / 5 skipped and a
+  current binary stays 27 / 0 / 0.
 
 ### MCP server (`kern-mcp`)
 
@@ -122,7 +131,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1323 Rust, 501 Python and 106 Node tests, and the count is gated against the README.
+- 1323 Rust, 502 Python and 107 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 
