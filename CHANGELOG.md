@@ -37,6 +37,10 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   `deploy.replicas`/`mode`/`placement`/`update_config`/`rollback_config`/`endpoint_mode`,
   `deploy.restart_policy`, and `deploy.resources.reservations` - a GPU request now says the service
   runs WITHOUT the device and where a device comes from.
+- A dependency that never becomes healthy fails in a second naming the box, and the error now carries its
+  own repair (`kern logs <box>`, and the three `healthcheck:` fields to look at). Without one it was
+  getting the generic "a stack is a docker-compose.yml or a kern TOML" pointer: advice about writing the
+  file, under a failure that had nothing to do with the file.
 - Teardown stops dependents before dependencies and waits; an init that ignores the stop signal gets
   its grace; `down` stops a stack's NATs; a refused first service leaves no empty pod; a pod holder
   stops holding when its pod stops existing.
@@ -135,7 +139,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1324 Rust, 502 Python and 107 Node tests, and the count is gated against the README.
+- 1325 Rust, 502 Python and 107 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 
