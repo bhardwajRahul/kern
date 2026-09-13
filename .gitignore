@@ -65,12 +65,17 @@ win-key*
 *.ots.bak
 *.bak
 
-# Debris the examples leave in their own directory when you run them: `try-any-distro.sh` extracts a
-# rootfs beside itself and `media-transcode.sh` writes its output clip. Both are build products of a
-# demo, not sources, and the rootfs is 8.7 MB - big enough that an accidental `git add -A` is worth
-# preventing rather than noticing in review.
-examples/*/
-!examples/*.sh
+# `examples/*/` USED TO BE HERE and it has to go, because the examples themselves live in folders
+# since 2026-09-13. It was written when `examples/` was flat, so any subdirectory there was debris by
+# definition: `try-any-distro.sh` extracted a rootfs beside itself and `media-transcode.sh` wrote its
+# clip. Neither is true any more - today's examples extract into `mktemp` dirs - and the rule had
+# started swallowing the library instead: MEASURED, `examples/compose/docker-compose-file.sh` was
+# written, tested end to end, `git add examples/` skipped it in silence, and the commit that claimed to
+# add it described a file it did not contain. `git mv` hid the problem, because moving a TRACKED file
+# works regardless of this file.
+#
+# What remains is named. If an example starts leaving something new behind it shows up in
+# `git status`, which is the visible failure rather than the silent one.
 examples/clip.mp4
 
 # Output of examples/edge/media-transcode.sh: the example regenerates it, so a committed copy is
