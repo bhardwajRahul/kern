@@ -7,6 +7,22 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Two more of the simulated readers' cases, measured; one was a gap in the pages, not in the code.**
+Case 6 asked whether `fault` is STABLE, since a verdict that is right most of the time breaks a product
+quietly: 15 repetitions each of oom, timeout, a segfault and a clean run gave one verdict and one exit
+code per shape, 60 for 60, and 48 calls alternating a fault with clean work in one session gave 0 wrong
+verdicts while the workspace accumulated exactly the 8 lines the clean cells wrote. No contamination
+between consecutive boxes.
+
+Case 9, a plugin filling the workspace, found nothing to fix in the runtime and a real hole in the
+notes. `/tmp` and `/dev/shm` are documented down to the byte; the workspace, which is where an agent
+actually writes, was documented nowhere as unbounded. Measured under `memory_mb=128`: a 400 MiB file
+lands with `exit_code 0, fault=None`, and `df` inside the box reports the HOST's 110 GiB free, so a job
+that preflights its own output size is told yes. With the default workspace that is temporary (a temp
+directory removed on close); with `workspace=` a 300 MiB file stays and the host's free space drops by
+300 MiB. Both binding note pages now say so, and say the bound has to come from the filesystem you point
+the workspace at, because no option here provides one.
+
 **A kernel that a cell killed told the next cell the wrong cause, and told a model nothing at all.**
 Use case 7 of the simulated readers, the shape that breaks a product quietly: a session that survives a
 fault but has lost its state. Measured on both bindings with a 128 MiB cap. Cell A sets `x = 41` and

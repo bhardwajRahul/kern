@@ -60,6 +60,19 @@ is read-only, so a package manager cannot run at all: `apk add git` answers `ERR
 database: Read-only file system`, and `apt-get install` fails the same way. If the job needs `git`,
 `make` or a compiler, that is a choice of `image=`, not something `setup=` can add.
 
+**Nothing bounds the WORKSPACE, and `df` inside the box agrees with the host.** `memory_mb` bounds RAM
+and the tmpfs mounts that are charged to it; the workspace is a host directory and is charged to your
+disk. Measured under `memory_mb=128`: a cell writing a 400 MiB file to the workspace returns
+`exit_code 0, fault=None` (`track_files` reports `fat.bin`), and `shutil.disk_usage("/workspace").free`
+inside the box reports **110 GiB**, which is the host's free space, so a job that preflights its own
+output size is told yes. With the default workspace the damage is temporary, since it is a temp
+directory removed when the `Sandbox` closes. With `workspace=` it is not: measured, a 300 MiB file is
+still there after close and the host's free space dropped by 300 MiB. No option here caps it, and
+`max_output_bytes`/`timeout_s` do not help, so bound it outside the box: a workspace on a filesystem you
+size (a quota, an LVM volume, a sized tmpfs you mount there yourself), and check what the last run left
+before starting the next. This is the same shape as `nproc` and `df` reporting the host under a `cpus`
+cap, one page down: the numbers a box reads describe the machine, not the box.
+
 **`max_output_bytes` limits what you RECEIVE, not what the job costs.** Measured: past the cap the
 output is discarded and the process keeps running to the end, so a marker file written after the noisy
 part is there and `exit_code` is 0 with `truncated=True`. A runaway producer therefore runs until
