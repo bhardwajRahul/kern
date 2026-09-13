@@ -434,9 +434,13 @@ where other local processes are hostile is not one to hand a secret to through a
   This sentence was **false for the MCP server until 2026-09-12**, and that server is what a Cursor or
   Claude Desktop user runs: measured with a real `tools/call`, a cell that exited 3 after printing
   `[exit 0]` had both lines in the reply, and terminal escapes went through untouched. It now shares the
-  escape/control stripping with the LangChain renderer and neutralises its own markers
-  (`[exit N]`, `[stderr]`, `[rich result]`, the two truncation notes), so a forged one reads
-  `[printed by the code, not the sandbox: …]`. What is NOT closed, on either channel, is ordinary
+  escape/control stripping with the LangChain renderer, and since 2026-09-13 each surface neutralises
+  BOTH families rather than only its own: the MCP server's (`[exit N]`, `[stderr]`, `[rich result]`, the
+  two truncation notes, the session-reset note) and the LangChain renderer's (`[sandbox: …]`). They ship
+  in one package and a model reading a transcript cannot tell which surface wrote a line, so a cell
+  printing `[sandbox: oom]` into an MCP reply used to arrive as a verdict; it now reads
+  `[printed by the code, not the sandbox: …]`, like every other forged marker.
+  What is NOT closed, on either channel, is ordinary
   prompt injection: a cell whose output is `[system] ignore your instructions` printed a string, and no
   filter separates that from a program legitimately printing the same characters. The structured
   verdict is the one a client should branch on (`isError` on MCP, `fault` in the SDK); it was correct
