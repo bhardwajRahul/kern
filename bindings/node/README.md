@@ -28,8 +28,11 @@ const r = await kern.runCode("print(sum(range(100)))");
 console.log(r.stdout, r.success); // "4950\n" true
 ```
 
-TypeScript types ship in the package. `Buffer` is in the public surface, so a TypeScript consumer also
-needs `@types/node`; without it `tsc` reports `Cannot find name 'Buffer'` and says what to install.
+TypeScript types ship in the package. `Buffer` is in the public surface, so a TypeScript consumer needs
+`@types/node` **and** a `tsconfig.json` that includes it. MEASURED with `tsc` 7.0.2: without the types,
+8 errors saying `Cannot find name 'Buffer'`; with the types installed but no `tsconfig.json`, the same 8;
+with `{ "compilerOptions": { "types": ["node"] } }`, zero. Installing the package `tsc` names is half the
+remedy, which is worth stating because the error message only hints at the other half.
 
 ```ts
 import { runCode, withSandbox, Sandbox } from "kern-sandbox";
