@@ -47,6 +47,14 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 
 ### Sandbox SDKs (`kern-sandbox`, Python and Node)
 
+- A clean-code and security pass over the above closed four more holes: the session-reset and truncation
+  notes were forgeable through the LangChain renderer (every frame is one list in the core now, and both
+  surfaces recognise all of it), the LangChain shell policy built a `-v` that skipped the mount validator
+  (workspace and `extra_box_args` both go through it), Node's `writeFile` opened its leaf by path after an
+  `lstat` pre-check and now opens it through a pinned parent fd with the same `/proc/self/fd` backstop
+  `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
+  under a credential directory is also refused BEFORE it is created, rather than after.
+
 - Published 0.2.0 through 0.2.11 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
   changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
   that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
@@ -104,7 +112,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1322 Rust, 499 Python and 105 Node tests, and the count is gated against the README.
+- 1323 Rust, 501 Python and 106 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 

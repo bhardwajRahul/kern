@@ -638,16 +638,56 @@ _ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates th
 # LangChain tool, the MCP server, and any caller building its own prompt) and a copy per renderer is
 # how one of them ends up without it: MEASURED on 2026-09-12, `SECURITY.md` claimed the MCP server
 # stripped these and its own framing, the LangChain renderer did both, and the MCP server did neither.
-# THE FRAMING BOTH AGENT SURFACES EMIT, spelled here ONCE because each of them has to neutralise BOTH.
-# Measured on 2026-09-13 with a release checklist: a cell that printed `[sandbox: oom]` (the LangChain
-# renderer's verdict marker) came back untouched through the MCP server, which neutralises only its own
-# `[exit N]`/`[stderr]` family; the reverse hole is the same size. A model does not know which surface it
-# is reading, and both families are documented as OURS in this one package, so either one forged in either
-# place is a verdict about the sandbox written by the code the sandbox was running.
+# THE FRAMING BOTH AGENT SURFACES EMIT, spelled here ONCE because each of them has to neutralise ALL of
+# it. Measured on 2026-09-13 with a release checklist: a cell that printed `[sandbox: oom]` (the LangChain
+# renderer's verdict marker) came back untouched through the MCP server, which neutralised only its own
+# `[exit N]`/`[stderr]` family. Sharing four of them left the same hole two markers wide: the LangChain
+# renderer still let through the MCP server's TRUNCATION note and its session-RESET note, and both are
+# claims about the sandbox (one about completeness, one about the session) that a cell could then make
+# about itself. A model does not know which surface it is reading, and both families are documented as
+# OURS in this one package, so the list is one list and each surface neutralises every entry.
 _FRAME_LC_FAULT = "[sandbox: "        # langchain: `[sandbox: oom]`
 _FRAME_MCP_EXIT = "[exit "            # mcp: `[exit 137, sandbox fault: ...]`
 _FRAME_MCP_STDERR = "[stderr]"
 _FRAME_MCP_RICH = "[rich result]"
+_FRAME_MCP_TRUNC = "[output truncated: reply-size cap]"
+_FRAME_MCP_RESET = "[the session's interpreter ended on that cell "
+_FRAME_MCP_IMG_TAIL = " image result(s) omitted: reply-size cap]"
+# The two truncation notices are INLINE rather than line-anchored, and each surface words its own; both
+# are in the shared list for the same reason as the rest.
+_FRAME_MCP_CLIP = ("...[truncated ", " chars]")
+_FRAME_LC_CUT = ("... ", " characters of output, cut to fit ...")
+
+# Line-anchored markers: at the START of a line is where the surface itself writes them, so an anchored
+# match is what tells "the frame" from a sentence that merely mentions it.
+_FRAME_LINE_MARKS = (
+    _FRAME_LC_FAULT,
+    _FRAME_MCP_EXIT,
+    _FRAME_MCP_STDERR,
+    _FRAME_MCP_RICH,
+    _FRAME_MCP_TRUNC,
+    _FRAME_MCP_RESET,
+)
+
+
+# TWO PATTERNS, not one, because the two surfaces neutralise these differently ON PURPOSE and the
+# difference is worth keeping: a line-anchored frame is LABELLED (the reader still sees what the code
+# printed), while a truncation notice is REPLACED, since leaving its words in place would leave the claim
+# about completeness standing. What is shared is the RECOGNITION: a marker added to either surface is
+# recognised by both from this one edit, which is what the reset note needed and did not have.
+_FORGED_LINE_FRAME = re.compile(
+    "|".join(
+        [*(r"^" + re.escape(m.rstrip()) for m in _FRAME_LINE_MARKS),
+         r"^\[\d+" + re.escape(_FRAME_MCP_IMG_TAIL)]
+    ),
+    re.MULTILINE,
+)
+_FORGED_CUT_NOTICE = re.compile(
+    "|".join(
+        [re.escape(_FRAME_MCP_CLIP[0]) + r"\d+" + re.escape(_FRAME_MCP_CLIP[1]),
+         re.escape(_FRAME_LC_CUT[0]) + r"\d+" + re.escape(_FRAME_LC_CUT[1])]
+    )
+)
 
 
 _ANSI_ESCAPES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
@@ -1192,7 +1232,7 @@ def _is_inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root + "/")
 
 
-def _kern_state_dirs() -> "list[tuple[str, str]]":
+def _kern_state_dirs() -> "dict[str, str]":
     """kern's OWN state on this host: (path, what it is). Refused as a mount source, like the docker
     socket and for the same reason.
 
@@ -1206,21 +1246,39 @@ def _kern_state_dirs() -> "list[tuple[str, str]]":
     `XDG_CACHE_HOME`, `HOME`) and a test or a service manager moves them.
     """
     uid = os.getuid()
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return [
-        (os.path.join(runtime, "kern"), "kern's runtime state (the registry, instance dirs, netns handles "
-                                        "and exit files of every box you are running)"),
-        (f"/run/user/{uid}/kern", "kern's runtime state"),
-        (os.path.join(cache, "kern"), "kern's image cache (a box that writes it poisons the rootfs a later "
-                                      "box runs)"),
-        (os.path.join(config, "kern"), "kern's configuration (the profiles a later box may be given)"),
-    ]
+    home = os.path.expanduser("~")
+    default_runtime = f"/run/user/{uid}"
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or default_runtime
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    what_runtime = ("kern's runtime state (the registry, instance dirs, netns handles and exit files of "
+                    "every box you are running)")
+    # A DICT, so the usual case where `XDG_RUNTIME_DIR` IS `/run/user/<uid>` collapses to one entry
+    # instead of listing the same directory twice with two different accounts of what it is.
+    return {
+        os.path.join(runtime, "kern"): what_runtime,
+        os.path.join(default_runtime, "kern"): what_runtime,
+        os.path.join(cache, "kern"): "kern's image cache (a box that writes it poisons the rootfs a later "
+                                     "box runs)",
+        os.path.join(config, "kern"): "kern's configuration (the profiles a later box may be given)",
+    }
 
 
-def _validate_mount(source: str, target: str) -> tuple[str, str]:
-    """Validate one host->box mount; refuse unsafe sources/targets. Returns (abs_real_source, target)."""
+def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
+    """Validate one host->box mount; refuse unsafe sources/targets. Returns (abs_real_source, target).
+
+    TWO HALVES, and callers exist for each. Everything except the last line is LEXICAL: it needs the
+    strings and the environment, not the filesystem. The existence check needs a directory that is
+    already there. Splitting them is not tidiness:
+
+    * `Sandbox(workspace=...)` CREATES the workspace before mounting it, so the whole check used to run
+      after the mkdir, which meant `workspace="~/.aws/ws"` created a directory under a credential
+      directory and THEN refused the mount.
+    * the LangChain shell policy builds its `-v` for a session directory whose lifetime it does not own,
+      and its argv tests pass paths that never exist on disk.
+
+    Both call `_validate_mount_lexical` and let the existence question belong to whoever owns the path.
+    """
     # A NUL CANNOT REACH THE OS LAYER AS A ValueError. Every other refusal here is `MountRefused`,
     # which is a `SandboxError`, and a caller's `except SandboxError` is the documented way to handle
     # a bad mount. `os.path.realpath` on a string with an embedded NUL raises `ValueError` instead, so
@@ -1260,9 +1318,8 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
             f"refusing to mount the sensitive host path {real!r} into a sandbox "
             "(this would defeat the isolation)"
         )
-    for state, what in _kern_state_dirs():
-        sreal = os.path.realpath(state)
-        if real == sreal or real.startswith(sreal + os.sep):
+    for state, what in _kern_state_dirs().items():
+        if _is_inside(real, os.path.realpath(state)):
             raise MountRefused(
                 f"refusing to mount {real!r}: it is {what}. Mounting kern's own state into a box it "
                 f"started gives the code inside the sandbox's control plane, which is the same reason "
@@ -1275,6 +1332,11 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
                 f"read them. If the job needs one secret, write THAT FILE into the workspace "
                 f"(sbx.write_file) or mount a directory that holds only it"
             )
+    return real, target
+
+def _validate_mount(source: str, target: str) -> tuple[str, str]:
+    """`_validate_mount_lexical` plus the one question that needs the filesystem: does the source exist?"""
+    real, target = _validate_mount_lexical(source, target)
     if not Path(real).exists():
         raise MountRefused(f"mount source does not exist: {source!r}")
     return real, target
@@ -1793,9 +1855,13 @@ class Sandbox:
             self._own_ws = True
         else:
             # A caller-supplied workspace is host input → validate it like a mount source, and DON'T
-            # delete it on exit (its contents persist across sessions - documented). Create it FIRST so
-            # a fresh persistent path is usable on the first run: mkdir is a no-op on an existing
-            # sensitive source (e.g. /etc), which _validate_mount then still refuses.
+            # delete it on exit (its contents persist across sessions - documented).
+            #
+            # THE LEXICAL HALF RUNS BEFORE THE MKDIR, the existence half after. The mkdir is here so a
+            # fresh persistent path works on the first run, and it used to come first, which meant
+            # `workspace="~/.aws/ws"` CREATED a directory under a credential directory and only then
+            # refused to mount it. Nothing the lexical half asks needs the directory to be there.
+            _validate_mount_lexical(self.workspace, _WORKSPACE)
             Path(self.workspace).mkdir(parents=True, exist_ok=True)
             _validate_mount(self.workspace, _WORKSPACE)
             self._ws = os.path.realpath(self.workspace)
@@ -2609,8 +2675,15 @@ class Sandbox:
         with tarfile.open(src, "r:*") as tf:
             members = tf.getmembers()
             for m in members:
-                if m.name.startswith("/") or ".." in m.name.split("/"):
-                    raise SandboxError(f"unsafe path in snapshot: {m.name!r}")
+                # THE SAME RULE THE HOST-SIDE FILE CALLS USE, not a second copy of it. This loop used to
+                # test `m.name.startswith("/")` and `".." in m.name.split("/")` itself, which is the
+                # lexical half of `_ws_path` written in a second dialect: the day a rule is added to the
+                # chokepoint (the absolute-path refusal was one, on 2026-09-13), a tar would be the one
+                # input that arrives from outside this process and does not get it.
+                try:
+                    self._ws_path(m.name)
+                except SandboxError as e:
+                    raise SandboxError(f"unsafe path in snapshot: {m.name!r} ({e})") from e
                 if not (m.isreg() or m.isdir()):
                     raise SandboxError(f"unsafe member type in snapshot (only files/dirs): {m.name!r}")
                 resolved = os.path.realpath(os.path.join(base, m.name))
@@ -3957,6 +4030,22 @@ def _exec_failure_binary(stderr: str) -> "tuple[str, str] | None":
     return (m.group(1), m.group(2).strip()) if m else None
 
 
+# One row per errno the boundary produces, so the shared prefix is written once and the next one is a
+# row rather than a branch.
+_PATH_REFUSALS = {
+    errno.ELOOP: (
+        "a component of that path is a SYMLINK. Host-side reads and writes descend the workspace with "
+        "O_NOFOLLOW and never follow one, because a link planted inside the workspace is how a box "
+        "reaches a host file it was not given (the kernel reports this as ELOOP). Remove it, or name "
+        "the file you meant"
+    ),
+    errno.ENXIO: (
+        "it is a FIFO with no reader. Opening one for writing would block until the box chose to read, "
+        "so the open is non-blocking and fails instead"
+    ),
+}
+
+
 def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
     """The message for a host-side open that the workspace boundary refused.
 
@@ -3966,19 +4055,10 @@ def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
     reader looking for a broken link chain when what happened is an attempt to reach a host file. Whoever
     reads this (a person, a log, a red team) should be able to tell the two apart.
     """
-    if e.errno == errno.ELOOP:
-        return SandboxError(
-            f"refusing to {verb} {path!r}: a component of that path is a SYMLINK. Host-side reads and "
-            f"writes descend the workspace with O_NOFOLLOW and never follow one, because a link planted "
-            f"inside the workspace is how a box reaches a host file it was not given (the kernel reports "
-            f"this as ELOOP). Remove it, or name the file you meant"
-        )
-    if e.errno == errno.ENXIO:
-        return SandboxError(
-            f"refusing to {verb} {path!r}: it is a FIFO with no reader. Opening one for writing would "
-            f"block until the box chose to read, so the open is non-blocking and fails instead"
-        )
-    return SandboxError(f"cannot {verb} {path!r}: {e}")
+    why = _PATH_REFUSALS.get(e.errno)
+    if why is None:
+        return SandboxError(f"cannot {verb} {path!r}: {e}")
+    return SandboxError(f"refusing to {verb} {path!r}: {why}")
 
 
 def _looks_like_startup_failure(stderr: str) -> bool:

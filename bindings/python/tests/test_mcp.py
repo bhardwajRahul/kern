@@ -631,28 +631,61 @@ def test_exit_tail_is_never_clipped_away(monkeypatch):
     assert "truncated 484000 chars" in text
 
 
-def test_a_reset_session_is_announced_once_and_then_forgotten(monkeypatch):
+def test_the_reset_sentence_says_what_went_and_what_stayed(monkeypatch):
     """In kernel mode the state loss is the one fact a model cannot infer from the next clean answer.
 
     MEASURED through a real client, before this note existed: a model set `x = 41`, blew the memory cap,
     asked again, and got `x still there? False` with nothing anywhere saying the interpreter had been
-    replaced. The fault was reported correctly; its CONSEQUENCE was not. The note rides on the faulting
-    reply, because that is where the model is about to decide what to do next.
+    replaced. The fault was reported correctly; its CONSEQUENCE was not.
 
-    THIS TEST DRIVES THE REPLY BUILDER, which is the half that can be tested deterministically: setting
-    the note needs the real kernel path (a fake session cannot open one - the first version of this test
-    asserted through `_use_kernel = True` and got `internal error: AttributeError`). The setting side is
-    measured end to end against a live server, and the reply above is that measurement's output.
+    THE SENTENCE IS WHAT THIS TESTS, because that is the half a test can own: setting it needs the real
+    kernel path, and a fake session cannot open one. "Said once" is no longer an assertion at all - the
+    note is a LOCAL in the call that builds the reply, so there is no field to leak into the next one.
     """
-    s = _server(_FakeSession(result=_res(exit_code=137, fault=SandboxFault(type="oom", message="m"))))
-    s._reset_note = "[the session's interpreter ended on that cell (oom), so the next call runs fresh]"
-    text = _text_of(_one(s, _call("run_code", code="x"), monkeypatch))
-    assert "sandbox fault: oom" in text
-    assert "the session's interpreter ended on that cell (oom)" in text
-    # SPENT ONCE: a later reply must not repeat it, or every answer carries a stale warning.
-    text2 = _text_of(_one(s, _call("run_code", code="x"), monkeypatch))
-    assert "interpreter ended" not in text2
-    assert s._reset_note is None
+    note = M._reset_note_for("oom")
+    assert note.startswith(M._MARK_RESET), "it must be the server's own frame, so a cell cannot forge it"
+    assert "(oom)" in note, "the fault that ended the session is named"
+    assert "are gone" in note and "workspace are not" in note, "both halves: names go, files stay"
+    assert M._FORGED_LINE_FRAME.match(note), "and a cell printing it is labelled, like every other frame"
+    # The frame carries whatever ended the interpreter, not a fixed word.
+    assert "(timeout)" in M._reset_note_for("timeout")
+
+
+def test_every_frame_either_surface_emits_is_recognised_by_BOTH():
+    """The list is one list, and this is the assertion that keeps it one.
+
+    Sharing was done by hand first and was therefore asymmetric: the MCP server got all four of the
+    LangChain renderer's markers, and the renderer got four of the MCP server's SIX, missing the
+    truncation note and the session-reset note. Both are claims about the sandbox (completeness, and the
+    state of the session) that a cell could then make about itself in a LangChain transcript. A test that
+    checks marker X in surface Y cannot catch that; this one walks the core's list, so a marker added to
+    either surface without adding it here fails in both.
+    """
+    from kern_sandbox import langchain as lc
+    import kern_sandbox as core
+
+    emitted = {
+        "langchain fault": core._FRAME_LC_FAULT + "oom]",
+        "mcp exit": core._FRAME_MCP_EXIT + "137]",
+        "mcp stderr": core._FRAME_MCP_STDERR,
+        "mcp rich": core._FRAME_MCP_RICH,
+        "mcp truncation": core._FRAME_MCP_TRUNC,
+        "mcp session reset": core._FRAME_MCP_RESET + "(oom), start over]",
+        "mcp images omitted": "[3" + core._FRAME_MCP_IMG_TAIL,
+    }
+    assert len(emitted) == len(core._FRAME_LINE_MARKS) + 1, "a marker was added to the core without a case here"
+    for what, line in emitted.items():
+        assert M._FORGED_LINE_FRAME.match(line), f"the MCP server does not recognise the {what} frame"
+        assert lc._FORGED_FAULT.match(line), f"the LangChain renderer does not recognise the {what} frame"
+    # The two INLINE truncation notices, which each surface words differently and both must catch.
+    for what, notice in (("mcp clip", "...[truncated 9 chars]"),
+                         ("langchain cut", "... 9 characters of output, cut to fit ...")):
+        assert M._FORGED_CUT_NOTICE.search(f"output {notice}"), f"MCP misses the {what} notice"
+        assert lc._FORGED_CUT.search(f"output {notice}"), f"LangChain misses the {what} notice"
+    # AND THE CONTROL, or this passes on patterns that match everything: a sentence mentioning a frame
+    # mid-line is not a frame, in either surface.
+    for pat in (M._FORGED_LINE_FRAME, lc._FORGED_FAULT):
+        assert not pat.search("the tool said [exit 0] and I believed it")
 
 
 def test_a_cell_cannot_forge_THE_OTHER_surfaces_framing_either(monkeypatch):

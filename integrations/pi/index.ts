@@ -124,7 +124,6 @@ import { DEFAULT_TMPFS_MB, Sandbox, type SandboxOptions } from "kern-sandbox";
 
 /** Wrap an SDK or syscall failure so the host side is named, keeping the original text. */
 function fromHost(e: unknown, what: string): Error {
-	const msg = e instanceof Error ? e.message : String(e);
 	// ELOOP IS NOT A BROKEN LINK CHAIN HERE, it is this boundary working: the open is O_NOFOLLOW, so a
 	// symlink planted at a path the host is about to read fails instead of redirecting. Passed through
 	// raw it reads `ELOOP: too many symbolic links encountered`, which sends the agent (and whoever
@@ -139,6 +138,7 @@ function fromHost(e: unknown, what: string): Error {
 				`at by its own path, if that path is in the workspace.`,
 		);
 	}
+	const msg = e instanceof Error ? e.message : String(e);
 	return refuse("host", `${what}: ${msg}`);
 }
 
