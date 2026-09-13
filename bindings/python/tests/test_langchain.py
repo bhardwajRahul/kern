@@ -1433,6 +1433,7 @@ class TestTheAliasesCannotWeakenWhatTheyTranslate:
             self._policy(memory_mb=0)
 
 
+@needs_shell
 def test_the_shell_policys_mount_goes_through_the_SAME_validator_as_every_other():
     """The one `-v` in this package that did not pass a validator, found by an altitude review.
 
