@@ -156,8 +156,11 @@ Every relaxing option says so in its name or docs:
 - **output bounded**: `maxOutputBytes` (64 MiB each) so a flooding box cannot exhaust host RAM.
 - **env off argv**: workload env is written to a private `0600` file, never `--env K=V` on the command
   line, so a credential in `env` does not leak into `ps`.
-- **mounts refused**: sensitive host sources (`/`, `/etc`, `/root`, `/proc`, `/sys`, `/dev`, the docker
-  socket, `$HOME`) and escaping targets are refused even when asked.
+- **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
+  `$HOME`, the docker socket), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
+  `.kube`, `.docker`, `.azure`, `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`),
+  **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir: the sandbox's control
+  plane), and escaping targets.
 - **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes, open the final component
   `O_NOFOLLOW` so a symlink the box plants cannot redirect host I/O, and refuse anything that is not a
   REGULAR file (see the notes for the FIFO that made a read hang).
