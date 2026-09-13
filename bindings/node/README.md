@@ -216,6 +216,14 @@ cannot exfiltrate elsewhere. Mutually exclusive with `network: true`. The `setup
 network to install dependencies; the allowlist governs the run phase, which is the one executing code
 you did not read.
 
+It is a **route-level** boundary, not proxy variables a program can ignore. Measured inside the box: a
+raw socket to an IP returns `ENETUNREACH`, DNS does not resolve, and a request to a domain outside the
+list is refused by the tunnel with `403`, while the same socket under `network: true` connects. The other
+edge of that: a client which does not speak to an HTTP proxy has no path out at all, so a Postgres, MySQL
+or Redis connection under `egressAllow` cannot resolve its host. For a database, the setting today is
+`network: true`.
+
+
 `kernel()` returns a `Kernel`, and a refused mount throws `MountRefused` rather than the generic
 `SandboxError`, so a caller can tell "this sandbox will not do that" from "the sandbox broke".
 `DEFAULT_TMPFS_MB` and `version` are exported for callers that assert on them.

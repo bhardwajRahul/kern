@@ -2004,3 +2004,104 @@ test("a dead kernel names what ended it and what survived", async () => {
   k4._teardownResult(null, "the code crashed", Date.now());
   assert.strictEqual(k4._death, "the code crashed");
 });
+
+test("an absolute path is refused, not reinterpreted as a workspace path", async () => {
+  // THE DEFECT THIS PINS, measured through a real box before the fix: `readFile("/etc/passwd")` returned
+  // "WORKSPACE DECOY", the content of a file the BOX had planted at the relative path `etc/passwd`, and
+  // `writeFile("/etc/passwd")` wrote into it. The Python binding refused the same call. Both were the
+  // same three lines, and the difference is in the primitive: `path.join(base, "/etc/passwd")` keeps the
+  // base while Python's `os.path.join` drops it. So neither behaviour had been DECIDED.
+  //
+  // The workspace boundary held either way, which is why this is easy to miss: no host file was read.
+  // What came back was a DIFFERENT FILE'S CONTENTS than the path asked for, and a caller who passes a
+  // host path (an agent framework composing one, a red team asserting the refusal) is told yes.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  const ws = path.join(os.tmpdir(), "kt-abs-" + Math.random().toString(36).slice(2));
+  fs.mkdirSync(ws);
+  try {
+    const s = new Sandbox({ workspace: ws });
+    await s.open();
+    try {
+      fs.mkdirSync(path.join(ws, "etc"));
+      fs.writeFileSync(path.join(ws, "etc", "passwd"), "DECOY"); // what the box would plant
+      for (const [what, fn] of [
+        ["readFile", () => s.readFile("/etc/passwd")],
+        ["writeFile", () => s.writeFile("/etc/passwd", "x")],
+      ]) {
+        await assert.rejects(fn, (e) => {
+          assert.ok(e instanceof SandboxError, what);
+          assert.match(e.message, /is absolute/);
+          assert.match(e.message, /RELATIVE to the workspace/);
+          return true;
+        }, `${what} must refuse an absolute path`);
+      }
+      // THE REFUSAL CAME BEFORE ANY I/O: the decoy is untouched, and the relative path still works.
+      assert.strictEqual(fs.readFileSync(path.join(ws, "etc", "passwd"), "utf8"), "DECOY");
+      assert.strictEqual((await s.readFile("etc/passwd")).toString(), "DECOY");
+      // AND A CONTROL, or this passes on a resolver that refuses everything.
+      await s.writeFile("ok.txt", "fine");
+      assert.strictEqual((await s.readFile("ok.txt")).toString(), "fine");
+    } finally {
+      await s.close();
+    }
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("a symlink the box planted is refused by NAME, not by a raw ELOOP", async () => {
+  // The refusal was always correct; the sentence was `ELOOP: too many symbolic links encountered`, which
+  // reads as a broken link chain. It is the opposite: the boundary refused to follow a link planted at a
+  // path the host was about to touch, which is an attempt to reach a host file and worth recognising in
+  // a log. Same reasoning as every other message in this binding: name what happened.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  const ws = path.join(os.tmpdir(), "kt-link-" + Math.random().toString(36).slice(2));
+  fs.mkdirSync(ws);
+  try {
+    const s = new Sandbox({ workspace: ws });
+    await s.open();
+    try {
+      fs.symlinkSync("/etc/passwd", path.join(ws, "planted"));
+      for (const [what, fn] of [
+        ["readFile", () => s.readFile("planted")],
+        ["writeFile", () => s.writeFile("planted", "x")],
+      ]) {
+        await assert.rejects(fn, (e) => {
+          assert.match(e.message, /is a SYMLINK/, what);
+          assert.match(e.message, /ELOOP/, "the errno stays, as the detail rather than the whole message");
+          return true;
+        });
+      }
+      // AND THE HOST FILE IS UNTOUCHED, which is the property the message describes.
+      assert.ok(fs.readFileSync("/etc/passwd", "utf8").length > 0);
+      assert.strictEqual(fs.readlinkSync(path.join(ws, "planted")), "/etc/passwd");
+    } finally {
+      await s.close();
+    }
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("setup refuses the shape a reader guesses first", () => {
+  // `setup` is one shell command; a list of package names is what a first-time reader writes. Without
+  // the guard it reached `_runSetup` and died as `TypeError: cmd.trim is not a function` at open(),
+  // an internal error where a sentence belongs, pointing at the wrong line.
+  for (const bad of [["pandas"], 42, {}]) {
+    assert.throws(() => new Sandbox({ setup: bad }), (e) => {
+      assert.ok(e instanceof SandboxError);
+      assert.match(e.message, /shell command STRING/);
+      assert.match(e.message, /setup: "pip install/); // the message shows the shape that works
+      return true;
+    }, `setup: ${JSON.stringify(bad)} must be refused`);
+  }
+  // A CONTROL, or this passes on a guard that refuses everything.
+  assert.strictEqual(new Sandbox({ setup: "pip install requests" }).setup, "pip install requests");
+  assert.strictEqual(new Sandbox().setup, null);
+});
