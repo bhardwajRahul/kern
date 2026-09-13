@@ -54,6 +54,13 @@ confident wrong answer first and a correction second.
   accepted an input they did not understand and produced a value that did not correspond to it
   (`parse_binary_size` on `31.2G`, `split_top_commas` on an escaped quote): the fix is never a wider
   accept, it is refusing the input or letting it fall onto the path that already reports it.
+- **Do not bump a caret dependency to the patch you just published.** `^0.2.12` already resolves 0.2.13
+  (a caret on a zero-major version allows `>=0.2.12 <0.3.0`), so the bump buys nothing and costs a window:
+  npm takes minutes to serve a new version, and CI ran `npm install` inside it and went red with
+  `ETARGET: No matching version found for kern-sandbox@^0.2.13`. Measured both halves: the published
+  `kern-pi` 1.0.1, which declares `^0.2.12`, installs 0.2.13 today. Raise the floor only when the
+  dependent needs something the older version does not have, and then publish, wait for the registry, and
+  push after.
 - **Inserting code just above a `def`, `fn` or `class` inserts it BELOW whatever documents that item.**
   Five times in one day: a new test took the `@integration` marker off the test it was inserted above
   (which then ran in the job that has no kern binary and failed there, not here); a new helper took
