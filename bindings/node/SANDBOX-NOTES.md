@@ -60,6 +60,15 @@ explicit flags that **override** a profile's values (and the `memoryMb` default 
 `memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
 Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
+**The fault taxonomy is kern's, and it does not care what the workload is written in.** `fault` comes from
+a descriptor kern writes at teardown, so a compiled program gets the same verdicts as a cell. Measured: a
+Node process allocating past a 128 MiB cap is `exitCode 137, fault.type "oom"`, a sleeper past the deadline
+is `timeout`, a Go binary built in the box is `oom` (the Go compiler itself is `oom` when 128 MiB will not
+build it), and `./hog || echo handled` is still `oom`, because the kill takes the whole cgroup. What a
+language helper adds is the rich side, not the verdict. The trap that makes a non-Python workload look
+fault-free is `HOME`: without it `go run` fails on its build cache with an ordinary `exitCode 1, fault
+null`, and with `env: { HOME: "/workspace" }` the same command under the same cap reports `oom`.
+
 **Nothing bounds the WORKSPACE, and `df` inside the box agrees with the host.** `memoryMb` bounds RAM
 and the tmpfs mounts charged to it; the workspace is a host directory, charged to your disk. Measured
 under `memoryMb: 128`: a cell writing a 400 MiB file there returns `exitCode: 0, fault: null` and the box
