@@ -134,3 +134,21 @@ would shadow the hardened `/dev`; its apparent size describes the HOST.
 `mounts={host_dir: "/dev/shm"}` is accepted and works, at two costs: a plain directory swaps an
 unbounded RAM path for an unbounded DISK one, and a file written there is still on the host after the
 box dies.
+
+## Found by running the flagship case: an agent that fixes its own code
+
+**`setup=` runs under the same `memory_mb` as your cells, and a pip install needs more than a cell
+does.** MEASURED with `setup="pip install pandas matplotlib"`: at `memory_mb=64` the setup box is
+OOM-killed before any of your code runs, and `Sandbox.__enter__` raises `SandboxError: setup failed
+(exit 137)` carrying kern's own OOM sentence; at 256 it succeeds. The cap that is right for a cell is
+not necessarily right for the install that precedes it, so size the Sandbox for the setup and cap the
+cells separately (below). A killed setup also leaves pip's `pip-unpack-*` directories in the workspace,
+which is a host directory: remove them or start from a clean one.
+
+**The cap is a property of the SESSION, not of a call.** `Sandbox.run_code` takes `timeout_s` but not
+`memory_mb`; the module-level `kern.run_code` takes both, because it builds a one-shot Sandbox for you.
+So an agent that reads `fault == "oom"` and wants to retry with more memory opens a NEW Sandbox on the
+SAME `workspace=`, which is the cheap move rather than the expensive one: MEASURED on this host, the
+first session paid 16.2 s for the pip install, and the second and third sessions on that workspace
+started in 364 ms and 756 ms because `.deps` was already there and `setup=` could be omitted. The file
+state persisting is what makes the retry cheap.
