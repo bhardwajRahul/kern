@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -2883,6 +2883,12 @@ class Kernel:
         self._q: "queue.Queue" = queue.Queue()
         self._err: "_CappedReader | None" = None
         self._dead = False
+        # WHY THE CAUSE IS KEPT. Every death funnels through `_teardown_result`, which KNOWS what ended
+        # the kernel, and the next cell then raised "a prior cell timed out, or the box exited" - two
+        # guesses where the answer was in hand (MEASURED: a cell that blew the memory cap produced
+        # `fault.type == "oom"`, and the very next cell blamed a timeout). Same class as the diagnosis
+        # that declares one of two causes: if it is known, name it.
+        self._death: "str | None" = None
         # Read end of kern's KERN_STARTED_FD channel. For a RESIDENT box kern writes it only at box
         # teardown (the box exits), i.e. when a cell kills the kernel - so it is read ONCE, bounded, on
         # death (see `_read_cap_signal`), never while the box is live (that would block).
@@ -2951,7 +2957,11 @@ class Kernel:
         if self._proc is None:
             raise SandboxError("kernel not started (use `with sbx.kernel() as k:`)")
         if self._dead:
-            raise SandboxError("kernel is dead (a prior cell timed out, or the box exited)")
+            why = f"a prior cell ended it ({self._death})" if self._death else "it was closed"
+            raise SandboxError(
+                f"kernel is dead: {why}. Files written to the workspace are still there; names and "
+                "imports from the earlier cells are gone. Open a new one with `sbx.kernel()`"
+            )
         if "\0" in code:
             raise SandboxError("code must not contain a NUL byte")
         eff = self._sbx._eff_timeout(timeout_s) if timeout_s is not None else self._timeout
@@ -3148,6 +3158,7 @@ class Kernel:
     def _teardown_result(
         self, kind: "str | None", msg: str, started: float, exit_code: int = -1
     ) -> ExecutionResult:
+        self._death = kind if kind is not None else "the code crashed"
         self._kill()
         # Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) raises,
         # it does not return a hollow result. timeout/killed stay as data.

@@ -1965,3 +1965,42 @@ test("a CRLF line keeps its carriage return, and a mid-line prefix is not a note
   assert.deepStrictEqual(b.runtimeNotes, []);
   assert.match(b.codeStderr, /real output/);
 });
+
+test("a dead kernel names what ended it and what survived", async () => {
+  // The one sentence every kernel user meets after a fault, and it had no test in this suite.
+  //
+  // It read "kernel is dead (a prior cell timed out, or the box exited)": two guesses offered where the
+  // answer was in hand. MEASURED end to end with `memoryMb: 128` against the same scenario the Python
+  // binding was measured on: cell A sets a name and writes a file, cell B blows the cap and comes back
+  // `fault.type === "oom"`, and cell C was told the cause was maybe a timeout. Every death funnels
+  // through `_teardownResult`, which is GIVEN the kind, so it records it and this names it.
+  const k = new kern.Kernel(new Sandbox({ memoryMb: 64 }), 5);
+  k._child = {}; // past the "not started" guard; this test is about the message, not the box
+  k._dead = true;
+  k._death = "oom";
+  await assert.rejects(() => k.runCode("x"), (e) => {
+    assert.ok(e instanceof SandboxError);
+    assert.match(e.message, /a prior cell ended it \(oom\)/);
+    assert.match(e.message, /workspace are still there/);
+    assert.match(e.message, /sbx\.kernel\(\)/); // and how to get a working one back
+    return true;
+  });
+  // NO CAUSE RECORDED is the other shape, and it must not invent one: an explicit close leaves the
+  // kernel dead with nothing to attribute.
+  const k2 = new kern.Kernel(new Sandbox(), 5);
+  k2._child = {};
+  k2._dead = true;
+  await assert.rejects(() => k2.runCode("x"), (e) => {
+    assert.match(e.message, /it was closed/);
+    assert.ok(!/a prior cell/.test(e.message));
+    return true;
+  });
+  // AND THE RECORDING IS WHAT MAKES THE FIRST HALF TRUE, not a constant: the funnel sets it from the
+  // kind it was handed, including the crash case, which is not a fault but still ends the kernel.
+  const k3 = new kern.Kernel(new Sandbox(), 5);
+  k3._teardownResult("timeout", "cell exceeded 5s", Date.now());
+  assert.strictEqual(k3._death, "timeout");
+  const k4 = new kern.Kernel(new Sandbox(), 5);
+  k4._teardownResult(null, "the code crashed", Date.now());
+  assert.strictEqual(k4._death, "the code crashed");
+});

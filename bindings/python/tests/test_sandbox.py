@@ -1957,6 +1957,45 @@ def test_the_kernel_path_names_a_blocked_escape_and_does_not_call_a_crash_a_faul
     assert k._kernel_death_fault("", 0, None, 0, True)[2] == -1
 
 
+def test_a_dead_kernel_names_what_ended_it_and_what_survived():
+    """The one sentence every kernel user meets after a fault, and it had no test.
+
+    It read "kernel is dead (a prior cell timed out, or the box exited)": two guesses offered where the
+    answer was already in hand. MEASURED end to end with `memory_mb=128`: cell A sets `x` and writes a
+    file, cell B blows the cap and comes back `fault.type == "oom"`, and cell C was told the cause was
+    maybe a timeout. Every death funnels through `_teardown_result`, which is GIVEN the kind, so the
+    cause is recorded there and named here - the same rule as the `kern ps` diagnosis that declared one
+    of two possible causes. It also answers the question the user actually has next, which is what they
+    lost: the workspace files are on disk, the interpreter's names are not.
+    """
+    k = Kernel(_cfg(memory_mb=64), timeout_s=5)
+    k._proc = object()  # past the "not started" guard; this test is about the message, not the box
+    k._dead, k._death = True, "oom"
+    with pytest.raises(SandboxError) as e:
+        k.run_code("x")
+    msg = str(e.value)
+    assert "a prior cell ended it (oom)" in msg
+    assert "workspace are still there" in msg and "gone" in msg
+    assert "sbx.kernel()" in msg, "and how to get a working one back"
+    # NO CAUSE RECORDED is the OTHER shape, and it must not invent one: an explicit close leaves the
+    # kernel dead with nothing to attribute, and claiming "a prior cell" there would be the same defect
+    # pointing the other way.
+    k2 = Kernel(_cfg(), timeout_s=5)
+    k2._proc, k2._dead = object(), True
+    with pytest.raises(SandboxError) as e2:
+        k2.run_code("x")
+    assert "it was closed" in str(e2.value)
+    assert "a prior cell" not in str(e2.value)
+    # AND THE RECORDING IS WHAT MAKES THE FIRST HALF TRUE, not a constant: the funnel sets it from the
+    # kind it was handed, including the crash case, which is not a fault but still ends the kernel.
+    k3 = Kernel(_cfg(), timeout_s=5)
+    k3._teardown_result("timeout", "cell exceeded 5s", time.monotonic())
+    assert k3._death == "timeout"
+    k4 = Kernel(_cfg(), timeout_s=5)
+    k4._teardown_result(None, "the code crashed", time.monotonic())
+    assert k4._death == "the code crashed"
+
+
 def test_kernel_oom_is_not_read_as_a_box_that_never_started():
     # REGRESSION, measured against kern 0.9.32-37-g02ecedf: kern's OOM sentence carries the `kern:`
     # prefix that `_looks_like_startup_failure` matches on, and `_kernel_death_fault` asked about the

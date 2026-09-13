@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.6";
+const VERSION = "0.2.7";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -2417,6 +2417,11 @@ class Kernel {
     this._waiters = []; // FIFO of { resolve, timer }; one reply per request keeps them in order
     this._stderr = Buffer.alloc(0);
     this._dead = false;
+    // WHY THE CAUSE IS KEPT. Every death funnels through `_teardownResult`, which KNOWS what ended the
+    // kernel, and the next cell then threw "a prior cell timed out, or the box exited" - two guesses
+    // where the answer was in hand (MEASURED: a cell that blew the memory cap produced
+    // `fault.type === "oom"`, and the very next cell blamed a timeout). If it is known, name it.
+    this._death = null;
     // kern's KERN_STARTED_FD bytes for a RESIDENT box: the enforcement byte (2nd) and the OOM-outcome
     // byte (3rd). kern writes them only at box teardown (a cell kills the kernel), so they arrive
     // ~concurrent with the death we detect on stdout; read once, bounded, on death (`_readCapSignal`).
@@ -2522,7 +2527,13 @@ class Kernel {
 
   async runCode(code, { timeoutS } = {}) {
     if (!this._child) throw new SandboxError("kernel not started");
-    if (this._dead) throw new SandboxError("kernel is dead (a prior cell timed out, or the box exited)");
+    if (this._dead) {
+      const why = this._death ? `a prior cell ended it (${this._death})` : "it was closed";
+      throw new SandboxError(
+        `kernel is dead: ${why}. Files written to the workspace are still there; names and imports ` +
+        "from the earlier cells are gone. Open a new one with `sbx.kernel()`"
+      );
+    }
     if (typeof code !== "string" || code.includes("\0"))
       throw new SandboxError("code must be a string with no NUL byte");
     const eff = timeoutS != null ? this._sbx._effTimeout(timeoutS) : this._timeout;
@@ -2681,6 +2692,7 @@ class Kernel {
   }
 
   _teardownResult(type, message, started, exitCode = -1) {
+    this._death = type === null ? "the code crashed" : type;
     this._kill();
     // Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) throws, it
     // does not return a hollow result. timeout/killed stay as data on the returned result.

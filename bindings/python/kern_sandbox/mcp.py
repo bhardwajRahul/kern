@@ -85,6 +85,7 @@ _MARK_STDERR = "[stderr]"
 _MARK_RICH = "[rich result]"
 _MARK_TRUNC = "[output truncated: reply-size cap]"
 _MARK_IMG_TAIL = " image result(s) omitted: reply-size cap]"
+_MARK_RESET = "[the session's interpreter ended on that cell "
 _CLIP_HEAD, _CLIP_TAIL = "...[truncated ", " chars]"
 _FORGED_FRAME = re.compile(
     "|".join(
@@ -94,6 +95,7 @@ _FORGED_FRAME = re.compile(
             r"^" + re.escape(_MARK_RICH),
             r"^" + re.escape(_MARK_TRUNC),
             r"^\[\d+" + re.escape(_MARK_IMG_TAIL),
+            r"^" + re.escape(_MARK_RESET),
             re.escape(_CLIP_HEAD) + r"\d+" + re.escape(_CLIP_TAIL),
         ]
     ),
@@ -238,6 +240,17 @@ _ARG_SPEC = {
 
 class _Server:
     """One MCP connection: lazily opens a single Sandbox session that backs every tool call."""
+
+    # WHY THIS NOTE EXISTS. In kernel mode a cell that kills the interpreter (an OOM, a timeout) got its
+    # fault reported and nothing said the SESSION had been reset. MEASURED through a real client: a model
+    # set `x = 41`, blew the memory, asked again, and got a clean reply in which `x` no longer existed -
+    # the one fact it cannot infer from a successful answer. The note rides on the faulting reply, where
+    # the model is about to decide what to do next, and is cleared as it is spent.
+    #
+    # A CLASS ATTRIBUTE, not an `__init__` line: the reply builder is driven directly by tests that
+    # construct this object without running `__init__`, so an instance attribute turned 23 of them into
+    # `internal error: AttributeError`. A default on the class cannot be missing.
+    _reset_note: "str | None" = None
 
     def __init__(self) -> None:
         self._sbx: "Sandbox | None" = None
@@ -545,6 +558,10 @@ class _Server:
             if r.fault is not None:
                 # this cell tore the kernel down (timeout/kill); drop it so the NEXT call respawns warm.
                 self._drop_kernel()
+                self._reset_note = (
+                    f"{_MARK_RESET}({r.fault.type}), so the next call runs in a FRESH one: names and "
+                    "imports defined before it are gone, while files in the workspace are not]"
+                )
         else:
             r = self._session().run_code(code, language=language, **kw)
         content: list = []
@@ -626,6 +643,11 @@ class _Server:
                 tail += f": {reason}"
         tail += "]"
         notes = [tail]
+        # SPENT ONCE, on the reply for the cell that ended the interpreter: only kernel mode sets it,
+        # because only there was state supposed to persist.
+        if self._reset_note is not None:
+            notes.append(self._reset_note)
+            self._reset_note = None
         if omitted:
             notes.append(f"[{omitted}{_MARK_IMG_TAIL}")
         if text_truncated:
