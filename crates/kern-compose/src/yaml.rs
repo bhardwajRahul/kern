@@ -4300,13 +4300,6 @@ fn parse_binary_size_str(s: &str) -> Option<u64> {
     kern_common::parse_binary_size(s.trim())
 }
 
-/// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps - the
-/// runtime enforces them via `--memory`/`--cpus`/`--pids-limit`. `deploy.resources.reservations` are
-/// soft best-effort hints with no kern equivalent, so they're left alone (a compose that only reserves
-/// still runs, just uncapped - which is what a reservation means). Anything else under `deploy:`
-/// (`replicas`, `restart_policy`, `placement`, …) is swarm/orchestration kern doesn't do; silently
-/// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
-/// inert for `kern compose`.
 /// The note for `deploy.resources.reservations`, which Docker treats as a scheduling request and kern
 /// has no scheduler for.
 ///
@@ -4335,6 +4328,26 @@ fn deploy_reservation_note(service: &str, key: &str) -> String {
     )
 }
 
+/// The keys under `deploy:` this parser MAPS. Everything else present is named, because the alternative
+/// is the defect this file exists to refuse: a stack that looks scaled, or accelerated, and is not.
+///
+/// EVERY KEY, not a list of the ones we thought of. `apply_deploy` used to warn from a hardcoded set of
+/// six plus `restart_policy`, so `deploy.resources.reservations` went silent until a release checklist
+/// asked a service for a GPU and got no output at all (2026-09-13). Four names were added to the list;
+/// this arm is what makes the NEXT key a warning instead of another silence. The service-key match at the
+/// top of this file ends the same way, which is where the shape came from.
+const DEPLOY_KEYS_MAPPED: [&str; 2] = ["resources", "restart_policy"];
+
+/// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps - the
+/// runtime enforces them via `--memory`/`--cpus`/`--pids-limit`.
+///
+/// EVERYTHING ELSE UNDER `deploy:` IS NAMED, which is the opposite of what this comment said until
+/// 2026-09-13 ("reservations ... are left alone", "silently skipped here rather than warned per-key").
+/// A release checklist asked a service for a GPU through `deploy.resources.reservations.devices` and got
+/// no output at all: the service ran without the device, which is the "runs but lies" shape this parser
+/// exists to refuse. `reservations` now warns per key through [`deploy_reservation_note`], the six
+/// orchestration keys keep their own sentence, and the catch-all arm names anything left, so the NEXT key
+/// a Compose release adds is a warning rather than another silence.
 fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     // `deploy.replicas` / `deploy.mode`: kern runs ONE box per service. Docker would start N, so
     // ignoring this in silence means a stack that looks scaled and is not - the exact "runs but lies"
@@ -4353,6 +4366,26 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
             ));
         }
     }
+    // ANYTHING ELSE UNDER `deploy:`, including a key a future Compose release adds. The six above get
+    // their own sentence because the remedy differs; this one only has to make sure nothing is silent.
+    for (key, _) in &node.children {
+        let known = DEPLOY_KEYS_MAPPED.contains(&key.as_str())
+            || [
+                "replicas",
+                "mode",
+                "placement",
+                "update_config",
+                "rollback_config",
+                "endpoint_mode",
+            ]
+            .contains(&key.as_str());
+        if !known {
+            warn(&format!(
+                "service '{name}': deploy.{key} ignored (kern maps deploy.resources and \
+                 deploy.restart_policy; everything else under deploy: needs an orchestrator)"
+            ));
+        }
+    }
     if let Some(rp) = node.child("restart_policy") {
         if rp.child("condition").is_some() {
             warn(&format!(
@@ -4363,17 +4396,15 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     // THE RESERVATIONS SUBTREE, BEFORE THE EARLY RETURN BELOW. It used to sit behind it: a file with
     // `reservations` and no `limits` produced not one word, and a service asking for a GPU ran without
     // one in silence. Checklist row G6.
-    if let Some(res) = node
-        .child("resources")
-        .and_then(|r| r.child("reservations"))
-    {
+    let resources = node.child("resources");
+    if let Some(res) = resources.and_then(|r| r.child("reservations")) {
         for k in ["devices", "cpus", "memory", "generic_resources"] {
             if res.child(k).is_some() {
                 warn(&deploy_reservation_note(name, k));
             }
         }
     }
-    let Some(limits) = node.child("resources").and_then(|r| r.child("limits")) else {
+    let Some(limits) = resources.and_then(|r| r.child("limits")) else {
         return;
     };
     let mut mapped = false;
@@ -5951,9 +5982,33 @@ const KNOWN_SERVICE_KEYS: [&str; 46] = [
     "runtime",
 ];
 
+// Warnings this parser emits, collected UNDER TEST so they can be asserted.
+//
+// Every `warn` in this file is a decision ("kern does not do this, and here is what that costs you"),
+// and until this existed not one of them was assertable: a test could only check the parsed RESULT, so a
+// warning could be deleted, reworded into nonsense, or moved behind an early return with the suite
+// green. That last one is not hypothetical - `deploy.resources.reservations` went silent exactly that
+// way, and the test written for the fix asserted the SENTENCE while the placement that makes it fire
+// stayed uncovered.
+//
+// THREAD-LOCAL, because cargo runs tests in threads and a shared Vec would have them reading each
+// other's warnings. Zero cost outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain what this thread has warned since the last call.
+#[cfg(test)]
+pub(crate) fn take_warnings() -> Vec<String> {
+    WARNINGS.with(|w| w.borrow_mut().drain(..).collect())
+}
+
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
 /// user sees exactly which part of their compose didn't map 1:1.
 fn warn(msg: &str) {
+    #[cfg(test)]
+    WARNINGS.with(|w| w.borrow_mut().push(msg.to_string()));
     eprintln!("kern: warning: compose: {}", sanitize_for_terminal(msg));
 }
 
@@ -9822,6 +9877,45 @@ services:
     }
 
     #[test]
+    fn apply_deploy_warns_even_when_there_are_no_limits_to_map() {
+        // THE PLACEMENT, not the sentence. `apply_deploy` returns early when `resources.limits` is
+        // absent, and the reservations check had to go BEFORE that return; the test written with the fix
+        // called `deploy_reservation_note` directly, so moving the check back below the return would have
+        // re-opened the defect with the suite green. This drives the parser and reads what it WARNED.
+        let file = "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        \
+                    reservations:\n          devices:\n            - capabilities: [gpu]\n";
+        let _ = take_warnings(); // start from a clean slate on this thread
+        parse(file).expect("a reservations-only deploy block still parses");
+        let warned = take_warnings();
+        assert!(
+            warned
+                .iter()
+                .any(|w| w.contains("reservations.devices") && w.contains("WITHOUT the device")),
+            "a GPU request with no `limits:` must still be named, got {warned:?}"
+        );
+        // AND THE CATCH-ALL ARM: a key kern does not map at all is named too, which is what stops the
+        // next silence instead of adding one more name to a list.
+        let _ = take_warnings();
+        parse("services:\n  a:\n    image: alpine\n    deploy:\n      labels:\n        t: infra\n")
+            .expect("parses");
+        let warned = take_warnings();
+        assert!(
+            warned.iter().any(|w| w.contains("deploy.labels ignored")),
+            "an unmapped deploy key must be named, got {warned:?}"
+        );
+        // A CONTROL, or this passes on a parser that warns about everything: a deploy block kern DOES
+        // map produces no `deploy.` warning at all.
+        let _ = take_warnings();
+        parse("services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        limits:\n          memory: 64m\n")
+            .expect("parses");
+        let warned = take_warnings();
+        assert!(
+            !warned.iter().any(|w| w.contains("deploy.")),
+            "a mapped deploy block must be silent, got {warned:?}"
+        );
+    }
+
+    #[test]
     fn the_str_tag_is_refused_over_a_collection_and_kept_over_every_scalar() {
         let svc = |v: &str| format!("services:\n  a:\n    image: alpine\n{v}");
 
@@ -9900,6 +9994,7 @@ mod services_shape_tests {
     ///
     /// THE CONTROL IS THE EMPTY CASE, which must NOT be reported as mis-shaped: without it this
     /// test would pass on a parser that called every `services:` block a list.
+
     #[test]
     fn a_services_block_of_the_wrong_shape_is_named_for_what_it_is() {
         let list = parse("services:\n  - web\n  - db\n");

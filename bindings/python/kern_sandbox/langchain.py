@@ -50,8 +50,9 @@ import re
 import shutil
 from typing import TYPE_CHECKING, Any, Literal
 
-from . import (_FRAME_LC_FAULT, _FRAME_MCP_EXIT, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _WORKSPACE,
-               ExecutionResult, Sandbox)
+from . import (_FORGED_CUT_NOTICE, _FORGED_LINE_FRAME, _FRAME_LC_CUT, _FRAME_LC_FAULT,
+               _WORKSPACE, ExecutionResult, Sandbox, _neutralise_terminal,
+               _validate_mount_lexical)
 
 if TYPE_CHECKING:  # typing only; this import never runs
     from langchain_core.tools import StructuredTool
@@ -103,29 +104,26 @@ _LANGUAGES = {
 # killed, and handing the forgery back for free at the text layer would undo it. So the marker is
 # neutralised wherever the code, and not this module, produced it. Same for the truncation marker,
 # which is a claim about completeness.
-_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 # Each marker is spelled ONCE and both uses are derived from it. Written out twice, the emitting side
 # and the neutralising side would be one condition in two places: reword the marker in `_render` and the
 # pattern here silently stops matching, which does not break a test, it reopens the forgery.
 _FAULT_MARK = _FRAME_LC_FAULT
-_CUT_HEAD, _CUT_TAIL = "... ", " characters of output, cut to fit ..."
+_CUT_HEAD, _CUT_TAIL = _FRAME_LC_CUT
 
-# BOTH families: this module's `[sandbox: ...]` and the MCP server's, because they ship together and a
-# model reading a transcript cannot tell which surface produced a line.
-_FORGED_FAULT = re.compile(
-    "|".join("^" + re.escape(m.rstrip()) for m in
-             (_FAULT_MARK, _FRAME_MCP_EXIT, _FRAME_MCP_STDERR, _FRAME_MCP_RICH)),
-    re.MULTILINE,
-)
-_FORGED_CUT = re.compile(re.escape(_CUT_HEAD) + r"\d+" + re.escape(_CUT_TAIL))
+# EVERY marker EITHER surface emits, recognised from the core's one list. Sharing only four of them left
+# this renderer letting through the MCP server's truncation and session-reset notes, which are claims
+# about completeness and about the session that a cell could then make about itself.
+_FORGED_FAULT = _FORGED_LINE_FRAME
+_FORGED_CUT = _FORGED_CUT_NOTICE
 
 
 def _untrusted(text: str) -> str:
     """Make one box-produced string safe to paste into a model's context."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = _CONTROL.sub("", _ANSI.sub("", text))
+    # THE CORE'S, not a copy: `_neutralise_terminal` does the newline normalisation and the escape and
+    # control stripping, and the comment above it in the core says why a copy per renderer is how one of
+    # them ends up without it. This module held the second copy of the hardest regex in the package.
+    text = _neutralise_terminal(text)
     text = _FORGED_FAULT.sub("[printed by the code, not the sandbox:", text)
     return _FORGED_CUT.sub("... (the code printed something shaped like a truncation notice) ...", text)
 
@@ -592,10 +590,27 @@ def _build_policy_class():
             holder = None
             if self._should_mount_workspace(workspace, temp_prefix):
                 mount_path, holder = self._mount_alias(workspace)
+                # THE SAME VALIDATOR THE REST OF THE PACKAGE USES, because this was the one `-v` in it
+                # that did not go through one. `Sandbox(workspace=...)` and `mounts={...}` both refuse
+                # `$HOME`, `/etc`, a credential directory and kern's own state; a shell session whose
+                # `workspace_root` pointed at any of those got it mounted instead, which made the
+                # refusal a property of one dataclass rather than of the package. The alias is resolved
+                # by `realpath` inside the validator, so pointing the symlink at a refused source is
+                # refused too.
+                _validate_mount_lexical(mount_path, mount_path)
                 argv.extend(["-v", f"{mount_path}:{mount_path}", "-w", mount_path])
             else:
                 argv.extend(["-w", "/"])
-            argv.extend(self.extra_box_args or ())
+            # `extra_box_args` is raw argv by design, and a `-v` smuggled through it reaches kern without
+            # any of the checks above. Route it through the same validator rather than documenting that
+            # this door is unlocked.
+            extra = list(self.extra_box_args or ())
+            for i, tok in enumerate(extra):
+                if tok in ("-v", "--volume", "--mount") and i + 1 < len(extra):
+                    spec = extra[i + 1]
+                    src, _, dst = spec.partition(":")
+                    _validate_mount_lexical(src, dst.split(":")[0] or src)
+            argv.extend(extra)
             argv.append("--")
             argv.extend(command)
             return argv, holder

@@ -2185,3 +2185,62 @@ test("kern's own state is refused as a mount source", () => {
     }
   }
 });
+
+test("a write lands inside the workspace even while a component is being swapped", async () => {
+  // THE ONE ASYMMETRY A SECURITY REVIEW FOUND IN THIS FILE. `readFile` had a race-free backstop (the
+  // `/proc/self/fd` check on the OPEN fd) and `writeFile` had only the lstat pre-check in
+  // `_ensureParentDirs` plus `O_NOFOLLOW` on the LEAF. `O_NOFOLLOW` says nothing about intermediate
+  // components, so a box swapping `mid` from a directory to a symlink in the window between the descent
+  // and the open makes the host create, and `O_TRUNC`, a file wherever that link points.
+  //
+  // The leaf is opened through a PINNED PARENT FD now (`/proc/self/fd/<dirfd>/<leaf>`), which the kernel
+  // resolves from the descriptor and not from the path, so there is no window left to hit. Measured while
+  // writing this: 426 074 attempts against a concurrent swapper gave 0 escapes and 3 refusals BEFORE the
+  // fix (the window is microseconds wide), and 368 291 attempts gave 0 escapes and 43 refusals after -
+  // the refusals are the swaps now being caught instead of followed.
+  //
+  // This test asserts the INVARIANT, not the counts: nothing may appear outside the workspace, ever.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "kt-race-"));
+  const victim = fs.mkdtempSync(path.join(os.tmpdir(), "kt-victim-"));
+  const ws = path.join(base, "ws");
+  fs.mkdirSync(ws);
+  const mid = path.join(ws, "mid");
+  fs.mkdirSync(mid);
+  const s = new Sandbox({ workspace: ws });
+  await s.open();
+  const swapper = require("node:child_process").spawn(
+    process.execPath,
+    ["-e", `const fs=require('fs');const [m,v]=process.argv.slice(1);const end=Date.now()+1500;
+            while(Date.now()<end){try{fs.rmSync(m,{recursive:true,force:true});fs.symlinkSync(v,m);
+            fs.unlinkSync(m);fs.mkdirSync(m);}catch{}}`, mid, victim],
+    { stdio: "ignore" },
+  );
+  try {
+    let attempts = 0;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+      attempts++;
+      try { await s.writeFile("mid/x", "payload"); } catch { /* a refused swap is the good outcome */ }
+      assert.strictEqual(fs.existsSync(path.join(victim, "x")), false,
+        "a host write landed OUTSIDE the workspace");
+    }
+    assert.ok(attempts > 100, `the race needs attempts to mean anything, got ${attempts}`);
+    // AND THE CONTROL: with nothing swapping, the same write works and lands where it should. The
+    // swapper has to be GONE first, or the control races it too (it was, the first time this ran).
+    swapper.kill();
+    await new Promise((r) => swapper.on("exit", r));
+    fs.rmSync(mid, { recursive: true, force: true });
+    fs.mkdirSync(mid);
+    await s.writeFile("mid/x", "payload");
+    assert.strictEqual(fs.readFileSync(path.join(mid, "x"), "utf8"), "payload");
+  } finally {
+    swapper.kill();
+    await s.close().catch(() => {});
+    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(victim, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});

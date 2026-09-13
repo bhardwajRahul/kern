@@ -1431,3 +1431,33 @@ class TestTheAliasesCannotWeakenWhatTheyTranslate:
         check rather than from the alias silently turning it into None or into the default."""
         with pytest.raises(ValueError, match="must be positive"):
             self._policy(memory_mb=0)
+
+
+def test_the_shell_policys_mount_goes_through_the_SAME_validator_as_every_other():
+    """The one `-v` in this package that did not pass a validator, found by an altitude review.
+
+    `Sandbox(workspace=...)` and `mounts={...}` refuse `$HOME`, `/etc`, `/root`, the docker socket, any
+    path with a credential directory in it and kern's own runtime state. This policy built
+    `-v <workspace>:<workspace>` straight into kern's argv, so a shell session whose `workspace_root`
+    pointed at any of those got it mounted: the refusal was a property of one dataclass instead of of the
+    package. It validates the LEXICAL half, because the session owns the directory's lifetime and an argv
+    builder must not require it to exist yet.
+    """
+    from kern_sandbox import MountRefused
+    from kern_sandbox.langchain import kern_execution_policy
+
+    policy = kern_execution_policy(mount_workspace="always")
+    for bad in ("/etc", str(Path.home()), str(Path.home() / ".ssh" / "sub"),
+                "/run/user/%d/kern" % os.getuid()):
+        with pytest.raises(MountRefused):
+            policy._build_command("kern", Path(bad), None, ["/bin/bash"])
+    # A CONTROL, or this passes on a builder that refuses every workspace.
+    argv, _ = policy._build_command("kern", Path("/tmp/a-session-dir"), None, ["/bin/bash"])
+    assert "-v" in argv and any(a.startswith("/tmp/a-session-dir") for a in argv)
+    # `extra_box_args` IS THE OTHER DOOR: raw argv by design, and a `-v` through it reached kern with no
+    # check at all.
+    smuggler = kern_execution_policy(mount_workspace="never", extra_box_args=("-v", "/etc:/etc"))
+    with pytest.raises(MountRefused):
+        smuggler._build_command("kern", Path("/tmp/a-session-dir"), None, ["/bin/bash"])
+    ok = kern_execution_policy(mount_workspace="never", extra_box_args=("--cpus", "1"))
+    assert "--cpus" in ok._build_command("kern", Path("/tmp/x"), None, ["/bin/bash"])[0]

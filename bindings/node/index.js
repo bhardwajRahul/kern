@@ -1995,18 +1995,61 @@ class Sandbox {
 
   /** Write `data` (Buffer|string) to `path` (workspace-relative) - host-direct, so the box sees it next
    * run. The final component is opened O_NOFOLLOW: a symlink the box planted can't redirect the write. */
+  /** Open the PARENT of a workspace-relative path as a directory fd, one component at a time, each with
+   * `O_NOFOLLOW`, and return that fd. The caller then opens the leaf THROUGH it via
+   * `/proc/self/fd/<dirfd>/<leaf>`, which the kernel resolves from the pinned descriptor rather than from
+   * the path string, so no component can be swapped between the check and the open.
+   *
+   * WHY, and it is the one asymmetry a security review found in this file: `readFile` has a race-free
+   * backstop (`_assertFdInWorkspace` on the open fd, line ~2094) and `writeFile` had only the `lstat`
+   * pre-check in `_ensureParentDirs` plus `O_NOFOLLOW` on the LEAF. `O_NOFOLLOW` does not touch
+   * intermediate components, so a box that swaps `mid` from a directory to a symlink in the window
+   * between the descent and the open makes the host create (and `O_TRUNC`) a file wherever that link
+   * points. Measured here: 426 074 attempts against a concurrent swapper produced 0 escapes and 3
+   * refusals, so the window is real and microseconds wide - too narrow to demonstrate cheaply and too
+   * cheap to close to leave open. Python's binding never had it: it descends with `openat`.
+   *
+   * The fd is the caller's to close. */
+  _openParentDirNofollow(rel) {
+    const base = fs.realpathSync(this._ws);
+    const full = this._wsPath(rel);
+    const relDir = path.relative(base, path.dirname(full));
+    let dirFd = fs.openSync(base, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    if (relDir === "" || relDir === ".") return dirFd;
+    for (const part of relDir.split(path.sep)) {
+      if (!part || part === ".") continue;
+      let next;
+      try {
+        next = fs.openSync(
+          `/proc/self/fd/${dirFd}/${part}`,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+        );
+      } catch (e) {
+        fs.closeSync(dirFd);
+        throw pathRefusal("write", rel, e);
+      }
+      fs.closeSync(dirFd);
+      dirFd = next;
+    }
+    return dirFd;
+  }
+
   async writeFile(rel, data) {
     this._requireEntered();
     const full = this._wsPath(rel);
-    this._ensureParentDirs(full); // symlink-safe descent, NOT mkdir -p (which follows a planted symlink)
+    this._ensureParentDirs(full); // creates missing dirs, symlink-safe, NOT mkdir -p (which follows one)
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+    // THE LEAF IS OPENED THROUGH A PINNED PARENT FD, not by path: see `_openParentDirNofollow`. The
+    // pre-check above still runs, because it is what CREATES the missing directories; what it cannot do
+    // is stay true between its own lstat and this open.
+    const dirFd = this._openParentDirNofollow(rel);
     let fd;
     try {
       // O_NONBLOCK for the same reason as readFile, and the write side is the WORSE of the two: opening
       // a FIFO for writing blocks until a reader appears, and with the flag it fails outright (ENXIO)
       // instead. Either way the call returns to the caller rather than parking there.
       fd = fs.openSync(
-        full,
+        `/proc/self/fd/${dirFd}/${path.basename(full)}`,
         fs.constants.O_WRONLY |
           fs.constants.O_CREAT |
           fs.constants.O_TRUNC |
@@ -2016,7 +2059,11 @@ class Sandbox {
       );
     } catch (e) {
       throw pathRefusal("write", rel, e);
+    } finally {
+      fs.closeSync(dirFd);
     }
+    // AND THE BACKSTOP THE READ PATH ALREADY HAD: where did the descriptor actually land?
+    this._assertFdInWorkspace(fd, rel);
     try {
       // The file the box left at this name has to be a REGULAR file before we write into it: writing
       // into a device node or a socket the box planted is host I/O it chose the target of.
@@ -2477,10 +2524,6 @@ function kernelDriver(outCap, resCap, hello = false) {
     .replaceAll("__KERN_HELLO__", hello ? "1" : "0");
 }
 
-/** A warm, persistent Python interpreter living in one long-lived box (see `Sandbox.kernel`). `runCode`
- * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
- * captured stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box
- * stays network-off and resource-capped. `close()` (or a per-cell timeout) tears the box down. */
 /** The message for a host-side open the workspace boundary refused.
  *
  * ELOOP here is not a filesystem oddity, it is the boundary working: the final component is opened
@@ -2502,7 +2545,10 @@ function pathRefusal(verb, rel, e) {
     );
   return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: ${e && e.message ? e.message : e}`);
 }
-
+/** A warm, persistent Python interpreter living in one long-lived box (see `Sandbox.kernel`). `runCode`
+ * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
+ * captured stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box
+ * stays network-off and resource-capped. `close()` (or a per-cell timeout) tears the box down. */
 class Kernel {
   constructor(sbx, timeoutS) {
     this._sbx = sbx;

@@ -40,8 +40,10 @@ import re
 import sys
 import traceback
 
-from . import (Kernel, Sandbox, SandboxError, __version__, _FRAME_LC_FAULT, _FRAME_MCP_EXIT,
-               _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _neutralise_terminal)
+from . import (Kernel, Sandbox, SandboxError, __version__, _FORGED_CUT_NOTICE,
+               _FORGED_LINE_FRAME, _FRAME_MCP_CLIP, _FRAME_MCP_EXIT, _FRAME_MCP_IMG_TAIL,
+               _FRAME_MCP_RESET, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _FRAME_MCP_TRUNC,
+               _neutralise_terminal)
 
 # The single MCP protocol revision we implement; initialize always answers with THIS (we negotiate to
 # our version, we never echo a client-chosen string back).
@@ -84,27 +86,10 @@ _MAX_NAME = 200                   # chars of a client-supplied method/tool name 
 _MARK_EXIT = _FRAME_MCP_EXIT
 _MARK_STDERR = _FRAME_MCP_STDERR
 _MARK_RICH = _FRAME_MCP_RICH
-_MARK_TRUNC = "[output truncated: reply-size cap]"
-_MARK_IMG_TAIL = " image result(s) omitted: reply-size cap]"
-_MARK_RESET = "[the session's interpreter ended on that cell "
-_CLIP_HEAD, _CLIP_TAIL = "...[truncated ", " chars]"
-_FORGED_FRAME = re.compile(
-    "|".join(
-        [
-            r"^" + re.escape(_MARK_EXIT) + r"\d+",
-            r"^" + re.escape(_MARK_STDERR),
-            r"^" + re.escape(_MARK_RICH),
-            r"^" + re.escape(_MARK_TRUNC),
-            r"^\[\d+" + re.escape(_MARK_IMG_TAIL),
-            r"^" + re.escape(_MARK_RESET),
-            # THE OTHER SURFACE'S VERDICT MARKER, because both ship in this package and a model cannot
-            # tell which one wrote a line: `[sandbox: oom]` used to pass through an MCP reply untouched.
-            r"^" + re.escape(_FRAME_LC_FAULT.rstrip()),
-            re.escape(_CLIP_HEAD) + r"\d+" + re.escape(_CLIP_TAIL),
-        ]
-    ),
-    re.MULTILINE,
-)
+_MARK_TRUNC = _FRAME_MCP_TRUNC
+_MARK_IMG_TAIL = _FRAME_MCP_IMG_TAIL
+_MARK_RESET = _FRAME_MCP_RESET
+_CLIP_HEAD, _CLIP_TAIL = _FRAME_MCP_CLIP
 
 
 def _untrusted(text: str) -> str:
@@ -115,10 +100,10 @@ def _untrusted(text: str) -> str:
     NOT closed, and not closable here: ordinary prompt injection. A cell whose output is
     `[system] ignore your instructions` printed a string, and no filter separates that from a program
     legitimately printing the same characters without destroying real output."""
-    return _FORGED_FRAME.sub(
-        lambda m: "[printed by the code, not the sandbox: " + m.group(0).lstrip(".["),
-        _neutralise_terminal(text),
-    )
+    label = lambda m: "[printed by the code, not the sandbox: " + m.group(0).lstrip(".[")  # noqa: E731
+    # BOTH shared patterns, in the core so the LangChain renderer recognises the same markers: this
+    # server labels every one of them, which keeps what the code printed visible while saying whose it is.
+    return _FORGED_CUT_NOTICE.sub(label, _FORGED_LINE_FRAME.sub(label, _neutralise_terminal(text)))
 
 
 def _clip(s: str, n: int) -> str:
@@ -169,7 +154,6 @@ _STATE_RESIDENT = (
     "server runs one warm interpreter; a call that is killed (OOM, timeout) ends it and the next call "
     "starts a fresh one, which the reply says when it happens."
 )
-_STATE_SENTENCE_PLACEHOLDER = _STATE_FRESH
 
 
 _TOOLS = [
@@ -180,8 +164,7 @@ _TOOLS = [
             "the user's own machine and return stdout/stderr plus any rich results. A matplotlib figure, "
             "the last bare expression, and every display() call are captured; charts come back as "
             "images you can see. The network is OFF and a mandatory timeout applies. FILE state in the "
-            "workspace persists across calls (write a file, read it next call). "
-            + _STATE_SENTENCE_PLACEHOLDER +
+            "workspace persists across calls (write a file, read it next call). {state}"
             " Use this to compute, analyze data, plot, or test code."
         ),
         "inputSchema": {
@@ -260,19 +243,24 @@ _ARG_SPEC = {
 }
 
 
+def _reset_note_for(fault_type: str) -> str:
+    """The line that tells a model its session was replaced, for the reply of the cell that ended it.
+
+    WHY IT EXISTS. In kernel mode a cell that kills the interpreter (an OOM, a timeout) had its fault
+    reported and nothing said the SESSION had been reset. MEASURED through a real client: a model set
+    `x = 41`, blew the memory, asked again, and got a clean reply in which `x` no longer existed, the one
+    fact it cannot infer from a successful answer. Files in the workspace DO survive, and the sentence
+    says both halves because the remedy differs: re-run the setup cell, do not re-download the data.
+    """
+    return (
+        f"{_MARK_RESET}({fault_type}), so the next call runs in a FRESH one: names and imports defined "
+        "before it are gone, while files in the workspace are not]"
+    )
+
+
 class _Server:
     """One MCP connection: lazily opens a single Sandbox session that backs every tool call."""
 
-    # WHY THIS NOTE EXISTS. In kernel mode a cell that kills the interpreter (an OOM, a timeout) got its
-    # fault reported and nothing said the SESSION had been reset. MEASURED through a real client: a model
-    # set `x = 41`, blew the memory, asked again, and got a clean reply in which `x` no longer existed -
-    # the one fact it cannot infer from a successful answer. The note rides on the faulting reply, where
-    # the model is about to decide what to do next, and is cleared as it is spent.
-    #
-    # A CLASS ATTRIBUTE, not an `__init__` line: the reply builder is driven directly by tests that
-    # construct this object without running `__init__`, so an instance attribute turned 23 of them into
-    # `internal error: AttributeError`. A default on the class cannot be missing.
-    _reset_note: "str | None" = None
 
     def __init__(self) -> None:
         self._sbx: "Sandbox | None" = None
@@ -448,23 +436,25 @@ class _Server:
         for t in tools:
             if t.get("name") != "run_code":
                 continue
-            # THE IMAGE, in the description and not only in the `language` property's: a client that
-            # lists the tools (and a model that reads the first paragraph and stops) should see which
-            # image this server actually runs, because every "does it have node/gcc/ffmpeg" question is
-            # answered by that name and by nothing else here. Checklist row D1.
-            t["description"] += f" This server's boxes run the OCI image `{image}`."
-            if self._use_kernel:
-                # REPLACED, not appended: two claims about the same fact is a contradiction the model
-                # has to guess its way out of.
-                assert _STATE_FRESH in t["description"], "the state sentence moved; the swap below is stale"
-                t["description"] = t["description"].replace(_STATE_FRESH, _STATE_RESIDENT, 1)
+            # THE STATE SENTENCE IS FILLED IN, not swapped afterwards: the description carries a `{state}`
+            # slot, so exactly one of the two claims can ever be in it. Building it with the fresh-box
+            # sentence and replacing that sentence later worked, and left a contradiction one missed
+            # `.replace` away, plus an ordering trap (the image line had to be appended BEFORE the swap).
+            #
+            # THE IMAGE, in the description and not only in the `language` property's: a client that lists
+            # the tools (and a model that reads the first paragraph and stops) should see which image this
+            # server actually runs, because every "does it have node/gcc/ffmpeg" question is answered by
+            # that name and nothing else here. Checklist row D1.
+            t["description"] = t["description"].format(
+                state=_STATE_RESIDENT if self._use_kernel else _STATE_FRESH
+            ) + f" This server's boxes run the OCI image `{image}`."
             lang = t["inputSchema"]["properties"]["language"]
             # Only the DEFAULT image's contents are a fact we hold. For any other image, say which one
             # it is and stop: guessing its interpreters from the tag would be inventing a measurement.
             if image == _DEFAULT_MCP_IMAGE:
                 lang["description"] += (
-                    " This server runs python:3.12-slim, which provides python, bash and sh but NOT"
-                    " node: do not offer node here."
+                    f" This server runs {_DEFAULT_MCP_IMAGE}, which provides python, bash and sh but"
+                    " NOT node: do not offer node here."
                 )
             else:
                 lang["description"] += (
@@ -552,6 +542,7 @@ class _Server:
         self._result(mid, {"content": content, "isError": is_err})
 
     def _run_code(self, args: dict) -> "tuple[list, bool]":
+        reset_note: "str | None" = None
         code = args.get("code", "")
         language = args.get("language", "python")
         # READ FROM THE SCHEMA, not from a second list written by hand. This guard used to be the
@@ -585,10 +576,7 @@ class _Server:
             if r.fault is not None:
                 # this cell tore the kernel down (timeout/kill); drop it so the NEXT call respawns warm.
                 self._drop_kernel()
-                self._reset_note = (
-                    f"{_MARK_RESET}({r.fault.type}), so the next call runs in a FRESH one: names and "
-                    "imports defined before it are gone, while files in the workspace are not]"
-                )
+                reset_note = _reset_note_for(r.fault.type)
         else:
             r = self._session().run_code(code, language=language, **kw)
         content: list = []
@@ -670,11 +658,11 @@ class _Server:
                 tail += f": {reason}"
         tail += "]"
         notes = [tail]
-        # SPENT ONCE, on the reply for the cell that ended the interpreter: only kernel mode sets it,
+        # ON THE REPLY FOR THE CELL THAT ENDED THE INTERPRETER, and only there: a LOCAL, so "said once"
+        # is structural instead of a field somebody has to remember to clear. Only kernel mode sets it,
         # because only there was state supposed to persist.
-        if self._reset_note is not None:
-            notes.append(self._reset_note)
-            self._reset_note = None
+        if reset_note is not None:
+            notes.append(reset_note)
         if omitted:
             notes.append(f"[{omitted}{_MARK_IMG_TAIL}")
         if text_truncated:
