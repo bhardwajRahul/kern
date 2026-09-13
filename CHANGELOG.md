@@ -7,6 +7,40 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The mount refusal list was absolute paths, so it refused `$HOME` and allowed `$HOME/.ssh`.** MEASURED:
+a box opened with `mounts={"~/.ssh": "/x"}` listed `id_ed25519` and `authorized_keys` from inside. `/`,
+`/etc`, `/root`, `/proc`, `/sys`, `/dev`, the docker socket and the home directory ITSELF were all
+refused, and its most sensitive child went through. Credential directories are now refused by NAME,
+anywhere in the source path (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.azure`, `.password-store`,
+`.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`), so `.kube/sub` is refused too, with a message that
+says what to do instead: write the one secret the job needs into the workspace. Controls in the test, or
+the guard could be refusing everything: an ordinary directory mounts, and so does `sshkeys`, because the
+match is per path component and not a substring.
+
+**And the READMEs said "a box that fails to start raises", which is half true.** MEASURED on a typo'd
+image tag: kern exits **1** with `error: registry: ... manifest unknown`, and `run_code`/`run` RETURN
+`exit_code 1, success False, fault.type "startup_failed"`, while `sbx.kernel()` on the same image RAISES.
+Both are deliberate, for a reason that was in the code and not on the page: a one-shot call is its own
+box, so the result carries the verdict, and a kernel IS the session, so there is nothing to return a
+result about. The Node notes went further and claimed kern exits 125 for a pull error, which it does not.
+The fault table now describes both shapes of `startup_failed`, the split is written down, and the advice
+that follows from it is explicit: branch on `fault`, not on `exit_code`, because a box that never ran
+exits 1 exactly like a script that did. One test pins both halves.
+
+**What the third case list measured and did not change.** `network=True` puts the box in the host's
+network namespace, so a service on the host's own `127.0.0.1` answers it: measured, a box read the body of
+a server bound to the host loopback, while `network=False` is refused and `egress_allow` returns `403`
+through the proxy, localhost included. That is now on both pages, because the services on a developer
+machine's loopback are the unguarded ones. An image pinned by DIGEST is reproducible (two runs
+byte-identical, `alpine:latest` a different release entirely on the same machine) and a wrong digest is
+refused by the registry, while the digest a TAG resolved to is recorded nowhere, which a forensic record
+has to carry itself. No host-side leak over 140 calls and sessions including 20 faulting ones (file
+descriptors, threads, children, cgroups, instance dirs: zero delta). And a `setsid` double-forked child of
+a box dies with it: visible from the host while the box lives (in its pid namespace, in the box's cgroup,
+writing heartbeats), gone with zero heartbeats after the cell blew the memory cap.
+
+kern-sandbox **0.2.9** on PyPI and npm.
+
 **An absolute path handed to a workspace call read a DIFFERENT FILE in the Node binding.** Measured
 through a real box: the cell planted `etc/passwd` inside the workspace, the host then called
 `readFile("/etc/passwd")`, and it came back `WORKSPACE DECOY`; `writeFile("/etc/passwd")` wrote into that

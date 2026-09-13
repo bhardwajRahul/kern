@@ -129,7 +129,7 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 | `oom` | the kernel's OOM killer took the box against its own memory cap. Read from a descriptor the code in the box cannot write, so it is an observation and not a guess from the exit code |
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here, which the message names |
 | `exec_failed` | the box started, the command did not exist inside it. `{language:"node"}` on an image with no `node` is the ordinary way there; the message names the binary AND the image |
-| `startup_failed` | your `timeoutS` fired while kern was still BUILDING the box, so the code never ran. A longer timeout does not help: a bind source on a dead NFS export does this |
+| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeoutS` fired while kern was still BUILDING the box (run it again: a fast second call was a cold image read), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make) |
 
 ```js
 const r = await kern.runCode("while True: pass", { timeoutS: 5 });

@@ -2105,3 +2105,44 @@ test("setup refuses the shape a reader guesses first", () => {
   assert.strictEqual(new Sandbox({ setup: "pip install requests" }).setup, "pip install requests");
   assert.strictEqual(new Sandbox().setup, null);
 });
+
+test("credential directories are refused as a mount source", async () => {
+  // The refusal list was absolute paths, so it refused `$HOME` and ALLOWED `$HOME/.ssh`. MEASURED
+  // before this, through the Python binding on the same list: a box mounted with `~/.ssh` listed
+  // `id_ed25519` and `authorized_keys`. Refusing the parent while allowing its most sensitive child is
+  // the wrong way round, and it is where a prompt-injected agent is steered ("read ~/.aws").
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "kt-cred-"));
+  try {
+    for (const name of [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".password-store"]) {
+      const d = path.join(root, name);
+      fs.mkdirSync(path.join(d, "inner"), { recursive: true });
+      for (const src of [d, path.join(d, "inner")]) { // the dir AND anything below it
+        // The mount is validated in the CONSTRUCTOR here, before anything opens.
+        assert.throws(() => new Sandbox({ mounts: { [src]: "/x" } }), (e) => {
+          assert.ok(e instanceof MountRefused, `${src}: ${e.constructor.name}`);
+          assert.match(e.message, /holds credentials/);
+          return true;
+        }, `${src} must be refused`);
+      }
+    }
+    for (const fname of [".netrc", ".git-credentials", ".pypirc", ".npmrc"]) {
+      fs.writeFileSync(path.join(root, fname), "secret");
+      assert.throws(() => new Sandbox({ mounts: { [path.join(root, fname)]: "/x" } }),
+        MountRefused, `${fname} must be refused`);
+    }
+    // CONTROLS: an ordinary directory opens, and so does one whose name merely CONTAINS a refused name
+    // (the check is per component, not substring).
+    for (const name of ["data", "sshkeys"]) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      const s = new Sandbox({ mounts: { [path.join(root, name)]: "/d" } });
+      await s.open();
+      await s.close();
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});

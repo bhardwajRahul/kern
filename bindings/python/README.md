@@ -71,9 +71,15 @@ sandbox acted:
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here. A cap being set is not evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
 | `exec_failed` | the box started, the command did not exist in the image; the message names both |
-| `startup_failed` | your `timeout_s` fired while kern was still BUILDING the box, so the code never ran. A longer timeout does not help: a bind source on a dead NFS export does this |
+| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeout_s` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make) |
 
-A box that fails to **start** raises `SandboxError` instead, because the code never ran.
+`startup_failed` is **returned** by `run_code`/`run`, because each call is its own box and the result
+carries the verdict: measured on a typo'd image tag, `exit_code` 1, `success` False, `fault.type`
+`startup_failed`, and kern's `error: registry: ... manifest unknown` in `stderr`. Two cases raise
+`SandboxError` instead: kern exiting **125**, its box-not-started code, with its own diagnostic (a refused
+mount at runtime, an unmappable `--user`, a seccomp/AppArmor/cgroup setup error), and **any** failure to
+start a `kernel()`, where the box is the session rather than one call, so there is nothing to return a
+result about. Branch on `fault`, not on `exit_code`: a box that never ran exits 1 like a script that did.
 
 `stderr` is one stream shared by kern and your code, so a note about an undelegated cgroup arrives
 interleaved with the program's own output. Right for a human at a terminal, wrong for anything that

@@ -805,6 +805,31 @@ def test_pull_network_failure_is_startup_failed():
     assert s._classify(1, curl, False).type == "startup_failed"
 
 
+def test_a_box_that_never_started_returns_here_and_raises_on_a_kernel():
+    """One event, two answers, and the docs now promise both, so both are pinned.
+
+    MEASURED with a typo'd image tag: kern exits **1** with `error: registry: ... manifest unknown`, and
+    `run_code` returns `exit_code 1, success False, fault.type "startup_failed"`, while `sbx.kernel()` on
+    the same image RAISES. That is not an inconsistency to fix: a one-shot call is its own box, so the
+    result carries the verdict, and a kernel IS the session, so there is nothing to return a result about.
+    The README said "a box that fails to start raises" without that split, which is what sent me looking.
+
+    The raise on the one-shot path stays gated on kern's 125 + marker pair, because a workload is allowed
+    to exit 125 itself and that must not read as a box that never started.
+    """
+    s = _cfg()
+    registry = ("-> resolving alpine:nope (linux/amd64)\n"
+                "error: registry: registry-1.docker.io has no such manifest for 'library/alpine'\n")
+    assert s._classify(1, registry, False).type == "startup_failed", "returned as data on exit 1"
+    marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n"
+    assert s._classify(125, marker, False).type == "startup_failed", "the pair `_spawn` raises on"
+    # THE KERNEL SIDE of the same event: its funnel raises rather than returning a hollow cell result.
+    k = Kernel(_cfg(), timeout_s=5)
+    with pytest.raises(SandboxError) as e:
+        k._teardown_result("startup_failed", registry.strip(), time.monotonic())
+    assert "registry" in str(e.value), "and it carries kern's own sentence, not a paraphrase"
+
+
 def test_classify_signal_exit_codes():
     # Every signal-derived exit maps to the right fault (or None for user crashes).
     s = _cfg()
@@ -1433,6 +1458,39 @@ def test_track_files_off_skips_diff_but_keeps_results():
 
 
 @integration
+def test_credential_directories_are_refused_as_a_mount_source(tmp_path):
+    """The refusal list was absolute paths, so it refused `$HOME` and ALLOWED `$HOME/.ssh`.
+
+    MEASURED before this: a box opened with `mounts={"~/.ssh": "/x"}` listed `id_ed25519` and
+    `authorized_keys`. Refusing the parent while allowing its most sensitive child is the wrong way round,
+    and it is exactly where a prompt-injected agent is steered ("read ~/.aws"). Matched by NAME, because
+    these live under a per-user home, and anywhere in the path, because `.kube/sub` is still `.kube`.
+    """
+    for name in (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".password-store"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "inner").mkdir()
+        with pytest.raises(MountRefused) as e:
+            kern._validate_mount(str(d), "/x")
+        assert "holds credentials" in str(e.value) and name in str(e.value)
+        # AND ANYTHING BELOW IT, or the guard is one `/subdir` away from useless.
+        with pytest.raises(MountRefused):
+            kern._validate_mount(str(d / "inner"), "/x")
+    for fname in (".netrc", ".git-credentials", ".pypirc", ".npmrc"):
+        f = tmp_path / fname
+        f.write_text("secret")
+        with pytest.raises(MountRefused):
+            kern._validate_mount(str(f), "/x")
+    # CONTROLS, or this passes on a guard that refuses every mount: an ordinary directory is accepted,
+    # and so is one whose name merely CONTAINS a refused name (the check is per component, not substring).
+    ok = tmp_path / "data"
+    ok.mkdir()
+    assert kern._validate_mount(str(ok), "/data")[1] == "/data"
+    lookalike = tmp_path / "sshkeys"
+    lookalike.mkdir()
+    assert kern._validate_mount(str(lookalike), "/k")[1] == "/k"
+
+
 def test_read_write_refuse_symlinked_dir_component():
     # SECURITY REGRESSION: a box plants a symlinked DIRECTORY component (`d/esc -> /etc`); host-side
     # read_file/write_file must NOT follow it out of the workspace (else read leaks arbitrary host files).
