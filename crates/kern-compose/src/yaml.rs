@@ -3917,7 +3917,24 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     // MEASURED as a gap on a neutral corpus of 259 real compose files: 6 of them
                     // use it, and it was the second most common remaining difference after the keys
                     // that ask kern to be less confining.
-                    "host" => b.net = true,
+                    // HONOURED, AND SAID OUT LOUD. It was applied in silence, which a release review
+                    // caught: this is the largest posture change a compose file can ask for (the service
+                    // gets NO network namespace, so the host's interfaces, its loopback and its sysctls
+                    // are the service's), and every smaller one in this file is named - `privileged`,
+                    // `runtime:`, a GPU reservation. Two consequences a reader cannot infer from the key
+                    // itself travel with it: peers stop resolving this service by name, because it is not
+                    // on the stack's network any more, and `ports:` for it does nothing, because it is
+                    // already on the host's.
+                    "host" => {
+                        b.net = true;
+                        warn(&format!(
+                            "service '{name}': 'network_mode: host' is applied and removes this \
+                             service's network isolation - it shares the HOST's interfaces, loopback \
+                             and sysctls, so a port on the host's 127.0.0.1 is reachable from it. Its \
+                             peers stop resolving it by name (it leaves the stack's network, as under \
+                             Docker) and any `ports:` it declares is a no-op"
+                        ));
+                    }
                     // `none` IS THE ISOLATION KERN GIVES BY DEFAULT OUTSIDE A POD: loopback and
                     // nothing else. Expressed by keeping the box out of the pod and attaching no
                     // NAT to it, so there is no route out of its namespace rather than a filter.
@@ -9874,6 +9891,55 @@ services:
                 "the device sentence is for devices only: {n}"
             );
         }
+    }
+
+    #[test]
+    fn network_mode_host_is_applied_and_said_out_loud() {
+        // FOUND BY A RELEASE REVIEW: `network_mode: host` was honoured in silence. It is the largest
+        // posture change a compose file can ask for, and every smaller one here is named. MEASURED
+        // before the warning, on a box brought up from such a file: the service saw the HOST's three
+        // interfaces (a box of its own sees two) and the host's `net.core.somaxconn`, so the key was
+        // applied and the reader was told nothing.
+        //
+        // The same review reported `ulimits` and `sysctls` as silent too. They are APPLIED, which is
+        // why they say nothing: measured in a box, `ulimits: {nofile: 4321}` gives `ulimit -n` 4321
+        // against a 1048576 default, and `sysctls: {net.core.somaxconn: 1234}` reads 1234 inside
+        // against the host's 4096. A key that works needs no warning; silence is only a defect when
+        // the file asked for something that does not happen, or happens and changes the posture.
+        let _ = take_warnings();
+        let b =
+            parse("services:\n  a:\n    image: alpine\n    network_mode: host\n").expect("parses");
+        assert!(b[0].net, "the key must still be APPLIED, not refused");
+        let warned = take_warnings();
+        let w = warned
+            .iter()
+            .find(|w| w.contains("network_mode: host"))
+            .unwrap_or_else(|| panic!("no warning for network_mode: host, got {warned:?}"));
+        assert!(
+            w.contains("removes this service's network isolation"),
+            "{w}"
+        );
+        assert!(
+            w.contains("peers stop resolving it by name"),
+            "the consequence a reader cannot infer: {w}"
+        );
+        assert!(
+            w.contains("no-op"),
+            "and that its `ports:` does nothing: {w}"
+        );
+        // CONTROLS, or this passes on a parser that warns about every network_mode: `none` is the
+        // default posture and `service:` is wired, and neither is a posture change to announce.
+        let _ = take_warnings();
+        parse("services:\n  a:\n    image: alpine\n    network_mode: none\n").expect("parses");
+        assert!(!take_warnings()
+            .iter()
+            .any(|w| w.contains("removes this service's network isolation")));
+        let _ = take_warnings();
+        parse("services:\n  a:\n    image: alpine\n  b:\n    image: alpine\n    network_mode: service:a\n")
+            .expect("parses");
+        assert!(!take_warnings()
+            .iter()
+            .any(|w| w.contains("removes this service's network isolation")));
     }
 
     #[test]

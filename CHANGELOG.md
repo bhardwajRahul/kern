@@ -29,6 +29,10 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - Keys honoured: `cpu_shares`, `memswap_limit` (a total, unlike cgroup v2's field), `ulimit`,
   `runtime:`, `ipv4_address:`, `depends_on` conditions, an image's `HEALTHCHECK`/`STOPSIGNAL`/`Cmd`/
   `Entrypoint`/`Env`, a healthcheck in exec form, `--tmpfs uid=`/`gid=`.
+- `network_mode: host` is applied, as Docker applies it, and now SAYS so: it removes the service's
+  network isolation (the host's interfaces, loopback and sysctls become the service's), its peers stop
+  resolving it by name, and any `ports:` it declares is a no-op. It was the one posture change in the
+  file that happened in silence.
 - Keys refused or named rather than ignored: an unknown service key (with the near-miss suggestion),
   `deploy.replicas`/`mode`/`placement`/`update_config`/`rollback_config`/`endpoint_mode`,
   `deploy.restart_policy`, and `deploy.resources.reservations` - a GPU request now says the service
@@ -131,7 +135,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1323 Rust, 502 Python and 107 Node tests, and the count is gated against the README.
+- 1324 Rust, 502 Python and 107 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 
