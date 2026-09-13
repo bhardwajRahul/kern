@@ -166,6 +166,39 @@ Three properties come from using the tool that already exists, and none of them 
 `ssh host kern-mcp` is already the minimal form. A wrapper around it would add surface without adding
 reach.
 
+## Six questions clients ask, measured on 2026-09-13
+
+**Do the server's environment variables reach the box?** No. With `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `OPENAI_API_KEY` and `GITHUB_TOKEN` set in the server process, a cell that
+dumped its own environment saw ten variables, all from the image plus `MPLCONFIGDIR` and `PYTHONPATH`,
+and none of the four. There is also no knob for passing any in: the box gets no secrets through this
+server at all.
+
+**Can the client mount a host directory?** No. There is no mount variable, so the only host path inside
+a box is the workspace. If you want the agent to work on a repository, point `KERN_MCP_WORKSPACE` at it
+and know what that means: the agent can then write anything in that tree, including a `.cursor/mcp.json`
+or `.mcp.json` that configures this server on the next restart. The SDK refuses `$HOME`, `/etc`, `/root`,
+the docker socket and any path with a credential directory in it (`.ssh`, `.aws`, `.kube`, ...), but a
+workspace you chose is a workspace you chose.
+
+**What happens when the client fires several calls at once?** They are serialised. Three `run_code` calls
+written back-to-back, each sleeping a second, came back in 3.0 s, one reply per id, in order, and each
+call saw the files the previous one had written. No race on the shared workspace, and no parallel speedup.
+
+**Do two clients (two editor windows, one config) see each other?** No. Each client spawns its own server
+process, and each process gets its own workspace: measured, two sessions had different workspace inodes
+and the second could not read the first's file. Both temp workspaces were removed when the servers
+exited, and the per-box scaffolding does not accumulate: 12 calls left one or two `.kern-env.*` files (the
+prewarm pool rotating), zero `.cell-*`, and an empty directory after exit.
+
+**Does `KERN_MCP_QUIET` hide the verdict?** No, and that is the one thing it must not do. With quiet on
+(the default) a cell that blew the memory cap still came back `isError: true` with
+`[exit 137, sandbox fault: oom: ...]` in the text, byte for byte the same verdict as with `KERN_MCP_QUIET=0`.
+Quiet suppresses kern's non-fatal NOTES, never a fault.
+
+**Is `KERN_MCP_SETUP` paid once or per call?** Once, at server start. With `KERN_MCP_SETUP=pip install
+tabulate`, the first call that imported it took 1294 ms and the second 120 ms, same session.
+
 ## What this is not
 
 It is not a hosted sandbox. There is no account, no API key and no egress: the code runs on a machine
@@ -174,5 +207,8 @@ trip to someone else's machine.
 
 It is not a way around the box's limits either. Everything in
 [docs/RESOURCES.md](RESOURCES.md) applies: `memory_mb` bounds the cgroup rather than the workload's
-usable memory, scratch is charged to that same cap, and each call is a fresh box, so anything a later
-call must find belongs in the workspace.
+usable memory, scratch is charged to that same cap, and each call is a fresh box unless
+`KERN_MCP_KERNEL=1`, so anything a later call must find belongs in the workspace. The `run_code` tool
+description states whichever of those two contracts is in force, and only that one: it used to carry the
+fresh-box sentence with the persistent-interpreter note appended after it, so in kernel mode the model
+read both and had to pick.
