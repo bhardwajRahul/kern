@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -2182,9 +2182,13 @@ class Sandbox:
                 return SandboxFault(
                     "startup_failed",
                     f"the box never started: kern was still setting it up when the {limit}s deadline "
-                    "fired, so the code never ran. A host path that blocks is what does this - a bind "
-                    "source on a dead NFS or a FUSE mount whose daemon is gone, an image layer on a "
-                    "stalled disk - and the remedy is that path, not a longer timeout",
+                    "fired, so the code never ran. Two shapes of cause, and they want opposite remedies. "
+                    "PERMANENT: a host path that blocks - a bind source on a dead NFS, a FUSE mount whose "
+                    "daemon is gone - where the remedy is that path and a longer timeout changes nothing. "
+                    "TRANSIENT: the image had to be read cold, which is what the FIRST call on a machine "
+                    "that just booted does (a warm box of this shape costs about 15 ms, and a 114 MB image "
+                    "read off a busy disk does not), where a longer timeout is exactly the remedy. Run it "
+                    "again: if the second call is fast, it was the cold read",
                 )
             return SandboxFault("timeout", f"exceeded the {limit}s time limit (killed by the binding)")
         # THE EXIT CODE IS THE RIGHT THING TO PROPAGATE AND THE WRONG THING TO CLASSIFY FROM, which is

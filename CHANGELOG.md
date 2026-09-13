@@ -7,6 +7,29 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Five readers of the post, simulated end to end, found two things.** A clean temp HOME, the install
+line the README gives (`curl … install.sh | sh`, which downloaded the 0.9.32 tarball, verified the
+checksum and warned that PATH was not set), and then five paths: the agent developer branching on
+`fault`, the Cursor/Claude Desktop user pasting the MCP config, the LangChain user, the Node and
+TypeScript developer, and the sceptic. Four of the five worked exactly as the text promises, on the
+PUBLISHED binary.
+
+**The `startup_failed` message asserted that a longer timeout does not help, and for one of its two
+causes that is false.** The first call on a machine that had just booted came back `startup_failed`
+with `exit=1` where every later call gave a clean `timeout` (15/15 afterwards, and not reproducible in
+17 tries). The verdict is right: the deadline fired while kern was still building the box, and the box
+never ran. But the message named only PERMANENT causes (a bind source on a dead NFS, a FUSE mount whose
+daemon is gone) and told the reader the remedy is that path. A cold read of a 114 MB image on a busy
+disk is the other shape, and there a longer timeout is exactly the remedy: a warm box of the same shape
+costs 15 ms here. The message now names both shapes, says they want opposite remedies, and tells the
+reader to run it again - if the second call is fast, it was the cold read. Same discipline as the `oom`
+verdict and the orphan warning: a diagnosis with two causes must not name one.
+
+**And the Node README's TypeScript remedy was half of one.** MEASURED with `tsc` 7.0.2 on a real
+`npm i kern-sandbox`: without `@types/node`, 8 errors saying `Cannot find name 'Buffer'`; with the types
+installed but no `tsconfig.json`, **the same 8**; with `{"compilerOptions":{"types":["node"]}}`, zero.
+The README said to install the package `tsc` names, which is the half the error message states out loud.
+
 **`examples/` was 103 files in one flat directory.** GitHub renders the file listing above the README,
 so the first thing a reader met was a wall they scroll past, and the index below it was a 100-row table.
 The examples are the asset; the layout was the problem.
