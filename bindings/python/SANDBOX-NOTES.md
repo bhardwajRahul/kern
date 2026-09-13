@@ -14,6 +14,17 @@ writes state to the workspace and a lock to `/tmp` writes both, and the next cal
 pointing at a path that is gone. Put anything a later call must find in the workspace. The `setup=` box is the exception: an install needs unbounded
 scratch, so the default is not applied there (an explicit `tmpfs=` still is).
 
+**A fault ends a `kernel()`, and only the workspace comes back.** A cell that is killed (OOM, timeout,
+a blocked syscall) takes the interpreter with it. Measured with `memory_mb=128`: cell A sets `x = 41` and
+writes `keep.txt`, cell B allocates until the cap bites (`exit_code` 137, `fault.type == "oom"`), and from
+there the two front ends differ on purpose. In the SDK the next `run_code` RAISES `kernel is dead: a prior
+cell ended it (oom). Files written to the workspace are still there; names and imports from the earlier
+cells are gone`, because a fresh interpreter handed back in silence would answer questions about state
+that no longer exists. The MCP server cannot raise at a model, so it opens a fresh kernel and says so on
+the reply for the cell that died; through it, cell C reads `x still there? False` with `keep.txt`
+unchanged. Either way `fault` is the signal: if it is not `None`, the names are gone and the files are not,
+so re-run the setup cell.
+
 **Toolchains in the box.** npm, Go, Rust and .NET cache under `$HOME`, and `$HOME` is inside the
 read-only root. The scratch at `/tmp` is half the answer; `HOME` is the other half, and no error says
 so. Go reports `failed to initialize build cache at /root/.cache`, which is true and does not mention

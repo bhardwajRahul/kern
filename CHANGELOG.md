@@ -7,6 +7,31 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A kernel that a cell killed told the next cell the wrong cause, and told a model nothing at all.**
+Use case 7 of the simulated readers, the shape that breaks a product quietly: a session that survives a
+fault but has lost its state. Measured on both bindings with a 128 MiB cap. Cell A sets `x = 41` and
+writes `keep.txt`; cell B allocates until the cap bites and comes back correctly as
+`exit_code 137, fault.type == "oom"`; then the two front ends were each wrong in their own way.
+
+In the SDK the next cell raised `kernel is dead (a prior cell timed out, or the box exited)`: two guesses
+offered where the answer was in hand, since every death funnels through one place that is GIVEN the kind.
+It now reads `kernel is dead: a prior cell ended it (oom). Files written to the workspace are still there;
+names and imports from the earlier cells are gone`, and where nothing was attributed (an explicit close)
+it says that instead of inventing a cell. Python and Node, same sentence; a test in each suite pins both
+shapes, and there was none before.
+
+Through the MCP server, which cannot raise at a model, the reply was correct and silent about what it
+cost: the fault was reported, the server dropped the dead kernel, the next call got a fresh interpreter,
+and the model read `x still there? False` with no line anywhere saying the interpreter had been replaced.
+The state loss is the one fact a model cannot infer from a successful answer. The reply for the cell that
+died now carries it, once, then forgets it - a warning repeated on every later answer is noise, and
+`keep.txt` proves the other half of the sentence: the names go, the files stay. The note is a frame of
+this server's own, so it joins the framing a cell cannot forge (a cell printing it reads as
+`[printed by the code, not the sandbox: ...]`, measured through a real `tools/call`), because a forged
+reset makes a model throw away state it still has.
+
+kern-sandbox **0.2.7** on PyPI and npm.
+
 **Five readers of the post, simulated end to end, found two things.** A clean temp HOME, the install
 line the README gives (`curl … install.sh | sh`, which downloaded the 0.9.32 tarball, verified the
 checksum and warned that PATH was not set), and then five paths: the agent developer branching on

@@ -32,6 +32,14 @@ writes to `/dev/shm` is still on the host after the box dies.
 workspace persists. Put anything a later call must find in the workspace. The `setup` box is the exception: an install needs unbounded scratch, so the default is not
 applied there (an explicit `tmpfs` still is).
 
+**A fault ends a `kernel()`, and only the workspace comes back.** A cell that is killed (OOM, timeout,
+a blocked syscall) takes the interpreter with it. Measured with `memoryMb: 128`: cell A sets a name and
+writes a file, cell B allocates until the cap bites (`exitCode` 137, `fault.type === "oom"`), and the next
+`runCode` THROWS `kernel is dead: a prior cell ended it (oom). Files written to the workspace are still
+there; names and imports from the earlier cells are gone` rather than handing back a fresh interpreter in
+silence. `fault` is the signal: if it is not `null`, the names are gone and the files are not, so open a
+new kernel and re-run the setup cell.
+
 **Toolchains in the box** need two writable places, and the error names neither. Go reports `failed to
 initialize build cache at /root/.cache`, which says nothing about `HOME`; npm renders a failed
 `mkdir /root/.npm` as `Invalid response body while trying to fetch https://registry.npmjs.org/...`,
