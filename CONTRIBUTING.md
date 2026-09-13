@@ -54,6 +54,14 @@ confident wrong answer first and a correction second.
   accepted an input they did not understand and produced a value that did not correspond to it
   (`parse_binary_size` on `31.2G`, `split_top_commas` on an escaped quote): the fix is never a wider
   accept, it is refusing the input or letting it fall onto the path that already reports it.
+- **Inserting code just above a `def`, `fn` or `class` inserts it BELOW whatever documents that item.**
+  Five times in one day: a new test took the `@integration` marker off the test it was inserted above
+  (which then ran in the job that has no kern binary and failed there, not here); a new helper took
+  `apply_deploy`'s doc comment, which also still described the behaviour the same commit had changed; a
+  test took another test's essay; a function took `class Kernel`'s JSDoc; and a `thread_local!` seam took
+  `fn warn`'s doc, which `-D warnings` caught as `unused doc comment` on a macro invocation. The rule:
+  insert after the complete unit (doc + decorators + item), and when a diff moves a doc block, read what
+  it now says about the code beneath it.
 - **Count kern's processes by `readlink /proc/<pid>/exe`, never by a pattern on the command line.**
   `pgrep -f kern` and a `grep` over `/proc/*/cmdline` both match YOUR OWN shell, because the pattern you
   are searching for is in the command you typed. Measured three times in one session: 92 "kern processes"
