@@ -54,6 +54,34 @@ confident wrong answer first and a correction second.
   accepted an input they did not understand and produced a value that did not correspond to it
   (`parse_binary_size` on `31.2G`, `split_top_commas` on an escaped quote): the fix is never a wider
   accept, it is refusing the input or letting it fall onto the path that already reports it.
+- **Count kern's processes by `readlink /proc/<pid>/exe`, never by a pattern on the command line.**
+  `pgrep -f kern` and a `grep` over `/proc/*/cmdline` both match YOUR OWN shell, because the pattern you
+  are searching for is in the command you typed. Measured three times in one session: 92 "kern processes"
+  on an idle machine, and a Chromium helper reported as a sandbox escape that had outlived its box (its
+  cmdline carried the marker string from the tool call that wrote the script). The census that works:
+
+  ```sh
+  for p in /proc/[0-9]*; do
+    [ "$(basename "$(readlink "$p/exe" 2>/dev/null)" 2>/dev/null)" = kern ] && echo "$p"
+  done | wc -l
+  ```
+
+  And when the thing you are looking for is inside a box, put a token in it that is generated at
+  RUNTIME, so no command line on the machine can contain it. Then prove the census can see the process
+  while it is alive, before believing a zero after it dies.
+- **One `XDG_RUNTIME_DIR` per worktree, or the registry is shared.** kern keeps its registry, instance
+  dirs, netns handles and exit files under `$XDG_RUNTIME_DIR/kern`, so two builds on one machine write
+  to the same place by default. Measured: another worktree's debug build cleared instance records under a
+  running compose stack, after which `compose down` truthfully reported `nothing was running` about boxes
+  that were still up, and `kern ps` printed the orphan warning naming them. Nothing was wrong with either
+  binary. Before running the compose or residue suites:
+
+  ```sh
+  export XDG_RUNTIME_DIR=/run/user/$(id -u)/kern-$(basename "$PWD")
+  mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+  ```
+
+  A red in those suites that you cannot explain is worth re-running isolated before you debug it.
 - **A green test proves nothing until you have seen it go red.** Sabotage the fix and watch the
   test fail. If it stays green, either the test or the sabotage is blind, and you do not yet know
   which.
