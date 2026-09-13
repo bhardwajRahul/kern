@@ -60,6 +60,14 @@ explicit flags that **override** a profile's values (and the `memoryMb` default 
 `memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
 Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
 
+**Nothing bounds the WORKSPACE, and `df` inside the box agrees with the host.** `memoryMb` bounds RAM
+and the tmpfs mounts charged to it; the workspace is a host directory, charged to your disk. Measured
+under `memoryMb: 128`: a cell writing a 400 MiB file there returns `exitCode: 0, fault: null` and the box
+reads the HOST's free space, so a job that preflights its own output size is told yes. The default
+workspace is a temp directory removed on close; a `workspace` you pass is not, and a 300 MiB file
+measurably stays. Nothing here caps it: put the workspace on a filesystem you size, and check what the
+last run left.
+
 **An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
 `fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success: true`
 and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is allowed
