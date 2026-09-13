@@ -8,6 +8,14 @@ with the box.
 pi's default posture is no sandbox: it runs with the permissions of the user who launched it.
 
 ```sh
+npm install kern-pi                 # the extension, and the SDK it drives
+cd /path/to/your/project
+pi -e ./node_modules/kern-pi
+```
+
+From a clone instead, which is what you want if you are changing it:
+
+```sh
 cd integrations/pi && npm install
 cd /path/to/your/project
 pi -e /path/to/kern/integrations/pi

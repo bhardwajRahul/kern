@@ -96,6 +96,16 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   two clients get two workspaces, `KERN_MCP_QUIET` never hides a verdict, and `KERN_MCP_SETUP` is paid
   once.
 
+### `kern-pi` (the pi coding agent's extension)
+
+- **1.0.1 on npm.** 1.0.0 asked for `kern-sandbox: ^0.1.41`, and for a zero-major version a caret range
+  stops at the next MINOR, so it resolved 0.1.x and never 0.2.x: a Pi user's model was reading the fault
+  verdicts from before this year's chain, because the extension writes `[kern: <fault.type>]` into the
+  stream the agent reads. The range is `^0.2.12` now. Verified by installing it: `npm i kern-pi` pulls
+  0.2.12, the package loads, and its file tools refuse `/etc/passwd`, a symlink planted in the workspace
+  (named as a symlink) and a relative path from the agent, while a legitimate write lands.
+- The README gives the npm route first and the clone second.
+
 ### Runtime and CLI
 
 - `--memory 64` is 64 BYTES and the message says so instead of sending the reader in a circle.
