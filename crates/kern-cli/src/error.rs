@@ -274,6 +274,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_compose_failure_that_is_not_about_the_file_gets_no_advice_about_the_file() {
+        // MEASURED on a valid stack whose dependency never became healthy: the error was right and the
+        // hint under it explained how to WRITE a compose file, which is advice about a thing that was
+        // not wrong. The mechanism was already here - a message carrying its own repair (a backticked
+        // command) suppresses the generic pointer - and that message simply had none. It does now, so
+        // this asserts the rule from both sides rather than the one sentence.
+        let carries_repair = Error::Compose(
+            "box 'x-api': dependency 'x-db' is unhealthy (its health check keeps failing) - run \
+             `kern logs x-db` for what the check sees"
+                .into(),
+        );
+        assert!(
+            carries_repair.hint().is_none(),
+            "a message with its own command must not get the file-format hint"
+        );
+        // AND THE OTHER SIDE, or this passes on a hint that never fires: a bare refusal about the file
+        // still gets the pointer, because there the reader IS writing one.
+        let about_the_file = Error::Compose("this file defines no services".into());
+        let h = about_the_file
+            .hint()
+            .expect("a file-shaped refusal keeps its hint");
+        assert!(
+            h.contains("docker-compose.yml") && h.contains("kern TOML"),
+            "{h}"
+        );
+    }
+
+    #[test]
     fn build_hint_routes_history_miss_to_the_builds_list() {
         // A build-history lookup miss points at `kern builds`, not the Dockerfile/FROM hint.
         let miss = Error::Build("no build '1-2'".into()).hint().unwrap();

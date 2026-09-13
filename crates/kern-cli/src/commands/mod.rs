@@ -4318,8 +4318,17 @@ fn wait_for_conditions(
                 break;
             }
             if status == "unhealthy" {
+                // THE MESSAGE CARRIES ITS OWN REPAIR, and that is load-bearing rather than polish: a
+                // `Compose` error without a backticked command gets the generic "a stack is a
+                // docker-compose.yml or a kern TOML" hint appended, which is advice about writing the
+                // FILE under a failure that has nothing to do with the file. MEASURED on a valid stack
+                // whose dependency never became healthy: the reader was told how to write a compose
+                // file. Its sibling one branch down (dead before healthy) already names `kern logs`,
+                // which is why that one reads right and this one did not.
                 return Err(Error::Compose(format!(
-                    "box '{}': dependency '{dep}' is unhealthy (its health check keeps failing)",
+                    "box '{}': dependency '{dep}' is unhealthy (its health check keeps failing) - run \
+                     `kern logs {dep}` for what the check sees, and check the `healthcheck:` command, \
+                     its `interval:` and its `retries:` in the file",
                     b.name
                 )));
             }
