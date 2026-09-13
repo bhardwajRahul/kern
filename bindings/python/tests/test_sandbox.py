@@ -796,6 +796,31 @@ def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
     assert s._classify(3, marker, False).type == "startup_failed"
 
 
+def test_a_profile_that_does_not_exist_is_a_box_that_never_started():
+    """`profiles=` is the one option whose refusal came back looking like the caller's code failing.
+
+    MEASURED with a `kern.toml` holding `vcpu:slice` and a call asking for `vcpu:non-esiste`: kern refuses
+    before any box exists ("config: no [[vcpu]] profile named 'non-esiste' ... create it with `kern config
+    add`"), exits 1, and the SDK reported `exit_code 1, fault=None` - which a caller branching on `fault`
+    cannot tell from their own code exiting 1. The marker list had every prefix kern prints on the image
+    and sandbox paths and not the one it prints on the CONFIG path, which is exactly the path a caller
+    reaches by using this option.
+    """
+    s = _cfg()
+    missing = ("error: config: no [[vcpu]] profile named 'non-esiste' in kern.toml - create it with "
+               "`kern config add vcpu:non-esiste ...`\n")
+    assert kern._looks_like_startup_failure(missing)
+    assert s._classify(1, missing, False).type == "startup_failed"
+    # The other two prefixes a box-that-never-ran can carry, both from the binding's own argv.
+    for line in ("error: usage: kern box <name> [flags]\n", "error: invalid box name: too long\n"):
+        assert kern._looks_like_startup_failure(line), line
+    # CONTROLS, or this widens the heuristic into "any stderr": a workload printing the words mid-line is
+    # its own failure, and so is one printing them with something before them.
+    assert not kern._looks_like_startup_failure("my app says error: config: bad\n")
+    assert not kern._looks_like_startup_failure("config: 3 keys loaded\n")
+    assert s._classify(1, "traceback: config error\n", False) is None
+
+
 def test_pull_network_failure_is_startup_failed():
     # A box that never started because the PULL failed (network/DNS down) prints kern's
     # "error: curl failed:" prefix. That is a startup failure, not the user's code failing.

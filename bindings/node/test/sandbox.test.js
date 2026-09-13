@@ -2263,3 +2263,32 @@ test("a two-byte kern is told apart from an external kill in the SENTENCE", () =
   assert.strictEqual(kind2, "killed");
   assert.ok(!/teardown bytes/.test(msg2), msg2);
 });
+
+test("a profile that does not exist is a box that never started", () => {
+  // `profiles` is the one option whose refusal came back looking like the caller's code failing.
+  // MEASURED through the Python binding with a kern.toml holding `vcpu:slice` and a call asking for
+  // `vcpu:non-esiste`: kern refuses before any box exists ("config: no [[vcpu]] profile named ...") and
+  // exits 1, and the binding reported `fault: null`, which a caller branching on `fault` cannot tell
+  // from their own code exiting 1. The marker list had every prefix kern prints on the image and sandbox
+  // paths and not the one it prints on the CONFIG path - the path this option reaches.
+  const missing =
+    "error: config: no [[vcpu]] profile named 'non-esiste' in kern.toml - create it with " +
+    "`kern config add vcpu:non-esiste ...`\n";
+  // Driven through `_classify`, which is where the predicate decides, rather than by exporting it: the
+  // package's exports are the API, and a test does not get to widen them.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  try {
+    const s = new Sandbox();
+    const cl = (stderr) => s._classify(1, null, stderr, false, 30);
+    assert.strictEqual(cl(missing)?.type, "startup_failed", "the config refusal must read as one");
+    for (const line of ["error: usage: kern box <name> [flags]\n", "error: invalid box name: too long\n"])
+      assert.strictEqual(cl(line)?.type, "startup_failed", line);
+    // CONTROLS, or this widens into "any stderr": the words mid-line are the workload's own failure.
+    assert.strictEqual(cl("my app says error: config: bad\n"), null);
+    assert.strictEqual(cl("config: 3 keys loaded\n"), null);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});

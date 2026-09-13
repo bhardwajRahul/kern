@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.13";
+const VERSION = "0.2.14";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1115,6 +1115,14 @@ function looksLikeStartupFailure(stderr) {
     "error: box:",
     "error: oci:",
     "error: image:",
+    // REACHABLE EXACTLY WHEN A CALLER PASSES `profiles`, and missing until it was measured: a profile
+    // name that is well formed but absent from `kern.toml` makes kern refuse before any box exists, and
+    // without this marker the call came back `exitCode 1, fault null`, which a caller reading `fault`
+    // cannot tell from their own code exiting 1.
+    "error: config:",
+    // The binding builds its own argv, so these mean IT got something wrong; either way the box never ran.
+    "error: usage:",
+    "error: invalid box name:",
   ];
   // The OOM sentence is skipped for a sharper reason than the benign notes: it is a report about a box
   // that RAN, and it is `kern:`-prefixed, so it used to satisfy this predicate. MEASURED, that is how a
