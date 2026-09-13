@@ -68,6 +68,18 @@ workspace is a temp directory removed on close; a `workspace` you pass is not, a
 measurably stays. Nothing here caps it: put the workspace on a filesystem you size, and check what the
 last run left.
 
+**`network: true` puts the box in the HOST's network namespace, so the host's own `127.0.0.1` is in
+reach.** Measured against a server bound to the host loopback: a box with `network: true` read its body.
+The services on a developer machine's loopback are the unguarded ones (a model runner, a notebook, a
+database with trust auth), so this is a real choice and not a detail. `network: false` refuses the same
+request (the box has its own loopback) and `egressAllow` answers `403` through the proxy, localhost
+included.
+
+**Pin the image by DIGEST when a run must be reproducible.** `image: "alpine@sha256:4bcff6..."` works and
+is cached by digest: two runs gave byte-identical stdout, while `alpine:latest` on the same machine gave a
+different release (3.22.1 against 3.24.1). kern does not record the digest a TAG resolved to, so a record
+that has to stand up later must carry the digest in the reference.
+
 **An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
 `fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success: true`
 and a contained fork bomb reads as a successful run. `EAGAIN` is an ordinary errno a program is allowed
@@ -81,8 +93,14 @@ and same image.
 message names the binary and the image because the remedy is one or the other. A shell's own
 `command not found` inside your script stays an ordinary non-zero exit.
 
-**A box that fails to start throws, and kern exits 125 for it**: a mount refused at runtime, an
-unmappable `--user`, a seccomp/AppArmor/cgroup setup error, or a pull/image error.
+**Which box-not-started failures THROW, and which come back as a fault.** kern exits **125**, its
+box-not-started code, with its own diagnostic for a mount refused at runtime, an unmappable `--user` or a
+seccomp/AppArmor/cgroup setup error, and that pair (125 + kern's marker) throws: the code never ran, so
+there is no result to hand back. An **image that cannot be pulled is not one of those**: measured on a
+typo'd tag, kern exits **1** with `error: registry: ... manifest unknown`, and `runCode`/`run` return
+`exitCode: 1, success: false, fault.type: "startup_failed"` with that message in `stderr`. A `kernel()`
+throws for either, because there the box IS the session. So branch on `fault`, not on `exitCode`: a box
+that never ran exits 1 exactly like a script that did.
 
 **Why `readFile` refuses a non-regular file, and why the flag alone was not enough.** A symlink is not
 the only thing a box can leave at a name: `mkfifo out.png` used to make `readFile("out.png")` wait for a

@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.8";
+const VERSION = "0.2.9";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -446,6 +446,26 @@ const REFUSED_MOUNT_SOURCES = new Set([
   "/run/docker.sock",
 ]);
 
+/** Credential directories, refused as a COMPONENT anywhere in the source. The set above is absolute
+ * paths, so it refused `$HOME` and accepted `$HOME/.ssh`: MEASURED, a box mounted with `~/.ssh` listed
+ * `id_ed25519` and `authorized_keys`. Refusing the parent and allowing its most sensitive child is the
+ * wrong way round, and it is the scenario a prompt-injected agent is steered into ("read ~/.aws"). These
+ * match by NAME because they live under a per-user home. No escape hatch, same as `/etc`: a job that
+ * needs one credential should be given that one file in the workspace. */
+const REFUSED_MOUNT_COMPONENTS = new Set([
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker",
+  ".azure",
+  ".password-store",
+  ".netrc",
+  ".git-credentials",
+  ".pypirc",
+  ".npmrc",
+]);
+
 /** A PROGRAMMER/config error, THROWN: bad argument, illegal mount, `kern` not installed, or the box
  * FAILED TO START (kern exits 125 - a mount refused at runtime, an unmappable `--user`, a seccomp or
  * AppArmor setup error). A box that never started ran no user code, so it rejects rather than resolve a
@@ -837,6 +857,13 @@ function validateMount(source, target) {
       `refusing to mount the sensitive host path ${JSON.stringify(real)} into a sandbox ` +
         "(this would defeat the isolation)",
     );
+  for (const part of real.split(path.sep))
+    if (REFUSED_MOUNT_COMPONENTS.has(part))
+      throw new MountRefused(
+        `refusing to mount ${JSON.stringify(real)}: ${JSON.stringify(part)} holds credentials, and code ` +
+          "in the box would read them. If the job needs one secret, write THAT FILE into the workspace " +
+          "(sbx.writeFile) or mount a directory that holds only it",
+      );
   return [real, target];
 }
 

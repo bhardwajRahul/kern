@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -490,6 +490,31 @@ _REFUSED_MOUNT_SOURCES = {
     "/dev",
     "/var/run/docker.sock",
     "/run/docker.sock",
+}
+
+
+# CREDENTIAL DIRECTORIES, REFUSED AS A COMPONENT ANYWHERE IN THE SOURCE. The set above is absolute
+# paths, so it refused `$HOME` and accepted `$HOME/.ssh`: MEASURED, a box mounted with
+# `mounts={"~/.ssh": "/x"}` listed `id_ed25519` and `authorized_keys`. Refusing the parent and allowing
+# its most sensitive child is the wrong way round, and it is the exact scenario a prompt-injected agent
+# is steered into ("read ~/.aws"). These are matched by NAME because they live under a per-user home, and
+# any path that has one as a component (the directory itself or anything below it) is refused.
+#
+# NO ESCAPE HATCH, the same as `/etc`: what a job legitimately needs is ONE credential, and the way to
+# give it one is to write that file into the workspace (or mount a directory holding only it), which is
+# also the only shape a reviewer can check.
+_REFUSED_MOUNT_COMPONENTS = {
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".azure",
+    ".password-store",
+    ".netrc",
+    ".git-credentials",
+    ".pypirc",
+    ".npmrc",
 }
 
 
@@ -1196,6 +1221,13 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
             f"refusing to mount the sensitive host path {real!r} into a sandbox "
             "(this would defeat the isolation)"
         )
+    for part in real.split(os.sep):
+        if part in _REFUSED_MOUNT_COMPONENTS:
+            raise MountRefused(
+                f"refusing to mount {real!r}: {part!r} holds credentials, and code in the box would "
+                f"read them. If the job needs one secret, write THAT FILE into the workspace "
+                f"(sbx.write_file) or mount a directory that holds only it"
+            )
     if not Path(real).exists():
         raise MountRefused(f"mount source does not exist: {source!r}")
     return real, target

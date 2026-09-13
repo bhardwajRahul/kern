@@ -122,6 +122,22 @@ nothing bounds; point it at a `tmpfs={"/home": "512m"}` instead if you want it c
 with the box.
 
 
+**`network=True` puts the box in the host's network namespace, so the host's own `127.0.0.1` is in
+reach.** Measured with a server bound to the host's loopback: from a box with `network=True` a request to
+`http://127.0.0.1:<port>/` returned the body. That is what sharing a namespace means, and it is worth
+saying out loud because the services on a developer machine's loopback are the unguarded ones: a model
+runner, a notebook, a database with trust auth, an auto-grader, a cloud-agent socket. Under
+`network=False` the same request is refused (the box has its own loopback) and under `egress_allow` it
+comes back `403` from the proxy, localhost included. Network is a session-level choice with no per-call
+override for this reason.
+
+**Pin the image by DIGEST when a run has to be reproducible later.** `image="alpine@sha256:4bcff6..."`
+works and is cached by digest; two runs of the same digest gave byte-identical stdout, while
+`alpine:latest` on the same machine gave a different release entirely (3.22.1 against 3.24.1). A wrong
+digest is refused at the registry (`manifest digest mismatch ... refusing`). What kern does NOT record is
+the digest a tag resolved to: `kern images --json` lists names, sizes and pull times, so a forensic or
+compliance record has to carry the digest in the reference you ran.
+
 **An enforced `pids` cap produces no fault, deliberately.** A refused `fork` returns `EAGAIN`, which a
 program is allowed to catch and exit 0 on, so a contained fork bomb reads as a successful run.
 Labelling that a sandbox fault would misreport a process that exited cleanly. The cap is still
