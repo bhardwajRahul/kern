@@ -50,7 +50,8 @@ import re
 import shutil
 from typing import TYPE_CHECKING, Any, Literal
 
-from . import _WORKSPACE, ExecutionResult, Sandbox
+from . import (_FRAME_LC_FAULT, _FRAME_MCP_EXIT, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _WORKSPACE,
+               ExecutionResult, Sandbox)
 
 if TYPE_CHECKING:  # typing only; this import never runs
     from langchain_core.tools import StructuredTool
@@ -108,10 +109,16 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 # Each marker is spelled ONCE and both uses are derived from it. Written out twice, the emitting side
 # and the neutralising side would be one condition in two places: reword the marker in `_render` and the
 # pattern here silently stops matching, which does not break a test, it reopens the forgery.
-_FAULT_MARK = "[sandbox: "
+_FAULT_MARK = _FRAME_LC_FAULT
 _CUT_HEAD, _CUT_TAIL = "... ", " characters of output, cut to fit ..."
 
-_FORGED_FAULT = re.compile("^" + re.escape(_FAULT_MARK.rstrip()), re.MULTILINE)
+# BOTH families: this module's `[sandbox: ...]` and the MCP server's, because they ship together and a
+# model reading a transcript cannot tell which surface produced a line.
+_FORGED_FAULT = re.compile(
+    "|".join("^" + re.escape(m.rstrip()) for m in
+             (_FAULT_MARK, _FRAME_MCP_EXIT, _FRAME_MCP_STDERR, _FRAME_MCP_RICH)),
+    re.MULTILINE,
+)
 _FORGED_CUT = re.compile(re.escape(_CUT_HEAD) + r"\d+" + re.escape(_CUT_TAIL))
 
 

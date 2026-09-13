@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.9";
+const VERSION = "0.2.10";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -445,6 +445,28 @@ const REFUSED_MOUNT_SOURCES = new Set([
   "/var/run/docker.sock",
   "/run/docker.sock",
 ]);
+
+/** kern's OWN state on this host: [path, what it is]. Refused as a mount source, like the docker socket
+ * and for the same reason.
+ *
+ * FOUND BY A CHECKLIST ROW, measured on the Python binding first: mounting `$XDG_RUNTIME_DIR/kern` was
+ * ACCEPTED, which hands the code in the box kern's control plane (the registry, instance dirs, netns
+ * handles and exit files of every box this user runs). The image cache is the same class one step
+ * removed: a box that writes it poisons the rootfs a LATER box runs. Resolved per call, because these
+ * follow the environment and a service manager moves them. */
+function kernStateDirs() {
+  const uid = process.getuid();
+  const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+  const home = os.homedir();
+  const cache = process.env.XDG_CACHE_HOME || path.join(home, ".cache");
+  const config = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return [
+    [path.join(runtime, "kern"), "kern's runtime state (the registry, instance dirs, netns handles and exit files of every box you are running)"],
+    [`/run/user/${uid}/kern`, "kern's runtime state"],
+    [path.join(cache, "kern"), "kern's image cache (a box that writes it poisons the rootfs a later box runs)"],
+    [path.join(config, "kern"), "kern's configuration (the profiles a later box may be given)"],
+  ];
+}
 
 /** Credential directories, refused as a COMPONENT anywhere in the source. The set above is absolute
  * paths, so it refused `$HOME` and accepted `$HOME/.ssh`: MEASURED, a box mounted with `~/.ssh` listed
@@ -857,6 +879,16 @@ function validateMount(source, target) {
       `refusing to mount the sensitive host path ${JSON.stringify(real)} into a sandbox ` +
         "(this would defeat the isolation)",
     );
+  for (const [state, what] of kernStateDirs()) {
+    let sreal;
+    try { sreal = fs.realpathSync(state); } catch { sreal = state; }
+    if (real === sreal || real.startsWith(sreal + path.sep))
+      throw new MountRefused(
+        `refusing to mount ${JSON.stringify(real)}: it is ${what}. Mounting kern's own state into a box ` +
+          "it started gives the code inside the sandbox's control plane, which is the same reason the " +
+          "docker socket is refused",
+      );
+  }
   for (const part of real.split(path.sep))
     if (REFUSED_MOUNT_COMPONENTS.has(part))
       throw new MountRefused(

@@ -4307,6 +4307,34 @@ fn parse_binary_size_str(s: &str) -> Option<u64> {
 /// (`replicas`, `restart_policy`, `placement`, …) is swarm/orchestration kern doesn't do; silently
 /// skipped here rather than warned per-key, since a single-node `deploy:` block is common and mostly
 /// inert for `kern compose`.
+/// The note for `deploy.resources.reservations`, which Docker treats as a scheduling request and kern
+/// has no scheduler for.
+///
+/// FOUND BY A RELEASE CHECKLIST ROW, measured: a service asking for a GPU with
+/// `deploy.resources.reservations.devices: [{capabilities: [gpu]}]` came up with **no output at all** and
+/// ran without the device. [`apply_deploy`] returns early when `resources.limits` is absent, so the whole
+/// `reservations` subtree was never looked at. Every neighbour in that function names what it drops
+/// (`replicas`, `mode`, `placement`, ...) for the same reason: a stack that looks scaled and is not, or
+/// looks accelerated and is not, is the "runs but lies" shape this parser exists to refuse.
+///
+/// The device half gets its own sentence because the remedy is different in kind: a device is granted by
+/// an operator through an `x-kern-vgpio:` profile plus `--allow-device-grants`, never by a downloaded
+/// file, and no wording of the compose key can change that.
+fn deploy_reservation_note(service: &str, key: &str) -> String {
+    if key == "devices" {
+        return format!(
+            "service '{service}': deploy.resources.reservations.devices ignored - kern grants NO device \
+             from a compose file, so this service runs WITHOUT the device (a GPU included) it asks for. \
+             A device comes from an operator: an `x-kern-vgpio:` profile plus `--allow-device-grants`"
+        );
+    }
+    format!(
+        "service '{service}': deploy.resources.reservations.{key} ignored - it is a scheduling request \
+         to an orchestrator, and kern runs one box per service with no scheduler. Write a CAP instead \
+         (`mem_limit:`/`cpus:`, or deploy.resources.limits), which kern does enforce"
+    )
+}
+
 fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     // `deploy.replicas` / `deploy.mode`: kern runs ONE box per service. Docker would start N, so
     // ignoring this in silence means a stack that looks scaled and is not - the exact "runs but lies"
@@ -4330,6 +4358,19 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
             warn(&format!(
                 "service '{name}': deploy.restart_policy ignored - use `restart:` (kern restarts on failure only)"
             ));
+        }
+    }
+    // THE RESERVATIONS SUBTREE, BEFORE THE EARLY RETURN BELOW. It used to sit behind it: a file with
+    // `reservations` and no `limits` produced not one word, and a service asking for a GPU ran without
+    // one in silence. Checklist row G6.
+    if let Some(res) = node
+        .child("resources")
+        .and_then(|r| r.child("reservations"))
+    {
+        for k in ["devices", "cpus", "memory", "generic_resources"] {
+            if res.child(k).is_some() {
+                warn(&deploy_reservation_note(name, k));
+            }
         }
     }
     let Some(limits) = node.child("resources").and_then(|r| r.child("limits")) else {
@@ -9751,6 +9792,35 @@ services:
     /// is an EMPTY STRING and legal, so "nothing follows the tag" cannot be the test; only the next
     /// content line separates the empty scalar from the block collection. A guard that refused on the
     /// bare tag alone would reject the last case here, which is why it is asserted.
+    #[test]
+    fn a_reservation_is_named_and_a_device_request_says_it_gets_nothing() {
+        // MEASURED with a release checklist: a service asking for a GPU through
+        // `deploy.resources.reservations.devices` came up with NO output and ran without the device,
+        // because `apply_deploy` returned early when `resources.limits` was absent and never looked at
+        // the reservations subtree. Every other key that function drops is named; these were not.
+        let dev = deploy_reservation_note("app", "devices");
+        assert!(dev.contains("runs WITHOUT the device"), "{dev}");
+        assert!(dev.contains("GPU"), "the word a reader searches for: {dev}");
+        assert!(
+            dev.contains("x-kern-vgpio") && dev.contains("--allow-device-grants"),
+            "a warning without a remedy is read once and skipped after that: {dev}"
+        );
+        // The scheduling half says something DIFFERENT, because the remedy is a cap and not a grant.
+        for k in ["cpus", "memory", "generic_resources"] {
+            let n = deploy_reservation_note("app", k);
+            assert!(n.contains(k), "{n}");
+            assert!(n.contains("no scheduler"), "{n}");
+            assert!(
+                n.contains("limits"),
+                "it must name what kern DOES enforce: {n}"
+            );
+            assert!(
+                !n.contains("WITHOUT the device"),
+                "the device sentence is for devices only: {n}"
+            );
+        }
+    }
+
     #[test]
     fn the_str_tag_is_refused_over_a_collection_and_kept_over_every_scalar() {
         let svc = |v: &str| format!("services:\n  a:\n    image: alpine\n{v}");

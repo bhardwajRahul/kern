@@ -125,6 +125,20 @@ import { DEFAULT_TMPFS_MB, Sandbox, type SandboxOptions } from "kern-sandbox";
 /** Wrap an SDK or syscall failure so the host side is named, keeping the original text. */
 function fromHost(e: unknown, what: string): Error {
 	const msg = e instanceof Error ? e.message : String(e);
+	// ELOOP IS NOT A BROKEN LINK CHAIN HERE, it is this boundary working: the open is O_NOFOLLOW, so a
+	// symlink planted at a path the host is about to read fails instead of redirecting. Passed through
+	// raw it reads `ELOOP: too many symbolic links encountered`, which sends the agent (and whoever
+	// reads its transcript) looking for a filesystem oddity instead of seeing a refused escape. The SDK
+	// says this in its own words for its own calls; the file tools have their own read path, so the
+	// sentence has to exist here too. Found by a release checklist row (E4).
+	if (e instanceof Error && (e as NodeJS.ErrnoException).code === "ELOOP") {
+		return refuse(
+			"gate",
+			`${what}: a component of that path is a SYMLINK, and these tools never follow one out of ` +
+				`${GUEST_WORKSPACE} (the kernel reports it as ELOOP). Read or write the file it points ` +
+				`at by its own path, if that path is in the workspace.`,
+		);
+	}
 	return refuse("host", `${what}: ${msg}`);
 }
 
