@@ -47,6 +47,23 @@ typescript eslint` needs 81 MiB of cache, so `HOME=/tmp` fails with `ENOSPC` aga
 default while `HOME=/workspace` succeeds. One small package fits either way, which is why testing
 with `express` proves nothing.
 
+**The fault taxonomy is kern's, not Python's, and it does not care what the workload is written in.**
+`fault` comes from a descriptor kern writes at teardown, so a compiled program gets the same verdicts as a
+cell. Measured: a Node process allocating past a 128 MiB cap returns `exit_code 137, fault.type "oom"` and
+`node -e "setTimeout(...)"` past the deadline returns `timeout`; a Go program built and run in the box
+returns `oom`, the **Go compiler itself** returns `oom` when 128 MiB is not enough to build, and a Go
+sleeper past the deadline returns `timeout`. A shell that tries to absorb the kill cannot:
+`./hog || echo handled` still came back `exit_code 137, fault.type "oom"`, because the OOM kills the whole
+cgroup rather than one process. What language-specific helpers add is the RICH side (a matplotlib figure,
+the value of a trailing expression), not the verdict.
+
+The trap that makes a non-Python workload look fault-free is the one two paragraphs up. Measured on the
+same Go program under the same cap: without `HOME`, `go run` fails with
+`failed to initialize build cache at /root/.cache: mkdir /root/.cache: read-only file system` and the call
+is `exit_code 1, fault=None`, which is correct, the sandbox did nothing; with `env={"HOME": "/workspace"}`
+the same command is `exit_code 137, fault.type "oom"`. A toolchain that cannot start looks exactly like
+code that failed, so give it `HOME` and scratch before reading anything into a clean exit 1.
+
 **Two numbers inside a box describe the host, not your box, and a program will act on them.** `df`
 reports a tmpfs's own size, and `nproc` reports the host's CPU count: measured under `cpus=0.5`,
 `nproc` says 28 while `cpu.max` says `50000 100000`, so `make -j$(nproc)` starts 28 jobs against half

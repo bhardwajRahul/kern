@@ -1,6 +1,6 @@
 {
   "name": "kern-pi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Route pi's bash, read, write, edit, ls, grep and find into a rootless kern box.",
   "license": "Apache-2.0",
   "homepage": "https://getkern.dev",
@@ -38,7 +38,7 @@
     "prepublishOnly": "rm -rf dist && tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "kern-sandbox": "^0.1.41"
+    "kern-sandbox": "^0.2.9"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.4",

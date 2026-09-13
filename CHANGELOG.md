@@ -7,6 +7,34 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`kern-pi` asked npm for an SDK line that cannot carry any of this year's fault fixes.** Its dependency
+was `kern-sandbox: ^0.1.41`, and for a zero-major version a caret range stops at the next MINOR, so it
+resolves 0.1.x and never 0.2.x. The extension writes `[kern: <fault.type>] <message>` straight into the
+stream the agent reads, so a Pi user's model was being handed the verdicts from before the 0.2.x chain: the
+`oom` a cell could forge in one line, a blocked escape reported as `killed` with a sentence about an
+external kill, a segfault reported as `killed` instead of `exit_code 139`. The range is `^0.2.9` now, and
+all eight Pi suites pass against it on this machine: 23 pure (peer removed), 74, 89, 25 hostile, 36 tools
+on GNU grep, 36 on BusyBox, registration against the real pi package, and 21 end to end with the pi binary
+driving the extension. Typecheck clean. `kern-pi` 1.0.1 here; publishing it is a separate step.
+
+**The fault taxonomy is kern's, not Python's, and both note pages now say so with numbers.** `fault` is
+read from a descriptor kern writes at teardown, so it does not depend on the language: measured, a Node
+process past a 128 MiB cap is `exit_code 137, fault.type "oom"` and a Node sleeper past the deadline is
+`timeout`; a Go program built and run in the box is `oom`, the Go COMPILER is `oom` when 128 MiB will not
+build it, and a Go sleeper is `timeout`. A shell cannot absorb it either: `./hog || echo handled` still
+came back `oom`, because the kill takes the whole cgroup rather than one process. What a language-specific
+helper adds is the rich side (a figure, a trailing expression), never the verdict.
+
+And the thing that makes a non-Python workload look fault-free is the documented `HOME` trap, now with its
+measured pair: the same Go program under the same cap is `exit_code 1, fault=None` with
+`failed to initialize build cache at /root/.cache` and no `HOME`, and `exit_code 137, fault.type "oom"`
+with `env={"HOME": "/workspace"}`. A toolchain that cannot start looks exactly like code that failed.
+
+**And the prewarm pool does not leak between calls.** Measured because it was raised as a risk: a cell
+wrote `/tmp/leak-<token>.txt`, set an environment variable and printed its hostname; the next call landed
+in a different box (different hostname), saw an empty `/tmp`, no such variable, and one pid. The workspace
+is shared, which is the documented half.
+
 **In kernel mode the MCP tool description said both things about state, and the false one came first.**
 `KERN_MCP_KERNEL=1` routes every `run_code` through one warm interpreter, so in-memory state persists.
 The description was built by APPENDING that note to a base sentence which said the opposite: measured
