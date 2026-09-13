@@ -1623,10 +1623,60 @@ def test_read_write_are_symlink_and_traversal_safe():
         s.write_file("a/b/c.txt", "nested")
         assert s.read_file("a/b/c.txt") == b"nested"
         s.run_code('import os; os.symlink("/etc/passwd", "/workspace/bad")')
-        with pytest.raises(SandboxError):
+        with pytest.raises(SandboxError) as e:
             s.read_file("bad")  # O_NOFOLLOW blocks a symlinked final component
+        # AND IT SAYS WHY: passed through raw, the refusal read `[Errno 40] Too many levels of symbolic
+        # link`, which sends a reader looking for a broken link chain when the truth is the opposite - the
+        # boundary refused to follow a link planted where the host was about to read. The errno stays as
+        # the detail.
+        assert "SYMLINK" in str(e.value) and "ELOOP" in str(e.value)
         with pytest.raises(SandboxError):
             s.read_file("../../../etc/passwd")  # lexical `..` containment
+
+
+def test_setup_refuses_the_shape_a_reader_guesses_first():
+    """`setup=` is one shell command, and a list of package names is what a first-time reader writes.
+
+    MEASURED on myself while testing ffmpeg in a box: `setup=["imageio-ffmpeg"]` came back as
+    `AttributeError: 'list' object has no attribute 'strip'` from inside `_run_setup`, an internal error
+    where a sentence belongs, and only at `__enter__` rather than at the constructor that was wrong. The
+    `cap_drop` guard beside it is the same shape (a bare string where a sequence goes).
+    """
+    for bad in (["pandas"], 42, ("pip install x",)):
+        with pytest.raises(SandboxError) as e:
+            Sandbox(setup=bad)  # type: ignore[arg-type]
+        assert "shell command STRING" in str(e.value)
+        assert 'setup="pip install' in str(e.value), "the message shows the shape that works"
+    # A CONTROL, or this passes on a guard that refuses every setup: the documented shape constructs.
+    assert Sandbox(setup="pip install requests").setup == "pip install requests"
+    assert Sandbox().setup is None
+
+
+def test_an_absolute_path_is_refused_and_not_reinterpreted():
+    """A host path handed to a workspace call is refused, and never resolved INSIDE the workspace.
+
+    MEASURED divergence between the two bindings, with the Node side silently wrong: there
+    `readFile("/etc/passwd")` returned "WORKSPACE DECOY", the content of a file the BOX had planted at the
+    relative path `etc/passwd`, and `writeFile` wrote into it. Python refused. Same three lines in both;
+    the difference is the primitive, since `os.path.join` DROPS the base for an absolute second argument
+    while Node's `path.join` KEEPS it. So the refusal here was an accident of the standard library, not a
+    decision, and the decision is now explicit in both.
+
+    The boundary held either way, which is why this hides: no host file was read. What came back was a
+    DIFFERENT FILE'S CONTENTS than the path asked for.
+    """
+    with Sandbox(timeout_s=20) as s:
+        s.run_code("import os; os.makedirs('/workspace/etc', exist_ok=True); "
+                   "open('/workspace/etc/passwd','w').write('DECOY')")
+        for call in (lambda: s.read_file("/etc/passwd"), lambda: s.write_file("/etc/passwd", b"x")):
+            with pytest.raises(SandboxError) as e:
+                call()
+            assert "is absolute" in str(e.value) and "RELATIVE" in str(e.value)
+        # THE REFUSAL CAME BEFORE ANY I/O, and the relative path still reaches the same file.
+        assert s.read_file("etc/passwd") == b"DECOY"
+        # A CONTROL, or this passes on a resolver that refuses everything.
+        s.write_file("ok.txt", b"fine")
+        assert s.read_file("ok.txt") == b"fine"
 
 
 @integration

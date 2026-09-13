@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import errno
 import json
 import os
 import queue
@@ -66,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1687,6 +1688,16 @@ class Sandbox:
         self._cap_drop_args = []
         for cap in self.cap_drop or ():
             self._cap_drop_args += ["--cap-drop", _validate_cap(cap)]
+        # SAME GUARD AS `cap_drop` ABOVE, for the same reason: the wrong shape is the natural guess.
+        # `setup=` is ONE SHELL COMMAND, and a list of package names is what a reader writes first
+        # (measured on myself: `setup=["imageio-ffmpeg"]` surfaced as `AttributeError: 'list' object has
+        # no attribute 'strip'` from inside `_run_setup`, an internal error where a sentence belongs).
+        if self.setup is not None and not isinstance(self.setup, str):
+            raise SandboxError(
+                f"setup must be a shell command STRING, not {type(self.setup).__name__}: write "
+                'setup="pip install pandas matplotlib" for packages, or any one line the setup box '
+                "should run (it runs once, with the network on)"
+            )
         if self._egress_allow and self.network:
             raise SandboxError(
                 "egress_allow and network=True are mutually exclusive: egress_allow gives a restricted "
@@ -2323,6 +2334,19 @@ class Sandbox:
         (in read/write) so a symlinked LAST component can't redirect the host I/O outside the workspace.
         """
         base = self._ws  # canonical since enter - no per-walk re-resolution
+        # AN ABSOLUTE PATH IS NOT A WORKSPACE PATH, and that is checked HERE rather than left to
+        # `os.path.join`, which happens to drop `base` when the second argument is absolute. Node's
+        # `path.join` does the OPPOSITE (it keeps the base), so the same three lines refused here and
+        # silently resolved `<workspace>/etc/passwd` there: MEASURED, `readFile("/etc/passwd")` returned a
+        # decoy the box had planted at that relative path, and `writeFile` wrote into it. The boundary held
+        # either way; the ANSWER was a different file's contents than the one asked for. A caller who
+        # passes a host path is asking for a host file, and the honest answer is a refusal.
+        if os.path.isabs(rel):
+            raise SandboxError(
+                f"path escapes the workspace: {rel!r} is absolute, and these calls take a path RELATIVE "
+                "to the workspace. Nothing outside it is readable or writable through them, and an "
+                "absolute path is NOT reinterpreted as a workspace one"
+            )
         # Lexical containment: join + normpath collapses `..`, then require it stays under base.
         full = os.path.normpath(os.path.join(base, rel))
         if full != base and not full.startswith(base + os.sep):
@@ -2367,7 +2391,7 @@ class Sandbox:
         try:  # openat descent re-checks every component O_NOFOLLOW, closing the create->open TOCTOU too
             fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         except OSError as e:
-            raise SandboxError(f"cannot write {path!r}: {e}") from e
+            raise _path_refusal("write", path, e) from e
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
 
@@ -2441,7 +2465,7 @@ class Sandbox:
         try:
             fd = self._open_nofollow(full, os.O_RDONLY)
         except OSError as e:
-            raise SandboxError(f"cannot read {path!r}: {e}") from e
+            raise _path_refusal("read", path, e) from e
         with os.fdopen(fd, "rb") as f:
             if max_bytes is None:
                 return f.read()
@@ -2467,7 +2491,7 @@ class Sandbox:
                 fd = self._open_nofollow(root, os.O_RDONLY | os.O_DIRECTORY)
                 os.close(fd)
             except OSError as e:
-                raise SandboxError(f"cannot list {subdir!r}: {e}") from e
+                raise _path_refusal("list", subdir, e) from e
         else:
             root = self._ws  # _ws is canonical (set at enter)
         return [FileInfo(path=p, size=s, change="created") for p, (_, s) in self._walk(root).items()]
@@ -3852,6 +3876,30 @@ def _exec_failure_binary(stderr: str) -> "tuple[str, str] | None":
     """
     m = _EXEC_FAILED_RE.search(stderr)
     return (m.group(1), m.group(2).strip()) if m else None
+
+
+def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
+    """The message for a host-side open that the workspace boundary refused.
+
+    ELOOP here is not a filesystem oddity, it is the boundary doing its job: every component is opened
+    O_NOFOLLOW, so a symlink the BOX planted at a path the host is about to read or write fails instead of
+    redirecting. Passed through raw it reads `[Errno 40] Too many levels of symbolic link`, which sends a
+    reader looking for a broken link chain when what happened is an attempt to reach a host file. Whoever
+    reads this (a person, a log, a red team) should be able to tell the two apart.
+    """
+    if e.errno == errno.ELOOP:
+        return SandboxError(
+            f"refusing to {verb} {path!r}: a component of that path is a SYMLINK. Host-side reads and "
+            f"writes descend the workspace with O_NOFOLLOW and never follow one, because a link planted "
+            f"inside the workspace is how a box reaches a host file it was not given (the kernel reports "
+            f"this as ELOOP). Remove it, or name the file you meant"
+        )
+    if e.errno == errno.ENXIO:
+        return SandboxError(
+            f"refusing to {verb} {path!r}: it is a FIFO with no reader. Opening one for writing would "
+            f"block until the box chose to read, so the open is non-blocking and fails instead"
+        )
+    return SandboxError(f"cannot {verb} {path!r}: {e}")
 
 
 def _looks_like_startup_failure(stderr: str) -> bool:

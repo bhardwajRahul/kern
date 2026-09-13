@@ -241,6 +241,14 @@ The box stays in its own network namespace and reaches the internet only through
 proxy. Mutually exclusive with `network=True`. Otherwise the network is on **only** during `setup=`, in
 a separate box that dies when setup ends.
 
+It is a **route-level** boundary, not a set of proxy variables a program can ignore, and that cuts both
+ways. Measured inside an `egress_allow` box: a raw socket to an IP returns `ENETUNREACH`, DNS does not
+resolve at all, and an HTTP request to a domain outside the list comes back `Tunnel connection failed:
+403 Forbidden`, while the same socket under `network=True` connects. Nothing leaves except through the
+proxy. So a client that does not speak to an HTTP proxy has **no path out**: a Postgres, MySQL or Redis
+connection under `egress_allow` fails to resolve its host, and that is the design rather than a bug. If
+the job needs a database, the network setting for it today is `network=True`.
+
 **`memory_mb` bounds the cgroup, not the workload's usable memory**, and `/dev/shm` is not bounded at
 all: measured, 200 MiB written there under `memory_mb=128` OOM-kills the box, while the same 200 MiB to
 `/tmp` returns `ENOSPC` and the box lives. Python's `multiprocessing` uses `/dev/shm` by default, so

@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.7";
+const VERSION = "0.2.8";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1227,6 +1227,15 @@ class Sandbox {
   constructor(opts = {}) {
     this.image = opts.image ?? DEFAULT_IMAGE;
     this.setup = opts.setup ?? null;
+    // `setup` is ONE SHELL COMMAND, and a list of package names is the natural first guess. Without this
+    // it reaches `_runSetup` and dies as `TypeError: cmd.trim is not a function`, an internal error where
+    // a sentence belongs (the Python binding had the same edge, as an AttributeError).
+    if (this.setup !== null && typeof this.setup !== "string")
+      throw new SandboxError(
+        `setup must be a shell command STRING, not ${Array.isArray(this.setup) ? "an array" : typeof this.setup}: ` +
+          'write setup: "pip install pandas matplotlib" for packages, or any one line the setup box ' +
+          "should run (it runs once, with the network on)",
+      );
     this.workspace = opts.workspace ?? null;
     this.memoryMb = opts.memoryMb === undefined ? 512 : opts.memoryMb;
     this.cpus = opts.cpus ?? null;
@@ -1875,7 +1884,21 @@ class Sandbox {
   _wsPath(rel) {
     // Lexical containment: normalize `..`/`.`, require it stays under the workspace base. Symlinks in
     // the final component are neutralized by O_NOFOLLOW on the actual open below.
+    //
+    // AN ABSOLUTE PATH IS NOT A WORKSPACE PATH, and it takes its own check because `path.join` KEEPS the
+    // base for an absolute second argument while Python's `os.path.join` DROPS it. The same three lines
+    // therefore refused in the Python binding and silently resolved `<workspace>/etc/passwd` here:
+    // MEASURED, `readFile("/etc/passwd")` returned a decoy the box had planted at that relative path and
+    // `writeFile("/etc/passwd")` wrote into it. The boundary held either way; the ANSWER was a different
+    // file's contents than the one asked for, which is worse than an error. A caller who passes a host
+    // path is asking for a host file, so the honest answer is a refusal.
     const base = this._ws;
+    if (path.isAbsolute(rel))
+      throw new SandboxError(
+        `path escapes the workspace: ${JSON.stringify(rel)} is absolute, and these calls take a path ` +
+          "RELATIVE to the workspace. Nothing outside it is readable or writable through them, and an " +
+          "absolute path is NOT reinterpreted as a workspace one",
+      );
     const full = path.normalize(path.join(base, rel));
     if (full !== base && !full.startsWith(base + path.sep))
       throw new SandboxError(`path escapes the workspace: ${JSON.stringify(rel)}`);
@@ -1933,7 +1956,7 @@ class Sandbox {
         0o644,
       );
     } catch (e) {
-      throw new SandboxError(`cannot write ${JSON.stringify(rel)}: ${e.message}`);
+      throw pathRefusal("write", rel, e);
     }
     try {
       // The file the box left at this name has to be a REGULAR file before we write into it: writing
@@ -2006,7 +2029,7 @@ class Sandbox {
       // a denial of service the workspace hands out for free, and O_NOFOLLOW does not touch it.
       fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (e) {
-      throw new SandboxError(`cannot read ${JSON.stringify(rel)}: ${e.message}`);
+      throw pathRefusal("read", rel, e);
     }
     try {
       this._assertFdInWorkspace(fd, rel); // race-free backstop: a swapped-in parent symlink is caught here
@@ -2399,6 +2422,28 @@ function kernelDriver(outCap, resCap, hello = false) {
  * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
  * captured stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box
  * stays network-off and resource-capped. `close()` (or a per-cell timeout) tears the box down. */
+/** The message for a host-side open the workspace boundary refused.
+ *
+ * ELOOP here is not a filesystem oddity, it is the boundary working: the final component is opened
+ * O_NOFOLLOW, so a symlink the BOX planted at a path the host is about to touch fails instead of
+ * redirecting. Raw, it reads `ELOOP: too many symbolic links encountered`, which sends a reader looking
+ * for a broken link chain when what happened is an attempt to reach a host file. */
+function pathRefusal(verb, rel, e) {
+  if (e && e.code === "ELOOP")
+    return new SandboxError(
+      `refusing to ${verb} ${JSON.stringify(rel)}: a component of that path is a SYMLINK. Host-side ` +
+        "reads and writes never follow one (O_NOFOLLOW), because a link planted inside the workspace is " +
+        "how a box reaches a host file it was not given (the kernel reports this as ELOOP). Remove it, " +
+        "or name the file you meant",
+    );
+  if (e && e.code === "ENXIO")
+    return new SandboxError(
+      `refusing to ${verb} ${JSON.stringify(rel)}: it is a FIFO with no reader. Opening one for writing ` +
+        "would block until the box chose to read, so the open is non-blocking and fails instead",
+    );
+  return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: ${e && e.message ? e.message : e}`);
+}
+
 class Kernel {
   constructor(sbx, timeoutS) {
     this._sbx = sbx;

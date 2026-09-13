@@ -7,6 +7,44 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**An absolute path handed to a workspace call read a DIFFERENT FILE in the Node binding.** Measured
+through a real box: the cell planted `etc/passwd` inside the workspace, the host then called
+`readFile("/etc/passwd")`, and it came back `WORKSPACE DECOY`; `writeFile("/etc/passwd")` wrote into that
+same file. Python refused the identical call. Both bindings had the same three lines, and the difference
+is the primitive underneath: `os.path.join` DROPS the base when the second argument is absolute, while
+Node's `path.join` KEEPS it. So the Python refusal was an accident of the standard library, not a
+decision, and the Node acceptance was the same accident pointing the other way.
+
+The workspace boundary held in both, which is why this hides: no host file was ever read. What came back
+was the content of a path the caller did not ask for, to a caller who passed a host path precisely because
+they wanted a host file. Both bindings now refuse it explicitly, naming the reason, with a test in each
+suite; there was none, on either side.
+
+**And a symlink refusal said ELOOP instead of saying symlink.** Host-side reads and writes descend the
+workspace with `O_NOFOLLOW`, so a link the box plants where the host is about to read fails rather than
+redirecting: correct, and reported as `[Errno 40] Too many levels of symbolic link`, which reads as a
+broken link chain instead of an attempt to reach a host file. One translator in each binding now names
+the cause and keeps the errno as the detail. The FIFO-with-no-reader case (`ENXIO`) goes through it too.
+
+**`setup=` given a list of package names failed as an internal error.** `setup=["imageio-ffmpeg"]` reached
+`_run_setup` and surfaced `AttributeError: 'list' object has no attribute 'strip'` at `__enter__`, and
+`cmd.trim is not a function` in Node, pointing at the wrong line. It is refused at construction now, with
+the shape that works in the message, like the `cap_drop` guard beside it.
+
+**What the rest of the second case list measured, and did not change.** The egress allowlist is a
+route-level boundary, not proxy variables a program can ignore: inside an `egress_allow` box a raw socket
+to an IP is `ENETUNREACH`, DNS does not resolve, a request to a domain off the list is refused by the
+tunnel with `403`, and the same socket under `network=True` connects (the control that makes the rest
+mean anything). The other edge of that is now written down: a client which does not speak to an HTTP proxy
+has no path out, so Postgres, MySQL or Redis under an allowlist cannot resolve its host. Residue after 25
+faulting runs plus five OOM cycles through the MCP server's drop-and-respawn: zero processes whose
+executable is kern, zero registry records, zero instance dirs, zero netns, zero cgroups, with a live box
+proving the census can see one. And ffmpeg 7.0.2, a static build, encodes h264 on four threads, thumbnails
+and transcodes inside a default box: `exit 0` three times, no `escape_blocked`, so the default seccomp
+allowlist covers an untrusted-input converter.
+
+kern-sandbox **0.2.8** on PyPI and npm.
+
 **Two more of the simulated readers' cases, measured; one was a gap in the pages, not in the code.**
 Case 6 asked whether `fault` is STABLE, since a verdict that is right most of the time breaks a product
 quietly: 15 repetitions each of oom, timeout, a segfault and a clean run gave one verdict and one exit
