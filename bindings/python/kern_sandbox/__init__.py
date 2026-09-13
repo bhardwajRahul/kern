@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.13"
+__version__ = "0.2.14"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -4093,6 +4093,16 @@ def _looks_like_startup_failure(stderr: str) -> bool:
         "error: box:",
         "error: oci:",
         "error: image:",
+        # REACHABLE EXACTLY WHEN A CALLER PASSES `profiles=`, and missing until it was measured: a
+        # profile name that is well formed but not in `kern.toml` makes kern refuse before any box
+        # exists ("config: no [[vcpu]] profile named 'x' ... create it with `kern config add`"), and
+        # without this marker the call came back `exit_code 1, fault=None`, which a caller reading
+        # `fault` cannot tell from their own code exiting 1. Same for a malformed config file.
+        "error: config:",
+        # The SDK builds its own argv, so these mean the BINDING got something wrong rather than the
+        # caller, but either way the box never ran and that is what `fault` has to say.
+        "error: usage:",
+        "error: invalid box name:",
     )
     # kern also writes BENIGN `kern:` diagnostics to stderr that are NOT a box-start failure: the
     # `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
