@@ -7,6 +7,47 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A release QA checklist, run end to end, found three things.** ~40 rows across install gates, fault
+taxonomy, a hostile model, MCP, Pi, Node and compose, plus a residue census. Everything else passed as
+written; these did not.
+
+**Mounting kern's OWN state into a box was accepted.** `mounts={"$XDG_RUNTIME_DIR/kern": "/x"}` went
+through, and that directory is the registry, the instance dirs, the netns handles and the exit files of
+every box the user is running: the code in the sandbox got the sandbox's control plane. The image cache is
+the same class one step removed (write it and the rootfs a LATER box runs is yours), and the config dir
+holds the profiles a later box may be given. All three are refused now in both bindings, resolved per call
+from the environment so a moved `XDG_RUNTIME_DIR` moves the refusal, with the message naming what it is.
+The docker socket was already refused for exactly this reason, which is what made the gap visible.
+
+**Each agent surface neutralised only its OWN framing.** A cell printing `[sandbox: oom]`, the LangChain
+renderer's verdict marker, came back untouched through an MCP reply; the reverse hole was the same size.
+Both families ship in this one package and a model cannot tell which surface wrote a line, so the four
+markers are spelled once in the core now and both surfaces neutralise all of them. The `run_code`
+description also names the image, which was only in the `language` property's description before.
+
+**A compose service could ask for a GPU and get silence.** `deploy.resources.reservations.devices:
+[capabilities: [gpu]]` produced no output at all and ran without the device, because `apply_deploy`
+returned early when `resources.limits` was absent and never looked at the reservations subtree, while every
+other key that function drops is named. It now says the service runs WITHOUT the device it asked for and
+where a device actually comes from (an `x-kern-vgpio:` profile plus `--allow-device-grants`); the
+scheduling reservations (`cpus`, `memory`, `generic_resources`) get their own sentence pointing at the caps
+kern does enforce. A Rust test pins both shapes.
+
+**And `kern-pi`'s own refusal passed a raw errno.** A symlink planted in the workspace and read through
+pi's file tools came back `ELOOP: too many symbolic links encountered`, the mechanism instead of the
+reason, because the file tools have their own read path rather than the SDK's. It now names the symlink and
+says these tools never follow one out of `/workspace`.
+
+**What the checklist itself needs, measured the hard way:** the compose and residue rows have to run with
+an isolated `XDG_RUNTIME_DIR`. Sharing `/run/user/<uid>/kern` with another kern on the machine (another
+worktree's debug build, in this case) wiped instance records under a running stack, and `compose down` then
+honestly reported "nothing was running" about boxes that were. Re-run isolated: `up` 2 boxes, `getent
+hosts db` resolving a peer, a repeated `up` idempotent, `down` stopping both, and the census back to
+baseline, zero delta on processes, instance dirs and pods. The fault-taxonomy battery is 27 ok, 0 failed,
+0 skipped on this host, and `kern top` piped to `cat` neither hangs nor emits an escape byte.
+
+kern-sandbox **0.2.11** (PyPI) and **0.2.10** (npm).
+
 **`kern-pi` asked npm for an SDK line that cannot carry any of this year's fault fixes.** Its dependency
 was `kern-sandbox: ^0.1.41`, and for a zero-major version a caret range stops at the next MINOR, so it
 resolves 0.1.x and never 0.2.x. The extension writes `[kern: <fault.type>] <message>` straight into the

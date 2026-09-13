@@ -40,7 +40,8 @@ import re
 import sys
 import traceback
 
-from . import Kernel, Sandbox, SandboxError, __version__, _neutralise_terminal
+from . import (Kernel, Sandbox, SandboxError, __version__, _FRAME_LC_FAULT, _FRAME_MCP_EXIT,
+               _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _neutralise_terminal)
 
 # The single MCP protocol revision we implement; initialize always answers with THIS (we negotiate to
 # our version, we never echo a client-chosen string back).
@@ -80,9 +81,9 @@ _MAX_NAME = 200                   # chars of a client-supplied method/tool name 
 # Each marker is spelled ONCE and both uses derive from it. Written out twice, the emitting side and the
 # neutralising side would be one condition in two places: reword a marker below and the pattern silently
 # stops matching, which does not break a test, it reopens the forgery.
-_MARK_EXIT = "[exit "
-_MARK_STDERR = "[stderr]"
-_MARK_RICH = "[rich result]"
+_MARK_EXIT = _FRAME_MCP_EXIT
+_MARK_STDERR = _FRAME_MCP_STDERR
+_MARK_RICH = _FRAME_MCP_RICH
 _MARK_TRUNC = "[output truncated: reply-size cap]"
 _MARK_IMG_TAIL = " image result(s) omitted: reply-size cap]"
 _MARK_RESET = "[the session's interpreter ended on that cell "
@@ -96,6 +97,9 @@ _FORGED_FRAME = re.compile(
             r"^" + re.escape(_MARK_TRUNC),
             r"^\[\d+" + re.escape(_MARK_IMG_TAIL),
             r"^" + re.escape(_MARK_RESET),
+            # THE OTHER SURFACE'S VERDICT MARKER, because both ship in this package and a model cannot
+            # tell which one wrote a line: `[sandbox: oom]` used to pass through an MCP reply untouched.
+            r"^" + re.escape(_FRAME_LC_FAULT.rstrip()),
             re.escape(_CLIP_HEAD) + r"\d+" + re.escape(_CLIP_TAIL),
         ]
     ),
@@ -444,6 +448,11 @@ class _Server:
         for t in tools:
             if t.get("name") != "run_code":
                 continue
+            # THE IMAGE, in the description and not only in the `language` property's: a client that
+            # lists the tools (and a model that reads the first paragraph and stops) should see which
+            # image this server actually runs, because every "does it have node/gcc/ffmpeg" question is
+            # answered by that name and by nothing else here. Checklist row D1.
+            t["description"] += f" This server's boxes run the OCI image `{image}`."
             if self._use_kernel:
                 # REPLACED, not appended: two claims about the same fact is a contradiction the model
                 # has to guess its way out of.

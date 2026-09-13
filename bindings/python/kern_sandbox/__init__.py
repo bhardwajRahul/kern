@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.10"
+__version__ = "0.2.11"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -638,6 +638,18 @@ _ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates th
 # LangChain tool, the MCP server, and any caller building its own prompt) and a copy per renderer is
 # how one of them ends up without it: MEASURED on 2026-09-12, `SECURITY.md` claimed the MCP server
 # stripped these and its own framing, the LangChain renderer did both, and the MCP server did neither.
+# THE FRAMING BOTH AGENT SURFACES EMIT, spelled here ONCE because each of them has to neutralise BOTH.
+# Measured on 2026-09-13 with a release checklist: a cell that printed `[sandbox: oom]` (the LangChain
+# renderer's verdict marker) came back untouched through the MCP server, which neutralises only its own
+# `[exit N]`/`[stderr]` family; the reverse hole is the same size. A model does not know which surface it
+# is reading, and both families are documented as OURS in this one package, so either one forged in either
+# place is a verdict about the sandbox written by the code the sandbox was running.
+_FRAME_LC_FAULT = "[sandbox: "        # langchain: `[sandbox: oom]`
+_FRAME_MCP_EXIT = "[exit "            # mcp: `[exit 137, sandbox fault: ...]`
+_FRAME_MCP_STDERR = "[stderr]"
+_FRAME_MCP_RICH = "[rich result]"
+
+
 _ANSI_ESCAPES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _CONTROL_BYTES = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
@@ -1180,6 +1192,33 @@ def _is_inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root + "/")
 
 
+def _kern_state_dirs() -> "list[tuple[str, str]]":
+    """kern's OWN state on this host: (path, what it is). Refused as a mount source, like the docker
+    socket and for the same reason.
+
+    FOUND BY A CHECKLIST ROW, measured: `mounts={"$XDG_RUNTIME_DIR/kern": "/x"}` was ACCEPTED, which hands
+    the code in the box kern's control plane - the registry, the instance directories, the netns handles,
+    the health and exit files of every other box this user is running. The image cache is the same class
+    one step removed: a box that can write it poisons the rootfs a LATER box runs. Neither is a kernel
+    escape, and both defeat the point of asking kern for a box.
+
+    Resolved per call rather than at import, because these follow the environment (`XDG_RUNTIME_DIR`,
+    `XDG_CACHE_HOME`, `HOME`) and a test or a service manager moves them.
+    """
+    uid = os.getuid()
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return [
+        (os.path.join(runtime, "kern"), "kern's runtime state (the registry, instance dirs, netns handles "
+                                        "and exit files of every box you are running)"),
+        (f"/run/user/{uid}/kern", "kern's runtime state"),
+        (os.path.join(cache, "kern"), "kern's image cache (a box that writes it poisons the rootfs a later "
+                                      "box runs)"),
+        (os.path.join(config, "kern"), "kern's configuration (the profiles a later box may be given)"),
+    ]
+
+
 def _validate_mount(source: str, target: str) -> tuple[str, str]:
     """Validate one host->box mount; refuse unsafe sources/targets. Returns (abs_real_source, target)."""
     # A NUL CANNOT REACH THE OS LAYER AS A ValueError. Every other refusal here is `MountRefused`,
@@ -1221,6 +1260,14 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
             f"refusing to mount the sensitive host path {real!r} into a sandbox "
             "(this would defeat the isolation)"
         )
+    for state, what in _kern_state_dirs():
+        sreal = os.path.realpath(state)
+        if real == sreal or real.startswith(sreal + os.sep):
+            raise MountRefused(
+                f"refusing to mount {real!r}: it is {what}. Mounting kern's own state into a box it "
+                f"started gives the code inside the sandbox's control plane, which is the same reason "
+                f"the docker socket is refused"
+            )
     for part in real.split(os.sep):
         if part in _REFUSED_MOUNT_COMPONENTS:
             raise MountRefused(

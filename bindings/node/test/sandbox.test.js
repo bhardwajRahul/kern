@@ -2146,3 +2146,42 @@ test("credential directories are refused as a mount source", async () => {
     else process.env.KERN_BIN = prev;
   }
 });
+
+test("kern's own state is refused as a mount source", () => {
+  // Mounting kern's control plane into a box kern started defeats the point of asking for a box. FOUND
+  // BY A RELEASE CHECKLIST ROW on the Python binding: `$XDG_RUNTIME_DIR/kern` was ACCEPTED, and it holds
+  // the registry, instance dirs, netns handles and exit files of every box the user runs. The image cache
+  // is the same class one step removed (write it and the rootfs a LATER box runs is yours). Same reason
+  // the docker socket is refused, which was in the list while these were not.
+  const prev = { kb: process.env.KERN_BIN, rt: process.env.XDG_RUNTIME_DIR,
+                 ca: process.env.XDG_CACHE_HOME, cf: process.env.XDG_CONFIG_HOME };
+  process.env.KERN_BIN = FAKE_KERN;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "kt-state-"));
+  try {
+    for (const [envName, dir] of [["XDG_RUNTIME_DIR", "rt"], ["XDG_CACHE_HOME", "ca"], ["XDG_CONFIG_HOME", "cf"]]) {
+      const base = path.join(root, dir);
+      fs.mkdirSync(path.join(base, "kern", "inner"), { recursive: true });
+      process.env[envName] = base;
+      for (const src of [path.join(base, "kern"), path.join(base, "kern", "inner")]) {
+        assert.throws(() => new Sandbox({ mounts: { [src]: "/x" } }), (e) => {
+          assert.ok(e instanceof MountRefused, `${src}: ${e.constructor.name}`);
+          assert.match(e.message, /kern's/);
+          return true;
+        }, `${src} must be refused`);
+      }
+    }
+    // CONTROLS: a lookalike name and an ordinary directory still mount.
+    for (const name of ["kernel-notes", "data"]) {
+      const ok = path.join(root, name);
+      fs.mkdirSync(ok, { recursive: true });
+      const s = new Sandbox({ mounts: { [ok]: "/d" } });
+      assert.ok(s);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    for (const [k2, v] of [["KERN_BIN", prev.kb], ["XDG_RUNTIME_DIR", prev.rt],
+                           ["XDG_CACHE_HOME", prev.ca], ["XDG_CONFIG_HOME", prev.cf]]) {
+      if (v === undefined) delete process.env[k2]; else process.env[k2] = v;
+    }
+  }
+});

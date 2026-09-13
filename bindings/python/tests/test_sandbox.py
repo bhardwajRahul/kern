@@ -1458,6 +1458,40 @@ def test_track_files_off_skips_diff_but_keeps_results():
 
 
 @integration
+def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
+    """Mounting kern's control plane into a box kern started defeats the point of asking for a box.
+
+    FOUND BY A RELEASE CHECKLIST ROW, measured: `mounts={"$XDG_RUNTIME_DIR/kern": "/x"}` was ACCEPTED. That
+    directory holds the registry, the instance dirs, the netns handles and the exit/health files of every
+    box this user is running, so the code in the sandbox gets the sandbox's own state. The image cache is
+    the same class one step removed (write it, and the rootfs a LATER box runs is yours), and the config
+    dir holds the profiles a later box may be given. Same reason the docker socket is refused, which was
+    already in the list while these were not.
+    """
+    rt, ca, cf = tmp_path / "rt", tmp_path / "ca", tmp_path / "cf"
+    for d in (rt, ca, cf):
+        (d / "kern" / "inner").mkdir(parents=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(rt))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(ca))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cf))
+    for d in (rt, ca, cf):
+        for src in (d / "kern", d / "kern" / "inner"):   # the dir AND anything below it
+            with pytest.raises(MountRefused) as e:
+                kern._validate_mount(str(src), "/x")
+            assert "kern's" in str(e.value), str(e.value)
+    # THE ENVIRONMENT IS READ PER CALL, not at import: moving XDG_RUNTIME_DIR moves the refusal with it.
+    other = tmp_path / "moved"
+    (other / "kern").mkdir(parents=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(other))
+    with pytest.raises(MountRefused):
+        kern._validate_mount(str(other / "kern"), "/x")
+    # CONTROLS: a sibling that merely starts with the same letters, and an ordinary directory, pass.
+    for name in ("kernel-notes", "data"):
+        ok = tmp_path / name
+        ok.mkdir()
+        assert kern._validate_mount(str(ok), "/d")[1] == "/d"
+
+
 def test_credential_directories_are_refused_as_a_mount_source(tmp_path):
     """The refusal list was absolute paths, so it refused `$HOME` and ALLOWED `$HOME/.ssh`.
 
