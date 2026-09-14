@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.14"
+__version__ = "0.2.15"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -613,6 +613,21 @@ class Result:
 # `_looks_like_startup_failure` skips them so a benign note cannot be read as a box that failed to
 # start. Those two must agree by construction; when they were separate lists they did not have to.
 _KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
+
+# The two prefixes kern's CLI writes AT COLUMN 0, and the whole vocabulary of "kern is speaking".
+# `kern-cli/src/main.rs` prints every error it ever reports through one `eprintln!("error: {}", ...)`,
+# and `ui::scrub_message` INDENTS every continuation line precisely so that a hostile value inside a
+# message cannot forge a line at column 0. So this is the complete set, by construction, and matching
+# it at column 0 is what keeps the runtime's guarantee worth something.
+#
+# WHAT THIS REPLACED, and why the shape was the defect: a list of eleven message OPENINGS
+# (`error: pull:`, `error: box:`, `error: config:` ...). Every one of them was added after a caller
+# measured a call that came back `fault=None`, because a whitelist of openings is an attempt to
+# enumerate the error TEXTS of a binary that has hundreds of them behind a single printer, and it can
+# never be closed. An external reviewer closed the argument in one command: `image=""` prints
+# `error: bad image reference: empty`, which is not in any of the eleven, so a box that never existed
+# came back indistinguishable from a script that exited 1.
+_KERN_SPEAKING = ("error: ", "kern:")
 
 # The sentence kern prints when it has READ the kernel's OOM counter for this box's own cgroup, as
 # opposed to anything the SDK could infer from an exit code. Kept as one constant because it is a
@@ -3242,7 +3257,12 @@ class Kernel:
                 f"interpreter is its PID 1. The sandbox did not act; the next call reopens a kernel",
                 rc,
             )
-        if _looks_like_startup_failure(err):
+        # AND THE BYTE DECIDES WHETHER THE TEXT IS BELIEVED. kern writes the teardown payload only for a
+        # box that existed, so `kern_wrote_payload` is positive proof that this kernel STARTED and a
+        # `startup_failed` here could only be a cell printing kern's prefix at column 0 and dying of
+        # something else. The one-shot path gets this from `_run_one`, which drops the verdict when the
+        # start byte is set; this path had no such guard, so the widened predicate gets it here.
+        if not kern_wrote_payload and _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start", rc
         # THE ONE CAUSE THIS PATH CAN NAME EXACTLY, before the honest-but-vague ones below. kern arms
         # PDEATHSIG on a foreground box, that signal fires on the death of the creating THREAD on Linux,
@@ -3696,7 +3716,10 @@ class _WarmBox:
         # unforgeable byte is preferred over the sentence here too.
         if _oom_verdict(oom_signal, err, kern_wrote_payload=kern_wrote):
             fault, default = "oom", "the box exceeded its memory cap and was OOM-killed"
-        elif _looks_like_startup_failure(err):
+        elif not kern_wrote and _looks_like_startup_failure(err):
+            # `not kern_wrote` for the reason `_kernel_death_fault` states: the payload exists only for a
+            # box that existed, so with it set this RAISE would be a cell's own line deciding that the
+            # box never came up.
             raise SandboxError(err.strip() or "the box failed to start")
         elif cap_signal == 2:
             fault, default = (
@@ -4079,46 +4102,29 @@ def _path_refusal(verb: str, path: str, e: OSError) -> "SandboxError":
 
 
 def _looks_like_startup_failure(stderr: str) -> bool:
-    """True iff kern (the PARENT, before the box exists) failed to start the box. Anchored on kern's own
-    diagnostic prefixes - printed by kern, not by the workload - so the workload can't forge them by
-    writing the marker to its own stderr. (Same discipline as the tar vetter: don't trust text the
-    adversary controls; kern's setup errors precede any workload output and carry kern's prefixes.)"""
-    markers = (
-        "kern:",
-        "error: pull:",
-        "error: curl failed:",
-        "error: registry:",
-        "error: manifest:",
-        "error: sandbox:",
-        "error: box:",
-        "error: oci:",
-        "error: image:",
-        # REACHABLE EXACTLY WHEN A CALLER PASSES `profiles=`, and missing until it was measured: a
-        # profile name that is well formed but not in `kern.toml` makes kern refuse before any box
-        # exists ("config: no [[vcpu]] profile named 'x' ... create it with `kern config add`"), and
-        # without this marker the call came back `exit_code 1, fault=None`, which a caller reading
-        # `fault` cannot tell from their own code exiting 1. Same for a malformed config file.
-        "error: config:",
-        # The SDK builds its own argv, so these mean the BINDING got something wrong rather than the
-        # caller, but either way the box never ran and that is what `fault` has to say.
-        "error: usage:",
-        "error: invalid box name:",
-    )
-    # kern also writes BENIGN `kern:` diagnostics to stderr that are NOT a box-start failure: the
-    # `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
-    # without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
-    # `security_profile="untrusted"` that hits a network error) would be mislabeled `startup_failed`.
+    """True iff KERN ITSELF reported an error on this box, rather than the workload failing.
+
+    `_KERN_SPEAKING` at column 0 is the whole test: kern has exactly one error printer and indents every
+    continuation line, so a line that starts there is kern's. What it deliberately does NOT try to do is
+    decide forgery from the text. A workload can print `error: anything` at column 0, and no list of
+    openings ever stopped that; what stops it is the byte kern writes to `KERN_STARTED_FD`, which the
+    workload does not hold. Callers pair this predicate with that byte:
+    :meth:`Sandbox._run_one` drops a `startup_failed` whenever kern signalled that the box started, and
+    the two kernel paths ask the byte first. That is the same discipline as the taxonomy above: the
+    unforgeable channel decides, the text only describes.
+    """
+    # kern's BENIGN lines are subtracted first, and they are the reason this cannot be a bare prefix
+    # test: the `--security-profile` banner and `warning:`/`note:` lines carry `kern:` too, so without
+    # the skip a workload that merely exits non-zero while one is on stderr (code under
+    # `security_profile="untrusted"` that hits a network error) would read as a box that never started.
     #
-    # The OOM sentence is skipped for a sharper reason: it is a report about a box that RAN, and it is
-    # `kern:`-prefixed, so it used to satisfy this predicate. MEASURED, that is how a real OOM on a
-    # resident kernel came back as `startup_failed` and was RAISED instead of returning an `oom` fault.
-    # A workload that prints the sentence itself and exits non-zero now reads as its own failure rather
-    # than a startup failure, the same accepted bound as `_exec_failure`.
+    # The OOM sentence is skipped for a sharper reason: it is a report about a box that RAN. MEASURED,
+    # that is how a real OOM on a resident kernel came back as `startup_failed` and was RAISED instead
+    # of returning an `oom` fault.
     for line in stderr.splitlines():
-        s = line.lstrip()
-        if s.startswith(_KERN_DIAGNOSTICS) or _kern_reported_oom(line):
+        if line.startswith(_KERN_DIAGNOSTICS) or _kern_reported_oom(line):
             continue
-        if "sandbox setup failed" in s or any(s.startswith(m) for m in markers):
+        if line.startswith(_KERN_SPEAKING) or "sandbox setup failed" in line:
             return True
     return False
 

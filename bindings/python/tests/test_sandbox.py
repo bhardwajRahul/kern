@@ -821,6 +821,44 @@ def test_a_profile_that_does_not_exist_is_a_box_that_never_started():
     assert s._classify(1, "traceback: config error\n", False) is None
 
 
+def test_any_error_kern_prints_before_the_box_exists_is_a_startup_failure():
+    """The class, after three patches that each closed one member of it.
+
+    `error: config:` was added because a caller measured it; before that `error: image:`, before that
+    `error: pull:`. An external reviewer then ran `image=""` and got
+    `error: bad image reference: empty`, in none of the eleven openings the list had grown to, so a box
+    that never existed came back `fault=None` again. The list was the defect: kern reports every error
+    through ONE `eprintln!("error: {}", ...)` in `kern-cli/src/main.rs` and there are hundreds of
+    messages behind it, so the enumeration cannot be finished.
+
+    kern's side of the contract is what makes the general rule safe: `ui::scrub_message` INDENTS every
+    continuation line, so column 0 belongs to kern's own prefixes. This tests the rule, not the members:
+    a domain that does not exist yet must classify, and indentation must disqualify a line.
+    """
+    s = _cfg()
+    for line in (
+        "error: bad image reference: empty\n",           # the reviewer's command, verbatim
+        "error: sandbox: need --rootfs or --image\n",    # its neighbour, reachable the same way
+        "error: banana: a domain nobody has written yet\n",
+    ):
+        assert kern._looks_like_startup_failure(line), line
+        assert s._classify(1, line, False).type == "startup_failed", line
+    # CONTROLS. Column 0 is the whole discipline: an indented `error:` is a continuation of a kern
+    # message (kern indents them) or a workload's own output, and neither means the box failed to start.
+    assert not kern._looks_like_startup_failure("       error: forged by a hostile value\n")
+    assert not kern._looks_like_startup_failure("  error: my compiler says so\n")
+    assert not kern._looks_like_startup_failure("kern: warning: something benign\n")
+    assert not kern._looks_like_startup_failure(_KERN_OOM_LINE)  # a report about a box that RAN
+    assert s._classify(2, "error: expected 1 argument\n", False).type == "startup_failed"
+    # ...which a WORKLOAD could print at column 0, and the text cannot tell. The byte can: kern writes
+    # the teardown payload only for a box that existed, so the kernel path refuses the verdict when it
+    # arrived, and `_run_one` drops it for the one-shot path (measured end to end, both bindings).
+    k = Kernel(_cfg(), timeout_s=5)
+    forged = "error: pull: forged by the cell\n"
+    assert k._kernel_death_fault(forged, kern_wrote_payload=False)[0] == "startup_failed"
+    assert k._kernel_death_fault(forged, kern_wrote_payload=True)[0] == "killed"
+
+
 def test_pull_network_failure_is_startup_failed():
     # A box that never started because the PULL failed (network/DNS down) prints kern's
     # "error: curl failed:" prefix. That is a startup failure, not the user's code failing.

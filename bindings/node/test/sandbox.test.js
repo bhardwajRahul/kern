@@ -2292,3 +2292,33 @@ test("a profile that does not exist is a box that never started", () => {
     else process.env.KERN_BIN = prev;
   }
 });
+
+test("any error kern prints before the box exists is a startup failure", () => {
+  // The CLASS, after three patches that each closed one member of it. `error: config:` was added because
+  // a caller measured it, `error: image:` before that, `error: pull:` before that. An external reviewer
+  // then ran `image: ""` and got `error: bad image reference: empty`, in none of the eleven openings the
+  // list had grown to. The list was the defect: kern reports every error through ONE
+  // `eprintln!("error: {}", ...)` and there are hundreds of messages behind it.
+  //
+  // What makes the general rule safe is kern's own side of the contract: `ui::scrub_message` INDENTS
+  // continuation lines, so column 0 belongs to kern's prefixes. So this tests the rule, not the members.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  try {
+    const s = new Sandbox();
+    const cl = (stderr) => s._classify(1, null, stderr, false, 30);
+    for (const line of [
+      "error: bad image reference: empty\n",          // the reviewer's command, verbatim
+      "error: sandbox: need --rootfs or --image\n",   // its neighbour, reachable the same way
+      "error: banana: a domain nobody has written yet\n",
+    ])
+      assert.strictEqual(cl(line)?.type, "startup_failed", line);
+    // CONTROLS. An indented `error:` is a continuation of a kern message or a workload's own output.
+    assert.strictEqual(cl("       error: forged by a hostile value\n"), null);
+    assert.strictEqual(cl("  error: my compiler says so\n"), null);
+    assert.strictEqual(cl("kern: warning: something benign\n"), null);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
