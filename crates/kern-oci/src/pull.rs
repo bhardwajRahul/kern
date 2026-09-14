@@ -121,6 +121,16 @@ pub struct ImageHealthcheck {
     pub interval_ns: Option<u64>,
     pub timeout_ns: Option<u64>,
     pub start_period_ns: Option<u64>,
+    /// Docker 25+'s `StartInterval`: how often to probe DURING the start period, as opposed to
+    /// `Interval`, which governs the steady state.
+    ///
+    /// MISSING IT IS A 60x DELAY, not a missing feature. MEASURED on Immich's postgres image, which
+    /// ships `Interval 300s, StartPeriod 300s, StartInterval 5s`: Docker probes every 5 s and marks
+    /// it healthy in about ten, kern waited the whole 300 s interval for its FIRST probe and reported
+    /// `starting` for five minutes. Anything gated on `depends_on: condition: service_healthy` waits
+    /// with it. An external reviewer found it by sampling the process table at 0.1 s and seeing the
+    /// probe run once, late, and pass.
+    pub start_interval_ns: Option<u64>,
     pub retries: Option<u32>,
 }
 
@@ -502,6 +512,7 @@ pub(crate) fn healthcheck_after(cfg: &str) -> Option<ImageHealthcheck> {
         interval_ns: crate::json::u64_field(obj, "Interval"),
         timeout_ns: crate::json::u64_field(obj, "Timeout"),
         start_period_ns: crate::json::u64_field(obj, "StartPeriod"),
+        start_interval_ns: crate::json::u64_field(obj, "StartInterval"),
         retries: crate::json::u64_field(obj, "Retries").and_then(|r| u32::try_from(r).ok()),
     })
 }
@@ -598,6 +609,26 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
         }
         _ if name.contains('/') => (DEFAULT_REGISTRY.to_string(), name.clone()),
         _ => (DEFAULT_REGISTRY.to_string(), format!("library/{name}")),
+    };
+    // DOCKER HUB IS NOT AT `docker.io`, and a ref that says so is not exotic: it is Podman's
+    // recommended style, what its short-name policy produces, and what Immich's own compose file
+    // ships (`image: docker.io/valkey/valkey:9@sha256:...`). Taken literally, kern asked `docker.io`
+    // for a manifest and got a document that is not one: unpinned it parsed as a manifest with NO
+    // LAYERS, and pinned it failed as a digest mismatch against a digest that returns 404
+    // MANIFEST_UNKNOWN in that repository. Two symptoms, one cause, and both messages sent the reader
+    // to look at the image instead of at the host. MEASURED by an external reviewer bringing up
+    // Immich on WSL2, and reproduced here.
+    //
+    // `library/` is added AFTER the alias, and only for Docker Hub: `docker.io/alpine` means
+    // `library/alpine` exactly as bare `alpine` does, while `ghcr.io/alpine` means what it says.
+    let registry = match registry.as_str() {
+        "docker.io" | "index.docker.io" => DEFAULT_REGISTRY.to_string(),
+        _ => registry,
+    };
+    let repo = if registry == DEFAULT_REGISTRY && !repo.contains('/') {
+        format!("library/{repo}")
+    } else {
+        repo
     };
     Ok((registry, repo, reference))
 }
@@ -781,7 +812,29 @@ fn manifest_error(manifest: &str, registry: &str, repo: &str) -> OciError {
              or the tag may not exist"
         ))
     } else {
-        OciError::Registry("no layers in manifest".into())
+        // THE LAST RESORT NAMES WHAT ARRIVED, because "no layers in manifest" describes the document
+        // and not the reason, and a reader acts on the reason. MEASURED: an explicit `docker.io/`
+        // prefix sent kern to a host that answers HTML, and this line reported a manifest problem for
+        // a response that was never a manifest - so the diagnosis went to the image name, three
+        // falsified hypotheses deep, instead of to the address. The first line of what came back is
+        // the cheapest thing that separates "this repository has no layers" from "this is not a
+        // registry": scrubbed and clipped, since it is a remote-controlled string.
+        let head: String = manifest
+            .trim_start()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        OciError::Registry(if head.is_empty() {
+            "no layers in manifest, and the response was empty: is this address a registry?".into()
+        } else {
+            format!(
+                "no layers in manifest: the response begins {head:?}, so this address may not be serving a registry API"
+            )
+        })
     }
 }
 
@@ -3255,6 +3308,49 @@ mod tests {
         assert_eq!(
             parse_ref("ghcr.io/org/app:v1").unwrap(),
             ("ghcr.io".into(), "org/app".into(), "v1".into())
+        );
+        // DOCKER HUB'S OWN NAMES ARE NOT ITS API HOST. `docker.io` is Podman's recommended style and
+        // what Immich's official compose file ships; taken literally it fetched a document that is not
+        // a manifest, so an unpinned pull said "no layers in manifest" and a pinned one said "digest
+        // mismatch" against a digest that does not exist in the repo. Both messages blamed the image.
+        for host in ["docker.io", "index.docker.io"] {
+            assert_eq!(
+                parse_ref(&format!("{host}/valkey/valkey:9")).unwrap(),
+                (DEFAULT_REGISTRY.into(), "valkey/valkey".into(), "9".into()),
+                "{host} must resolve to Docker Hub's API host"
+            );
+            // `library/` is added for the one-segment form here exactly as it is for a bare name, and
+            // only for Docker Hub: `ghcr.io/alpine` means what it says.
+            assert_eq!(
+                parse_ref(&format!("{host}/alpine:3.19")).unwrap(),
+                (
+                    DEFAULT_REGISTRY.into(),
+                    "library/alpine".into(),
+                    "3.19".into()
+                )
+            );
+            assert_eq!(
+                parse_ref(&format!("{host}/library/alpine:3.19")).unwrap(),
+                (
+                    DEFAULT_REGISTRY.into(),
+                    "library/alpine".into(),
+                    "3.19".into()
+                )
+            );
+        }
+        // THE CONTROL: no other registry gets the `library/` courtesy, or a one-segment repo on a
+        // private registry would be rewritten into a path that does not exist there.
+        assert_eq!(
+            parse_ref("ghcr.io/app:v1").unwrap(),
+            ("ghcr.io".into(), "app".into(), "v1".into())
+        );
+        assert_eq!(
+            parse_ref("registry.example.com:5000/app:v1").unwrap(),
+            (
+                "registry.example.com:5000".into(),
+                "app".into(),
+                "v1".into()
+            )
         );
         // DIGEST pins: the whole `sha256:<hex>` is the manifest reference, and the name loses any tag
         // (a digest pins harder than a tag). A `host:port` must survive - it is not the digest's `:`.

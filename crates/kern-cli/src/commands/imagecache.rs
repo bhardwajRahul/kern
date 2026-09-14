@@ -152,6 +152,7 @@ pub(crate) fn write_image_config(
             ("hcinterval", h.interval_ns),
             ("hctimeout", h.timeout_ns),
             ("hcstart", h.start_period_ns),
+            ("hcstartint", h.start_interval_ns),
         ] {
             if let Some(v) = v {
                 line(k, &v.to_string());
@@ -202,6 +203,7 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
                         "hcinterval" => h.interval_ns = v.parse().ok(),
                         "hctimeout" => h.timeout_ns = v.parse().ok(),
                         "hcstart" => h.start_period_ns = v.parse().ok(),
+                        "hcstartint" => h.start_interval_ns = v.parse().ok(),
                         _ => h.retries = v.parse().ok(),
                     }
                 }

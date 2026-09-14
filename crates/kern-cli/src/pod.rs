@@ -1027,6 +1027,46 @@ pub fn create_with_range(
 /// egress + DNS.
 const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", "-U", "none"];
 
+/// The name pasta's tap gets INSIDE the namespace, DECLARED by kern in both cases rather than left to
+/// pasta, which names it after the HOST's interface and so gives a name that varies by machine.
+///
+/// Two values because the namespace differs, not because the platform does:
+///
+/// - alone in a namespace (a pod's shared netns, a single box) `eth0` is free, and it is the name a
+///   workload expects to find. Declaring it makes it the same on every host, where before it was
+///   `eth0` on WSL2 and a cloud VM, `wlp4s0` on the laptop this was developed on, `enp5s0` elsewhere.
+///   So this is not a rename, it is the end of a lottery: anything in a box that looked for `eth0` by
+///   name already failed on every host whose NIC is called something else.
+/// - on the pod BRIDGE the veth is already `eth0` (renamed for the workload in `kern-isolation`), so
+///   the tap needs a name of its own or pasta dies with `TUNSETIFF failed: Invalid argument` and the
+///   box comes up with peers and no internet. MEASURED on WSL2, and reproduced on ordinary Linux by
+///   forcing this constant to `eth0`.
+///
+/// Which one is chosen belongs to the CALLER, because only the caller knows which namespace it is
+/// attaching to. An external reviewer caught the first version of this fix using the bridge name
+/// everywhere, which renamed the interface on two paths that never had the collision.
+const PASTA_IF_ALONE: &str = "eth0";
+const PASTA_IF_ON_BRIDGE: &str = "kern0";
+
+/// The host's first non-loopback nameserver, which is the address pasta must be told to answer.
+///
+/// `None` when the host resolves through a loopback stub (systemd-resolved and friends): pasta cannot
+/// copy that address into a namespace where it would mean the box's own loopback, so it substitutes a
+/// public resolver, and a box on such a host resolves today. This is only about the OTHER shape, where
+/// the copied address is a real one the box cannot reach.
+fn host_resolver_to_forward() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    text.lines()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .next()
+                .filter(|k| *k == "nameserver")
+                .and(l.split_whitespace().nth(1))
+        })
+        .find(|a| !a.starts_with("127.") && *a != "::1" && a.parse::<std::net::Ipv4Addr>().is_ok())
+        .map(str::to_string)
+}
+
 /// The exact argv passed to `pasta` for a pod, as a pure function of the pod dir + holder PID, so the
 /// invariants above are unit-testable without spawning anything. `--config-net` copies the host's
 /// addresses/routes into the ns tap and NATs outbound; pasta then daemonizes (the spawned process
@@ -1061,7 +1101,12 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 /// becomes the only thing that reaps it. That is why the pasta kill there is no longer conditional
 /// on the holder still being alive: with the watch off, a holder that dies outside teardown would
 /// otherwise leave pasta running forever.
-fn pasta_args(dir: &std::path::Path, holder: i32, watch_netns: bool) -> Vec<std::ffi::OsString> {
+fn pasta_args(
+    dir: &std::path::Path,
+    holder: i32,
+    watch_netns: bool,
+    ns_ifname: &str,
+) -> Vec<std::ffi::OsString> {
     let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(16);
     a.push("--config-net".into());
     a.push("-q".into());
@@ -1070,6 +1115,30 @@ fn pasta_args(dir: &std::path::Path, holder: i32, watch_netns: bool) -> Vec<std:
     a.extend(PASTA_NO_PORT_MAP.iter().map(Into::into));
     if !watch_netns {
         a.push("--no-netns-quit".into());
+    }
+    // THE NAME OF PASTA'S TAP, CHOSEN BY US RATHER THAN BY THE HOST. `--config-net` alone makes pasta
+    // name the interface it creates in the namespace after the HOST's template interface, so the name
+    // varies with the machine: `wlp4s0` on a laptop, `eth0` on WSL2 and on most cloud VMs. In bridge
+    // wiring a box already has an `eth0` (the veth, renamed for the workload's benefit in
+    // `kern-isolation`), so on exactly the hosts whose NIC is called `eth0` the two collide and pasta
+    // dies with `TUNSETIFF failed: Invalid argument`: the box comes up, reaches its peers, and has no
+    // internet. MEASURED on WSL2 by an external reviewer, against the same file working on 0.9.32
+    // (shared namespace, no veth, no collision) - a REGRESSION of the bridge default on that platform.
+    a.push("-I".into());
+    a.push(ns_ifname.into());
+    // TELL PASTA TO ANSWER THE RESOLVER IT ADVERTISES. `--config-net` copies the host's nameserver
+    // into the box, and on a home or edge network that address IS the default gateway, which pasta
+    // impersonates inside the namespace. pasta does not forward DNS queries by default, so they land
+    // on pasta and die: MEASURED on a Raspberry Pi 5, a box with `nameserver 192.168.1.1` and a
+    // working route (`nc 1.1.1.1:443` connects) that could not resolve a single name, with no warning
+    // from anything. `--dns-forward` is pasta's own answer for exactly this.
+    //
+    // ONLY FOR A NON-LOOPBACK RESOLVER, and the distinction is the host's, not ours: where the host
+    // runs a stub on `127.0.0.53` (systemd-resolved) pasta already substitutes a public resolver that
+    // works, which is why this was invisible on a laptop and not on a board.
+    if let Some(ns) = host_resolver_to_forward() {
+        a.push("--dns-forward".into());
+        a.push(ns.into());
     }
     a.push("--userns".into());
     a.push(format!("/proc/{holder}/ns/user").into());
@@ -1274,7 +1343,8 @@ fn output_within(
 }
 
 fn setup_outbound(name: &str, holder: i32) -> Outbound {
-    setup_outbound_in(&pod_dir(name), holder)
+    // A pod's SHARED namespace has no veth in it: `eth0` is free and is what a workload expects.
+    setup_outbound_in(&pod_dir(name), holder, PASTA_IF_ALONE)
 }
 
 /// Attach a rootless NAT to the namespaces of `target_pid`, keeping its state in `dir`.
@@ -1292,7 +1362,7 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
 /// `target_pid` must be a process whose `/proc/<pid>/ns/{user,net}` the caller keeps alive for the
 /// duration of this call. For a box that is the gate: PID 1 is blocked on a read with its namespaces
 /// fully built, so the pid cannot be recycled and the namespaces cannot vanish underneath pasta.
-fn setup_outbound_in(dir: &std::path::Path, holder: i32) -> Outbound {
+fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Outbound {
     let Some(pasta) = which_pasta() else {
         return Outbound::NotInstalled;
     };
@@ -1301,7 +1371,7 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32) -> Outbound {
     let spawn = |watch_netns: bool| {
         output_within(
             std::process::Command::new(&pasta)
-                .args(pasta_args(&dir, holder, watch_netns))
+                .args(pasta_args(&dir, holder, watch_netns, ns_ifname))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped()),
@@ -1625,7 +1695,8 @@ pub fn attach_box_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), Strin
     if std::fs::create_dir_all(dir).is_err() {
         return Err(format!("could not create {}", dir.display()));
     }
-    match setup_outbound_in(dir, pid1) {
+    // This box is a BRIDGE member: its veth is already `eth0`, so the tap takes the other name.
+    match setup_outbound_in(dir, pid1, PASTA_IF_ON_BRIDGE) {
         // `NoDns` is success HERE, unlike for a pod: the box writes its own `/etc/resolv.conf` from
         // the `--dns` arguments it was given at launch, so the file this function could not write is
         // one nothing reads. Reporting it as a failure would refuse egress that is working.
@@ -2626,6 +2697,7 @@ mod tests {
                 std::path::Path::new("/run/user/1000/kern/pods/demo"),
                 4242,
                 watch_netns,
+                PASTA_IF_ALONE,
             );
             let flat: Vec<String> = argv
                 .iter()
@@ -2751,11 +2823,101 @@ mod tests {
     /// The two directions are asserted separately because "present when needed" and "absent
     /// otherwise" are two claims, and the defect that motivated all of this was one condition
     /// standing in for two.
+    /// The name of pasta's tap is DECLARED by kern in both namespaces, and differs from the veth's.
+    ///
+    /// MEASURED, and this test exists because the failure was invisible on the machine that wrote the
+    /// feature. `--config-net` alone lets pasta name the namespace interface after the HOST's template
+    /// interface: `wlp4s0` on the laptop this was developed on, `eth0` on WSL2 and on most cloud VMs.
+    /// A bridge member already HAS an `eth0` (the veth, renamed for the workload), so on those hosts
+    /// pasta died with `TUNSETIFF failed: Invalid argument` and every service in a multi-service stack
+    /// came up with peers and no internet, while the same file on v0.9.32 (one shared namespace, no
+    /// veth) had outbound. An external reviewer measured it on WSL2; forcing the bridge constant to
+    /// "eth0" reproduced it on ordinary Linux, word for word.
+    ///
+    /// The assertions are on the RELATIONSHIPS, never on the strings. Pinning "kern0" would pass just
+    /// as well with both names set to the same value, which is the defect; and pinning only the bridge
+    /// case would let the OTHER namespace go back to whatever the host's NIC is called, which is the
+    /// lottery this replaced.
+    /// pasta is told to ANSWER the resolver it advertises, and only when that address is a real one.
+    ///
+    /// MEASURED on a Raspberry Pi 5, which is the shape a laptop hides: the host resolves through the
+    /// LAN router, pasta copies that address into the box, and it is the same address pasta
+    /// impersonates as the gateway - so queries land on pasta, which does not forward by default. The
+    /// box had a working route (`nc 1.1.1.1:443` connected) and could not resolve a single name, with
+    /// no warning from anything. With `--dns-forward` the same box, same nameserver, resolves.
+    ///
+    /// The laptop control is the other half: there the host's resolver is a loopback stub, pasta
+    /// substitutes a public one, the box resolves today, and this must not change it.
+    #[test]
+    fn pasta_is_told_to_forward_dns_only_for_a_reachable_resolver() {
+        let pick = |conf: &str| -> Option<String> {
+            conf.lines()
+                .filter_map(|l| {
+                    l.split_whitespace()
+                        .next()
+                        .filter(|k| *k == "nameserver")
+                        .and(l.split_whitespace().nth(1))
+                })
+                .find(|a| {
+                    !a.starts_with("127.") && *a != "::1" && a.parse::<std::net::Ipv4Addr>().is_ok()
+                })
+                .map(str::to_string)
+        };
+        assert_eq!(pick("nameserver 192.168.1.1\n"), Some("192.168.1.1".into()));
+        assert_eq!(
+            pick("search lan\nnameserver 10.0.0.1\n"),
+            Some("10.0.0.1".into())
+        );
+        // A loopback stub is NOT forwarded: inside a namespace that address is the box's own
+        // loopback, and pasta already substitutes something that works.
+        assert_eq!(pick("nameserver 127.0.0.53\n"), None);
+        assert_eq!(pick("nameserver ::1\n"), None);
+        // Neither is a file with nothing usable in it.
+        assert_eq!(pick("# nothing here\noptions ndots:2\n"), None);
+        // The FIRST usable one wins, and a loopback stub before it does not stop the search.
+        assert_eq!(
+            pick("nameserver 127.0.0.53\nnameserver 9.9.9.9\n"),
+            Some("9.9.9.9".into())
+        );
+    }
+
+    #[test]
+    fn pastas_tap_is_named_by_kern_and_never_like_the_bridge_veth() {
+        let dir = std::path::Path::new("/run/user/1000/kern/pods/demo");
+        let named = |ns_ifname: &str| {
+            let argv = pasta_args(dir, 4242, true, ns_ifname);
+            let i = argv
+                .iter()
+                .position(|a| a == "-I")
+                .expect("kern must NAME the interface, or pasta copies the host NIC's name");
+            argv.get(i + 1)
+                .expect("-I with no name")
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Both call sites declare a name, and the name they declare is the one that travels.
+        assert_eq!(named(PASTA_IF_ALONE), PASTA_IF_ALONE);
+        assert_eq!(named(PASTA_IF_ON_BRIDGE), PASTA_IF_ON_BRIDGE);
+        // On the bridge it cannot be the veth's name. That collision is TUNSETIFF EINVAL, and a whole
+        // platform with no outbound.
+        assert_ne!(PASTA_IF_ON_BRIDGE, "eth0");
+        assert_ne!(PASTA_IF_ON_BRIDGE, PASTA_IF_ALONE);
+        // Alone in a namespace it SHOULD be the ordinary name: nothing is holding it, and a workload
+        // that looks for `eth0` finds it on every host instead of on some of them.
+        assert_eq!(PASTA_IF_ALONE, "eth0");
+        for n in [PASTA_IF_ALONE, PASTA_IF_ON_BRIDGE] {
+            assert!(
+                !n.is_empty() && n.len() < 16,
+                "a name the kernel will take: {n:?}"
+            );
+        }
+    }
+
     #[test]
     fn no_netns_quit_is_the_retry_only_and_matches_only_its_own_refusal() {
         let dir = std::path::Path::new("/run/user/1000/kern/pods/demo");
         let has = |watch: bool| {
-            pasta_args(dir, 4242, watch)
+            pasta_args(dir, 4242, watch, PASTA_IF_ALONE)
                 .iter()
                 .any(|a| a == "--no-netns-quit")
         };

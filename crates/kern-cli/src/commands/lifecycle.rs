@@ -75,8 +75,19 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
             unsafe { libc::usleep(100_000) }; // 100 ms - let the process exec before the first probe
             first = false;
         } else {
-            unsafe { libc::sleep(hc.interval as libc::c_uint) };
-            elapsed = elapsed.saturating_add(hc.interval);
+            // INSIDE THE START PERIOD, THE START INTERVAL GOVERNS. Docker 25+ splits the two: a
+            // database that declares `Interval 300s, StartPeriod 300s, StartInterval 5s` is probed
+            // every 5 s while it boots and every 300 s afterwards. Reading only `Interval` made the
+            // FIRST probe land 300 s in, so a database ready in ten seconds reported `starting` for
+            // five minutes and every `depends_on: condition: service_healthy` waited with it.
+            // `0` is "the image said nothing", which keeps the previous behaviour exactly.
+            let wait = if hc.start_interval > 0 && elapsed < hc.start_period {
+                hc.start_interval
+            } else {
+                hc.interval
+            };
+            unsafe { libc::sleep(wait as libc::c_uint) };
+            elapsed = elapsed.saturating_add(wait);
         }
         // The box may have been `kern rename`d since we started: resolve its CURRENT name by pid so we
         // follow the rename instead of writing health under (and looking up) the stale original name.
@@ -1180,6 +1191,8 @@ pub(crate) struct HealthConfig {
     pub(crate) interval: u64,
     pub(crate) retries: u32,
     pub(crate) start_period: u64,
+    /// Probe cadence INSIDE the start period (0 = none declared: use `interval` throughout).
+    pub(crate) start_interval: u64,
     pub(crate) timeout: u64,
     pub(crate) action: HealthAction,
 }
@@ -1198,6 +1211,7 @@ impl HealthConfig {
             interval: self.interval,
             retries: self.retries,
             start_period: self.start_period,
+            start_interval: self.start_interval,
             timeout: self.timeout,
             action: self.action,
         })
@@ -1210,6 +1224,7 @@ pub(crate) struct OwnedHealth {
     pub(crate) interval: u64,
     pub(crate) retries: u32,
     pub(crate) start_period: u64,
+    pub(crate) start_interval: u64,
     pub(crate) timeout: u64,
     pub(crate) action: HealthAction,
 }

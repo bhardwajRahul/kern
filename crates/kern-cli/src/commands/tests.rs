@@ -2094,6 +2094,7 @@ mod net_resource_tests {
                 interval_ns: Some(30_000_000_000),
                 timeout_ns: Some(5_000_000_000),
                 start_period_ns: Some(2_000_000_000),
+                start_interval_ns: None,
                 retries: Some(4),
             }),
         };

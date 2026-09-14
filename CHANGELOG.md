@@ -15,6 +15,21 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - Each service gets its **own** network namespace on a bridge, which is Docker's arrangement. `--pod`
   keeps one shared namespace and one `127.0.0.1`, and is faster; `kern compose <file> config` prints
   which wiring a bring-up will use.
+- **A box on a home or edge network had internet and could not resolve a name.** pasta copies the
+  host's nameserver into the box, and on such a network that address is the LAN router, which is also
+  the gateway pasta impersonates inside the namespace; pasta does not forward DNS queries unless it is
+  told to, so they died there. MEASURED on a Raspberry Pi 5: `nc 1.1.1.1:443` connected and not one
+  name resolved, silently. kern passes `--dns-forward` for a real (non-loopback) host resolver now. A
+  laptop resolving through a `127.0.0.53` stub was never affected, which is why this was invisible
+  until the board ran it.
+- **A multi-service stack had no outbound on every host whose NIC is called `eth0`** (WSL2, most cloud
+  VMs), while the same file on v0.9.32 reached the internet. kern renames the bridge veth to `eth0` for
+  the workload's benefit, and pasta, told only `--config-net`, names its own tap after the HOST's
+  interface: on those machines the two are the same name and pasta dies with `TUNSETIFF failed: Invalid
+  argument`. kern names that interface itself now, and names it per namespace: `kern0` beside the veth
+  on the bridge, and `eth0` where nothing is holding it (a pod's shared namespace). The second half is
+  a fix of its own: that name used to be the host's, so a box saw `eth0` on a cloud VM and `wlp4s0` on
+  a laptop, and anything looking for `eth0` inside a box worked on some machines and not others.
 - Peers resolve by service name, by `networks.<net>.aliases` and by the name a service announces.
   `external: true` joins a network shared between projects, `network_mode: service:X` gets that
   service's namespace, and a bridge service has outbound and a resolver.
@@ -49,6 +64,31 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - Inside a box: `localhost` resolves to something listening, `HOME` follows the user, a workload gets
   its image's groups, a command knows the box's name, a box name may be 200 characters, and a box that
   dies against its `pids` cap says so.
+- **A database that was ready in ten seconds reported `starting` for five minutes.** Docker 25+ splits
+  the probe cadence in two: `Interval` for the steady state and `StartInterval` for the start period.
+  kern read only the first, so an image declaring `Interval 300s, StartPeriod 300s, StartInterval 5s`
+  (Immich's postgres) had its FIRST probe land 300 seconds in, and everything gated on
+  `depends_on: condition: service_healthy` waited with it. Both are honoured now, from the image config
+  and from a Dockerfile's `HEALTHCHECK --start-interval`, which kern used to accept with a printed
+  apology for not applying it.
+- **A failed `up` left its surviving boxes rebuilding forever.** `restart: always` is a promise about a
+  workload, and a box that never started has none: it exits 125 (kern's box-not-started code, and
+  Docker's), logs "never released: the launcher closed the pre-exec gate", and was restarted without a
+  cap. Measured on a real stack: 26 rounds for one service, 15 for another. That case is budgeted now
+  like `on-failure` is, it counts out loud (`never started (exit 125); retrying (3/10)`), and it says
+  why it stopped. A workload that exits keeps Docker's uncapped contract, unchanged.
+- **An explicit `docker.io/` prefix broke every pull**, and it is not an exotic spelling: it is
+  Podman's recommended style and what Immich's official compose file ships. Docker Hub's API is at
+  `registry-1.docker.io`, so kern was asking `docker.io` for a manifest and getting a document that is
+  not one: unpinned it read as "no layers in manifest", pinned it read as a digest mismatch against a
+  digest that does not exist in the repository. `docker.io` and `index.docker.io` resolve to the API
+  host now, and `docker.io/alpine` means `library/alpine` exactly as bare `alpine` does.
+- A relay test reported a phantom defect on a host that runs kern outside a delegated cgroup tree,
+  which kern's own message calls "an ordinary ssh session on most distributions": the stack came up,
+  the relay carried, and `exec` fail-closed because the command could not be put in the box's cgroup.
+  The test threw away that stderr and the 126, so it could only say `Got: ""`. It reports both now,
+  and the shared "this host cannot run the fixture" predicate knows that refusal, so such a host skips
+  instead of going red.
 - The compatibility rate ships with its corpus and its definition. The v0.9.32 claim of "14% to 94%"
   was the CEILING under a permissive definition; the strict one measures 35% on the same 259 files, and
   both numbers are in `docs/DOCKER-COMPAT.md` with the census scripts that produce them.
@@ -63,7 +103,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
   under a credential directory is also refused BEFORE it is created, rather than after.
 
-- Published 0.2.0 through 0.2.16 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
+- Published 0.2.0 through 0.2.17 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
   changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
   that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
   `KERN_BIN` that is not kern raises instead of reporting success.
@@ -106,6 +146,16 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 
 ### MCP server (`kern-mcp`)
 
+- **Every `run_code` reply names the kern that ran it** (`[exit 0 in kern 0.9.32]`), and the tool
+  description leads with what a client's own shell cannot do (seccomp, no capabilities, read-only root,
+  its own `/dev`, no host filesystem) instead of with "on the user's own machine". A reviewer wired the
+  server into Cursor correctly and the agent answered "the sandbox run completed successfully" from its
+  own python, never calling the tool: the description had described the client's terminal too, and
+  nothing in a reply could contradict a run that never happened.
+- An argument a tool does not have is refused rather than dropped: every schema is
+  `additionalProperties: false` and the server checks what it was sent against what it advertised, so a
+  call carrying `image` or `network` gets `-32602` naming it, and nothing runs. It used to run the code
+  under the server's own posture and answer `[exit 0]`, which tells a model its request succeeded.
 - Box output is untrusted text on its way into a model: terminal escapes and control bytes are
   stripped, and **both** surfaces' framing is neutralised, this server's (`[exit N]`, `[stderr]`,
   `[rich result]`, the truncation and session-reset notes) and the LangChain renderer's
@@ -144,7 +194,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1325 Rust, 505 Python and 110 Node tests, and the count is gated against the README.
+- 1330 Rust, 512 Python and 110 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 

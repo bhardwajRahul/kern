@@ -37,6 +37,17 @@ jobs:
       - name: test
         run: cargo test --all
         # HW/privilege-gated tests skip gracefully, so x86 CI stays green.
+        #
+        # AND A SKIP HERE IS INVISIBLE, which is why the suite is told to REQUIRE its fixtures on this
+        # runner. `cargo test` hides the stderr of a test that passes, so a file whose fixtures are
+        # missing skips most of itself and still reports 133/133, and nobody reads a log to find out.
+        # An external reviewer measured exactly that on his own machine: 96 of 133 skipped for a
+        # missing busybox, green. MEASURED here rather than assumed: this runner ships
+        # `busybox-static` (the webstack job's apt output says it REMOVES it to install `busybox`), so
+        # `/bin/busybox` is present and this variable asserts a property that already holds. The day a
+        # runner image drops it, this goes red instead of quietly running a third of the file.
+        env:
+          KERN_TEST_REQUIRE_FIXTURES: "1"
       - name: docs
         # The two prose gates. They existed before this step and ran only when someone remembered
         # them, which is the same as not running: the three figures that drifted over the launch
