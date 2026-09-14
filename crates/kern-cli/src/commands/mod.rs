@@ -343,6 +343,8 @@ pub struct BoxRunArgs<'a> {
     pub health_retries: u32,
     /// `--health-start-period <sec>`: grace period where a failing check keeps "starting".
     pub health_start_period: u64,
+    /// `--health-start-interval <sec>`: probe cadence INSIDE the start period (0 = steady interval).
+    pub health_start_interval: u64,
     /// `--health-timeout <sec>`: kill a single check that exceeds this (0 = no timeout).
     pub health_timeout: u64,
     /// `--health-action <restart|stop|none>`: what to do when a box turns unhealthy.

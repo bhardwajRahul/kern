@@ -180,6 +180,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --health-interval N Seconds between health checks (default 30)
     --health-retries N  Consecutive failures before a box is unhealthy (default 3)
     --health-start-period N  Grace period where failures keep it starting (default 0)
+    --health-start-interval N  Probe this often INSIDE the start period (default: the interval)
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
     --net [host|none]   Share the host network (bare/host); none = isolated (default)

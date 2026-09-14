@@ -199,6 +199,9 @@ pub enum Command {
         health_retries: u32,
         /// `--health-start-period <sec>`: initial grace where a failing check keeps "starting" (0).
         health_start_period: u64,
+        /// `--health-start-interval <sec>`: probe THIS often while inside the start period (0 = use
+        /// the steady interval throughout). Docker 25+'s `StartInterval`.
+        health_start_interval: u64,
         /// `--health-timeout <sec>`: kill a single check that runs longer than this (0 = no timeout).
         health_timeout: u64,
         /// `--health-action <restart|stop|none>`: what to do when a box turns unhealthy.
@@ -1942,6 +1945,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut health_interval = 30u64;
     let mut health_retries = 3u32;
     let mut health_start_period = 0u64;
+    let mut health_start_interval = 0u64;
     let mut health_timeout = 0u64;
     let mut health_action: Option<String> = None;
     let mut env_file: Vec<String> = Vec::new();
@@ -2354,6 +2358,19 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     {
                         Some(n) => health_retries = n,
                         None => return Err(Error::Usage("--health-retries <n> (>= 1, e.g. 3)")),
+                    }
+                }
+                // `--health-start-interval <sec>`: cadence INSIDE the start period. Separate from
+                // `--health-interval` because Docker 25+ separates them, and reading only the steady
+                // one made the first probe land a whole interval in: a database ready in ten seconds
+                // reported `starting` for five minutes.
+                "--health-start-interval" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(s) => health_start_interval = s,
+                        None => {
+                            return Err(Error::Usage("--health-start-interval <seconds> (e.g. 5)"))
+                        }
                     }
                 }
                 // `--health-start-period <sec>`: grace period where failures keep "starting".
@@ -2949,6 +2966,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             health_interval,
             health_retries,
             health_start_period,
+            health_start_interval,
             health_timeout,
             health_action,
             env_file,
@@ -3733,6 +3751,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             health_interval,
             health_retries,
             health_start_period,
+            health_start_interval,
             health_timeout,
             health_action,
             env_file,
@@ -3805,6 +3824,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             health_interval,
             health_retries,
             health_start_period,
+            health_start_interval,
             health_timeout,
             health_action: health_action.as_deref(),
             env_file: &env_file,

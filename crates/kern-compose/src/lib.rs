@@ -187,6 +187,8 @@ pub struct ComposeBox {
     pub health_interval: Option<i64>,
     pub health_retries: Option<String>,
     pub health_start_period: Option<String>,
+    /// `healthcheck.start_interval`, Docker 25+: probe cadence inside the start period.
+    pub health_start_interval: Option<String>,
     pub health_timeout: Option<String>,
     pub health_action: Option<String>,
     pub read_only: bool,
@@ -747,6 +749,9 @@ impl ComposeBox {
         }
         if let Some(v) = &self.health_start_period {
             cmd.arg("--health-start-period").arg(v);
+        }
+        if let Some(v) = &self.health_start_interval {
+            cmd.arg("--health-start-interval").arg(v);
         }
         if let Some(v) = &self.health_timeout {
             cmd.arg("--health-timeout").arg(v);
@@ -1312,6 +1317,7 @@ impl ComposeBox {
             health_interval,
             health_retries,
             health_start_period,
+            health_start_interval,
             health_timeout,
             health_action,
             // Added late and forgotten once each: a field that reaches the struct but not this list
@@ -1725,6 +1731,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             }
             "health_retries" => b.health_retries = Some(s(val)?),
             "health_start_period" => b.health_start_period = Some(s(val)?),
+            "health_start_interval" => b.health_start_interval = Some(s(val)?),
             "health_timeout" => b.health_timeout = Some(s(val)?),
             "health_action" => b.health_action = Some(s(val)?),
             // Switches - TOML booleans.
