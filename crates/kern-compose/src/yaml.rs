@@ -5566,6 +5566,15 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
     if let Some(v) = node.child("timeout").and_then(|n| n.scalar.as_deref()) {
         b.health_timeout = parse_duration_secs(&scalar_str(v)).map(|s| s.to_string());
     }
+    // `start_interval` (Docker 25+) was read by NOBODY and ignored in silence: a file declaring it got
+    // the steady interval for its first probe, which on a 300s/300s/5s healthcheck is five minutes of
+    // `starting` on a service that was ready in ten seconds.
+    if let Some(v) = node
+        .child("start_interval")
+        .and_then(|n| n.scalar.as_deref())
+    {
+        b.health_start_interval = parse_duration_secs(&scalar_str(v)).map(|s| s.to_string());
+    }
     if let Some(v) = node.child("start_period").and_then(|n| n.scalar.as_deref()) {
         // `start_period` reaches `--health-start-period <seconds>`, where 0 is MEANINGFUL ("no startup
         // grace") - so allow_zero=true, handling every zero spelling (`0s`, `0m`, `0h0m0s`) uniformly.
@@ -8194,8 +8203,19 @@ mod tests {
         assert_eq!(b.health_timeout.as_deref(), Some("30")); // 30s → "30", not "30s"
         assert_eq!(b.health_start_period.as_deref(), Some("90")); // 1m30s → 90
         assert_eq!(b.health_retries.as_deref(), Some("4")); // a plain count, unchanged
-                                                            // `start_period` 0 (no grace) is legitimate and must reach the box as `0`, not be dropped -
-                                                            // for EVERY zero spelling, not just `0s` (the old literal whitelist dropped `0m`/`0h`).
+                                                            // `start_interval` (Docker 25+) used to be read by nobody and dropped in SILENCE, so a file
+                                                            // that asked to be probed every 5s while booting got its first probe a whole interval in.
+                                                            // MEASURED on Immich's postgres (300s/300s/5s): five minutes of `starting` on a database that
+                                                            // answered in ten seconds, and every `depends_on: service_healthy` waiting behind it.
+        let si = "services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      interval: 300s\n      start_period: 300s\n      start_interval: 5s\n";
+        let b2 = &boxes(si)[0];
+        assert_eq!(b2.health_start_interval.as_deref(), Some("5"));
+        assert_eq!(b2.health_interval, Some(300)); // e il suo gemello resta quello che era
+                                                   // THE CONTROL: a file that does not ask for it leaves it unset, and the steady interval
+                                                   // governs from the first probe exactly as before.
+        assert_eq!(b.health_start_interval, None);
+        // `start_period` 0 (no grace) is legitimate and must reach the box as `0`, not be dropped -
+        // for EVERY zero spelling, not just `0s` (the old literal whitelist dropped `0m`/`0h`).
         for zero in ["0s", "0m", "0h", "0", "0h0m0s"] {
             let y0 = format!("services:\n  a:\n    image: x\n    healthcheck:\n      test: t\n      start_period: {zero}\n");
             assert_eq!(

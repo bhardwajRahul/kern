@@ -64,6 +64,10 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - Inside a box: `localhost` resolves to something listening, `HOME` follows the user, a workload gets
   its image's groups, a command knows the box's name, a box name may be 200 characters, and a box that
   dies against its `pids` cap says so.
+- **CLI, additive:** `--health-start-interval <sec>`, the flag behind Docker 25+'s `start_interval`.
+  Nothing is renamed or removed; a box that does not pass it behaves exactly as before. `kern compose`
+  sets it from `healthcheck.start_interval:`, which until now was read by nobody and dropped in
+  silence.
 - **A database that was ready in ten seconds reported `starting` for five minutes.** Docker 25+ splits
   the probe cadence in two: `Interval` for the steady state and `StartInterval` for the start period.
   kern read only the first, so an image declaring `Interval 300s, StartPeriod 300s, StartInterval 5s`

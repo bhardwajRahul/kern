@@ -217,7 +217,9 @@ empty, and never for a bind mount of a host path. A multi-layer image is read th
 kernel-merged overlay view, so a file a higher layer deleted does not come back.
 
 **The image's own `HEALTHCHECK` and `STOPSIGNAL` are used** when the file declares none. A
-`healthcheck:` in the file replaces the image's entirely, numbers included. An explicit
+`healthcheck:` in the file replaces the image's entirely, numbers included, and that includes Docker
+25+'s `start_interval:` (how often to probe while inside `start_period:`), which is honoured from both
+the file and the image. An explicit
 `stop_signal:` wins even when it names `SIGTERM`; a signal name kern does not know leaves the box on
 `SIGTERM` rather than refusing to start it.
 
@@ -225,7 +227,9 @@ kernel-merged overlay view, so a file a higher layer deleted does not come back.
 succeeds and the service fails later inside its own code. Such a service needs real Docker.
 
 **`restart:` in a pod does not survive a reboot.** A pod member is supervised in-process and restarted
-on any exit for the life of the stack, but a systemd unit cannot re-join the pod's network namespace.
+on any exit of its WORKLOAD for the life of the stack, but a systemd unit cannot re-join the pod's
+network namespace. A box that never started is the one exception: it exits 125, it has no workload to
+restart, and retrying it is budgeted rather than endless.
 For reboot-survival run that service as a standalone box: `kern box <name> --restart unless-stopped`,
 which has no pod and therefore no pod egress.
 

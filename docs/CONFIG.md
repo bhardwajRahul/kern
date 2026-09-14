@@ -292,6 +292,8 @@ health_cmd           = "wget -qO- localhost/health"   # --health-cmd
 health_interval      = 30         # --health-interval (integer seconds)
 health_retries       = "3"        # --health-retries
 health_start_period  = "10"       # --health-start-period
+health_start_interval = "5"       # --health-start-interval (probe cadence INSIDE the start period,
+                                  #   Docker 25+'s start_interval; default: the steady interval)
 health_timeout       = "2"        # --health-timeout
 health_action        = "restart"  # --health-action <restart|stop|none>
 

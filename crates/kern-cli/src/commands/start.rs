@@ -1635,9 +1635,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         interval: img_health.interval.unwrap_or(args.health_interval),
         retries: img_health.retries.unwrap_or(args.health_retries),
         start_period: img_health.start_period.unwrap_or(args.health_start_period),
-        // NO FLAG FALLBACK, because there is no flag: `0` means "probe at the steady-state interval
-        // from the start", which is exactly what kern did before this field existed.
-        start_interval: img_health.start_interval.unwrap_or(0),
+        // Same fallback shape as every other number here: the image's value when the caller named no
+        // probe of their own, otherwise the flag (which compose sets from `healthcheck.start_interval`).
+        // `0` on both sides means "nobody asked", and the steady interval governs from the first probe,
+        // which is exactly what kern did before this field existed.
+        start_interval: img_health
+            .start_interval
+            .unwrap_or(args.health_start_interval),
         timeout: img_health.timeout.unwrap_or(args.health_timeout),
         action: health_action,
     };
