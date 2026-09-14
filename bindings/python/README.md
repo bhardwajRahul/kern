@@ -336,16 +336,18 @@ shape rather than one box per call, with its own page:
 
 ## Performance
 
-One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `python:3.12-slim`, p50 over
-25 calls after a discarded warm-up. Your hardware will differ: measure and claim your own number.
+One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `python:3.12-slim`, the
+released musl binary, p50 after a discarded warm-up. Your hardware will differ: measure and claim your
+own number, and take the p50 rather than the best run. The bare-box row read 3.9 here until the host
+was checked: it was the MINIMUM, and the machine had 300 orphaned box processes on it from test runs.
 
 | call (p50) | kern-sandbox | docker |
 |---|---|---|
-| `run(["true"])`, bare box | **3.9 ms** | |
+| `run(["true"])`, bare box | **4.3 ms** | |
 | `run_code("print(1)")`, plus the CPython start | **14.3 ms** | ~290 ms |
 
 `run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost, not
-kern's, and it is why 14.3 rather than 3.9.
+kern's, and it is why 14.3 rather than 4.3.
 
 **The host and the image are part of the claim.** The same call reads ~40 ms on WSL2 and ~17 ms on
 `python:3.12-alpine`, whose interpreter starts slower. Quote the row that matches yours.
