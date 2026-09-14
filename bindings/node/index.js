@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.15";
+const VERSION = "0.2.16";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1789,10 +1789,17 @@ class Sandbox {
             detail = reason || "the box could not execute it";
           }
           fault = sandboxFault("exec_failed", `'${what}' could not be started in the box: ${detail}`);
-        } else if (boxStarted && fault && fault.type === "startup_failed") {
+        } else if (fault && fault.type === "startup_failed" && (boxStarted || stdout.trim())) {
           // kern signalled the box STARTED, so a `startup_failed` here is only the stderr heuristic
           // matching a marker the WORKLOAD wrote (code-based faults are decided first). The box
           // demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.
+          //
+          // STDOUT IS THE SECOND WITNESS, and it is here because the first one can be absent. MEASURED
+          // with a KERN_BIN wrapper that closes `KERN_STARTED_FD` before exec'ing the real kern: the box
+          // ran, printed, exited 1 with `error: forged` on stderr, and came back `startup_failed`. The
+          // same hole is open on any kern too old to write the byte. A box that never started cannot
+          // print, and every genuine startup failure measured returns stdout EMPTY, so this is only ever
+          // read as evidence FOR a box having run, never against: a silent workload loses nothing.
           fault = null;
         }
         // A box that FAILED TO START ran no user code, so REJECT rather than resolve a hollow

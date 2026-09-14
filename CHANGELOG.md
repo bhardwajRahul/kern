@@ -63,7 +63,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
   under a credential directory is also refused BEFORE it is created, rather than after.
 
-- Published 0.2.0 through 0.2.15 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
+- Published 0.2.0 through 0.2.16 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
   changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
   that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
   `KERN_BIN` that is not kern raises instead of reporting success.
@@ -75,7 +75,8 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   before the box exists is now one, decided from kern's own prefix at column 0 rather than from a list of
   message openings that had to be extended each time a caller met a new one: a missing `profiles=` name
   (`error: config:`) and an empty `image=` (`error: bad image reference:`) were both coming back
-  `exit_code 1` with no fault.
+  `exit_code 1` with no fault. The verdict is refused whenever kern signalled that the box started or
+  the box printed anything, so a workload writing kern's prefix cannot claim it never ran.
 - A kernel a cell killed now names what ended it and what survived: "a prior cell ended it (oom). Files
   written to the workspace are still there; names and imports from the earlier cells are gone".
 - Workspace I/O refuses what it cannot contain, and says which: an absolute path (it is never
@@ -143,7 +144,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1325 Rust, 504 Python and 109 Node tests, and the count is gated against the README.
+- 1325 Rust, 505 Python and 110 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 

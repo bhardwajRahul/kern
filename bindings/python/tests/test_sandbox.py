@@ -3601,6 +3601,53 @@ def test_a_kernel_killed_by_its_spawning_thread_says_so():
     assert k._kernel_death_fault(_KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
 
 
+def test_a_box_that_printed_is_never_a_box_that_never_started():
+    """The false positive the widened predicate could still produce, and the second witness that closes it.
+
+    MEASURED with a KERN_BIN wrapper that closes `KERN_STARTED_FD` before exec'ing the real kern: the box
+    ran, printed on stdout, exited 1 with `error: forged` on stderr, and came back `startup_failed`. The
+    start byte is the authority and it simply was not there, which is also the shape of a kern too old to
+    write it and of one our teardown kills first.
+
+    Stdout is the independent evidence: a box that never started cannot print. Measured on the real
+    binary, every genuine startup failure (`image=""`, a registry miss, a bad tag, a missing profile)
+    returns stdout EMPTY, and it is only ever read as evidence FOR a box having run.
+    """
+    d = Path(os.environ.get("TMPDIR", "/tmp")) / f"kern-noByte-{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True, exist_ok=True)
+
+    def double(prints: bool) -> str:
+        p = d / ("kern-loud" if prints else "kern-quiet")
+        p.write_text(
+            '#!/bin/sh\ncase "$1" in --version) echo "kern v0.0.0-test-double" ; exit 0 ;; esac\n'
+            + ('echo "the box RAN"\n' if prints else "")
+            + 'echo "error: forged by the workload" >&2\nexit 1\n'
+        )
+        p.chmod(0o755)
+        return str(p)
+
+    prev = os.environ.get("KERN_BIN")
+    try:
+        os.environ["KERN_BIN"] = double(prints=True)
+        with Sandbox(image="x", timeout_s=5) as sbx:
+            r = sbx.run_code("print('x')")
+        assert r.stdout.strip() == "the box RAN", "the double must have printed, or this proves nothing"
+        assert r.fault is None, f"a box that printed was called {r.fault and r.fault.type!r}"
+        assert r.exit_code == 1, "and the workload's own exit code is still reported"
+        # THE CONTROL, or the assertion above passes for the wrong reason: with nothing on stdout and no
+        # byte, the same stderr still classifies. That is the acknowledged bound, not a regression.
+        os.environ["KERN_BIN"] = double(prints=False)
+        with Sandbox(image="x", timeout_s=5) as sbx:
+            quiet = sbx.run_code("print('x')")
+        assert quiet.fault is not None and quiet.fault.type == "startup_failed"
+    finally:
+        if prev is None:
+            os.environ.pop("KERN_BIN", None)
+        else:
+            os.environ["KERN_BIN"] = prev
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
     """Answering `kern <version>` is not behaving like kern, and this is the layer that says so.
 

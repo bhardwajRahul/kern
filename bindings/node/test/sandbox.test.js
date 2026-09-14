@@ -2293,6 +2293,44 @@ test("a profile that does not exist is a box that never started", () => {
   }
 });
 
+test("a box that printed is never a box that never started", async () => {
+  // The false positive the widened predicate could still produce, and the second witness that closes it.
+  // MEASURED with a KERN_BIN wrapper that closes `KERN_STARTED_FD` before exec'ing the real kern: the box
+  // ran, printed on stdout, exited 1 with `error: forged` on stderr, and came back `startup_failed`. The
+  // start byte is the authority and it was simply not there, which is also the shape of a kern too old to
+  // write it. A box that never started cannot print, and every genuine startup failure measured on the
+  // real binary returns stdout EMPTY, so stdout is only ever read as evidence FOR a box having run.
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `kern-nobyte-${process.pid}-`));
+  const double = (prints) => {
+    const p = path.join(d, prints ? "kern-loud" : "kern-quiet");
+    fs.writeFileSync(
+      p,
+      '#!/bin/sh\ncase "$1" in --version) echo "kern v0.0.0-test-double" ; exit 0 ;; esac\n' +
+        (prints ? 'echo "the box RAN"\n' : "") +
+        'echo "error: forged by the workload" >&2\nexit 1\n',
+    );
+    fs.chmodSync(p, 0o755);
+    return p;
+  };
+  const prev = process.env.KERN_BIN;
+  try {
+    process.env.KERN_BIN = double(true);
+    const loud = await runCode("print('x')", { image: "x", timeoutS: 5 });
+    assert.strictEqual(loud.stdout.trim(), "the box RAN", "the double must print, or this proves nothing");
+    assert.strictEqual(loud.fault, null, "a box that printed was called a box that never started");
+    assert.strictEqual(loud.exitCode, 1, "and the workload's own exit code is still reported");
+    // THE CONTROL: with nothing on stdout and no byte, the same stderr still classifies. That is the
+    // acknowledged bound, not a regression.
+    process.env.KERN_BIN = double(false);
+    const quiet = await runCode("print('x')", { image: "x", timeoutS: 5 });
+    assert.strictEqual(quiet.fault?.type, "startup_failed");
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("any error kern prints before the box exists is a startup failure", () => {
   // The CLASS, after three patches that each closed one member of it. `error: config:` was added because
   // a caller measured it, `error: image:` before that, `error: pull:` before that. An external reviewer
