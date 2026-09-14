@@ -4,6 +4,13 @@ One isolated `/bin/true`, x86_64 desktop, kernel 7.0.0, static musl binary, 200 
 Reproduce with `python3 examples/benchmark.py`; your numbers will differ with CPU, kernel and
 filesystem.
 
+**Check what `docker` is on your machine before you compare against it.** kern ships an optional
+drop-in: `~/.local/bin/docker` can be a symlink to `kern`, and then a benchmark that shells out to
+`docker` measures kern against itself and reports it as the competitor. MEASURED here on 2026-09-14:
+`docker run --rm alpine true` read 4.2 ms, which is not Docker being fast, it is kern answering to
+Docker's name. `readlink -f $(command -v docker)` settles it in one line, and the real one is usually
+`/usr/bin/docker` with a daemon that has to be running.
+
 | runtime | cold start | 200 in parallel |
 |---|---:|---:|
 | **kern** `box --rootfs` | **2.5 ms** | **0.11 s** |
