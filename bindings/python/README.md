@@ -148,8 +148,8 @@ share one process and one box.
 
 ```python
 with kern.Sandbox() as sbx, sbx.kernel() as k:
-    k.run_code("import numpy as np; a = np.arange(1_000_000)")
-    print(k.run_code("a.sum()").results[0].text)     # 499999500000
+    k.run_code("total = sum(range(1_000_000))")
+    print(k.run_code("total").results[0].text)       # 499999500000
 ```
 
 A refused mount raises `MountRefused` rather than the generic `SandboxError`, so a caller can tell
