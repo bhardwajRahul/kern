@@ -313,6 +313,7 @@ architectures; building from source stays supported and produces the larger figu
 | Raspberry Pi 5 | aarch64 | ✅ manually validated |
 | Arduino UNO Q (Android kernel, Debian userland) | aarch64 | ✅ manually validated |
 | macOS, **inside a Linux VM** | aarch64 | ✅ verified by hand on **colima** (Lima / OrbStack / UTM are the same shape, untested), caps not enforced on a default guest ([notes](FAQ.md#does-it-run-on-macos)) |
+| **Inside a container** (Docker, a k8s pod) | x86_64 | ✅ automated CI, `--privileged`: a 64m box inside `docker run --privileged`, red if the cap does not bite, and red if `doctor` and the box disagree where the controller cannot be delegated. How far below `--privileged` it still runs is [not measured](../ROADMAP.md) |
 
 kern needs a **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**, and a **Linux
 userland**. The kernel *flavor* doesn't matter: kern runs even on an *Android kernel* with a Linux
