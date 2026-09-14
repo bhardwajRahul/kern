@@ -1,5 +1,9 @@
 # `kern-mcp`: a local code interpreter for any MCP client
 
+Claude Desktop, Cursor, LM Studio, Windsurf, Goose: the config below is the same in all of them,
+because LM Studio follows Cursor's `mcp.json` notation and the others share its shape. What differs
+is where the file lives, not what goes in it.
+
 `kern-mcp` ships in the Python package (`pip install kern-sandbox`) and speaks
 [Model Context Protocol](https://modelcontextprotocol.io) over stdio, newline-delimited JSON-RPC 2.0.
 It is dependency-free: it imports the standard library and `kern_sandbox`, nothing else.

@@ -92,7 +92,7 @@ puts `stderr` into a prompt. `code_stderr` is the same string without kern's own
 holds exactly what was taken out, and `stderr` still holds both in order. The LangChain tool and the
 MCP server use `code_stderr`.
 
-## Use it from an MCP client (Cursor, Claude Desktop, anything that speaks MCP)
+## Use it from an MCP client (Cursor, Claude Desktop, LM Studio, anything that speaks MCP)
 
 The package ships **`kern-mcp`**, a dependency-free
 [Model Context Protocol](https://modelcontextprotocol.io) stdio server: the model writes code, kern
@@ -113,6 +113,9 @@ one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board), both in
   }
 }
 ```
+
+One block, three clients: LM Studio follows Cursor's `mcp.json` notation, and Claude Desktop's file
+has the same shape, so what differs is where the file lives rather than what goes in it.
 
 Tools: `run_code` (python/bash, and node on an image that has it), `write_file`, `read_file`,
 `list_files`. File state persists across calls; each call is a fresh, network-off box. The tool schema

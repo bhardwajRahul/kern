@@ -23,7 +23,7 @@ agent branches on a value instead of parsing text to work out who ended the run.
 
 On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). Python gets the same
 package on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/), which also ships an **MCP
-server** for Claude Desktop and Cursor.
+server** for Claude Desktop, Cursor and LM Studio.
 
 ```js
 const kern = require("kern-sandbox");
