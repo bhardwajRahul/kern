@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.14";
+const VERSION = "0.2.15";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1104,34 +1104,31 @@ function kernReportedOom(stderr) {
   return false;
 }
 
+/** The two prefixes kern's CLI writes AT COLUMN 0, which is the whole vocabulary of "kern is speaking".
+ * `kern-cli/src/main.rs` reports every error through one `eprintln!("error: {}", ...)` and
+ * `ui::scrub_message` indents every continuation line so a hostile value inside a message cannot forge a
+ * line at column 0. Mirrors `_KERN_SPEAKING`.
+ *
+ * WHAT THIS REPLACED: a list of eleven message OPENINGS, each added after a caller measured a
+ * `fault: null`. Enumerating the error texts of a binary with hundreds of them behind one printer cannot
+ * be finished, and an external reviewer ended the argument with `image: ""`, whose
+ * `error: bad image reference: empty` was in none of the eleven. */
+const KERN_SPEAKING = ["error: ", "kern:"];
+
+/** True iff KERN ITSELF reported an error on this box, rather than the workload failing.
+ *
+ * It does NOT decide forgery from the text: a workload can print `error: anything` at column 0, and no
+ * list of openings ever stopped that. The `KERN_STARTED_FD` byte does, and the callers pair it with this
+ * predicate (`_runOne` drops a `startup_failed` when kern signalled a start; the kernel paths ask the
+ * byte first). Mirrors `_looks_like_startup_failure`. */
 function looksLikeStartupFailure(stderr) {
-  const markers = [
-    "kern:",
-    "error: pull:",
-    "error: curl failed:",
-    "error: registry:",
-    "error: manifest:",
-    "error: sandbox:",
-    "error: box:",
-    "error: oci:",
-    "error: image:",
-    // REACHABLE EXACTLY WHEN A CALLER PASSES `profiles`, and missing until it was measured: a profile
-    // name that is well formed but absent from `kern.toml` makes kern refuse before any box exists, and
-    // without this marker the call came back `exitCode 1, fault null`, which a caller reading `fault`
-    // cannot tell from their own code exiting 1.
-    "error: config:",
-    // The binding builds its own argv, so these mean IT got something wrong; either way the box never ran.
-    "error: usage:",
-    "error: invalid box name:",
-  ];
-  // The OOM sentence is skipped for a sharper reason than the benign notes: it is a report about a box
-  // that RAN, and it is `kern:`-prefixed, so it used to satisfy this predicate. MEASURED, that is how a
-  // real OOM on a resident kernel came back as `startup_failed` and was THROWN instead of returning an
-  // `oom` fault.
+  // kern's BENIGN lines are subtracted first, which is why this cannot be a bare prefix test: the
+  // posture banner and `warning:`/`note:` carry `kern:` too. The OOM sentence is skipped for a sharper
+  // reason: it is a report about a box that RAN, and MEASURED that is how a real OOM on a resident
+  // kernel came back as `startup_failed` and was THROWN instead of returning an `oom` fault.
   for (const line of stderr.split("\n")) {
-    const s = line.replace(/^\s+/, "");
-    if (isKernDiagnostic(s) || kernReportedOom(s)) continue;
-    if (s.includes("sandbox setup failed") || markers.some((m) => s.startsWith(m))) return true;
+    if (isKernDiagnostic(line) || kernReportedOom(line)) continue;
+    if (KERN_SPEAKING.some((m) => line.startsWith(m)) || line.includes("sandbox setup failed")) return true;
   }
   return false;
 }
@@ -2813,7 +2810,13 @@ class Kernel {
         `the code crashed: the cell died on signal ${workloadSignal} (${SIGNAL_NAMES[workloadSignal]}), which took the kernel box with it because the interpreter is its PID 1. The sandbox did not act; the next call reopens a kernel`,
         rc,
       ];
-    if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start", rc];
+    // AND THE BYTE DECIDES WHETHER THE TEXT IS BELIEVED. kern writes the teardown payload only for a box
+    // that existed, so `kernWrotePayload` is positive proof that this kernel STARTED and a
+    // `startup_failed` here could only be a cell printing kern's prefix at column 0 and dying of
+    // something else. The one-shot path gets this from `_runOne`, which drops the verdict when the start
+    // byte is set; this path had no such guard, so the widened predicate gets it here.
+    if (!kernWrotePayload && looksLikeStartupFailure(err))
+      return ["startup_failed", "the kernel box failed to start", rc];
     if (capSignal === 2)
       return [
         "killed",
@@ -3249,7 +3252,10 @@ class WarmBox {
     if (oomVerdict(oomSignal, err, boxStarted)) {
       type = "oom";
       dflt = "the box exceeded its memory cap and was OOM-killed";
-    } else if (looksLikeStartupFailure(err)) {
+    } else if (!boxStarted && looksLikeStartupFailure(err)) {
+      // `!boxStarted` for the reason `_kernelDeathFault` states: kern writes the teardown payload only
+      // for a box that existed, so with the byte set this THROW would be a cell's own column-0 line
+      // deciding that the box never came up.
       throw new SandboxError(err.trim() || "the box failed to start");
     } else if (capSignal === 2) {
       dflt =
