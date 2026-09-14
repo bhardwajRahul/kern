@@ -107,7 +107,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
   `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
   under a credential directory is also refused BEFORE it is created, rather than after.
 
-- Published 0.2.0 through 0.2.17 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
+- Published 0.2.0 through 0.2.18 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
   changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
   that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
   `KERN_BIN` that is not kern raises instead of reporting success.
