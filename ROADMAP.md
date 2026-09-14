@@ -9,7 +9,7 @@ What kern does not do. Nothing here is a commitment or a date. Shipped work is i
 |---|---|
 | **GPU slices** | Nothing caps a GPU. `kern doctor` prints the tier a cap would have: `TIER-HW` where a MIG or SR-IOV partition exists, `TIER-SOFT` everywhere else, where a quota is bypassed by skipping the vendor library |
 | **A VM tier** | A shared kernel is the wrong boundary for genuinely hostile, multi-tenant code, and [SECURITY.md](SECURITY.md) says so rather than arguing. A microVM tier is the honest answer to that case. Nothing ships, and it would be its own thing rather than a flag on a box |
-| **The OCI runtime spec** | Reading and writing the bundle format (`config.json`, the lifecycle verbs) is under consideration. Being a CRI implementation, or the `--runtime` under podman or a kubelet, is not: the format yes, the component position no |
+| **Running kern INSIDE a container or a pod** | It works, and CI gates it: `kern box --memory 64m` runs inside a privileged `docker run` on every push and the build fails if the cap does not bite. What is not measured is how far DOWN from `--privileged` it still runs, and that ladder (privileged, then the default seccomp, then the default AppArmor, then a read-only cgroup, then without `SYS_ADMIN`) is the only thing between here and a pod spec a security team would sign |
 | **More governed resources** | I/O bandwidth and IOPS ship and bind where the host delegates `io`. Widening that, plus network shaping |
 | **Snapshot and warm start** | Rootless CRIU needs a capability and seccomp suspended, so it would be opt-in and same-host |
 | **macOS** | No native port, and a non-goal. A Mac runs the ordinary Linux kern in a Linux VM. Under consideration: a shim so `kern` can be typed on the macOS side |
@@ -18,6 +18,13 @@ What kern does not do. Nothing here is a commitment or a date. Shipped work is i
 compose `privileged:` key, an automatic fallback on a port collision, and a per-box seccomp profile
 from a file. A stack is one pod, and an arbitrary OCI profile is a parser whose bugs permit rather
 than crash.
+
+**And the OCI RUNTIME spec, deliberately.** Reading OCI images is a format and is done; being the
+`--runtime` under podman, or a CRI implementation under a kubelet, is a position, and the answer is
+no. The user would type `podman`, the UX would be podman's, and none of what makes kern a product
+(its CLI, compose, pods, prewarming, the SDK) would be reached. On the kubelet path it is worse: the
+posture becomes runc's, without the user namespace, with the caller's seccomp and
+`noNewPrivileges` off, which hands over a kern missing the four reasons to choose kern.
 
 ## Known gaps, and what would settle them
 
