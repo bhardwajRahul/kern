@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.15"
+__version__ = "0.2.16"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -2270,10 +2270,20 @@ class Sandbox:
             else:
                 detail = reason or "the box could not execute it"
             fault = SandboxFault("exec_failed", f"{what!r} could not be started in the box: {detail}")
-        elif box_started and fault is not None and fault.type == "startup_failed":
+        elif fault is not None and fault.type == "startup_failed" and (box_started or stdout.strip()):
             # kern signalled the box STARTED, so a `startup_failed` here can only be the stderr heuristic
             # matching a marker the WORKLOAD wrote (the code-based faults are decided before it). The box
             # demonstrably ran: this is the workload's own non-zero exit - reclassify to a normal result.
+            #
+            # STDOUT IS THE SECOND WITNESS, and it is here because the first one can be absent. MEASURED
+            # with a KERN_BIN wrapper that closes `KERN_STARTED_FD` before exec'ing the real kern: the box
+            # ran, printed, exited 1 with `error: forged` on stderr, and came back `startup_failed` - a
+            # box that had demonstrably run, reported as one that never started. The same hole is open on
+            # any kern too old to write the byte, and on one our own teardown kills before it can.
+            # A box that never started cannot print: every genuine startup failure measured here
+            # (`image=""`, a registry miss, a bad tag, a missing profile) returns stdout EMPTY, so
+            # non-empty stdout is proof the workload ran. It is only ever read in this direction - as
+            # evidence FOR a box having run, never against - so a silent workload loses nothing.
             fault = None
         # A box that FAILED TO START ran no user code, so raise rather than return a hollow
         # ExecutionResult (empty stdout). Gated on `rc == 125` (kern's Docker-convention box-not-started
