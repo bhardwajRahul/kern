@@ -557,6 +557,9 @@ pub(crate) struct ImageHealthDefaults {
     pub(crate) interval: Option<u64>,
     pub(crate) retries: Option<u32>,
     pub(crate) start_period: Option<u64>,
+    /// How often to probe DURING the start period (Docker 25+'s `StartInterval`). `None` means the
+    /// image said nothing, and the steady-state interval governs from the first probe as before.
+    pub(crate) start_interval: Option<u64>,
     pub(crate) timeout: Option<u64>,
 }
 
@@ -591,6 +594,7 @@ pub(crate) fn image_health_defaults(
         interval: secs_from_nanos(h.interval_ns),
         retries: h.retries,
         start_period: secs_from_nanos(h.start_period_ns),
+        start_interval: secs_from_nanos(h.start_interval_ns),
         timeout: secs_from_nanos(h.timeout_ns),
     }
 }
@@ -1631,6 +1635,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         interval: img_health.interval.unwrap_or(args.health_interval),
         retries: img_health.retries.unwrap_or(args.health_retries),
         start_period: img_health.start_period.unwrap_or(args.health_start_period),
+        // NO FLAG FALLBACK, because there is no flag: `0` means "probe at the steady-state interval
+        // from the start", which is exactly what kern did before this field existed.
+        start_interval: img_health.start_interval.unwrap_or(0),
         timeout: img_health.timeout.unwrap_or(args.health_timeout),
         action: health_action,
     };
@@ -2767,6 +2774,34 @@ fn await_box_started(
     Ok(())
 }
 
+/// Should a box that just exited `code` be started again? The whole restart policy, as a pure
+/// function, so the rule is testable without forking anything.
+///
+/// `always`/`unless-stopped` restart on ANY exit including 0, uncapped: Docker's contract, kept up for
+/// the stack's lifetime. `on-failure` restarts a non-zero exit within its budget.
+///
+/// AND 125 IS NEITHER, because it is not a workload exit at all: it is kern's own box-not-started code
+/// (Docker's too), used as the discriminator elsewhere in this file. Under `always` it was restarted
+/// forever, so a stack whose `up` died left its surviving boxes rebuilding a box that could not be
+/// built. MEASURED by an external reviewer bringing up Immich: 26 iterations for one service, 15 for
+/// another, each logging "never released: the launcher closed the pre-exec gate ... the workload did
+/// not run". Docker does not restart a container it failed to create.
+///
+/// BOUNDED RATHER THAN FORBIDDEN, because not every 125 is permanent: a bind source that appears a
+/// second later, a peer still writing the pod's network. It gets the same budget `on-failure` uses.
+fn should_restart(
+    code: i32,
+    always: bool,
+    on_failure: bool,
+    attempt: u32,
+    max_restarts: u32,
+) -> bool {
+    if code == 125 {
+        return attempt <= max_restarts;
+    }
+    always || (on_failure && code != 0 && attempt <= max_restarts)
+}
+
 /// Supervisor loop: run the box and wait for it; with `--restart` (on-failure) re-run it on a
 /// non-zero exit, up to a cap with a 1 s backoff so a perpetually-crashing box eventually gives up.
 /// Each attempt is a FRESH child - `run_in_sandbox_with` unshares its *caller*, so it can't be
@@ -3018,15 +3053,44 @@ fn supervise_box(
         // wrap in release. At one restart / 30 s the cap is ~4000 years, but the guarantee should not
         // depend on the build profile. Cost is identical.
         attempt = attempt.saturating_add(1);
-        // `always`/`unless-stopped`: restart on ANY exit (including 0), uncapped - Docker's contract,
-        // kept up for the stack's lifetime. `on-failure`: only a non-zero exit, capped at max_restarts.
-        let restart_now = if restart.always {
-            true
-        } else {
-            restart.on_failure && code != 0 && attempt <= max_restarts
-        };
+        // A BOX THAT NEVER STARTED IS NOT A WORKLOAD THAT EXITED, and `always` is a promise about a
+        // workload. 125 is kern's own box-not-started convention (and Docker's), used as the
+        // discriminator elsewhere in this file; under `always` it was restarted forever, so a stack
+        // whose `up` died left its surviving boxes rebuilding a box that could not be built. MEASURED
+        // by an external reviewer bringing up Immich, 26 iterations for one service and 15 for
+        // another, each logging "never released: the launcher closed the pre-exec gate without
+        // releasing this box - the workload did not run"; reproduced here by pointing one service at
+        // an image that cannot be pulled. Docker does not restart a container it could not create.
+        //
+        // BOUNDED, NOT FORBIDDEN, because not every 125 is permanent: a bind source that appears a
+        // second later, a peer that is still writing the pod's network. So the same budget `on-failure`
+        // uses applies, and when it runs out the box says why instead of stopping silently.
+        let never_started = code == 125;
+        let restart_now = should_restart(
+            code,
+            restart.always,
+            restart.on_failure,
+            attempt,
+            max_restarts,
+        );
+        if never_started && !restart_now {
+            eprintln!(
+                "kern: box '{}' never started {max_restarts} times in a row (exit 125); not \
+                 restarting it again. `restart: always` restarts a workload that exits, and no \
+                 workload ran here: the reason is in the lines above this one",
+                name.as_str()
+            );
+        }
         if restart_now {
-            if restart.always {
+            if never_started {
+                // NOT "(always)": that word promises forever, and this case is budgeted. The reader who
+                // sees attempt 3 of 10 knows the loop ends, which is the whole difference from the log
+                // an external reviewer watched go round 26 times.
+                eprintln!(
+                    "kern: box '{}' never started (exit 125); retrying ({attempt}/{max_restarts})",
+                    name.as_str()
+                );
+            } else if restart.always {
                 eprintln!(
                     "kern: box '{}' exited {code}; restarting (always)",
                     name.as_str()
@@ -3834,6 +3898,33 @@ mod pod_dns_tests {
 
 #[cfg(test)]
 mod image_defaults_tests {
+
+    /// `restart: always` is a promise about a WORKLOAD, and a box that never started has none.
+    ///
+    /// MEASURED by an external reviewer on a real stack (Immich, one image that would not pull): the
+    /// surviving services logged "never released: the launcher closed the pre-exec gate ... the
+    /// workload did not run" and were restarted 26 and 15 times, unbounded, while `ps` showed them
+    /// running. Reproduced here by pointing one service at an image that cannot be pulled.
+    #[test]
+    fn a_box_that_never_started_is_not_restarted_forever() {
+        // 125 is kern's box-not-started code: budgeted even under `always`, and the budget ENDS.
+        assert!(super::should_restart(125, true, false, 1, 10));
+        assert!(super::should_restart(125, true, false, 10, 10));
+        assert!(!super::should_restart(125, true, false, 11, 10));
+        // ...and it is the exit code that decides, not the policy: `on-failure` sees the same bound.
+        assert!(!super::should_restart(125, false, true, 11, 10));
+        // THE CONTROLS, or this would be "never restart anything". A workload that exits, for any
+        // reason, keeps Docker's contract: `always` is uncapped, including a clean exit.
+        assert!(super::should_restart(0, true, false, 9_999, 10));
+        assert!(super::should_restart(1, true, false, 9_999, 10));
+        assert!(super::should_restart(137, true, false, 9_999, 10));
+        // `on-failure` restarts a failure within budget, never a success.
+        assert!(super::should_restart(1, false, true, 10, 10));
+        assert!(!super::should_restart(1, false, true, 11, 10));
+        assert!(!super::should_restart(0, false, true, 1, 10));
+        // and no policy means no restart at all.
+        assert!(!super::should_restart(1, false, false, 1, 10));
+    }
     use super::*;
 
     fn hc(test: &[&str]) -> kern_oci::ImageHealthcheck {
@@ -3842,6 +3933,7 @@ mod image_defaults_tests {
             interval_ns: Some(30_000_000_000),
             timeout_ns: Some(5_000_000_000),
             start_period_ns: Some(2_000_000_000),
+            start_interval_ns: None,
             retries: Some(4),
         }
     }
@@ -3896,6 +3988,37 @@ mod image_defaults_tests {
                 "postgrest".to_string(),
                 "--ready".to_string()
             ]))
+        );
+    }
+
+    /// The image's `StartInterval` must reach the checker, because reading only `Interval` is a 60x
+    /// delay on a real image.
+    ///
+    /// MEASURED on Immich's postgres (`Interval 300s, StartPeriod 300s, StartInterval 5s`): Docker
+    /// probes every 5 s and calls it healthy in about ten; kern waited the full 300 s for its FIRST
+    /// probe and reported `starting` for five minutes, with every `depends_on: service_healthy`
+    /// waiting behind it. An external reviewer sampled the process table at 0.1 s and saw the probe
+    /// run once, at 300 s, and pass.
+    #[test]
+    fn an_images_start_interval_reaches_the_checker() {
+        let mut h = hc(&["CMD-SHELL", "true"]);
+        h.start_interval_ns = Some(5_000_000_000);
+        let d = image_health_defaults(Some(&h), None);
+        assert_eq!(d.start_interval, Some(5));
+        // ...and an image that says nothing leaves it unset, which is "use the steady interval from
+        // the first probe" - exactly what kern did before the field existed.
+        let mut silent = hc(&["CMD-SHELL", "true"]);
+        silent.start_interval_ns = None;
+        assert_eq!(
+            image_health_defaults(Some(&silent), None).start_interval,
+            None
+        );
+        // THE CONTROL that the whole block is still all-or-nothing: a caller's own probe takes the
+        // image's numbers away with it, this one included.
+        let flag = kern_oci::HealthTest::Shell("mine".into());
+        assert_eq!(
+            image_health_defaults(Some(&h), Some(&flag)).start_interval,
+            None
         );
     }
 

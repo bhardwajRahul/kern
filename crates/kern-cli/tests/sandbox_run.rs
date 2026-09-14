@@ -121,11 +121,49 @@ fn catches_sigint(pid: u32) -> bool {
 }
 
 /// A statically-linked busybox we can drop into an otherwise-empty rootfs, or `None`.
+///
+/// IT ASKS PATH, and that is not a convenience. This probed two absolute paths and nothing else, so a
+/// machine with a perfectly good `~/.local/bin/busybox` and no passwordless sudo reported "no busybox
+/// available" and SKIPPED. MEASURED by an external reviewer on WSL2: **96 of 133 tests skipped for
+/// this reason alone**, and the run still printed a green 133/133. A suite that skips 72% of itself
+/// and reports success is worse than a red one, because nobody looks.
+///
+/// `KERN_TEST_REQUIRE_FIXTURES=1` turns that silence into a failure, for the one place it matters:
+/// CI, where no human reads the skip lines. See `the_fixtures_this_suite_needs_are_here`.
 fn static_busybox() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("KERN_TEST_BUSYBOX").map(PathBuf::from) {
+        return p.exists().then_some(p);
+    }
     ["/bin/busybox", "/usr/bin/busybox"]
         .iter()
         .map(PathBuf::from)
         .find(|p| p.exists())
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|d| d.join("busybox"))
+                    .find(|p| p.exists())
+            })
+        })
+}
+
+/// The fixtures this file needs, asserted rather than skipped around, when the caller says so.
+///
+/// OPT-IN, and the default is deliberately the old behaviour: a contributor on a machine without
+/// busybox should get skips and not a wall of red. `KERN_TEST_REQUIRE_FIXTURES=1` is for CI, where a
+/// skip is invisible (`cargo test` hides the stderr of a test that passes) and a suite can report
+/// 133/133 while a majority of it never ran.
+#[test]
+fn the_fixtures_this_suite_needs_are_here() {
+    if std::env::var_os("KERN_TEST_REQUIRE_FIXTURES").is_none() {
+        eprintln!("skip: set KERN_TEST_REQUIRE_FIXTURES=1 to make missing fixtures a failure");
+        return;
+    }
+    assert!(
+        static_busybox().is_some(),
+        "no static busybox on this host, so most of this file would SKIP and the run would still be \
+         green. Install one (`apt-get install busybox`) or point KERN_TEST_BUSYBOX at it"
+    );
 }
 
 /// Is unprivileged userns *actually* usable here? Guessing from sysctls is not enough: on
@@ -182,6 +220,36 @@ fn host_cannot_build_a_box(text: &str) -> bool {
         || text.contains("could not map the pod user namespace")
         || text.contains("unprivileged user namespaces may be unavailable")
         || text.contains("newuidmap")
+        // AND THE HOST THAT CAN BUILD A BOX AND NOT ENTER IT, which is the sixth time the list was
+        // written from one machine. kern fail-closes `exec` where it cannot put the command in the
+        // box's cgroup, because 0.9.31 ran exec'd commands UNCAPPED (300 MB survived a 64 MiB box).
+        // By kern's own wording that host is "an ordinary ssh session on most distributions", so it is
+        // not exotic at all: an external reviewer hit it on WSL2 and a relay test reported `Got: ""`,
+        // a phantom defect in a relay that was carrying perfectly. Proved single-variable: the same
+        // test binary and fixture PASS from a `systemd-run --user --scope` shell and FAIL from
+        // `/init.scope`.
+        //
+        // Safe to fold into this predicate rather than a second one: the marker is kern's own refusal
+        // text, so it cannot appear in a run where no exec was refused, and every site that already
+        // asks "can this host run the fixture?" gets the answer without being edited.
+        || text.contains("could not be placed in the box's cgroup")
+}
+
+/// Everything a finished kern invocation said: the status AND both streams.
+///
+/// EXISTS BECAUSE SEVEN TESTS THREW THE ANSWER AWAY. Each of them kept `stdout` only, so when kern
+/// fail-closed an `exec` (126, with the reason on stderr) the assertion could only report an empty
+/// string, and the panic named the thing under test instead of the refusal: a relay "not carrying", a
+/// peer "not delivering a body", a cgroup "not counting an exec". All seven were one host condition,
+/// and none of them could say so. A message that cannot name its own cause costs the next reader the
+/// whole investigation, and it cost one.
+fn said(o: &std::process::Output) -> String {
+    format!(
+        "[exit {}] {}{}",
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
 }
 
 /// Build a minimal rootfs: `bin/busybox` + `/proc` mountpoint. `tag` keeps the path unique per
@@ -542,6 +610,10 @@ fn the_pid1_fallback_finds_the_box_init_with_and_without_a_health_checker() {
             .output();
         let _ = fs::remove_dir_all(&xdg);
 
+        if host_cannot_build_a_box(&text) {
+            eprintln!("skip: this host cannot exec into a box: {text}");
+            return;
+        }
         assert!(
             text.contains("ALIVE"),
             "the fallback did not reach the box init ({}a health checker): {text}",
@@ -5549,10 +5621,20 @@ fn box_exec_enters_running_box() {
         .args(["exec", "xbox", "--", "/bin/busybox", "hostname"])
         .output()
         .expect("run kern");
+    if host_cannot_build_a_box(&said(&h)) {
+        eprintln!("skip: this host cannot exec into a box: {}", said(&h));
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", "xbox"])
+            .output();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
     assert!(
         String::from_utf8_lossy(&h.stdout).contains("xbox"),
         "exec should see the box's hostname: {}",
-        String::from_utf8_lossy(&h.stdout)
+        said(&h)
     );
 
     // exec propagates the exit code.
@@ -6735,8 +6817,14 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
             "printf 'GET /hello HTTP/1.0\r\n\r\n' | nc -w 2 srv 7311",
         ])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| said(&o))
         .unwrap_or_default();
+    if host_cannot_build_a_box(&immediately) {
+        eprintln!("skip: this host cannot exec into a box: {immediately}");
+        run(&["down"]);
+        cleanup(&root, &xdg, &toml);
+        return;
+    }
 
     std::thread::sleep(std::time::Duration::from_millis(6000));
     let after = logs_of("cli");
@@ -8069,6 +8157,13 @@ fn an_exec_killed_by_the_box_oom_cap_says_why() {
         eprintln!("skip: the capped box did not start");
         return;
     };
+    if host_cannot_build_a_box(&said(&loud_out)) {
+        eprintln!(
+            "skip: this host cannot exec into a box: {}",
+            said(&loud_out)
+        );
+        return;
+    }
     // If the workload somehow survived, there was no OOM to report and the test has measured
     // nothing. Say so rather than assert on a message that would be wrong to print.
     if loud_out.status.success() {
@@ -8159,14 +8254,29 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
         let base = cgroup_num(dir.join("pids.current")).unwrap_or(0);
         let mut child = kern()
             .args(["exec", roomy, "--", "/bin/busybox", "sleep", "3"])
+            // KEPT, because without it a refused exec is indistinguishable from one that ran and did
+            // not count: both leave `pids.current` where it was, and the assertion below would report
+            // "the command ran outside the box's caps" for a command that never ran at all.
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn exec");
+        let mut why = String::new();
         let mut peak = base;
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             peak = peak.max(cgroup_num(dir.join("pids.current")).unwrap_or(0));
         }
+        if let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut why);
+        }
         let _ = child.wait();
+        if host_cannot_build_a_box(&why) {
+            eprintln!("skip: this host cannot exec into a box: {why}");
+            let _ = kern().args(["stop", roomy]).output();
+            let _ = fs::remove_dir_all(&root_ok);
+            return;
+        }
         grew = Some((base, peak));
     }
     let _ = kern().args(["stop", roomy]).output();
@@ -10391,7 +10501,13 @@ fn a_live_kern_run_is_not_reported_as_a_box_by_ps() {
         let _ = child.kill();
         let _ = child.wait();
         eprintln!(
-            "skip: `kern run` created no leaf of its own here, so this host caps another way"
+            // HIS WORDS, MEASURED ON THE HOST THAT PRODUCES IT, not mine guessed from a machine where
+            // it never fires: `kern.slice` EXISTS there (so the earlier skip is not the one firing),
+            // the live `kern run` sits in `0::/init.scope`, and no leaf named after it appears. "Caps
+            // another way" claimed a second mechanism; there is none, it does not cap at all.
+            "skip: kern.slice exists, but `kern run` never moved its process into it - the process \
+             stayed in the caller's own cgroup, so no leaf named after it can appear, and nothing \
+             caps it here"
         );
         return;
     };
@@ -11102,7 +11218,8 @@ fn a_health_probe_is_not_refused_where_kern_exec_would_be() {
 
     let rerr = String::from_utf8_lossy(&refused.stderr).into_owned();
     if !rerr.contains("could not be placed") {
-        eprintln!("skip: this host placed the exec at the pids limit, so the branch under test was never reached");
+        eprintln!("skip: this host could not keep the pids-limited box alive - it exits within a fraction of a \
+             second with an empty log, so the exec found no box at all rather than a refusal");
         return;
     }
     let seen = String::from_utf8_lossy(&ps.stdout).into_owned();
@@ -11492,8 +11609,21 @@ fn the_relay_wiring_reaches_into_a_service_that_runs_as_a_non_root_user() {
             "-c",
             "nc -w2 peer 7000 </dev/null && echo REACH=yes || echo REACH=no",
         ])
+        // BOTH STREAMS AND THE STATUS. On WSL2 this assertion failed with `Got: ""`, which says only
+        // that stdout was empty: the `nc` never printed either answer, so the shell never ran, so the
+        // question is what `compose exec` refused - and that was on stderr, which this threw away,
+        // with the 126 in the status it also threw away. Every other kern call in this test
+        // concatenates both streams; the exec was the one that did not. A diagnosis that cannot name
+        // its own cause costs the next reader the whole investigation, and it cost one.
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| {
+            format!(
+                "[exit {}] {}{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
         .unwrap_or_default();
     down(&[]);
     let (podded, pod_ok) = up(&["--pod"]);
@@ -11514,10 +11644,16 @@ fn the_relay_wiring_reaches_into_a_service_that_runs_as_a_non_root_user() {
             // above was written from this machine's failures and missed the runner's entirely.
             || host_cannot_build_a_box(t)
     };
-    if unavailable(&relayed) || unavailable(&podded) {
+    // `reach` IS ASKED TOO, and that is the defect this closes. The refusal that matters here does not
+    // appear in the bring-up: the stack comes up, the relay is built and carries, and then `exec`
+    // fail-closes because the command cannot be put in the box's cgroup. Reading only the two `up`
+    // outputs, this test called a working relay broken on every host that runs kern outside a
+    // delegated cgroup tree, which kern's own message calls "an ordinary ssh session on most
+    // distributions".
+    if unavailable(&relayed) || unavailable(&podded) || unavailable(&reach) {
         eprintln!(
-            "skip: this host cannot run the fixture (no `alpine` in the cache, or no uid range to \
-             drop to 5050 with)"
+            "skip: this host cannot run the fixture (no `alpine` in the cache, no uid range to drop \
+             to 5050 with, or no exec into a box from this cgroup): {reach}"
         );
         return;
     }
@@ -11707,6 +11843,17 @@ fn two_projects_meet_on_an_external_network_and_stop_when_one_leaves() {
     };
     let joiner_sees = probe(&b_dir, "proxy", "api", 8000);
     let incumbent_sees = probe(&a_dir, "api", "proxy", 9000);
+    // THE PROBE'S OWN TEXT, not just the bring-up's. This test already consulted the shared predicate
+    // and still went red on a host that refuses `exec`, because it consulted it on the `up` output:
+    // the stack came up, the network was joined, and the refusal arrived later, from the probe.
+    if host_cannot_build_a_box(&joiner_sees) || host_cannot_build_a_box(&incumbent_sees) {
+        eprintln!("skip: this host cannot exec into a box: {joiner_sees}{incumbent_sees}");
+        let _ = compose(&b_dir, &["down"]);
+        let _ = compose(&a_dir, &["down"]);
+        let (_, _) = net_cmd(&["rm", &net]);
+        cleanup(&base, &root);
+        return;
+    }
 
     // 4. TEARDOWN: the joiner leaves, and the name it published must stop resolving in the other
     // project's box.
@@ -12133,8 +12280,14 @@ fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&root);
 
-    if up.contains("user namespaces") || up.contains("newuidmap") {
+    if up.contains("user namespaces") || up.contains("newuidmap") || host_cannot_build_a_box(&up) {
         eprintln!("skip: the stack could not start here");
+        return;
+    }
+    // AND THE EXEC IS ASKED TOO: the stack comes up, and the probe that reads the shared namespace is
+    // the thing a host outside a delegated cgroup tree refuses.
+    if host_cannot_build_a_box(&reach) {
+        eprintln!("skip: this host cannot exec into a box: {reach}");
         return;
     }
     assert!(

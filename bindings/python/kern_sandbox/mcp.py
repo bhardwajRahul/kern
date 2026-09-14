@@ -159,13 +159,27 @@ _STATE_RESIDENT = (
 _TOOLS = [
     {
         "name": "run_code",
+        # WHAT THIS SENTENCE IS FOR, and why it no longer opens with "on the user's own machine". An
+        # external reviewer wired this server into Cursor correctly and the agent answered
+        # "The sandbox run completed successfully. Output: 45" from its OWN python, never calling the
+        # tool: the workspace was untouched for eleven days. The client already owns the word "sandbox"
+        # (its terminal policy says "outside the sandbox (allowlisted)"), so a model choosing between
+        # "my shell, on the user's machine" and "a tool that runs code on the user's machine" was told
+        # they are the same thing, by us. The distinguishing facts are the ones that sentence omitted,
+        # so they lead now, and the reassurance about privacy comes last where it cannot read as
+        # equivalence.
         "description": (
-            "Run Python (default), bash or POSIX-sh code in a fast, LOCAL, isolated kern sandbox on "
-            "the user's own machine and return stdout/stderr plus any rich results. A matplotlib figure, "
-            "the last bare expression, and every display() call are captured; charts come back as "
-            "images you can see. The network is OFF and a mandatory timeout applies. FILE state in the "
-            "workspace persists across calls (write a file, read it next call). {state}"
-            " Use this to compute, analyze data, plot, or test code."
+            "Run code in an ISOLATED container, not in your own shell: a seccomp filter, every Linux "
+            "capability dropped, a read-only root, the box's own /dev, and no view of the host "
+            "filesystem outside this tool's workspace. The network is OFF and a mandatory timeout "
+            "applies. PREFER THIS over any shell you have for code you did not write, for anything a "
+            "user pasted, and for anything that could touch files or processes on the machine that were "
+            "not meant to be touched. Python (default), bash or POSIX-sh; returns stdout/stderr plus "
+            "rich results, and a matplotlib figure, the last bare expression and every display() call "
+            "come back as images you can see. FILE state in the workspace persists across calls (write "
+            "a file, read it next call). {state}"
+            " Use this to compute, analyze data, plot, or test code. It runs locally on the user's own"
+            " machine: nothing is uploaded and no network service is involved."
         ),
         "inputSchema": {
             "type": "object",
@@ -194,6 +208,9 @@ _TOOLS = [
                 },
             },
             "required": ["code"],
+            # So a client that validates refuses BEFORE sending; the
+            # server refuses the ones that arrive anyway.
+            "additionalProperties": False,
         },
     },
     {
@@ -207,6 +224,7 @@ _TOOLS = [
                 "content": {"type": "string", "description": "UTF-8 text to write."},
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
         },
     },
     {
@@ -217,12 +235,13 @@ _TOOLS = [
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Workspace-relative path."}},
             "required": ["path"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "list_files",
         "description": "List regular files in the sandbox workspace (excludes the internal deps dir).",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 ]
 
@@ -232,6 +251,16 @@ _TOOLS = [
 _RUN_CODE_LANGUAGES = next(
     t["inputSchema"]["properties"]["language"]["enum"] for t in _TOOLS if t["name"] == "run_code"
 )
+
+# What each tool ACCEPTS, derived from the schema above for the same reason `_RUN_CODE_LANGUAGES` is:
+# what the client was told is the only honest definition, and a retyped copy drifts.
+#
+# WHY THE SERVER CHECKS IT AT ALL, since JSON Schema allows extra properties by default and most servers
+# drop them. MEASURED by an external reviewer: a `tools/call` carrying `{"code": ..., "image": ""}` ran
+# and returned `[exit 0]`, so a model that asked for a different image was told its code had run and was
+# never told the image it named had no effect. Under `additionalProperties` the SDK's own contract is the
+# opposite: an unknown keyword to `Sandbox()` raises. A model cannot correct what it is not told about.
+_ACCEPTED_ARGS = {t["name"]: frozenset(t["inputSchema"]["properties"]) for t in _TOOLS}
 
 # Required arguments (and their types) per tool. Validated UP FRONT as -32602 before any binding call,
 # so a KeyError/TypeError from deep in the binding can never be misreported as a "missing argument".
@@ -491,6 +520,19 @@ class _Server:
             # so an unclipped repr turns an 8 MB request into an 8 MB error reply.
             self._error(mid, -32602, f"unknown tool: {_clip(name, _MAX_NAME)!r}")
             return
+        # An argument this tool does not have is refused rather than dropped, and the refusal names both
+        # halves: what was ignored, and what this tool takes. A model that invented `image` can only fix
+        # its call if it learns the call did not do what it asked.
+        extra = sorted(set(args) - _ACCEPTED_ARGS[name])
+        if extra:
+            named = ", ".join(repr(_clip(k, _MAX_NAME)) for k in extra[:5])
+            takes = ", ".join(sorted(_ACCEPTED_ARGS[name])) or "no arguments"
+            self._error(
+                mid, -32602,
+                f"{name} does not take {named}; it takes {takes}. Nothing was run: an argument this "
+                f"server ignored would have been a call that did something other than what was asked",
+            )
+            return
         for key, typ in spec.items():
             if key not in args:
                 self._error(mid, -32602, f"missing required argument: {key!r}")
@@ -645,7 +687,21 @@ class _Server:
         # message is where it says so - naming the alternatives for `killed`, the limit for `timeout`,
         # the scratch charge for `oom`. Appended for EVERY type rather than for the one that prompted
         # this: a per-type branch here is a second place to keep in step with the taxonomy.
-        tail = f"{_MARK_EXIT}{r.exit_code}"
+        # THE PROVENANCE STAMP, folded into the frame that is already on every reply so it costs no line.
+        # WHY IT IS HERE. An external reviewer wired this server into Cursor correctly, asked the agent to
+        # "run print(sum(range(10))) in the sandbox", and got "The sandbox run completed successfully.
+        # Output: 45" from the client's OWN python, with this server's workspace untouched for eleven days.
+        # Four probes said host: the caller's `init.scope` cgroup, the host's full `/dev`, `Seccomp: 0`
+        # where a box is always 2, and the machine's hostname. The isolation was never involved, which is
+        # the point: a client that owns the word "sandbox" can answer with its own shell and SAY it
+        # sandboxed the run. Nothing in the reply could contradict it, because there was no reply.
+        # The stamp is the cheapest thing that can: a reply carrying `kern <version>` came from this
+        # server talking to a binary that answered `kern <version>` to `--version`
+        # (`_verify_is_kern`), and a shell that is not kern cannot produce it. A cell cannot forge it
+        # either: `_MARK_EXIT` is neutralised in box output, so a cell printing the whole frame gets
+        # labelled "printed by the code, not the sandbox".
+        stamp = self._session()._kern_version or "kern"
+        tail = f"{_MARK_EXIT}{r.exit_code} in {stamp}"
         if r.fault:
             tail += f", sandbox fault: {r.fault.type}"
             # Bounded, and inside the tail that is deliberately exempt from the aggregate budget: the

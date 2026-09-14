@@ -2,6 +2,11 @@
 
 **Run AI-generated code in a real sandbox, one fresh box per call, in about 4 ms.**
 
+That 4 ms is the BOX. A trivial `run_code` costs more, because an interpreter has to start
+inside it: about 16 ms for Python on the machine this was measured on, of which ~12 is CPython
+itself (a bare `python3 -c` on the host already costs ~8). The two numbers answer two different
+questions, and quoting one where the other belongs is how a benchmark becomes a lie.
+
 `kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**: a rootless,
 kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
 tool-call, a model's generated snippet, a CI step: code that runs before anyone reads it gets its own

@@ -100,6 +100,9 @@ pub enum Instr {
         interval_ns: Option<u64>,
         timeout_ns: Option<u64>,
         start_period_ns: Option<u64>,
+        /// Docker 25+'s probe cadence INSIDE the start period. Parsed and now APPLIED: kern's checker
+        /// used one interval, so this was accepted with an apology printed at build time.
+        start_interval_ns: Option<u64>,
         retries: Option<u32>,
     },
     /// `STOPSIGNAL <signal>`: the signal the runtime sends to PID 1 to stop the container. Baked for
@@ -716,12 +719,14 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         interval_ns: None,
                         timeout_ns: None,
                         start_period_ns: None,
+                        start_interval_ns: None,
                         retries: None,
                     });
                 } else {
                     let mut interval_ns = None;
                     let mut timeout_ns = None;
                     let mut start_period_ns = None;
+                    let mut start_interval_ns = None;
                     let mut retries = None;
                     let mut tail = body;
                     while tail.starts_with("--") {
@@ -747,17 +752,10 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                             "--interval" => interval_ns = dur(value)?,
                             "--timeout" => timeout_ns = dur(value)?,
                             "--start-period" => start_period_ns = dur(value)?,
-                            // BuildKit's newer knob. kern's checker has no separate first-probe
-                            // interval, so honouring it would be a claim it cannot keep: accepted
-                            // and named, because refusing the build over it would be worse.
-                            "--start-interval" => {
-                                dur(value)?;
-                                eprintln!(
-                                    "kern build: HEALTHCHECK --start-interval is accepted and not \
-                                     applied - kern's checker uses one interval, so the first probe \
-                                     follows --interval"
-                                );
-                            }
+                            // BuildKit's newer knob, APPLIED since the checker learned to probe at
+                            // its own cadence inside the start period. It used to be accepted with a
+                            // printed apology, which was the honest thing to do while it was true.
+                            "--start-interval" => start_interval_ns = dur(value)?,
                             "--retries" => {
                                 retries = Some(value.parse::<u32>().map_err(|_| {
                                     format!(
@@ -798,6 +796,7 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                         interval_ns,
                         timeout_ns,
                         start_period_ns,
+                        start_interval_ns,
                         retries,
                     });
                 }
@@ -1592,6 +1591,7 @@ mod tests {
                 interval_ns: Some(30_000_000_000),
                 timeout_ns: None,
                 start_period_ns: None,
+                start_interval_ns: None,
                 retries: Some(2),
             }
         );
@@ -1608,6 +1608,7 @@ mod tests {
                 interval_ns: None,
                 timeout_ns: None,
                 start_period_ns: None,
+                start_interval_ns: None,
                 retries: None,
             }
         );

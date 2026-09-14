@@ -3862,6 +3862,7 @@ fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile
             interval_ns,
             timeout_ns,
             start_period_ns,
+            start_interval_ns,
             retries,
         } => {
             if test.first().is_some_and(|t| t == "NONE") {
@@ -3872,6 +3873,7 @@ fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile
                     interval_ns: *interval_ns,
                     timeout_ns: *timeout_ns,
                     start_period_ns: *start_period_ns,
+                    start_interval_ns: *start_interval_ns,
                     retries: *retries,
                 });
             }

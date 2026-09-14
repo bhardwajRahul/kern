@@ -35,6 +35,19 @@ because the command and the package have different names and there is no `kern-m
 | `read_file` | read a UTF-8 workspace file; the read is size-capped so a box cannot flood the client |
 | `list_files` | list regular files in the workspace, excluding the internal deps dir |
 
+**Every `run_code` reply says which kern ran it**, as `[exit 0 in kern 0.9.32]`, folded into the frame
+that was already there so it costs no line. The reason is not the isolation, which holds: a client that
+has a sandbox of its own can answer a request to "run this in the sandbox" from its own shell and report
+success, and nothing in the conversation contradicts it because no call was ever made. A reply carrying
+this stamp came through a binary that identified itself as kern; a shell that is not kern cannot produce
+it, and a cell that prints the frame gets it labelled as its own words.
+
+**An argument a tool does not have is refused, not dropped.** Every schema is
+`additionalProperties: false`, and the server checks the arguments it receives against the schema it
+advertised: a call carrying `image` or `network` comes back `-32602` naming what was ignored and what
+the tool takes, and nothing runs. A model that asks for a posture it did not get, and is told the code
+ran, has no way to correct itself.
+
 **File state persists across calls** through a workspace directory on disk; in-memory state does not,
 because each call is a fresh box. That is the same model the SDK documents, and the one exception is
 `KERN_MCP_KERNEL`, which the tool description tells the model about at `tools/list` time.
