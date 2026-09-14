@@ -1,6 +1,6 @@
 # kern-sandbox
 
-**Run AI-generated code in a fast, real sandbox, one fresh box per call.**
+**Run LLM-generated code in a fast, real sandbox, one fresh box per call.**
 
 Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
 interpreter starting inside it costs more than the box does. Both depend on your machine, so they are

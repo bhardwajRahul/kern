@@ -2,7 +2,7 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-**kern:** a fast, rootless sandbox and virtual resource runtime. Run any workload in a real container, including an agent's tool-call or AI-generated code.
+**kern:** a fast, rootless sandbox and virtual resource runtime. Run any workload in a real container, including an agent's tool-call or LLM-generated code.
 
 **A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
@@ -49,7 +49,7 @@ and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
-- **Run LLM-generated code, one container per call.** The snippet a model just wrote, the command an
+- **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
   agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
   fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
   caps the kernel enforces, capabilities dropped, seccomp deny-by-default, timeout applied from the
