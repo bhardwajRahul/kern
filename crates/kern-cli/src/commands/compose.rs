@@ -166,6 +166,15 @@ fn apply_memory_policy(
             b.swap_max =
                 crate::commands::service_swap_allowance(None, before.as_deref(), host_swap);
         }
+        // THE TASK CEILING, on the same argument as the two above and from the same kind of
+        // measurement. A box with no `pids_limit:` inherited the SANDBOX default of 512 tasks, which
+        // is a fork-bomb ceiling for a snippet and not a budget for a server: on Sentry's official
+        // file ClickHouse aborts under it with "Couldn't get 512 threads from global thread pool"
+        // and reaches `healthy` in 25 s at 2048. Docker imposes nothing here; a ceiling is kept, at
+        // podman's own default, so a downloaded stack still cannot take the machine.
+        if b.pids_limit.is_none() {
+            b.pids_limit = Some(kern_isolation::DEFAULT_COMPOSE_PIDS_MAX.to_string());
+        }
     }
     let named: Vec<&str> = moved.iter().map(String::as_str).collect();
     crate::commands::memory_ceiling_note(&named, ceiling?)
@@ -198,13 +207,22 @@ fn missing_external_volumes(
     }
     let one = missing.len() == 1;
     Some(format!(
-        "the file declares {} `external: true`, which means kern must NOT create {}, and {} does \
-         not exist: {}. Create it with `kern volume create <name>` (or drop `external: true` to let \
-         kern create it on first use, accepting that the service starts on empty storage).",
+        // The VERB and the IMPERATIVE agree with the count too, not just the pronouns. With six
+        // missing volumes this read "and they does not exist" and then "Create it": measured on
+        // Sentry's file, which declares exactly six.
+        "the file declares {} `external: true`, which means kern must NOT create {}, and {}: {}. \
+         Create {} with `kern volume create <name>` (or drop `external: true` to let kern create \
+         {} on first use, accepting that the service starts on empty storage).",
         if one { "this volume" } else { "these volumes" },
         if one { "it" } else { "them" },
-        if one { "it" } else { "they" },
+        if one {
+            "it does not exist"
+        } else {
+            "they do not exist"
+        },
         missing.join(", "),
+        if one { "it" } else { "them" },
+        if one { "it" } else { "them" },
     ))
 }
 
@@ -632,9 +650,26 @@ impl Drop for EmptyPodGuard<'_> {
 }
 
 pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
+    // `run`'s STDOUT IS THE WORKLOAD'S, and this has to be decided BEFORE anything narrates - the
+    // pod is created (and announced) further down this same function. A caller doing
+    // `state=$(docker compose run --rm -T svc sh -c 'printf skipped')` was getting three lines of
+    // kern's pod narration ahead of the word it was testing; Sentry's `install.sh` then reported
+    // "Could not determine whether the SeaweedFS encryption key migration is needed".
+    if o.action == ComposeAction::Run {
+        crate::pod::narrate_to_stderr_from_now_on();
+    }
     let ComposeOpts {
         files,
         action,
+        pull: pull_override,
+        stop_timeout,
+        ignore_pull_failures,
+        build_args,
+        rmi,
+        run_name,
+        run_entrypoint,
+        run_env,
+        run_user,
         bridge: want_bridge,
         allow_privileged,
         force_pod,
@@ -1315,6 +1350,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `[kern] compose_memory_max` restores a strict ceiling and is a CEILING: it also caps a
     // `mem_limit:` that asks for more, because a limit a downloaded file can raise limits nothing.
     //
+    // `--pull <policy>` OVERRIDES EVERY SERVICE'S `pull_policy:` for this invocation, which is what
+    // `docker compose run --pull=never` means. Applied here, once, before any verb sees the boxes:
+    // a flag honoured by `run` and not by `up` would be the same class of defect as a key honoured
+    // by `up` and not by `pull`, which this file fixed two days ago.
+    if let Some(p) = pull_override {
+        for b in &mut boxes {
+            b.pull = Some(p.to_string());
+        }
+    }
     // BEFORE THE VERB DISPATCH, so `config` shows the caps `up` applies. This file has paid three
     // times for a decision taken inside the `up` branch.
     if let Some(note) = apply_memory_policy(
@@ -1505,6 +1549,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         action,
         &mut boxes,
         &TerminalOpts {
+            stop_timeout,
+            ignore_pull_failures,
+            build_args,
+            rmi,
             pod: &pod,
             file,
             tail,
@@ -1750,7 +1798,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //  4. `image:` + `build:` together = build AND tag as `image` (compose semantics); a `build:` with
     //     no `image:` gets a synthesized tag. We never silently use a stale registry image for a box
     //     the user meant to build locally.
-    resolve_builds(&mut boxes, file, &self_exe)?;
+    // `run`'s stdout is the WORKLOAD'S. Every other verb here narrates to a terminal and its stdout
+    // is kern's to use. See `resolve_builds_narrating`.
+    crate::commands::resolve_builds_for(
+        &mut boxes,
+        file,
+        &self_exe,
+        action != ComposeAction::Run,
+        // `run --no-deps <svc>` starts exactly one service, so exactly one image can be needed.
+        // Without `--no-deps` the dependencies start too and every one of them may need building,
+        // which is the whole-file case.
+        (action == ComposeAction::Run && no_deps && !services.is_empty()).then_some(services),
+        build_args,
+    )?;
     // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
     // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
     // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
@@ -1801,20 +1861,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             true,
         );
     }
-    if action == ComposeAction::Run {
-        return compose_run(
-            &mut boxes,
-            &pod,
-            file,
-            services,
-            run_cmd,
-            run_rm,
-            no_deps,
-            &self_exe,
-            &project_dir,
-        );
-    }
-
     // A fresh epoch token for THIS `up`. Stamped into every `depends_completed` target's exit sidecar
     // and required to match on read, so a sidecar left by a previous `up` of the same stack can't
     // satisfy this run's wait (adversarial-review 1a). Uniqueness only needs to hold within this
@@ -1888,11 +1934,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // ONE BRIDGE CARRIES ONE NETWORK. A file that declares two subnets is told which one was taken,
     // because silently picking decides where a service answers.
-    let declared: Vec<&str> = {
-        let mut v: Vec<&str> = boxes
-            .iter()
-            .filter_map(|b| b.net_subnet.as_deref())
-            .collect();
+    // OWNED, not borrowed from `boxes`: the `run` dispatch below needs `&mut boxes` (it applies the
+    // one-off's `--entrypoint`), and a `&str` held from here would pin the whole slice immutably for
+    // the rest of the function.
+    let declared: Vec<String> = {
+        let mut v: Vec<String> = boxes.iter().filter_map(|b| b.net_subnet.clone()).collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -2339,6 +2385,43 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             plan
         }
     };
+
+    // `run` IS DISPATCHED HERE, AFTER THE ADDRESS PLAN, and that position is the fix rather than a
+    // tidy-up. It used to run before the wiring was decided, so the one-off joined the pod's USER
+    // namespace with no address of its own on the bridge and with the pod-style hosts file: MEASURED
+    // on Sentry's `install.sh`, `getent hosts kafka` inside the one-off answered `127.0.0.1` while
+    // that Kafka was at `10.89.0.7`, and `snuba-api bootstrap` died on a broker it could not reach.
+    // Everything between the old position and this one is work a `run` needs too - the builds, the
+    // relative binds, the memory policy and the wiring decision.
+    if action == ComposeAction::Run {
+        // A `run` IS A ONE-SHOT, so the service's `restart:` does not apply to it and is dropped
+        // rather than refused. Docker documents the same: `compose run` starts a one-off container
+        // and does not apply the restart policy. kern answered `--restart always/unless-stopped
+        // needs -d` and ended the invocation - which is correct for `kern box` and wrong for this
+        // verb, and it stopped Sentry's `install.sh` at `docker compose run --rm relay credentials`.
+        for b in &mut boxes {
+            b.restart = false;
+            b.restart_always = false;
+        }
+        return compose_run(
+            &address_plan,
+            bridge_cidr,
+            &mut boxes,
+            &pod,
+            file,
+            services,
+            run_cmd,
+            run_rm,
+            no_deps,
+            &self_exe,
+            &project_dir,
+            run_name,
+            run_entrypoint,
+            run_env,
+            run_user,
+            detach,
+        );
+    }
 
     // Count what will actually be LAUNCHED, not how many services the file has: with drift
     // reconciliation the levels may already have been filtered down to the changed ones, and a
@@ -3117,6 +3200,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 /// failing runtime.
 #[allow(clippy::too_many_arguments)]
 fn compose_run(
+    // The stack's wiring, so the one-off is addressed the way its peers are.
+    address_plan: &[crate::nopod::Assigned],
+    bridge_cidr: Option<&str>,
     boxes: &mut [crate::compose::ComposeBox],
     pod: &str,
     file: &str,
@@ -3126,6 +3212,16 @@ fn compose_run(
     no_deps: bool,
     self_exe: &std::path::Path,
     project_dir: &std::path::Path,
+    // `--name <n>`: the one-off's box name, instead of the generated `<service>-run-<pid>`.
+    name: Option<&str>,
+    // `--entrypoint <cmd>`: replaces the image's entrypoint for this run only.
+    entrypoint: Option<&str>,
+    // `-e KEY=VALUE`: environment for this one-off, applied over the service's own.
+    env: &[String],
+    // `--user <uid[:gid]>`: the identity this one-off runs as, over the service's own.
+    user: Option<&str>,
+    // `-d`: start the one-off and return, instead of waiting for it.
+    detach: bool,
 ) -> Result<(), Error> {
     let Some(target) = selected.first() else {
         return Err(Error::Compose(format!(
@@ -3139,16 +3235,49 @@ fn compose_run(
     };
 
     // 1. THE DEPENDENCIES, through `up` itself.
+    //
+    // ALL THREE KINDS, and that omission is what made this step do nothing on a real file. A
+    // `depends_on:` written with CONDITIONS - `condition: service_healthy` / `service_completed_
+    // successfully`, which is how every non-trivial compose file writes it - lands in
+    // `depends_healthy` / `depends_completed`, and only the bare form lands in `depends_on`. Reading
+    // the bare list alone, `run` started nothing for a service whose dependencies were all
+    // conditional. MEASURED on Sentry's `install.sh`: `dcr snuba-api bootstrap --force` ran with no
+    // Kafka, no ClickHouse and no Redis, and died in `list_topics` with
+    // `KafkaError{code=_TRANSPORT}` - an error about a broker that was never started.
+    //
+    // DEDUPED, because a service may name the same dependency in two of the three lists.
     let deps: Vec<String> = boxes
         .get(idx)
-        .map(|b| b.depends_on.clone())
+        .map(|b| {
+            let mut all: Vec<String> = b
+                .depends_on
+                .iter()
+                .chain(b.depends_healthy.iter())
+                .chain(b.depends_completed.iter())
+                .cloned()
+                .collect();
+            all.sort_unstable();
+            all.dedup();
+            all
+        })
         .unwrap_or_default();
     if !no_deps && !deps.is_empty() {
-        // The names as the FILE writes them: `up` maps its own selectors onto box names, and
-        // `depends_on` holds file names.
+        // BOX names, which is what these lists hold after the rename at the top of this file - and
+        // what `up`'s selector accepts beside the service name.
         let mut up = std::process::Command::new(self_exe);
         up.current_dir(project_dir);
-        up.arg("compose").arg(file).arg("up").arg("-d");
+        // `--wait`, BECAUSE THE CONDITIONS ARE THE POINT. A dependency written
+        // `condition: service_healthy` is a promise that the one-off will not run before the
+        // dependency answers, and starting the box is not that promise: MEASURED on Sentry's
+        // `install.sh`, `snuba-api bootstrap` ran the instant Kafka's box existed and died in
+        // `list_topics` with `KafkaError{code=_TRANSPORT}` while that Kafka was still opening its
+        // sockets. `up --wait` is the same wait `up` already performs for a stack, so there is one
+        // implementation of "ready" and not two.
+        up.arg("compose")
+            .arg(file)
+            .arg("up")
+            .arg("-d")
+            .arg("--wait");
         for d in &deps {
             up.arg(d);
         }
@@ -3169,12 +3298,38 @@ fn compose_run(
     let Some(b) = boxes.get_mut(idx) else {
         return Err(Error::Compose("run: the service disappeared".to_string()));
     };
-    let one_off = format!("{}-run-{}", b.name, std::process::id());
+    // `--name` IS THE NAME, when one was given: a caller that named its one-off intends to find it
+    // again (Sentry's installer runs `--name sentry_seaweedfs_migration` and then waits on it), and
+    // a generated name would make that lookup fail. Validated by `kern box` itself, which is the one
+    // authority on what a box may be called.
+    // The FILE's name for this service, which is the key the address plan and the hosts wiring use.
+    let target_service = b.service_name().to_string();
+    let one_off = match name {
+        Some(n) => n.to_string(),
+        None => format!("{}-run-{}", b.name, std::process::id()),
+    };
+    // `--entrypoint` REPLACES the image's, for this run only, which is what Docker does. Applied to
+    // the box definition rather than to the argv so it goes through the same path as the file's own
+    // `entrypoint:`.
+    if let Some(e) = entrypoint {
+        if let Some(bm) = boxes.get_mut(idx) {
+            // Docker takes a STRING here and splits it as a shell would; the file's own
+            // `entrypoint:` may be a list. One element is the faithful reading of the flag: the
+            // whole value is the program, and anything after it on the command line is its argv.
+            bm.entrypoint = Some(vec![e.to_string()]);
+        }
+    }
+    let Some(b) = boxes.get_mut(idx) else {
+        return Err(Error::Compose(format!("run: service '{target}' vanished")));
+    };
     // See the doc: published ports belong to the service's own box, not to a one-off beside it.
     b.ports.clear();
     b.expose.clear();
     let mut c = std::process::Command::new(self_exe);
     c.current_dir(project_dir);
+    // THE CHILD NARRATES TO STDERR TOO: it is the process that creates the pod and announces it, and
+    // this invocation's stdout belongs to the workload. See `pod::narrate_to_stderr`.
+    c.env("KERN_NARRATE_STDERR", "1");
     c.arg("box").arg(&one_off);
     b.push_box_flags(&mut c);
     // Join the stack's pod when there IS one, so the one-off reaches `db` by name exactly as the
@@ -3182,6 +3337,57 @@ fn compose_run(
     // dependencies, and then a one-off with no peers needs no network of its own.
     if crate::pod::holder_pid(pod).is_some() {
         c.arg("--pod").arg(pod);
+        // ON A BRIDGE, JOINING THE POD IS NOT ENOUGH. A member keeps its own network namespace and
+        // takes an address on the bridge; a one-off that only joined the pod's USER namespace had no
+        // address there and a hosts file pointing every peer at its own `127.0.0.1`. MEASURED inside
+        // the one-off: `getent hosts kafka` answered `127.0.0.1` while that Kafka was at 10.89.0.7,
+        // so `snuba-api bootstrap` died on `KafkaError{code=_TRANSPORT}`.
+        //
+        // THE ADDRESS IS THE SERVICE'S OWN, because the one-off IS that service for the length of the
+        // command and the file's peers already expect it there. If the service's own box is running,
+        // taking its address would give two boxes one address, so the one-off goes without and keeps
+        // the previous behaviour rather than breaking the member that is up.
+        if let Some(cidr) = bridge_cidr {
+            let mine = address_plan.iter().find(|a| a.service == target_service);
+            if let (Some((_, _, prefix)), Some(a), false) = (
+                kern_isolation::pod_bridge_parts(cidr),
+                mine,
+                crate::commands::is_box_alive(&b.name),
+            ) {
+                c.arg("--pod-bridge")
+                    .arg(format!("{}/{prefix}", std::net::Ipv4Addr::from(a.alias)));
+            }
+        }
+    }
+    // THE PEERS, AT THE ADDRESSES THEY ACTUALLY HOLD. `add_host_args` is the same function every
+    // member is wired with, asked for this service's view: peers at their aliases, itself at its own.
+    if let Some(entries) = crate::nopod::add_host_args(address_plan, &target_service, false) {
+        for e in entries {
+            c.arg("--add-host").arg(e);
+        }
+    }
+    // `-d` DETACHES, and until this the flag was accepted and ignored: `run -d` ran the one-off in
+    // the FOREGROUND and returned when it exited, so a caller starting a server this way waited
+    // forever. MEASURED on Sentry's `install.sh`, which starts a temporary SeaweedFS filer with
+    // `run -d` and then polls it: the installer sat on that line for 14 minutes with the box up and
+    // healthy, because the command that started it had not returned.
+    //
+    // ⛔ BEFORE THE `--`, AND THAT IS NOT A DETAIL: after it, every token is the WORKLOAD'S, so a
+    // `-d` appended at the end reached `weed` as an argument and the server printed its usage
+    // instead of starting. Measured the same way the defect above was.
+    if detach {
+        c.arg("-d");
+    }
+    // AFTER the service's own environment (`push_box_flags` above), so a key given on the command
+    // line wins: `kern box` lets a later `--env` override an earlier one, and the flag is the
+    // caller's answer for this one run.
+    for e in env {
+        c.arg("--env").arg(e);
+    }
+    // AFTER the service's own `user:`, for the same reason: the flag is the caller's answer for this
+    // one run, and `kern box` lets the later `--user` win.
+    if let Some(u) = user {
+        c.arg("--user").arg(u);
     }
     // The command: what was typed, or the service's own when nothing was.
     let argv: &[String] = if cmd.is_empty() { &b.command } else { cmd };
@@ -3192,6 +3398,7 @@ fn compose_run(
         }
     }
     // FOREGROUND, stdio inherited: this is an interactive one-off and its output is the point.
+    // Detached, `kern box -d` prints its own line and returns, which is what `-d` asks for.
     let st = c
         .status()
         .map_err(|e| Error::Compose(format!("run: launching '{one_off}': {e}")))?;
@@ -3296,7 +3503,7 @@ fn watch_and_abort(
     // about to produce: `--exit-code-from db`, where `db` never exits on its own, reports the 137
     // the stop leaves behind. Reaping inside the teardown made every one of these exit 0.
     let ((stopped, pod_existed), names) =
-        crate::commands::tear_down_stack_keeping(all, &selected, pod, false);
+        crate::commands::tear_down_stack_keeping(all, &selected, pod, false, None);
     crate::commands::print_down_summary(stopped, pod_existed, pod);
 
     // The status: the NAMED service's if one was named (137 when the teardown is what ended it),

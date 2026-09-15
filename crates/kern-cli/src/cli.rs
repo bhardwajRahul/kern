@@ -447,6 +447,8 @@ pub enum Command {
     Inspect {
         name: String,
         json: bool,
+        /// `--format <go template>`: Docker's, for the field set kern can answer truthfully.
+        format: Option<String>,
     },
     /// `kern prune`: garbage-collect leftover logs/health/registry files of boxes no longer running.
     Prune,
@@ -533,6 +535,26 @@ pub enum Command {
         /// One or more compose files, merged left-to-right (`-f base -f override`).
         files: Vec<String>,
         /// Which compose verb to run (see [`commands::ComposeAction`]).
+        /// `--pull <always|missing|never>`: overrides every service's `pull_policy:` for this
+        /// invocation, which is what `docker compose run --pull=never` means.
+        pull: Option<String>,
+        /// `-t/--timeout <secs>` on `stop`/`down`/`restart`: the grace before the SIGKILL.
+        stop_timeout: Option<u64>,
+        /// `--ignore-pull-failures`: a registry that cannot serve an image ends the image, not the run.
+        ignore_pull_failures: bool,
+        /// `build --build-arg K=V`, repeatable: forwarded to every service built by this invocation.
+        build_args: Vec<String>,
+        /// `run --name <n>`: the one-off's box name.
+        run_name: Option<String>,
+        /// `run --entrypoint <cmd>`: replaces the image's entrypoint for this run.
+        run_entrypoint: Option<String>,
+        /// `run -e KEY=VALUE`, repeatable: environment for this one-off, over the service's own.
+        run_env: Vec<String>,
+        /// `run --user <uid[:gid]>`: the identity this one-off runs as.
+        run_user: Option<String>,
+        /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`
+        /// every image it names.
+        rmi: Option<bool>,
         action: commands::ComposeAction,
         no_pod: bool,
         /// `--bridge`: wire the stack the way Docker does. Each service keeps its OWN network
@@ -1193,15 +1215,46 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 None => return Err(Error::Usage("logs <name> [--tail N] [-f|--follow]")),
             }
         }
-        // `inspect <name> [--json]`: full detail for one box.
+        // `inspect <name> [--json] [--format <tmpl>]`: full detail for one box or image.
+        //
+        // `--format` IS DOCKER'S, AND IT IS WHAT SCRIPTS READ. A wait loop asking
+        // `docker inspect --format '{{.State.Running}}' <name>` is the canonical way to poll a
+        // container, and kern answered `unknown flag "--format"`: measured on Sentry's `install.sh`,
+        // whose SeaweedFS migration polls exactly that. A field kern cannot answer truthfully is
+        // refused BY NAME rather than guessed, which is the rule the `version`/`info` renderer
+        // already follows.
         Some("inspect") => {
-            reject_unknown_flags("inspect", &rest, &["--json"])?;
-            match rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+            reject_unknown_flags("inspect", &rest, &["--json", "--format"])?;
+            let format = flag_value(&rest, "--format");
+            // The NAME is the first positional that is not a flag's value. Walked explicitly,
+            // because `--format '{{.State.Running}}' <name>` puts a non-flag token immediately after
+            // a flag and a naive "first token without a dash" takes the template for the box.
+            let mut name: Option<&str> = None;
+            let mut skip_next = false;
+            for a in rest.iter().skip(1) {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if *a == "--format" {
+                    skip_next = true;
+                    continue;
+                }
+                if !a.starts_with('-') && name.is_none() {
+                    name = Some(a);
+                }
+            }
+            match name {
                 Some(n) => Command::Inspect {
-                    name: (*n).to_string(),
+                    name: n.to_string(),
                     json: rest.contains(&"--json"),
+                    format,
                 },
-                None => return Err(Error::Usage("inspect <name> [--json]")),
+                None => {
+                    return Err(Error::Usage(
+                        "inspect <name> [--json] [--format <template>]",
+                    ))
+                }
             }
         }
         // `prune`: GC leftover logs/health/registry files of boxes no longer running.
@@ -1425,6 +1478,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut bridge = false;
             let mut allow_privileged = false;
             let mut allow_device_grants = false;
+            let mut pull: Option<String> = None;
+            let mut stop_timeout: Option<u64> = None;
+            let mut ignore_pull_failures = false;
+            let mut build_args: Vec<String> = Vec::new();
+            let mut run_name: Option<String> = None;
+            let mut run_entrypoint: Option<String> = None;
+            let mut run_env: Vec<String> = Vec::new();
+            let mut run_user: Option<String> = None;
+            // `Some(false)` = `--rmi local`, `Some(true)` = `--rmi all`.
+            let mut rmi: Option<bool> = None;
             let mut tail: Option<usize> = None;
             let mut follow = false;
             let mut all = false;
@@ -1455,7 +1518,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     run_cmd.push((*a).to_string());
                     continue;
                 }
-                match *a {
+                // `--flag=value` IS THE SAME FLAG. Docker accepts both spellings and real scripts
+                // use both: Sentry's `install.sh` runs `docker compose … run --pull=never --rm`,
+                // and kern answered `unknown flag '--pull=never'`, which stopped the official
+                // installer of a stack this runtime claims to run. Normalised HERE and not before
+                // the loop, because after `run <service>` every token belongs to the command and
+                // `mycmd --opt=1` must reach it whole.
+                let (key, inline) = match a.split_once('=') {
+                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+                    _ => (*a, None),
+                };
+                match key {
                     "--no-pod" => no_pod = true,
                     // `--bridge`: the third wiring, and the only one that is Docker's arrangement.
                     // Each service gets its own network namespace on a bridge the pod holds, so a
@@ -1467,31 +1540,137 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // it the stack keeps one namespace and the segregation is dropped, which is what
                     // kern did before and is still the faster wiring.
                     "--pod" => force_pod = true,
+                    // `--pull <policy>`: Docker's per-invocation override, mapped through the ONE
+                    // table the `pull_policy:` key uses (`pull_policy_word`). A word neither
+                    // vocabulary knows is REFUSED rather than ignored: silently pulling when the
+                    // caller asked not to is the failure this flag exists to prevent.
+                    "--pull" => {
+                        let raw = inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose --pull <always|missing|never>"))?;
+                        match kern_compose::pull_policy_word(&raw) {
+                            Some(mapped) => pull = Some(mapped.to_string()),
+                            None => {
+                                return Err(Error::Usage(
+                                    "compose --pull takes always, missing or never",
+                                ))
+                            }
+                        }
+                    }
+                    // `-t/--timeout <secs>`: the stop grace for THIS teardown, replacing what each
+                    // box recorded at start. `0` is a real value (Docker reads it as "kill now"), so
+                    // a parse failure is refused rather than folded into the default.
+                    "-t" | "--timeout" => {
+                        let raw = inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose -t <seconds>"))?;
+                        stop_timeout =
+                            Some(raw.trim().parse::<u64>().map_err(|_| {
+                                Error::Usage("compose -t <seconds> (a whole number)")
+                            })?);
+                    }
+                    // `--ignore-pull-failures` is what `compose pull` ALREADY does for a service that
+                    // declares `build:`, and the flag asks for it unconditionally: a registry that
+                    // does not have an image is reported and the run continues.
+                    "--ignore-pull-failures" => ignore_pull_failures = true,
+                    // `run --name <n>` and `run --entrypoint <cmd>`: Docker's two one-off overrides.
+                    // Sentry's installer uses both in one command to run a migration under a name it
+                    // then waits on.
+                    "--name" => {
+                        run_name = Some(
+                            inline_or_next(inline, &mut it)
+                                .ok_or(Error::Usage("compose run --name <name>"))?,
+                        )
+                    }
+                    "--entrypoint" => {
+                        run_entrypoint = Some(
+                            inline_or_next(inline, &mut it)
+                                .ok_or(Error::Usage("compose run --entrypoint <command>"))?,
+                        )
+                    }
+                    // `run -e KEY=VALUE`, repeatable: an environment entry for THIS one-off, on top
+                    // of the service's own. Sentry's installer bootstraps its node store with three
+                    // of them in one command.
+                    "-e" | "--env" => run_env.push(
+                        inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose run -e KEY=VALUE"))?,
+                    ),
+                    // `run --user <uid[:gid]>`: Docker's per-invocation identity, which kern's box
+                    // already takes as `--user`. Sentry's installer fixes a directory's ownership
+                    // with `run --user 0 ... chown`.
+                    "-u" | "--user" => {
+                        run_user = Some(
+                            inline_or_next(inline, &mut it)
+                                .ok_or(Error::Usage("compose run --user <uid[:gid]>"))?,
+                        )
+                    }
+                    // `compose build --build-arg K=V`, repeatable, forwarded to every service this
+                    // invocation builds. Sentry's installer passes six of them (the proxy set) on
+                    // every single build, so without this its `build` step could not run at all.
+                    "--build-arg" => build_args.push(
+                        inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose build --build-arg K=V"))?,
+                    ),
+                    // `--rmi <local|all>` on `down`: also remove the stack's images. `local` is
+                    // Docker's "only the ones this file produced", which for kern is exactly the
+                    // services that declare `build:`; `all` is every image the file names. A third
+                    // word is refused rather than folded into one of the two, because the difference
+                    // between them is other people's images.
+                    "--rmi" => {
+                        let raw = inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose down --rmi <local|all>"))?;
+                        match raw.trim().to_ascii_lowercase().as_str() {
+                            "local" => rmi = Some(false),
+                            "all" => rmi = Some(true),
+                            _ => return Err(Error::Usage("compose down --rmi takes local or all")),
+                        }
+                    }
+                    // `--quiet-pull` only asks for less output, and kern's pull narration is already
+                    // terminal-gated: accepted, with the same note the other no-effect flags get.
+                    "--quiet-pull" => eprintln!(
+                        "kern: warning: compose: '--quiet-pull' has no effect on kern - ignored"
+                    ),
                     "--allow-device-grants" => allow_device_grants = true,
                     // The operator's half of `privileged: true`. Its own flag and not folded into
                     // `--allow-device-grants`: one grants access to named device nodes, the other
                     // relaxes the seccomp filter, and an operator who wants one has not asked for
                     // the other.
                     "--allow-privileged" => allow_privileged = true,
+                    // `-f` IS DOCKER'S FILE FLAG BEFORE THE VERB AND ITS FOLLOW FLAG AFTER `logs`,
+                    // and reading it as `--follow` everywhere is how `kern compose -f
+                    // docker-compose.yml logs web` came to hang. MEASURED by an external reviewer,
+                    // who lost half an hour to a job parked on it, and reproduced here in one pair:
+                    // `compose docker-compose.yml logs a` prints and exits, `compose -f
+                    // docker-compose.yml logs a` never returns. It is also the invocation in every
+                    // project README, since that is how `docker compose` is written, which is why it
+                    // silently "worked" for `up -d` (a harmless follow) and bit only on `logs`.
+                    "-f" | "--file" if action.is_none() => {
+                        let w = inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose -f <file>"))?;
+                        // Same slots the positional form fills, so `-f a.yml -f b.yml` merges exactly
+                        // as `compose a.yml b.yml` does.
+                        if file.is_none() {
+                            file = Some(w.clone());
+                        }
+                        files.push(w);
+                    }
                     "-f" | "--follow" => follow = true,
                     "-a" | "--all" => all = true,
                     "-p" | "--project-name" => {
                         project = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
                                 .ok_or(Error::Usage("compose -p <project-name>"))?,
                         );
                     }
                     "--env-file" => {
                         env_file = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
                                 .ok_or(Error::Usage("compose --env-file <path>"))?,
                         );
                     }
                     "--profile" => {
                         profiles.push(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
                                 .ok_or(Error::Usage("compose --profile <name>"))?,
                         );
@@ -1500,7 +1679,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // script runs unchanged, and NOTED so nobody believes they did something.
                     // `--parallel` is not silently honoured - kern has its own concurrency cap.
                     "--ansi" | "--progress" | "--parallel" => {
-                        let v = it.next().map(|v| (*v).to_string()).unwrap_or_default();
+                        let v = inline_or_next(inline, &mut it).unwrap_or_default();
                         eprintln!(
                             "kern: warning: compose: '{a} {v}' has no effect on kern - ignored"
                         );
@@ -1543,7 +1722,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // is the NAMED service's, which is 137 when the abort is what killed it.
                     "--exit-code-from" => {
                         exit_code_from = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
                                 .ok_or(Error::Usage("compose --exit-code-from <service>"))?,
                         );
@@ -1561,14 +1740,14 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--services" => ps_services = true,
                     "--format" => {
                         ps_format = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
                                 .ok_or(Error::Usage("compose ps --format <template|json>"))?,
                         );
                     }
                     "--wait-timeout" => {
                         wait_timeout = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .ok_or(Error::Usage("compose --wait-timeout N (seconds)"))?,
                         );
@@ -1591,7 +1770,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--tail" => {
                         // A non-numeric `--tail` is a typo, not "show everything": refuse it.
                         tail = Some(
-                            it.next()
+                            inline_or_next(inline, &mut it)
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .ok_or(Error::Usage("compose --tail N (a number of lines)"))?,
                         );
@@ -1644,6 +1823,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Compose {
                 files,
                 action: action.unwrap_or(commands::ComposeAction::Up),
+                pull,
+                stop_timeout,
+                ignore_pull_failures,
+                build_args,
+                run_name,
+                run_entrypoint,
+                run_env,
+                run_user,
+                rmi,
                 no_pod,
                 bridge,
                 allow_privileged,
@@ -1693,6 +1881,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             Command::Compose {
                 files: vec![file],
                 action,
+                // The shorthand takes no `--pull`: it is `kern up` in a directory, and a policy
+                // override belongs to the explicit form.
+                pull: None,
+                stop_timeout: None,
+                ignore_pull_failures: false,
+                build_args: Vec::new(),
+                run_name: None,
+                run_entrypoint: None,
+                run_env: Vec::new(),
+                run_user: None,
+                rmi: None,
                 no_pod,
                 bridge,
                 allow_privileged,
@@ -3257,6 +3456,21 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
 
 /// Parse `pull <image> [--dest <dir>] [--platform os/arch]`. `None` if no image was given.
 /// Value following a `--flag` token in `rest` (e.g. `--username alice`), or `None`.
+/// The value of a flag written either way: `--flag value` or `--flag=value`.
+///
+/// `inline` is the right-hand side when the caller split one off the token; otherwise the value is
+/// the next argument. ONE function, so a flag cannot accept one spelling and not the other - which is
+/// what `--pull=never` did, and it stopped Sentry's official installer.
+fn inline_or_next<'a, I: Iterator<Item = &'a &'a str>>(
+    inline: Option<&str>,
+    it: &mut std::iter::Peekable<I>,
+) -> Option<String> {
+    match inline {
+        Some(v) => Some(v.to_string()),
+        None => it.next().map(|v| (*v).to_string()),
+    }
+}
+
 fn flag_value(rest: &[&str], flag: &str) -> Option<String> {
     rest.iter()
         .position(|a| *a == flag)
@@ -3615,45 +3829,84 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
     let mut quiet = false;
     let mut i = 1; // rest[0] == "build"
     while i < rest.len() {
-        match rest[i] {
+        // `--flag=value` IS THE SAME FLAG HERE TOO, and a build is where scripts use it most:
+        // `docker build --platform=linux/amd64 --build-arg=K=V`. The split takes the FIRST `=` only,
+        // so `--build-arg=K=V` keeps `K=V` whole.
+        let (key, inline) = match rest[i].split_once('=') {
+            Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+            _ => (rest[i], None),
+        };
+        // The value of the flag just matched, from the token itself or from the next argument.
+        let mut value = |usage: &'static str| -> Result<String, Error> {
+            match inline {
+                Some(v) => Ok(v.to_string()),
+                None => {
+                    i += 1;
+                    rest.get(i)
+                        .map(|v| (*v).to_string())
+                        .ok_or(Error::Usage(usage))
+                }
+            }
+        };
+        match key {
             "-t" | "--tag" => {
-                i += 1;
-                let t = rest.get(i).ok_or(Error::Usage("-t <name[:tag]>"))?;
-                check_reference(t, "build -t")?;
-                tag = Some((*t).to_string());
+                let t = value("-t <name[:tag]>")?;
+                check_reference(&t, "build -t")?;
+                tag = Some(t);
             }
             "-f" | "--file" => {
-                i += 1;
-                file = Some(
-                    rest.get(i)
-                        .ok_or(Error::Usage("-f <Dockerfile>"))?
-                        .to_string(),
-                );
+                file = Some(value("-f <Dockerfile>")?);
             }
             "--build-arg" => {
-                i += 1;
-                build_args.push(
-                    rest.get(i)
-                        .ok_or(Error::Usage("--build-arg K=V"))?
-                        .to_string(),
-                );
+                build_args.push(value("--build-arg K=V")?);
+            }
+            // `--platform <os/arch>`: ACCEPTED WHEN IT IS THIS MACHINE, REFUSED OTHERWISE. kern runs
+            // the host's architecture and emulates nothing, so honouring a foreign platform is not
+            // something it can do and ignoring the flag would build the wrong image quietly. The
+            // same rule and the same words the compose parser already applies to `platform:`.
+            //
+            // MEASURED: Sentry's `install.sh` builds every one of its images with
+            // `--platform=linux/amd64`, which on this machine IS the host, and kern refused the flag
+            // outright - so the official installer stopped at its first build.
+            "--platform" => {
+                let want = value("--platform <os/arch> (e.g. linux/amd64)")?;
+                let host_os = "linux";
+                let host_arch = match std::env::consts::ARCH {
+                    "x86_64" => "amd64",
+                    "aarch64" => "arm64",
+                    other => other,
+                };
+                let w = want.trim().to_ascii_lowercase();
+                let matches = w.is_empty()
+                    || w == host_arch
+                    || w == format!("{host_os}/{host_arch}")
+                    || w.starts_with(&format!("{host_os}/{host_arch}/"));
+                if !matches {
+                    return Err(Error::Build(format!(
+                        "--platform {want}: kern builds for this machine ({host_os}/{host_arch}) and emulates nothing, so the image would build and then fail to exec. Build it on a matching host"
+                    )));
+                }
             }
             // `--target <stage>`: stop at that stage of a multi-stage Dockerfile. Compose spells the
             // same thing `build.target:`, and the builder refuses a name the file does not define
             // rather than falling back to the last stage, which would build the wrong image quietly.
             "--target" => {
-                i += 1;
-                target = Some(
-                    rest.get(i)
-                        .filter(|v| !v.trim().is_empty())
-                        .ok_or(Error::Usage(
-                            "--target <stage> (a name from a `FROM … AS <name>`)",
-                        ))?
-                        .to_string(),
-                );
+                let t = value("--target <stage> (a name from a `FROM … AS <name>`)")?;
+                if t.trim().is_empty() {
+                    return Err(Error::Usage(
+                        "--target <stage> (a name from a `FROM … AS <name>`)",
+                    ));
+                }
+                target = Some(t);
             }
             "-q" | "--quiet" => quiet = true,
-            s if s.starts_with('-') => return Err(Error::Usage("unknown build flag")),
+            // NAMED, because "unknown build flag" sent a reader to re-read their whole command line
+            // to find which word kern meant.
+            s if s.starts_with('-') => {
+                return Err(Error::Build(format!(
+                    "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, -q/--quiet"
+                )))
+            }
             s if context.is_none() => context = Some(s.to_string()),
             _ => return Err(Error::Usage("build takes a single context directory")),
         }
@@ -3970,7 +4223,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         ),
         Command::Stats { json, names } => commands::stats(json, &names),
         Command::Logs { name, tail, follow } => commands::logs(&name, tail, follow),
-        Command::Inspect { name, json } => commands::inspect(&name, json),
+        Command::Inspect { name, json, format } => {
+            commands::inspect_formatted(&name, json, format.as_deref())
+        }
         Command::Prune => commands::prune(),
         Command::Gc { images } => commands::gc(images),
         Command::Doctor => crate::doctor::doctor(),
@@ -4003,6 +4258,15 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Compose {
             files,
             action,
+            pull,
+            stop_timeout,
+            ignore_pull_failures,
+            build_args,
+            run_name,
+            run_entrypoint,
+            run_env,
+            run_user,
+            rmi,
             no_pod,
             bridge,
             allow_privileged,
@@ -4031,6 +4295,15 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         } => commands::compose(commands::ComposeOpts {
             files: &files,
             action,
+            pull: pull.as_deref(),
+            stop_timeout,
+            ignore_pull_failures,
+            build_args: &build_args,
+            run_name: run_name.as_deref(),
+            run_entrypoint: run_entrypoint.as_deref(),
+            run_env: &run_env,
+            run_user: run_user.as_deref(),
+            rmi,
             no_pod,
             bridge,
             allow_privileged,
@@ -5576,7 +5849,8 @@ mod tests {
             parse(&["inspect".into(), "web".into()]).unwrap().1,
             Command::Inspect {
                 name: "web".into(),
-                json: false
+                json: false,
+                format: None
             }
         );
         assert_eq!(
@@ -5585,7 +5859,8 @@ mod tests {
                 .1,
             Command::Inspect {
                 name: "web".into(),
-                json: true
+                json: true,
+                format: None
             }
         );
         // Missing name → usage error (a lone `--json` is not a name).
