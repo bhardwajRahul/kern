@@ -43,9 +43,13 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh  
 
 ## What kern is
 
-**Two verbs.** `kern box app --image alpine -- sh` puts a process in a container: namespaces, a pivoted
-root, seccomp, cgroup caps. `kern run --memory 256m --cpus 0.5 -- ./train.sh` caps it and nothing else:
-no image, no namespaces, the host still visible.
+A rootless container runtime in one static binary. No daemon.
+
+```sh
+kern box --image alpine -- sh              # full isolation
+kern run --memory 256m --cpus 0.5 -- ./job # limits only, host still visible
+kern compose up -d
+```
 
 A `vcpu:`, `vdisk:` or `vgpio:` profile written once in a `kern.toml` attaches by name to either.
 
