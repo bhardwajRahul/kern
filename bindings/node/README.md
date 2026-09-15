@@ -164,8 +164,8 @@ Every relaxing option says so in its name or docs:
 - **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
   `$HOME`, the docker socket), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
   `.kube`, `.docker`, `.azure`, `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`),
-  **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir: the sandbox's control
-  plane), and escaping targets.
+  **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that
+  holds every named volume: the sandbox's control plane), and escaping targets.
 - **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes, open the final component
   `O_NOFOLLOW` so a symlink the box plants cannot redirect host I/O, and refuse anything that is not a
   REGULAR file (see the notes for the FIFO that made a read hang).

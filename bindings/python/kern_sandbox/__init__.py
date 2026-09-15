@@ -67,7 +67,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.20"
+__version__ = "0.2.22"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1259,24 +1259,44 @@ def _kern_state_dirs() -> "dict[str, str]":
 
     Resolved per call rather than at import, because these follow the environment (`XDG_RUNTIME_DIR`,
     `XDG_CACHE_HOME`, `HOME`) and a test or a service manager moves them.
+
+    EACH DIRECTORY IS LISTED TWICE: where the environment says it is, AND where XDG says it is by
+    default. The runtime dir was already spelled both ways; the other three were not, and an external
+    reviewer measured the consequence in one process: with `XDG_DATA_HOME=/tmp/xdh2`, the path
+    `~/.local/share/kern` was ACCEPTED and still held `builds` and `volumes`. The variable answers
+    "which kern will this SDK spawn", which is the right input for the guard, but the data a previous
+    run left on disk does not move when the variable does.
     """
     uid = os.getuid()
     home = os.path.expanduser("~")
     default_runtime = f"/run/user/{uid}"
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or default_runtime
-    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
-    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    what_runtime = ("kern's runtime state (the registry, instance dirs, netns handles and exit files of "
-                    "every box you are running)")
-    # A DICT, so the usual case where `XDG_RUNTIME_DIR` IS `/run/user/<uid>` collapses to one entry
-    # instead of listing the same directory twice with two different accounts of what it is.
-    return {
-        os.path.join(runtime, "kern"): what_runtime,
-        os.path.join(default_runtime, "kern"): what_runtime,
-        os.path.join(cache, "kern"): "kern's image cache (a box that writes it poisons the rootfs a later "
-                                     "box runs)",
-        os.path.join(config, "kern"): "kern's configuration (the profiles a later box may be given)",
-    }
+    # (configured, default, what it is) - one row per directory, so a fourth cannot be added to the
+    # environment lookup and forgotten in the refusal list.
+    known = (
+        (os.environ.get("XDG_RUNTIME_DIR"), default_runtime,
+         "kern's runtime state (the registry, instance dirs, netns handles and exit files of every box "
+         "you are running)"),
+        (os.environ.get("XDG_CACHE_HOME"), os.path.join(home, ".cache"),
+         "kern's image cache (a box that writes it poisons the rootfs a later box runs)"),
+        (os.environ.get("XDG_CONFIG_HOME"), os.path.join(home, ".config"),
+         "kern's configuration (the profiles a later box may be given)"),
+        # THE THIRD SIBLING, and the one the list missed. Found by an external reviewer who took the
+        # two that WERE refused as the shape of the rule and looked for the rest: this holds
+        # `volumes/` (the contents of every named volume on the host, which is every compose stack's
+        # database) and `builds/` (the build records a later image is assembled from). Refusing the
+        # runtime dir and the cache while accepting this one was not a smaller policy, it was an
+        # inconsistent one.
+        (os.environ.get("XDG_DATA_HOME"), os.path.join(home, ".local", "share"),
+         "kern's data (every named volume on this host, and the build records a later image is "
+         "assembled from)"),
+    )
+    # A DICT, so the usual case where the variable IS the default collapses to one entry instead of
+    # listing the same directory twice with two different accounts of what it is.
+    dirs: "dict[str, str]" = {}
+    for configured, default, what in known:
+        for base in (configured or default, default):
+            dirs.setdefault(os.path.join(base, "kern"), what)
+    return dirs
 
 
 def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:

@@ -196,7 +196,8 @@ a box is the workspace. If you want the agent to work on a repository, point `KE
 and know what that means: the agent can then write anything in that tree, including a `.cursor/mcp.json`
 or `.mcp.json` that configures this server on the next restart. The SDK refuses `$HOME`, `/etc`, `/root`,
 the docker socket, any path with a credential directory in it (`.ssh`, `.aws`, `.kube`, ...) and kern's
-own state (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir), but a workspace you chose is a
+own state (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that holds every
+named volume), but a workspace you chose is a
 workspace you chose.
 
 **What happens when the client fires several calls at once?** They are serialised. Three `run_code` calls
