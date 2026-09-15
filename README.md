@@ -51,8 +51,6 @@ kern run --memory 256m --cpus 0.5 -- ./job # limits only, host still visible
 kern compose up -d
 ```
 
-A `vcpu:`, `vdisk:` or `vgpio:` profile written once in a `kern.toml` attaches by name to either.
-
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
 - **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
