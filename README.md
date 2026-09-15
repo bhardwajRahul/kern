@@ -43,9 +43,14 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh  
 
 ## What kern is
 
-**One binary that manages resources, of which isolation is the first.** That is why there is no
-single row for kern in a comparison table: it is a container runtime, a sandbox, a resource slicer
-and a stack runner at once, in one static binary with no daemon.
+**One binary that hands a process a slice of a machine: isolation, CPU, memory, disk, devices.** A
+container is one of those slices, the one that includes everything at once, and that is why there are
+two verbs.
+
+`kern box app --image alpine -- sh` gives a process the lot: namespaces, a pivoted root, seccomp, cgroup
+caps. `kern run --memory 256m --cpus 0.5 -- ./train.sh` gives it one dimension and nothing else, so the
+process still sees the host, with no image and no sandbox. Declare a slice once in a `kern.toml` and
+attach it by name to either one.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.4 ms.
