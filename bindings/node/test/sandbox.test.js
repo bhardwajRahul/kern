@@ -2153,12 +2153,18 @@ test("kern's own state is refused as a mount source", () => {
   // the registry, instance dirs, netns handles and exit files of every box the user runs. The image cache
   // is the same class one step removed (write it and the rootfs a LATER box runs is yours). Same reason
   // the docker socket is refused, which was in the list while these were not.
+  //
+  // The DATA dir joined the list after an external reviewer took the refused two as the shape of the
+  // rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, the CONTENT of every named
+  // volume on the host, and `builds/`. Its two siblings were refused by name and it was not.
   const prev = { kb: process.env.KERN_BIN, rt: process.env.XDG_RUNTIME_DIR,
-                 ca: process.env.XDG_CACHE_HOME, cf: process.env.XDG_CONFIG_HOME };
+                 ca: process.env.XDG_CACHE_HOME, cf: process.env.XDG_CONFIG_HOME,
+                 da: process.env.XDG_DATA_HOME };
   process.env.KERN_BIN = FAKE_KERN;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "kt-state-"));
   try {
-    for (const [envName, dir] of [["XDG_RUNTIME_DIR", "rt"], ["XDG_CACHE_HOME", "ca"], ["XDG_CONFIG_HOME", "cf"]]) {
+    for (const [envName, dir] of [["XDG_RUNTIME_DIR", "rt"], ["XDG_CACHE_HOME", "ca"],
+                                  ["XDG_CONFIG_HOME", "cf"], ["XDG_DATA_HOME", "da"]]) {
       const base = path.join(root, dir);
       fs.mkdirSync(path.join(base, "kern", "inner"), { recursive: true });
       process.env[envName] = base;
@@ -2168,6 +2174,28 @@ test("kern's own state is refused as a mount source", () => {
           assert.match(e.message, /kern's/);
           return true;
         }, `${src} must be refused`);
+      }
+    }
+    // THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
+    // reviewer, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
+    // was ACCEPTED and still held `builds` and `volumes`. Both spellings are in the list now, so the
+    // guard covers where kern WILL write and where a previous run already did.
+    {
+      const fakeHome = path.join(root, "home");
+      for (const d of [[".local", "share"], [".cache"], [".config"]])
+        fs.mkdirSync(path.join(fakeHome, ...d, "kern"), { recursive: true });
+      const prevHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      for (const k3 of ["XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"])
+        process.env[k3] = path.join(root, "elsewhere");
+      try {
+        for (const d of [[".local", "share"], [".cache"], [".config"]]) {
+          const src = path.join(fakeHome, ...d, "kern");
+          assert.throws(() => new Sandbox({ mounts: { [src]: "/x" } }), MountRefused,
+            `${src} must be refused while XDG points elsewhere`);
+        }
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
       }
     }
     // CONTROLS: a lookalike name and an ordinary directory still mount.
@@ -2180,7 +2208,8 @@ test("kern's own state is refused as a mount source", () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
     for (const [k2, v] of [["KERN_BIN", prev.kb], ["XDG_RUNTIME_DIR", prev.rt],
-                           ["XDG_CACHE_HOME", prev.ca], ["XDG_CONFIG_HOME", prev.cf]]) {
+                           ["XDG_CACHE_HOME", prev.ca], ["XDG_CONFIG_HOME", prev.cf],
+                           ["XDG_DATA_HOME", prev.da]]) {
       if (v === undefined) delete process.env[k2]; else process.env[k2] = v;
     }
   }

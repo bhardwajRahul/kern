@@ -242,7 +242,8 @@ Sandbox(
 cover a `mounts` bind. Three groups: the host's own (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`,
 `/dev`, `$HOME`, the docker socket), anything with a **credential directory** in its path (`.ssh`, `.aws`,
 `.gnupg`, `.kube`, `.docker`, `.azure`, `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`,
-`.npmrc`), and **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir): that last
+`.npmrc`), and **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data
+dir that holds every named volume): that last
 one is the sandbox's control plane, so handing it to the code in a box defeats the box.
 
 **`setup=` output is read-only to your code.** A cell cannot change what the next cell imports.

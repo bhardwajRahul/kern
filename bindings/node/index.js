@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.20";
+const VERSION = "0.2.22";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -456,16 +456,35 @@ const REFUSED_MOUNT_SOURCES = new Set([
  * follow the environment and a service manager moves them. */
 function kernStateDirs() {
   const uid = process.getuid();
-  const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
   const home = os.homedir();
-  const cache = process.env.XDG_CACHE_HOME || path.join(home, ".cache");
-  const config = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
-  return [
-    [path.join(runtime, "kern"), "kern's runtime state (the registry, instance dirs, netns handles and exit files of every box you are running)"],
-    [`/run/user/${uid}/kern`, "kern's runtime state"],
-    [path.join(cache, "kern"), "kern's image cache (a box that writes it poisons the rootfs a later box runs)"],
-    [path.join(config, "kern"), "kern's configuration (the profiles a later box may be given)"],
+  // EACH DIRECTORY TWICE: where the environment says it is, AND where XDG says it is by default. The
+  // runtime dir was already spelled both ways; the other three were not, and a reviewer measured the
+  // consequence in one process - with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED
+  // and still held `builds` and `volumes`. The variable answers "which kern will this SDK spawn",
+  // which is the right input for the guard, but data a previous run left on disk does not move with it.
+  //
+  // The DATA dir itself joined the list after the same reviewer took the refused two as the shape of
+  // the rule and looked for the rest: it holds `volumes/`, the CONTENT of every named volume on this
+  // host, and `builds/`, the records a later image is assembled from.
+  const known = [
+    [process.env.XDG_RUNTIME_DIR, `/run/user/${uid}`,
+      "kern's runtime state (the registry, instance dirs, netns handles and exit files of every box you are running)"],
+    [process.env.XDG_CACHE_HOME, path.join(home, ".cache"),
+      "kern's image cache (a box that writes it poisons the rootfs a later box runs)"],
+    [process.env.XDG_CONFIG_HOME, path.join(home, ".config"),
+      "kern's configuration (the profiles a later box may be given)"],
+    [process.env.XDG_DATA_HOME, path.join(home, ".local", "share"),
+      "kern's data (every named volume on this host, and the build records a later image is assembled from)"],
   ];
+  // A MAP, so the usual case where the variable IS the default collapses to one entry instead of
+  // listing the same directory twice with two different accounts of what it is.
+  const out = new Map();
+  for (const [configured, dflt, what] of known)
+    for (const base of [configured || dflt, dflt]) {
+      const dir = path.join(base, "kern");
+      if (!out.has(dir)) out.set(dir, what);
+    }
+  return [...out];
 }
 
 /** Credential directories, refused as a COMPONENT anywhere in the source. The set above is absolute

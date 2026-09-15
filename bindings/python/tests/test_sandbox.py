@@ -1529,14 +1529,20 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     the same class one step removed (write it, and the rootfs a LATER box runs is yours), and the config
     dir holds the profiles a later box may be given. Same reason the docker socket is refused, which was
     already in the list while these were not.
+
+    The DATA dir was missing from that list until an external reviewer took the refused two as the shape
+    of the rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, which is the CONTENT of
+    every named volume on the host (every compose stack's database), and `builds/`. On his machine a
+    sandbox could be handed all of them, read-write, while its two siblings were refused by name.
     """
-    rt, ca, cf = tmp_path / "rt", tmp_path / "ca", tmp_path / "cf"
-    for d in (rt, ca, cf):
+    rt, ca, cf, da = tmp_path / "rt", tmp_path / "ca", tmp_path / "cf", tmp_path / "da"
+    for d in (rt, ca, cf, da):
         (d / "kern" / "inner").mkdir(parents=True)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(rt))
     monkeypatch.setenv("XDG_CACHE_HOME", str(ca))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(cf))
-    for d in (rt, ca, cf):
+    monkeypatch.setenv("XDG_DATA_HOME", str(da))
+    for d in (rt, ca, cf, da):
         for src in (d / "kern", d / "kern" / "inner"):   # the dir AND anything below it
             with pytest.raises(MountRefused) as e:
                 kern._validate_mount(str(src), "/x")
@@ -1547,6 +1553,21 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(other))
     with pytest.raises(MountRefused):
         kern._validate_mount(str(other / "kern"), "/x")
+    # THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
+    # reviewer, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
+    # still held `builds` and `volumes`, because the guard protected the CONFIGURED directory while the
+    # data a previous run wrote sat at the default one. Both spellings are in the list now.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "elsewhere"))
+    home = os.path.expanduser("~")
+    for default in (
+        os.path.join(home, ".local", "share", "kern"),
+        os.path.join(home, ".cache", "kern"),
+        os.path.join(home, ".config", "kern"),
+        f"/run/user/{os.getuid()}/kern",
+    ):
+        assert default in kern._kern_state_dirs(), f"{default} is not refused when XDG points elsewhere"
     # CONTROLS: a sibling that merely starts with the same letters, and an ordinary directory, pass.
     for name in ("kernel-notes", "data"):
         ok = tmp_path / name
