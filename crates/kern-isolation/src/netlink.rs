@@ -42,6 +42,12 @@ const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLMSG_ERROR: u16 = 2;
 
+/// `IFLA_ADDRESS`: an interface's link-layer address, set at CREATE time so it is never random.
+const IFLA_ADDRESS: u16 = 1;
+/// A locally-administered address for the self-check below; the pod path derives its own from the
+/// member's IP (see `member_mac`).
+#[cfg(test)]
+const TEST_MAC: [u8; 6] = [0x02, 0x42, 0x0a, 0x59, 0x00, 0x63];
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
@@ -215,7 +221,12 @@ pub fn add_veth(name: &str, peer: &str) -> io::Result<()> {
 /// `ip link add X type veth peer name Y netns <pid>` sends.
 ///
 /// `pid` IS READ IN THE CALLER'S PID NAMESPACE, like every other `IFLA_NET_NS_PID`.
-pub fn add_veth_peer_in_netns(name: &str, peer: &str, pid: i32) -> io::Result<()> {
+pub fn add_veth_peer_in_netns(
+    name: &str,
+    peer: &str,
+    pid: i32,
+    peer_mac: Option<[u8; 6]>,
+) -> io::Result<()> {
     let mut p = ifinfomsg(0).to_vec();
     push_attr(&mut p, IFLA_IFNAME, &cstr(name));
     let li = open_nest(&mut p, IFLA_LINKINFO);
@@ -224,11 +235,24 @@ pub fn add_veth_peer_in_netns(name: &str, peer: &str, pid: i32) -> io::Result<()
     let peer_nest = open_nest(&mut p, VETH_INFO_PEER);
     p.extend_from_slice(&ifinfomsg(0));
     push_attr(&mut p, IFLA_IFNAME, &cstr(peer));
+    if let Some(mac) = peer_mac {
+        push_attr(&mut p, IFLA_ADDRESS, &mac);
+    }
     push_attr(&mut p, IFLA_NET_NS_PID, &pid.to_ne_bytes());
     close_nest(&mut p, peer_nest);
     close_nest(&mut p, data);
     close_nest(&mut p, li);
     send_newlink(&p, NLM_F_CREATE | NLM_F_EXCL)
+}
+
+/// Set the link-layer address of the interface with index `index`.
+///
+/// The fallback twin of the `peer_mac` argument above: where the peer is created HERE and moved, its
+/// address is set here, before the move, so both forms leave the member with the same MAC.
+pub fn set_address(index: i32, mac: [u8; 6]) -> io::Result<()> {
+    let mut p = ifinfomsg(index).to_vec();
+    push_attr(&mut p, IFLA_ADDRESS, &mac);
+    send_newlink(&p, 0)
 }
 
 /// Attach `index` to the bridge with index `master`.
@@ -494,7 +518,10 @@ mod tests {
                     return 11; // the target never got a namespace of its own
                 }
                 let verdict = {
-                    if add_veth_peer_in_netns("kvf", "kpf", target).is_err() {
+                    // A CHOSEN address here too, so this case exercises the shape the pod path
+                    // actually sends: `IFLA_ADDRESS` inside the peer's nest, which a kernel that
+                    // ignored it would leave random.
+                    if add_veth_peer_in_netns("kvf", "kpf", target, Some(TEST_MAC)).is_err() {
                         12
                     } else if index_of("kvf").is_none() {
                         13 // the near end must be here: the pair was not created at all

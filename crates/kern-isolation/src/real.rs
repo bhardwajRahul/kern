@@ -1554,6 +1554,28 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
                  hint: the AppArmor profile '{profile}' would not admit the exec - is it loaded on \
                  the host? (`apparmor_parser -r <profile>` loads it; `-R` removes it)"
             );
+        } else if io.kind() == std::io::ErrorKind::NotFound && cmd.starts_with('/') {
+            // THREE CAUSES SHARE ONE ERRNO, and the old hint recited all three at once, so the reader
+            // had to work out which. We are inside the box's mount namespace here, so ONE `stat`
+            // decides between them. Measured cost of not deciding: an external reviewer met
+            // `cannot start 'tini' in box: No such file or directory` on a cached image whose rootfs
+            // was missing `/sbin/tini`, and the hint sent him to check the path and the libraries of
+            // a command whose file simply was not there.
+            if std::fs::symlink_metadata(cmd).is_err() {
+                eprintln!(
+                    "kern: cannot start '{cmd}' in box: {io}\n\
+                     hint: that path does not exist in this box's filesystem. If the box came from an \
+                     image, the image does not ship it there, or its cache entry is damaged - \
+                     `--pull always` re-fetches the image"
+                );
+            } else {
+                eprintln!(
+                    "kern: cannot start '{cmd}' in box: {io}\n\
+                     hint: the file IS there, so this is its interpreter or dynamic loader that is \
+                     not - a binary built against glibc cannot run in a musl rootfs, and a `#!` line \
+                     names a program that must exist too"
+                );
+            }
         } else {
             eprintln!(
                 "kern: cannot start '{cmd}' in box: {io}\n\
@@ -3122,6 +3144,44 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
     }
     for f in ["possible", "present", "online"] {
         let _ = std::fs::write(format!("{dir}/{f}"), format!("{range}\n"));
+    }
+    // THE SAME RANGE IN THE SECOND SPELLING THE ECOSYSTEM READS, and not a fourth fact: a `cpu<N>`
+    // directory per id already named by the three files above. This is the rule at the top of this
+    // function ("nothing about the host beyond the CPU RANGE the box is allowed to run on") held
+    // exactly, because the ids are the ones just written and nothing is put inside the directories.
+    //
+    // WHY IT IS NOT COSMETIC. A tool that counts `cpu[0-9]*` entries instead of parsing `present`
+    // finds none and answers 1. MEASURED, one binary and two environments: `busybox:latest`'s own
+    // busybox 1.38 answers `nproc --all` = 28 when run on this host and = 1 inside a kern box, while
+    // Debian's coreutils answers 28 in the same box. Sentry's `install.sh` runs
+    // `docker run --rm busybox nproc --all` and refuses to install below 4 cores.
+    //
+    // EMPTY DIRECTORIES, DELIBERATELY: no `topology/`, no `cache/`, no `cpufreq/`. Those WOULD be new
+    // host facts, and the decision recorded above is that this is not an emulated `sysfs`.
+    //
+    // BOUNDED: a `possible` line of `0-8191` is a real shape on a large host, and a box start is a
+    // 3.5 ms path. The cap is the count, not the ids - every id below it keeps its own directory, so
+    // the answer stays exact for every machine anyone runs a sandbox on.
+    const MAX_CPU_DIRS: usize = 4096;
+    let mut made = 0usize;
+    for part in range.split(',') {
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (a.trim().parse::<u32>(), b.trim().parse::<u32>()),
+            None => {
+                let one = part.trim().parse::<u32>();
+                (one.clone(), one)
+            }
+        };
+        let (Ok(lo), Ok(hi)) = (lo, hi) else {
+            continue; // a malformed part is skipped, never guessed at
+        };
+        for id in lo..=hi.min(lo.saturating_add(MAX_CPU_DIRS as u32)) {
+            if made >= MAX_CPU_DIRS {
+                return;
+            }
+            let _ = std::fs::create_dir(format!("{dir}/cpu{id}"));
+            made += 1;
+        }
     }
 }
 
@@ -5655,6 +5715,26 @@ pub struct BridgeAttach {
     pub prefix: u8,
 }
 
+/// The link-layer address a pod member takes, derived from the address it answers on.
+///
+/// WHY IT IS DERIVED AND NOT LEFT TO THE KERNEL. A `veth` created without one gets a RANDOM MAC, so
+/// a service that is stopped and started again comes back on the same IP behind a different MAC -
+/// and its peers hold the old one in their neighbour caches until the kernel expires it. MEASURED on
+/// this repo's own acceptance matrix, on a laptop, a VPS and three boards identically: `compose
+/// start` returns in 171 ms and the restarted service is unreachable BY ITS PEERS for **29.3
+/// seconds**, while a service that was never stopped keeps answering. Nothing is wrong with the
+/// box, the bridge or the name resolution: `10.89.0.3` answers on its address the whole time.
+///
+/// `02:42:<the four address bytes>` is Docker's own scheme for exactly this, which makes a stable
+/// MAC the familiar behaviour rather than a kern invention: `02` marks it locally administered and
+/// unicast, and the address bytes make it unique inside the pod by construction. A restart now
+/// reuses it, so the peers' caches stay CORRECT instead of being invalidated after the fact.
+#[must_use]
+pub fn member_mac(ip: std::net::Ipv4Addr) -> [u8; 6] {
+    let o = ip.octets();
+    [0x02, 0x42, o[0], o[1], o[2], o[3]]
+}
+
 /// Split `10.89.0.0/24` into the address a bridge takes (`.1`) and its netmask.
 ///
 /// THE GATEWAY IS THE FIRST HOST ADDRESS, which is the convention every reader expects and the one
@@ -5725,6 +5805,7 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
     let me = std::process::id() as i32;
     let vname = format!("kv{me}");
     let pname = format!("kp{me}");
+    let mac = member_mac(at.ip);
     // SAFETY: a fork from the single-threaded box setup path; the child only does namespace and
     // netlink work and then `_exit`s without touching the parent's state.
     let pid = unsafe { libc::fork() };
@@ -5768,7 +5849,8 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
                 // ignored the namespace has `made` true and `born_far` false, and calling
                 // `add_veth` again for it fails with `EEXIST` - which is what happened, and turned
                 // the rescue into a second way to fail.
-                let fast = crate::netlink::add_veth_peer_in_netns(&vname, &pname, me).is_ok();
+                let fast =
+                    crate::netlink::add_veth_peer_in_netns(&vname, &pname, me, Some(mac)).is_ok();
                 let born_far = fast && crate::netlink::index_of(&pname).is_none();
                 let made = fast || crate::netlink::add_veth(&vname, &pname).is_ok();
                 if !made {
@@ -5792,8 +5874,18 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
                                 // the target namespace - and has to make the trip, paying the grace
                                 // period the fast form avoids.
                                 match crate::netlink::index_of(&pname) {
-                                    Some(p) if crate::netlink::move_to_netns(p, me).is_ok() => 0,
-                                    Some(_) => 9,
+                                    Some(p) => {
+                                        // The address BEFORE the move: after it the index means
+                                        // nothing here (see `move_to_netns`), and a member that
+                                        // took the slow path must still get the stable MAC or it
+                                        // keeps the defect this fixes.
+                                        let _ = crate::netlink::set_address(p, mac);
+                                        if crate::netlink::move_to_netns(p, me).is_ok() {
+                                            0
+                                        } else {
+                                            9
+                                        }
+                                    }
                                     None => 5,
                                 }
                             }

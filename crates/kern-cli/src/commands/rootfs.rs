@@ -96,76 +96,21 @@ pub(crate) fn scratch_path_is_confined(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Remove `dir` from inside a user namespace mapped to the caller's full subordinate range, so files
-/// owned by subordinate uids (left by a `--uid-range` / pod box whose workload dropped privilege) are
-/// unlinkable (they appear owned by ns-root under the map). Forks a child that unshares a user ns and
-/// blocks; the parent maps it with `newuidmap`/`newgidmap`; the child then `remove_dir_all`s as ns-root.
+/// Remove `dir` as root of an id-mapped user namespace, so files owned by subordinate uids (left by
+/// a `--uid-range` / pod box, or by the layer extractor) are unlinkable: under that map they belong
+/// to ids this process owns. Best effort, like every other cleanup path - a directory that cannot be
+/// removed is reported by the caller that notices it is still there.
+///
+/// ONE MECHANISM FOR THE WHOLE TREE. This used to carry its own fork + `unshare` + `newuidmap`
+/// sequence, which was the THIRD copy of it in the repo; `kern_isolation::with_id_mapped_userns` is
+/// the one the rest of kern uses and it is strictly the better one - it refuses to fork a
+/// multi-threaded process, and it degrades to a single-uid map where the helpers are unusable
+/// instead of giving up.
 pub(crate) fn remove_dir_all_ranged(dir: &std::path::Path) {
-    let (uid, gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    // Resolve the range + trusted helpers via the ONE authoritative kern-isolation impl (same as the
-    // box-start path), so cleanup can't drift; no allocation → give up.
-    let name = kern_isolation::username(uid);
-    let (Some(newuidmap), Some(newgidmap)) = (
-        kern_isolation::trusted_helper("newuidmap"),
-        kern_isolation::trusted_helper("newgidmap"),
-    ) else {
-        return;
-    };
-    let (Some((sub_uid, uc)), Some((sub_gid, gc))) = (
-        kern_isolation::sub_range("/etc/subuid", name.as_deref(), uid),
-        kern_isolation::sub_range("/etc/subgid", name.as_deref(), gid),
-    ) else {
-        return;
-    };
-    let mut c2p = [0i32; 2];
-    let mut p2c = [0i32; 2];
-    if unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0 || unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0
-    {
-        return;
-    }
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return;
-    }
-    if pid == 0 {
-        unsafe {
-            libc::close(c2p[0]);
-            libc::close(p2c[1])
-        };
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-            unsafe { libc::_exit(1) };
-        }
-        let _ = unsafe { libc::write(c2p[1], b"1".as_ptr().cast(), 1) };
-        let mut b = [0u8; 1];
-        let _ = unsafe { libc::read(p2c[0], b.as_mut_ptr().cast(), 1) };
-        // ns-root over the whole range now: the subuid-owned files map to ids we own here → removable.
-        let _ = std::fs::remove_dir_all(dir);
-        unsafe { libc::_exit(0) };
-    }
-    unsafe {
-        libc::close(c2p[1]);
-        libc::close(p2c[0])
-    };
-    let mut b = [0u8; 1];
-    let _ = unsafe { libc::read(c2p[0], b.as_mut_ptr().cast(), 1) };
-    let map = |bin: &std::path::Path, own: u32, sub: u32, count: u32| {
-        let _ = std::process::Command::new(bin)
-            .args([
-                pid.to_string(),
-                "0".into(),
-                own.to_string(),
-                "1".into(),
-                "1".into(),
-                sub.to_string(),
-                count.to_string(),
-            ])
-            .status();
-    };
-    map(&newuidmap, uid, sub_uid, uc);
-    map(&newgidmap, gid, sub_gid, gc);
-    let _ = unsafe { libc::write(p2c[1], b"1".as_ptr().cast(), 1) };
-    let mut st = 0;
-    crate::eintr::waitpid(pid, &mut st, 0);
+    let owned = dir.to_path_buf();
+    let _ = kern_isolation::with_id_mapped_userns(move |_| {
+        i32::from(std::fs::remove_dir_all(&owned).is_err())
+    });
 }
 
 /// Sweep orphaned overlay scratch: `<scratch>/<name>-<pid>/` dirs whose box is no longer live.
@@ -1306,23 +1251,63 @@ pub(crate) fn supports_reflink(dir: &std::path::Path) -> Option<bool> {
 
 /// `cp -a src/. dst` - copy the CONTENTS of `src` into the existing `dst`, preserving symlinks,
 /// modes and timestamps (used to make a mutable copy of the pulled base rootfs).
+///
+/// TWO ATTEMPTS, because the plain user cannot read every base image. A Debian or Ubuntu base ships
+/// directories like `/var/cache/apt/archives/partial` at mode 0700, and after extraction they are
+/// owned by a SUBORDINATE uid, which the user running `cp` cannot traverse. MEASURED by an external
+/// reviewer on Sentry's official compose file: every `build:` on a Debian base died here, 21 of 57
+/// services, before anything started. `FROM alpine` built fine, which is what named the cause.
+///
+/// So a failed copy is retried as ns-root over the subordinate range, where those directories are
+/// readable and `cp -a` can reproduce their ownership on the other side. Same map the extractor used
+/// to create them, and the same one `remove_dir_all_ranged` uses to delete them.
 pub(crate) fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> {
     std::fs::create_dir_all(dst).map_err(|e| Error::Sandbox(format!("build rootfs: {e}")))?;
-    let ok = std::process::Command::new("cp")
-        .arg("-a")
-        .arg("--reflink=auto") // copy-on-write clone on btrfs/xfs (near-free); plain copy elsewhere
-        .arg("--") // paths are absolute, but stop cp treating any of them as a flag
-        .arg(format!("{}/.", src.display()))
-        .arg(dst)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Sandbox(
-            "copying the base rootfs failed (is `cp` available?)".into(),
-        ))
+    let run = || {
+        std::process::Command::new("cp")
+            .arg("-a")
+            .arg("--reflink=auto") // copy-on-write clone on btrfs/xfs (near-free); plain copy elsewhere
+            .arg("--") // paths are absolute, but stop cp treating any of them as a flag
+            .arg(format!("{}/.", src.display()))
+            .arg(dst)
+            .output()
+    };
+    let out = match run() {
+        Ok(o) => o,
+        // THE ONE CASE THE OLD MESSAGE GUESSED AT. `cp` really is missing or unspawnable here, and
+        // nothing else in this function can say that.
+        Err(e) => {
+            return Err(Error::Sandbox(format!(
+                "copying the base rootfs needs `cp`, which could not be run: {e}"
+            )))
+        }
+    };
+    if out.status.success() {
+        return Ok(());
+    }
+    // `cp` already printed its own lines; keep the first for a message that names what happened
+    // instead of asking the reader to look for a binary that is present.
+    let said = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .next()
+        .unwrap_or("no output")
+        .trim()
+        .to_string();
+    match kern_isolation::with_id_mapped_userns(|_| {
+        i32::from(!run().map(|o| o.status.success()).unwrap_or(false))
+    }) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::Sandbox(format!(
+            "copying the base rootfs failed, as this user and again as root over your subordinate \
+             uid range: {said}"
+        ))),
+        // No namespace to retry in, so the first failure is the whole story, and the remedy is the
+        // one the rest of kern names for this class: a uid allocation.
+        Err(_) => Err(Error::Sandbox(format!(
+            "copying the base rootfs failed: {said}. A base image's directories can be owned by \
+             subordinate uids, which needs newuidmap/newgidmap and an allocation in /etc/subuid to \
+             read"
+        ))),
     }
 }
 
