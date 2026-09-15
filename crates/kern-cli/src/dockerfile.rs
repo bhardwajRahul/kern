@@ -234,9 +234,23 @@ pub fn lint(instrs: &[Instr]) -> Vec<String> {
             _ => {}
         }
     }
-    if !instrs
-        .iter()
-        .any(|i| matches!(i, Instr::Cmd(_) | Instr::Entrypoint(_)))
+    // A DOCKERFILE WITHOUT `CMD` INHERITS THE BASE'S, so this may only speak when there is no base to
+    // inherit from. It used to fire on every `FROM <image>` that added no command of its own, and
+    // Sentry's official file is 21 such builds: kern printed "the image has no default command" for
+    // images whose config it had just written with `entrypoint /docker-entrypoint.sh` and `cmd run
+    // web`. A warning that the artifact beside it contradicts teaches the reader to skip warnings.
+    //
+    // `FROM scratch` is the case that IS knowable here: nothing precedes it, so a stage with no
+    // command really has none. Everything else needs the base's config, which the executor has and
+    // this pure lint does not, so it says nothing rather than something false.
+    let last_base = instrs.iter().rev().find_map(|i| match i {
+        Instr::From { image, .. } => Some(image.as_str()),
+        _ => None,
+    });
+    if last_base == Some("scratch")
+        && !instrs
+            .iter()
+            .any(|i| matches!(i, Instr::Cmd(_) | Instr::Entrypoint(_)))
     {
         warns.push("no CMD or ENTRYPOINT: the image has no default command".into());
     }
@@ -1346,13 +1360,33 @@ mod tests {
 
     #[test]
     fn lint_flags_unpinned_base_and_missing_cmd_but_not_clean() {
-        // Unpinned FROM + no CMD → two warnings.
+        // Unpinned FROM → one warning, and NOT the "no CMD" one: a Dockerfile without `CMD`
+        // inherits its base's, so that sentence is false for every base that has one. MEASURED on
+        // Sentry's official file, 21 builds `FROM $SENTRY_IMAGE`: kern printed "the image has no
+        // default command" for images whose config it had just written with `entrypoint
+        // /docker-entrypoint.sh` and `cmd run web`. The artifact contradicted the warning.
         let dirty = lint(&[Instr::From {
             image: "alpine".into(),
             as_name: None,
         }]);
         assert!(dirty.iter().any(|w| w.contains("no tag pinned")));
-        assert!(dirty.iter().any(|w| w.contains("no CMD")));
+        assert!(
+            !dirty.iter().any(|w| w.contains("no CMD")),
+            "a base can supply the command: {dirty:?}"
+        );
+        // `FROM scratch` is the case this lint CAN decide: nothing precedes it, so a stage with no
+        // command really has none.
+        let scratch = lint(&[
+            Instr::From {
+                image: "scratch".into(),
+                as_name: None,
+            },
+            Instr::Run(vec!["true".into()]),
+        ]);
+        assert!(
+            scratch.iter().any(|w| w.contains("no CMD")),
+            "nothing precedes scratch: {scratch:?}"
+        );
         // A pinned base + a CMD → clean, zero warnings.
         let clean = lint(&[
             Instr::From {
