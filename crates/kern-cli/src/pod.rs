@@ -752,6 +752,30 @@ fn route_overlapping(text: &str, want_bits: u32, want_prefix: u32) -> Option<Str
     None
 }
 
+/// Does kern's own narration go to stderr instead of stdout?
+///
+/// `compose run` is the one verb whose STDOUT belongs to the workload, so everything kern says
+/// during it belongs on the other stream. Set once by that verb before anything narrates; every
+/// other path leaves it false and prints exactly where it always did.
+static NARRATE_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Send kern's own narration to stderr for the rest of this process.
+pub fn narrate_to_stderr_from_now_on() {
+    NARRATE_STDERR.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether narration currently goes to stderr.
+///
+/// THE ENVIRONMENT IS PART OF THE ANSWER, because the narration that mattered was printed by a CHILD:
+/// `compose run` spawns `kern box --pod <p>`, and it is that process which creates the pod and
+/// announces it. A flag set in the parent cannot reach it; `KERN_NARRATE_STDERR=1` can, and it
+/// travels exactly as far as the command that sets it.
+#[must_use]
+pub fn narrate_to_stderr() -> bool {
+    NARRATE_STDERR.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("KERN_NARRATE_STDERR").is_some()
+}
+
 /// passes `ImageDefault` when the stack has image boxes and `Requested` when a service asked in as
 /// many words; a pod of root-only services stays single-uid (faster, more isolated).
 pub fn create_with_range(
@@ -974,23 +998,33 @@ pub fn create_with_range(
     // alternative was a dummy `Outbound` value standing in for "not consulted", which is a lie the
     // type would then carry to every reader of the match below.
     let outbound = want_outbound.then(|| setup_outbound(name, pid));
-    println!("created pod '{name}'");
-    println!(
+    // WHICH STREAM THIS NARRATION GOES TO IS THE CALLER'S BUSINESS, and `compose run` is why: that
+    // verb's stdout belongs to the WORKLOAD. A caller doing
+    // `state=$(docker compose run --rm -T svc sh -c 'printf skipped')` got these three lines ahead of
+    // the word it was testing, and Sentry's `install.sh` then reported "Could not determine whether
+    // the SeaweedFS encryption key migration is needed" - a question kern had answered and talked over.
+    macro_rules! say {
+        ($($a:tt)*) => {
+            if narrate_to_stderr() { eprintln!($($a)*) } else { println!($($a)*) }
+        };
+    }
+    say!("created pod '{name}'");
+    say!(
         "  add boxes: kern box <name> --pod {name} -d -- …  (publish a service with -p on its box)"
     );
     // One line per CAUSE. This was one line for five different states, and the one it printed told
     // a user with pasta installed to install pasta.
     match outbound {
         None => {
-            println!("  network: loopback-only (--no-outbound) - services reach each other; no egress")
+            say!("  network: loopback-only (--no-outbound) - services reach each other; no egress")
         }
         Some(Outbound::Up) => {
-            println!("  network: services reach each other by name + outbound to the internet (pasta)")
+            say!("  network: services reach each other by name + outbound to the internet (pasta)")
         }
-        Some(Outbound::NotInstalled) => println!(
+        Some(Outbound::NotInstalled) => say!(
             "  network: loopback-only - services reach each other; NO outbound (install `passt`/`pasta` for egress)"
         ),
-        Some(Outbound::Failed(why)) => println!(
+        Some(Outbound::Failed(why)) => say!(
             "  network: loopback-only - services reach each other; pasta IS installed but did not \
              start: {why}"
         ),

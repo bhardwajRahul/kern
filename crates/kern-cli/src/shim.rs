@@ -79,6 +79,8 @@ pub enum ShimError {
     InjectedFlag { role: &'static str, value: String },
     /// An empty image reference (`docker run "" …`): invalid, and would silently shift the command.
     EmptyImage,
+    /// A `--format` template naming a field kern cannot answer truthfully.
+    UnknownTemplateField { cmd: &'static str, field: String },
 }
 
 impl fmt::Display for ShimError {
@@ -96,6 +98,10 @@ impl fmt::Display for ShimError {
             ShimError::MissingValue { flag } => {
                 write!(f, "docker compat: flag '{flag}' expects a value")
             }
+            ShimError::UnknownTemplateField { cmd, field } => write!(
+                f,
+                "docker compat: `docker {cmd} --format` names '{{{{{field}}}}}', which kern cannot answer - refusing rather than printing something a script would read as the answer. `docker {cmd}` without --format prints what kern knows."
+            ),
             ShimError::MissingImage => {
                 write!(f, "docker compat: `docker run` needs an image argument")
             }
@@ -207,6 +213,121 @@ fn reject_leading_dash(role: &'static str, value: &str) -> Result<(), ShimError>
         });
     }
     Ok(())
+}
+
+/// The `docker` calls that ask for a FACT rather than an action, answered here and printed by the
+/// caller. `None` means this argv is an ordinary translation.
+///
+/// WHY THIS EXISTS, MEASURED. `docker version --format '{{.Server.Os}}/{{.Server.Arch}}'` dropped the
+/// template and printed kern's version string with exit 0, so a script doing
+/// `PLATFORM=$(docker version --format …)` got `kern 0.9.32-review.5` where it expected
+/// `linux/amd64` and carried on with it. An external reviewer traced Sentry's `install.sh` stopping
+/// at "Detecting Docker platform" to exactly that. Every other gap in this surface fails CLOSED -
+/// exit 1, the caller takes its error branch - and this one failed OPEN, which is the only kind that
+/// corrupts a result instead of stopping it.
+///
+/// A TEMPLATE FIELD kern CANNOT ANSWER IS REFUSED, not guessed and not ignored: the whole defect was
+/// an answer that looked like an answer. `docker version` and `docker info` without `--format` keep
+/// printing what they printed.
+///
+/// NOT A GO TEMPLATE ENGINE. The fields below are the ones init scripts read; anything else is
+/// `UnknownTemplateField`. Substitution is textual over `{{.Field}}` tokens, so a template that
+/// mixes known fields with literal text (`{{.Server.Os}}/{{.Server.Arch}}`) renders as Docker
+/// renders it.
+pub fn direct_reply(argv: &[String]) -> Option<Result<String, ShimError>> {
+    let (verb, rest) = argv.split_first()?;
+    // `docker compose version` IS THE CANONICAL "is compose here" PROBE and it was read as a FILE:
+    // `compose: reading docker-compose.yml: No such file or directory`, because `version` landed in
+    // the file slot. It answers like `docker --version` already does, with kern's own string: this
+    // surface has never claimed to be Docker, and a script that greps the output learns the truth.
+    if verb == "compose" {
+        let mut it = rest.iter().map(String::as_str);
+        if it.next() == Some("version") {
+            // `--short`/`--format json` are the two flags scripts pass here; neither changes what
+            // kern can honestly say, so they are accepted and the answer is the same string.
+            return Some(Ok(format!(
+                "Docker Compose version {}",
+                kern_common::VERSION
+            )));
+        }
+    }
+    if verb != "version" && verb != "info" {
+        return None;
+    }
+    let mut it = rest.iter();
+    let mut tmpl: Option<String> = None;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--format" | "-f" => match it.next() {
+                Some(v) => tmpl = Some(v.clone()),
+                None => {
+                    return Some(Err(ShimError::MissingValue {
+                        flag: "--format".into(),
+                    }))
+                }
+            },
+            other => {
+                if let Some(v) = other.strip_prefix("--format=") {
+                    tmpl = Some(v.to_string());
+                }
+            }
+        }
+    }
+    let tmpl = tmpl?;
+    let cmd: &'static str = if verb == "version" { "version" } else { "info" };
+    Some(render_docker_template(cmd, &tmpl))
+}
+
+/// Substitute the `{{.Field}}` tokens of `tmpl` with what kern knows, or refuse by name.
+///
+/// THE TWO VERBS DISAGREE ON PURPOSE, because Docker's do: `version` reports the Go arch
+/// (`amd64`, `arm64`) and `info` reports the machine one (`x86_64`, `aarch64`). A script reads one
+/// or the other and compares it against a fixed string, so answering both with one spelling would
+/// break whichever half we chose against.
+fn render_docker_template(cmd: &'static str, tmpl: &str) -> Result<String, ShimError> {
+    let go_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let field = |name: &str| -> Option<&'static str> {
+        // `'static` values only, so this table cannot grow a computed answer by accident.
+        match (cmd, name) {
+            (_, "Server.Os") | (_, "Client.Os") | (_, "OSType") => Some("linux"),
+            ("version", "Server.Arch") | ("version", "Client.Arch") => Some(go_arch),
+            ("info", "Architecture") => Some(std::env::consts::ARCH),
+            (_, "Server.Version") | (_, "Client.Version") | (_, "ServerVersion") => {
+                Some(kern_common::VERSION)
+            }
+            _ => None,
+        }
+    };
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            // An unterminated `{{` is not a template kern can claim to have rendered.
+            return Err(ShimError::UnknownTemplateField {
+                cmd,
+                field: after.trim().to_string(),
+            });
+        };
+        let name = after[..close].trim().trim_start_matches('.');
+        match field(name) {
+            Some(v) => out.push_str(v),
+            None => {
+                return Err(ShimError::UnknownTemplateField {
+                    cmd,
+                    field: format!(".{name}"),
+                })
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Translate a full `docker <verb> …` argv (WITHOUT arg0) into a `kern …` argv.
@@ -1141,6 +1262,49 @@ mod fuzz_robustness {
     /// symlink, so the shim did not recognise itself, together with the UNTRANSLATED arguments. As
     /// root it did not happen, because the direct path does not re-exec: which is why it went
     /// unnoticed on every development machine.
+    #[test]
+    fn a_format_template_is_answered_or_refused_but_never_ignored() {
+        // THE ONLY GAP IN THIS SURFACE THAT FAILED OPEN. `docker version --format
+        // '{{.Server.Os}}/{{.Server.Arch}}'` dropped the template and printed kern's version with
+        // exit 0, so `PLATFORM=$(docker version --format …)` took `kern 0.9.32-review.5` for
+        // `linux/amd64` and the script carried on with it. MEASURED by an external reviewer as the
+        // exact step Sentry's `install.sh` stops at. Every other gap here exits 1.
+        let sv = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
+        let d = |a: &[&str]| super::direct_reply(&sv(a));
+        assert_eq!(
+            d(&["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]),
+            Some(Ok(format!(
+                "linux/{}",
+                if std::env::consts::ARCH == "x86_64" {
+                    "amd64"
+                } else if std::env::consts::ARCH == "aarch64" {
+                    "arm64"
+                } else {
+                    std::env::consts::ARCH
+                }
+            )))
+        );
+        // `info` reports the MACHINE arch where `version` reports the Go one, because Docker's two
+        // verbs disagree and a script compares against one spelling or the other.
+        assert_eq!(
+            d(&["info", "--format", "{{.OSType}}/{{.Architecture}}"]),
+            Some(Ok(format!("linux/{}", std::env::consts::ARCH)))
+        );
+        // A field kern cannot answer is REFUSED by name, never guessed and never dropped.
+        assert!(matches!(
+            d(&["version", "--format", "{{.Server.APIVersion}}"]),
+            Some(Err(super::ShimError::UnknownTemplateField { .. }))
+        ));
+        // `docker compose version` is the canonical "is compose here" probe; it used to be read as a
+        // FILE name (`reading docker-compose.yml: No such file or directory`).
+        assert!(matches!(d(&["compose", "version"]), Some(Ok(_))));
+        // Everything else is an ordinary translation, including the two verbs without a template.
+        assert_eq!(d(&["version"]), None);
+        assert_eq!(d(&["info"]), None);
+        assert_eq!(d(&["compose", "up", "-d"]), None);
+        assert_eq!(d(&["ps"]), None);
+    }
+
     #[test]
     fn the_reexec_replays_the_translated_argv_not_the_typed_one() {
         let typed: Vec<String> = ["run", "--rm", "alpine:3.19", "echo", "hi"]

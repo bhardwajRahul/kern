@@ -3880,6 +3880,35 @@ fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile
                 });
             }
         }
+        // EXPOSE IS NOT INFORMATIONAL TO KERN, and treating it as such cost a decision rather than a
+        // label. `kern compose` reads an image's exposed set to find two services claiming one
+        // internal port, and that finding decides whether the stack gets one shared namespace or a
+        // bridge (see `kern_oci::ImageConfig::exposed_ports`). A BUILT image declared nothing, so
+        // every `build:` service was wired on a blind answer - 21 of the 57 services in Sentry's
+        // official file. Found by this repo's own `inspect <image>` test, which read the config back
+        // and saw `ExposedPorts` empty after an `EXPOSE 8080`.
+        //
+        // DOCKER'S GRAMMAR: `<port>` or `<port>/<proto>`, one `Instr` per token, so `EXPOSE 80 443`
+        // arrives here twice. A port that does not parse is DROPPED rather than guessed at: the
+        // parser accepts the line as text and this is the one place that knows what a port is.
+        Instr::Expose(spec) => {
+            let (num, proto) = match spec.split_once('/') {
+                Some((n, p)) => (n, p),
+                None => (spec.as_str(), "tcp"),
+            };
+            if let Ok(port) = num.trim().parse::<u16>() {
+                let udp = proto.trim().eq_ignore_ascii_case("udp");
+                // Deduped: a Dockerfile repeating a port, or a base that already declared it, must
+                // not make the set say it twice.
+                if !config
+                    .exposed_ports
+                    .iter()
+                    .any(|(p, u)| *p == port && *u == udp)
+                {
+                    config.exposed_ports.push((port, udp));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -4169,14 +4198,42 @@ fn resolved_build_context(
     Ok(Some((ctx_abs, dfile)))
 }
 
-fn resolve_builds(
+/// Resolve ONE service's build context and dockerfile against `base`, applying the confinement rules
+/// in full, or `Ok(None)` when the service declares no `build:`.
+///
+/// THE GUARDS LIVE HERE AND NOWHERE ELSE. `resolve_builds` used to hold them inline, and adding a
+/// second reader of `build.context` (`watch`) would have meant a second copy of a traversal check -
+/// the exact shape in which one copy later drifts and stops refusing `context: ../../../etc`. Both
+/// callers now get the same answer or the same refusal.
+///
+/// Guard 1: the canonical `base/context` must stay beneath `base`, so a context in a third-party
+/// compose file cannot escape the project tree. Guard 1b: a `dockerfile:`, which Docker resolves
+/// [`resolve_builds_narrating`], restricted to the services named in `only`.
+///
+/// `None` builds every service that declares `build:`, which is what `up` and `build` need. `Some`
+/// is for `run --no-deps`, where NOTHING else is going to start: MEASURED on Sentry's file, a single
+/// `compose run --rm --no-deps relay --version` built 21 images before running one command, and
+/// `install.sh` makes that call three times.
+pub(crate) fn resolve_builds_for(
     boxes: &mut [crate::compose::ComposeBox],
     file: &str,
     self_exe: &std::path::Path,
+    to_stdout: bool,
+    only: Option<&[String]>,
+    extra_args: &[String],
 ) -> Result<(), Error> {
     let base = compose_base(file)?;
 
     for b in boxes.iter_mut() {
+        // A service nobody is going to start does not need its image built. Matched on BOTH spellings
+        // a caller may have typed - the service name and the box name - because `run` takes the
+        // service name and the boxes carry the project-prefixed one.
+        if let Some(names) = only {
+            let service = b.service_name().to_string();
+            if !names.iter().any(|n| n == &service || n == &b.name) {
+                continue;
+            }
+        }
         // The guards moved into `resolved_build_context` so `watch` applies the identical ones; see
         // its doc comment for why a second copy of a traversal check is the thing to avoid.
         //
@@ -4223,10 +4280,32 @@ fn resolve_builds(
         if let Some(t) = &bd.target {
             cmd.arg("--target").arg(t);
         }
+        // THE COMMAND LINE FIRST, THE FILE SECOND, because `kern build` lets a later `--build-arg`
+        // win and the file's value is the one the author chose for THIS service. A `--build-arg` on
+        // the command line is a default for every service, not an override of a service that decided.
+        for a in extra_args {
+            cmd.arg("--build-arg").arg(a);
+        }
         for a in &bd.args {
             cmd.arg("--build-arg").arg(a); // already ${VAR}-interpolated by the parser (guard 2)
         }
         cmd.arg(&ctx_abs);
+        // THE CHILD'S STDOUT IS THIS PROCESS'S STDERR when the build is a side effect: its narration
+        // is still SEEN (a terminal shows both) and it is out of the way of whatever the caller is
+        // capturing. The build's own stderr is untouched, so a failure reads exactly as before.
+        if !to_stdout {
+            // `dup(2)` on fd 2, wrapped as an owned descriptor: `Stdio` needs one it may close, and
+            // closing THIS process's stderr would take the rest of the run's diagnostics with it.
+            // SAFETY: `dup` returns a fresh descriptor this process owns; a failure leaves the
+            // child's stdout inherited, which is the previous behaviour and not a new failure mode.
+            let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+            if dup >= 0 {
+                // SAFETY: `dup` is a valid descriptor this process owns and does not use elsewhere.
+                cmd.stdout(unsafe {
+                    <std::process::Stdio as std::os::fd::FromRawFd>::from_raw_fd(dup)
+                });
+            }
+        }
         // Guard 3 - a build failure fails the whole `up` with a linked, service-named message.
         let status = cmd.status().map_err(|e| {
             Error::Compose(format!("service '{}': running `kern build`: {e}", b.name))
@@ -4542,7 +4621,13 @@ pub(crate) struct Stopped {
     pub(crate) stopped: Vec<String>,
 }
 
-fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &str) -> Stopped {
+fn stop_stack(
+    boxes: &[crate::compose::ComposeBox],
+    selected: &[String],
+    pod: &str,
+    // The `-t <secs>` of this invocation, or `None` to keep each box's own `--stop-timeout`.
+    grace: Option<u64>,
+) -> Stopped {
     // DEPENDENTS FIRST, AND ONE LEVEL AT A TIME. Docker stops a service before the services it
     // depends on, and waits for a level to exit (or exhaust its grace) before signalling the next.
     //
@@ -4567,7 +4652,7 @@ fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &s
     // what was alive when it began.
     let was_alive: Vec<String> = names.iter().filter(|n| is_box_alive(n)).cloned().collect();
     for batch in stop_batches(boxes, &names) {
-        let _ = stop(&batch, false);
+        let _ = crate::commands::inspect::stop_with_grace(&batch, false, grace);
     }
     for n in &names {
         if !is_box_alive(n) {
@@ -6275,7 +6360,7 @@ pub(crate) fn tear_down_stack(
     selected: &[String],
     pod: &str,
 ) -> (usize, bool) {
-    tear_down_stack_keeping(boxes, selected, pod, true).0
+    tear_down_stack_keeping(boxes, selected, pod, true, None).0
 }
 
 /// [`tear_down_stack`], with a say over whether the exit records are reaped, and returning the
@@ -6291,6 +6376,8 @@ pub(crate) fn tear_down_stack_keeping(
     selected: &[String],
     pod: &str,
     reap: bool,
+    // `Some(n)` replaces every box's own `--stop-timeout` for this teardown: `down -t <secs>`.
+    grace: Option<u64>,
 ) -> ((usize, bool), Vec<String>) {
     // The relay holder FIRST, before the boxes stop. Killing it takes every relay with it through
     // PDEATHSIG, and doing it first means no relay is left pumping into a box that is being torn
@@ -6331,7 +6418,7 @@ pub(crate) fn tear_down_stack_keeping(
             crate::network::leave(net, box_name);
         }
     }
-    let outcome = stop_stack(boxes, selected, pod);
+    let outcome = stop_stack(boxes, selected, pod, grace);
     let names = outcome.asked;
     // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
     // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
@@ -6432,6 +6519,14 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
 struct TerminalOpts<'a> {
     pod: &'a str,
     file: &'a str,
+    /// `-t/--timeout <secs>`: the grace this teardown gives, replacing each box's own.
+    stop_timeout: Option<u64>,
+    /// `--ignore-pull-failures`: a registry that cannot serve an image ends the image, not the run.
+    ignore_pull_failures: bool,
+    /// `build --build-arg K=V`, repeatable.
+    build_args: &'a [String],
+    /// `down --rmi <local|all>`: `Some(false)` the images this file BUILDS, `Some(true)` all of them.
+    rmi: Option<bool>,
     tail: Option<usize>,
     follow: bool,
     /// `-a/--all` for `ps`: also list the stack's recently-exited services.
@@ -6523,6 +6618,20 @@ fn run_terminal_verb(
             crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
             validate_conditions(boxes)?;
             check_port_collisions(boxes)?;
+            // `--services`: THE NAMES, ONE PER LINE, AND NOTHING ELSE. The flag was parsed and only
+            // `ps` consumed it, so `config --services` printed the whole human report - and the
+            // canonical use of this verb is a shell loop over its output. MEASURED on Sentry's
+            // `install.sh`: `for service in $($dc config --services)` word-split the report and tried
+            // to build a service called `compose`, which is the first word of the header line.
+            //
+            // BEFORE the wiring notes and the per-service lines, because those go to stdout too and
+            // a caller asking for a list must not have to filter them.
+            if o.ps_services {
+                for b in boxes.iter().filter(|b| selected(b)) {
+                    println!("{}", b.service_name());
+                }
+                return Ok(true);
+            }
             // The pod-global conflicts too: `config` is the verb you run to find out whether the file
             // will come up, so every rejection `up` performs has to be reachable from here. Reporting
             // a clean dry run for a stack that `up` then refuses is worse than not having the verb.
@@ -7135,20 +7244,57 @@ fn run_terminal_verb(
             return Ok(true);
         }
         ComposeAction::Pull => {
-            let mut n = 0usize;
+            // `pull_policy:` DECIDES HERE TOO. `up` honoured it and this verb did not, so on a file
+            // whose services declare `pull_policy: never` kern went to the registry for a name that
+            // only exists locally, failed, and aborted the run - leaving every image AFTER it
+            // unfetched. MEASURED by an external reviewer on Sentry's official compose file, where
+            // 48 of 57 services carry the key and 21 also carry `build:`: the verb could not succeed
+            // at all. The image of a service that is BUILT is produced by `compose build`, so a
+            // registry that does not have it is not an error either; it is reported and the pull
+            // carries on, which is what Docker does with the same file.
+            let (mut pulled, mut never, mut buildable) = (0usize, 0usize, Vec::new());
             for b in boxes.iter().filter(|b| selected(b)) {
-                if let Some(img) = b.image.as_deref() {
-                    pull(img, None, None)?;
-                    n += 1;
+                let Some(img) = b.image.as_deref() else {
+                    continue;
+                };
+                if b.pull.as_deref() == Some("never") {
+                    never += 1;
+                    continue;
+                }
+                match pull(img, None, None) {
+                    Ok(()) => pulled += 1,
+                    // A service that declares `build:` is ALWAYS tolerated here (its image is
+                    // produced locally); `--ignore-pull-failures` extends that to every service,
+                    // which is what the flag means and what Docker does with it.
+                    Err(e) if b.build.is_some() || o.ignore_pull_failures => {
+                        buildable.push((b.service_name(), e))
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            println!("compose pull: {n} image(s) up to date");
+            println!("compose pull: {pulled} image(s) up to date");
+            if never > 0 {
+                println!("compose pull: {never} service(s) skipped: `pull_policy: never`");
+            }
+            // NAMED, not counted: a reader who wanted these images needs to know which ones are not
+            // there and what the next command is.
+            if !buildable.is_empty() {
+                let names: Vec<&str> = buildable.iter().map(|(n, _)| *n).collect();
+                println!(
+                    "compose pull: {} service(s) not in a registry: {}",
+                    buildable.len(),
+                    names.join(", ")
+                );
+                println!(
+                    "compose pull: `kern compose build` produces the ones that declare `build:`"
+                );
+            }
             return Ok(true);
         }
         ComposeAction::Build => {
             let self_exe = std::env::current_exe()
                 .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
-            resolve_builds(boxes, file, &self_exe)?;
+            resolve_builds_for(boxes, file, &self_exe, true, None, o.build_args)?;
             println!("compose build: done");
             return Ok(true);
         }
@@ -7170,6 +7316,47 @@ fn run_terminal_verb(
                     orphans.len(),
                     orphans.join(", ")
                 );
+            }
+            // `--rmi <local|all>`, AFTER the stop and before the volumes: an image cannot be
+            // removed while a box still has it mounted as an overlay lower, and `down` is the moment
+            // that stops being true. `local` is Docker's "only what this file produced", which for
+            // kern is precisely the services that declare `build:` - removing a service's PULLED
+            // image would take somebody else's copy of `postgres:14` off the machine.
+            if let Some(all_images) = o.rmi {
+                let mut refs: Vec<&str> = boxes
+                    .iter()
+                    .filter(|b| all_images || b.build.is_some())
+                    .filter_map(|b| b.image.as_deref())
+                    .collect();
+                refs.sort_unstable();
+                refs.dedup();
+                // THROUGH THE ONE REMOVAL FUNCTION `kern rmi` uses, so this cannot come to mean
+                // something different from the verb it borrows. `None` back is "no such entry",
+                // which for an image that was never pulled is the normal case here and not an error.
+                let cache = imagecache::cache_dir();
+                let mut gone = 0usize;
+                let mut absent: Vec<&str> = Vec::new();
+                for r in &refs {
+                    match imagecache::remove_image(&cache, r) {
+                        Some(_) => gone += 1,
+                        None => absent.push(r),
+                    }
+                }
+                println!(
+                    "compose down: {gone} image(s) removed{}",
+                    if all_images {
+                        ""
+                    } else {
+                        " (built by this file)"
+                    }
+                );
+                if !absent.is_empty() {
+                    println!(
+                        "compose down: {} not in the local cache: {}",
+                        absent.len(),
+                        absent.join(", ")
+                    );
+                }
             }
             if o.remove_volumes {
                 match remove_project_volumes(boxes, pod) {
@@ -7208,7 +7395,7 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.clone())
                 .collect();
-            let names = stop_stack(boxes, &chosen, pod).stopped;
+            let names = stop_stack(boxes, &chosen, pod, o.stop_timeout).stopped;
             if was_no_pod {
                 // No pod is named, because none exists. `start` is still the way back, and it carries
                 // the mode forward on its own.
@@ -7241,7 +7428,7 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.clone())
                 .collect();
-            let names = stop_stack(boxes, &chosen, pod).stopped;
+            let names = stop_stack(boxes, &chosen, pod, o.stop_timeout).stopped;
             println!(
                 "compose restart: {} box(es) stopped, restarting",
                 names.len()
@@ -7313,6 +7500,38 @@ pub struct ComposeOpts<'a> {
     /// `-v` on `down`: also delete the named volumes this project owns (see
     /// [`remove_project_volumes`] for the three conditions that bound what it deletes).
     pub remove_volumes: bool,
+    /// `--pull <always|missing|never>`: Docker's per-invocation override of every service's
+    /// `pull_policy:`. `None` leaves each service with what its file says.
+    ///
+    /// IT EXISTS BECAUSE A REAL INSTALLER RUNS IT: Sentry's `install.sh` calls
+    /// `docker compose … run --pull=never --rm`, and kern answered `unknown flag`, which ended the
+    /// official installation of a stack this runtime claims to run.
+    pub pull: Option<&'a str>,
+    /// `-t/--timeout <secs>` on `stop`/`down`/`restart`: the grace before the SIGKILL, replacing what
+    /// each box recorded at start. `None` keeps each box's own `--stop-timeout`.
+    ///
+    /// SENTRY'S INSTALLER RUNS `docker compose down -t 30 --remove-orphans`, and kern answered
+    /// `unknown flag '-t'`.
+    pub stop_timeout: Option<u64>,
+    /// `--ignore-pull-failures` on `pull`: a registry that cannot serve an image is reported and the
+    /// run continues, instead of ending it. kern already does this for a service that declares
+    /// `build:`; the flag asks for it unconditionally, and Sentry's installer passes it.
+    pub ignore_pull_failures: bool,
+    /// `build --build-arg K=V`, repeatable: forwarded to every service this invocation builds, ON TOP
+    /// of the `build.args:` the file declares. The file's value wins for a key both set, which is
+    /// Docker's order: the command line is a default for services that did not decide.
+    pub build_args: &'a [String],
+    /// `run --name <n>`: the one-off's box name. `None` generates `<service>-run-<pid>`.
+    pub run_name: Option<&'a str>,
+    /// `run --entrypoint <cmd>`: replaces the image's entrypoint for this run only.
+    pub run_entrypoint: Option<&'a str>,
+    /// `run -e KEY=VALUE`, repeatable: environment for this one-off, applied OVER the service's own.
+    pub run_env: &'a [String],
+    /// `run --user <uid[:gid]>`: the identity this one-off runs as, over the service's own.
+    pub run_user: Option<&'a str>,
+    /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`
+    /// every image it names. `None` leaves the image cache alone, which is `down`'s own behaviour.
+    pub rmi: Option<bool>,
     /// `-d`: return as soon as the stack is up. Without it, an `up` whose stdout is a TERMINAL
     /// streams the stack's logs and stops the stack on Ctrl-C, as `docker compose up` does. See
     /// [`crate::cli::Command::Compose::detach`] for why the terminal is the condition.

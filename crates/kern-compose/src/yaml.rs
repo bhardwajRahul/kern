@@ -2567,9 +2567,33 @@ fn collect_ulimits(node: &Node, svc: &str) -> Vec<String> {
         }
     }
     for (name, def) in &node.children {
-        // Scalar form: `nofile: 1024`.
+        // Scalar form: `nofile: 1024`, AND the one-line mapping `nofile: {soft: N, hard: M}`, which
+        // is a scalar to this parser. Without the inline-map test the brace text was passed through
+        // as the value and the box refused the whole invocation with `usage: kern --ulimit
+        // NAME=SOFT[:HARD]`, so a service using Docker's flow spelling never started - and under
+        // `up -d` the reader saw only "failed to start". Sentry writes the block form, which is why
+        // this survived: the two spellings mean the same thing and only one of them worked.
         if let Some(sc) = &def.scalar {
             let v = scalar_str(sc);
+            let inline = parse_inline_map(&v);
+            if !inline.is_empty() {
+                let get = |k: &str| {
+                    inline
+                        .iter()
+                        .find(|(ik, _)| ik == k)
+                        .map(|(_, iv)| iv.trim().to_string())
+                        .filter(|iv| !iv.is_empty())
+                };
+                match (get("soft"), get("hard")) {
+                    (Some(sv), Some(h)) => out.push(format!("{name}={sv}:{h}")),
+                    (Some(sv), None) => out.push(format!("{name}={sv}")),
+                    (None, Some(h)) => out.push(format!("{name}={h}")),
+                    (None, None) => warn(&format!(
+                        "service '{svc}': ulimits '{name}' has neither a value nor soft/hard - ignored"
+                    )),
+                }
+                continue;
+            }
             if !v.trim().is_empty() {
                 out.push(format!("{name}={}", v.trim()));
                 continue;
@@ -3599,12 +3623,12 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     .unwrap_or_default()
                     .trim()
                     .to_ascii_lowercase();
-                match v.as_str() {
-                    "always" => b.pull = Some("always".to_string()),
-                    "never" => b.pull = Some("never".to_string()),
-                    "missing" | "if_not_present" => b.pull = Some("missing".to_string()),
-                    other => warn(&format!(
-                        "service '{name}': 'pull_policy: {other}' has no kern equivalent - kern pulls \
+                // THE SAME TABLE THE `--pull` FLAG USES (`pull_policy_word`), so the key and the
+                // flag cannot come to mean different things.
+                match crate::pull_policy_word(&v) {
+                    Some(mapped) => b.pull = Some(mapped.to_string()),
+                    None => warn(&format!(
+                        "service '{name}': 'pull_policy: {v}' has no kern equivalent - kern pulls \
                          when the image is absent (`missing`); use always/never/missing"
                     )),
                 }
@@ -6270,6 +6294,37 @@ mod tests {
     /// names a namespace, which is a fact about this file that survives the parse; what kern can do
     /// about it depends on a wiring the parser cannot see. `container:`/`bridge`/`default` stay
     /// notes: the first names something outside the file, the other two describe what kern provides.
+    #[test]
+    fn a_one_line_ulimits_mapping_means_the_same_as_the_block_form() {
+        // DOCKER SPELLS THIS TWO WAYS and only one of them worked. The flow form is a SCALAR to this
+        // parser, so `nofile: {soft: 1024, hard: 1024}` was passed through as the value and the box
+        // refused the whole invocation with `usage: kern --ulimit NAME=SOFT[:HARD]` - under `up -d`
+        // the reader saw "failed to start" and nothing else. Sentry writes the block form, which is
+        // why it survived a stack of 57 services.
+        let block = parse(
+            "services:\n  a:\n    image: alpine\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 2048\n",
+        )
+        .expect("parses");
+        let flow = parse(
+            "services:\n  a:\n    image: alpine\n    ulimits:\n      nofile: {soft: 1024, hard: 2048}\n",
+        )
+        .expect("parses");
+        assert_eq!(block[0].ulimits, vec!["nofile=1024:2048".to_string()]);
+        assert_eq!(
+            flow[0].ulimits, block[0].ulimits,
+            "the two spellings must agree"
+        );
+        // The plain scalar keeps working, and so does a mapping that names one bound.
+        let scalar =
+            parse("services:\n  a:\n    image: alpine\n    ulimits:\n      nofile: 4321\n")
+                .expect("parses");
+        assert_eq!(scalar[0].ulimits, vec!["nofile=4321".to_string()]);
+        let one =
+            parse("services:\n  a:\n    image: alpine\n    ulimits:\n      nofile: {soft: 99}\n")
+                .expect("parses");
+        assert_eq!(one[0].ulimits, vec!["nofile=99".to_string()]);
+    }
+
     #[test]
     fn network_mode_host_and_none_become_fields_and_the_rest_stay_notes() {
         let svc = |mode: &str| {

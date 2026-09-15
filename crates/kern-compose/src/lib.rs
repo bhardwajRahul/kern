@@ -79,6 +79,23 @@ pub const ABSENT_PROFILE_KINDS: [&str; 1] = ["vgpu"];
 /// denied` on every start, so the database never came up and the `service_healthy` gate its backend
 /// waits on timed out after 120 s.
 pub const SPEC_SECRET_MODE: &str = "444";
+/// Map a `pull_policy:`/`--pull` word onto kern's three values, or `None` for one kern has no
+/// equivalent for.
+///
+/// ONE TABLE FOR BOTH SPELLINGS. The key in the file and the flag on the command line are the same
+/// question, and `docker compose run --pull=never` (Sentry's official installer runs exactly that)
+/// must mean what `pull_policy: never` means. `build` is Docker's "build it instead", which for kern
+/// is `never` plus the `build:` the file already carries; `policy`/`if_not_present` are Docker's
+/// spellings of the default.
+#[must_use]
+pub fn pull_policy_word(v: &str) -> Option<&'static str> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "always" => Some("always"),
+        "never" | "build" => Some("never"),
+        "missing" | "if_not_present" | "policy" => Some("missing"),
+        _ => None,
+    }
+}
 
 /// One service in a compose file. Most fields mirror a `kern box` flag (`None`/empty/`false` =
 /// "flag absent"); `name`/`command`/`depends_on` are structural - `depends_on` is compose-only, and
