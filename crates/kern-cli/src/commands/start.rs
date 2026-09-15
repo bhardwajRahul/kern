@@ -2843,12 +2843,34 @@ fn supervise_box(
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), std::process::id())));
     let mut attempt = 0u32;
+    // ⛔ THE PRE-EXEC GATE IS A ONE-SHOT, AND A RESTART MUST NOT WAIT ON IT. The gate's write end
+    // belongs to the LAUNCHER (`compose up`), which releases every box and then returns; a box the
+    // supervisor restarts afterwards finds that descriptor at EOF and refuses to exec, forever.
+    // MEASURED on Sentry's `install.sh`: a `restart: always` service whose workload exited once then
+    // logged `never started (exit 125); retrying (7/10)` until its budget ran out, with `kern ps`
+    // still showing it as `starting` - and the message blamed a launcher that had done its job.
+    //
+    // WHAT THE GATE IS FOR decides this: it holds the FIRST exec until the peer network exists. By
+    // the time anything restarts, that network is built, so there is nothing left to wait for. The
+    // variable is removed from THIS process's environment, which is what every forked attempt
+    // inherits, so the change reaches the restart and nothing else.
+    //
+    // Removed after the first attempt is FORKED rather than after it succeeds: a box that fails to
+    // start for its own reasons gets the same treatment on retry, which is the case that produced
+    // the 10 wasted attempts.
+    let mut gate_dropped = false;
     let final_code = loop {
         let ready = if attempt == 0 {
             have_pipe.then_some(wr)
         } else {
             None
         };
+        if attempt > 0 && !gate_dropped {
+            // SAFETY: single-threaded supervisor between forks; no other thread can be reading the
+            // environment here.
+            unsafe { std::env::remove_var("KERN_GATE_FD") };
+            gate_dropped = true;
+        }
         // Wall-clock this attempt so a box that stayed up counts as recovered (see the reset below).
         let started = std::time::Instant::now();
         let runner = unsafe { libc::fork() };

@@ -655,9 +655,179 @@ fn mem_cap_row(asked: Option<u64>, enforced: Option<u64>) -> String {
     }
 }
 
+/// Report a cached IMAGE, for the case where `name` is not a running box.
+///
+/// WHY `inspect` ANSWERS BOTH. Docker's `inspect` takes a container OR an image, and kern's took only
+/// a box: `docker inspect alpine` through the drop-in answered `no running box named 'alpine'` for a
+/// reference the machine had on disk. Reported by an external reviewer as a declared gap on that
+/// surface; the fix belongs in kern's own verb rather than in the translation layer, because the
+/// question ("what is this thing kern knows about") is the same one either spelling is asking.
+///
+/// A BOX FIRST, ALWAYS. The box registry is consulted before the image cache, so a box named after an
+/// image still reports the box - the live thing is what a reader inspecting a name is asking about,
+/// and this path is only reached when there is no such box.
+///
+/// THE JSON IS DOCKER'S SHAPE, not kern's flat one. There was no prior kern shape for an image to
+/// break (`--json` is additive by contract, and this subject is new), and a consumer of
+/// `inspect <image>` reads `.Config.Env` / `.Config.Cmd`. Fields kern does not know are OMITTED
+/// rather than filled: there is no image digest in the cache entry, so no `Id` is printed, and a
+/// reader templating `.Id` gets nothing instead of a fabricated value.
+fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
+    let cache = crate::commands::imagecache::cache_dir();
+    let safe = crate::commands::imagecache::sanitize_ref(name);
+    if !crate::commands::imagecache::cache_entry_complete(&cache, &safe) {
+        // ONE MESSAGE NAMING BOTH SUBJECTS, because at this point neither exists and a reader told
+        // only about boxes goes looking for the wrong thing.
+        return Err(Error::NotRunning(format!(
+            "nothing named '{name}': no running box, and no image in the local cache. `kern images` lists images and `kern pull {name}` fetches one"
+        )));
+    }
+    let cfg = crate::commands::imagecache::read_image_config(&cache.join(format!("{safe}.image")));
+    let (size, _dangling) = crate::commands::imagecache::image_stat(&cache, &safe);
+    if json {
+        let arr = |v: &[String]| -> String {
+            let items: Vec<String> = v.iter().map(|x| json_str(x)).collect();
+            format!("[{}]", items.join(","))
+        };
+        // `ExposedPorts` is Docker's OBJECT keyed by `<port>/<proto>`, not a list: a consumer walks
+        // its keys.
+        let ports: Vec<String> = cfg
+            .exposed_ports
+            .iter()
+            .map(|(p, udp)| {
+                format!(
+                    "{}:{{}}",
+                    json_str(&format!("{p}/{}", if *udp { "udp" } else { "tcp" }))
+                )
+            })
+            .collect();
+        let opt = |o: &Option<String>| o.as_deref().map(json_str).unwrap_or_else(|| "null".into());
+        println!(
+            "[{{\"RepoTags\":[{}],\"Os\":\"linux\",\"Architecture\":{},\"Size\":{},\"Config\":{{\"Entrypoint\":{},\"Cmd\":{},\"Env\":{},\"WorkingDir\":{},\"User\":{},\"ExposedPorts\":{{{}}},\"StopSignal\":{}}}}}]",
+            json_str(name),
+            // DOCKER'S SPELLING FOR THIS FIELD, which is the Go one: `docker image inspect` says
+            // `amd64` where `docker info` says `x86_64`, and a consumer compares against a fixed
+            // string. Same table as the shim's `--format` renderer, for the same reason.
+            json_str(match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            }),
+            size,
+            arr(&cfg.entrypoint),
+            arr(&cfg.cmd),
+            arr(&cfg.env),
+            opt(&cfg.workdir),
+            opt(&cfg.user),
+            ports.join(","),
+            opt(&cfg.stop_signal),
+        );
+        return Ok(());
+    }
+    let p = crate::ui::Palette::detect();
+    println!("{}{name}{} (image)", p.b, p.z);
+    let row = |k: &str, v: &str| {
+        if !v.is_empty() {
+            println!("  {k:<14} {v}");
+        }
+    };
+    row("size", &human_bytes(size));
+    row("entrypoint", &cfg.entrypoint.join(" "));
+    row("command", &cfg.cmd.join(" "));
+    row("workdir", cfg.workdir.as_deref().unwrap_or(""));
+    row("user", cfg.user.as_deref().unwrap_or(""));
+    row("stop signal", cfg.stop_signal.as_deref().unwrap_or(""));
+    let ports: Vec<String> = cfg
+        .exposed_ports
+        .iter()
+        .map(|(port, udp)| format!("{port}/{}", if *udp { "udp" } else { "tcp" }))
+        .collect();
+    row("exposes", &ports.join(", "));
+    // The ENV is a list and can be long; it is printed one per line so a reader can grep it, and
+    // counted first so the reader knows what they are looking at.
+    if !cfg.env.is_empty() {
+        println!("  {:<14} {} variable(s)", "env", cfg.env.len());
+        for e in &cfg.env {
+            println!("    {e}");
+        }
+    }
+    if let Some(h) = &cfg.healthcheck {
+        row("healthcheck", &h.test.join(" "));
+    }
+    Ok(())
+}
+
+/// `inspect` with Docker's `--format`, for the field set kern can answer TRUTHFULLY.
+///
+/// WHY THE FIELDS ARE ENUMERATED AND NOT MAPPED FROM A STRUCT. Docker's inspect document has
+/// hundreds of fields describing a daemon kern does not have; answering one of them with a plausible
+/// value is worse than refusing it, because a script that reads `.HostConfig.NetworkMode` and gets a
+/// guess makes a decision on it. The table below is what kern KNOWS, and anything else is refused by
+/// name - the same rule `docker version --format` follows after it failed open once.
+///
+/// MEASURED: Sentry's `install.sh` polls `docker inspect --format '{{.State.Running}}' <name>` in a
+/// 60-iteration wait loop; kern answered `unknown flag "--format"`, the loop broke on the first
+/// iteration and the step reported the container never became ready.
+pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result<(), Error> {
+    let Some(tmpl) = format else {
+        return inspect(name, json);
+    };
+    let b = registry::find_ref(name);
+    let running = b.is_some();
+    let health = b
+        .as_ref()
+        .map(|i| registry::health_of(&i.name, i.pid))
+        .unwrap_or_default();
+    // Docker's `.State.Status` vocabulary, restricted to the three states kern's registry can be in.
+    let status = match (&b, health.as_str()) {
+        (None, _) => "exited",
+        (Some(_), "paused") => "paused",
+        (Some(_), _) => "running",
+    };
+    let field = |f: &str| -> Option<String> {
+        match f {
+            "State.Running" => Some(running.to_string()),
+            "State.Status" => Some(status.to_string()),
+            "State.Paused" => Some((status == "paused").to_string()),
+            // Docker prints `healthy`/`unhealthy`/`starting`, and an empty string for a container
+            // with no healthcheck. kern's registry uses the same words.
+            "State.Health.Status" => Some(health.clone()),
+            "State.Pid" => Some(b.as_ref().map_or(0, |i| i.pid1_recorded).to_string()),
+            "Name" => Some(format!("/{name}")),
+            "Config.Image" | "Image" => b.as_ref().map(|i| i.rootfs.clone()),
+            _ => None,
+        }
+    };
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            return Err(Error::Usage(
+                "inspect --format: an unterminated `{{` is not a template",
+            ));
+        };
+        let key = after[..close].trim().trim_start_matches('.');
+        match field(key) {
+            Some(v) => out.push_str(&v),
+            None => {
+                return Err(Error::NotRunning(format!(
+                    "inspect --format names '{{{{.{key}}}}}', which kern cannot answer - refusing rather than printing something a script would read as the answer. `kern inspect {name} --json` prints what kern knows"
+                )))
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    println!("{out}");
+    Ok(())
+}
+
 pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
-    let b = registry::find_ref(name)
-        .ok_or_else(|| Error::NotRunning(format!("no running box named '{name}'")))?;
+    let Some(b) = registry::find_ref(name) else {
+        return inspect_image(name, json);
+    };
     let health = registry::health_of(&b.name, b.pid);
     let mem = registry::mem_bytes(b.cgroup_pid());
     let cpu = registry::cpu_usec(b.cgroup_pid());
@@ -1059,6 +1229,20 @@ pub fn top() -> Result<(), Error> {
 }
 
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
+    stop_with_grace(names, all, None)
+}
+
+/// [`stop`], with the per-invocation grace `docker compose down -t <secs>` sets.
+///
+/// `None` keeps each box's OWN recorded grace, which is what every other caller wants: the value was
+/// chosen when the box was started (`--stop-timeout`, default 10 s, Docker's default) and a service
+/// that asked for 60 s to flush should get 60 s. `Some(n)` REPLACES it for this teardown, which is
+/// what the flag means - Sentry's `install.sh` runs `docker compose down -t 30 --remove-orphans`, and
+/// a flag accepted and not honoured is the defect this codebase refuses to ship.
+///
+/// `Some(0)` IS A REAL VALUE, not "unset": Docker reads `-t 0` as "do not wait, kill now", and the
+/// `> 0` tests below are what implement that, unchanged.
+pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
     let running = registry::list();
     let mut targets: Vec<_> = if all {
@@ -1123,7 +1307,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
     // killed at 6201 ms and the 4 s one at 6201. Ascending, each waits only the difference from the
     // one before it, so every member is killed on its own grace and the stack still finishes in
     // max(grace). `sort_by_key` is stable, so boxes asking the same grace keep the caller's order.
-    targets.sort_by_key(|b| b.stop_grace);
+    targets.sort_by_key(|b| grace.unwrap_or(b.stop_grace));
     // PHASE 1: send every box its stop signal BEFORE waiting on any of them, and share ONE deadline.
     // Stopping serially made each box burn its own full grace in turn, so an N-service stack of
     // workloads that ignore SIGTERM took N x grace (measured: 20 s for two `sh -c sleep` services).
@@ -1147,7 +1331,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
             // stopped for good, where before this hold existed the runner simply died and the init
             // reparented and reaped itself. An exit code is not worth turning a self-healing case
             // into a leak, so those boxes keep the unguarded read.
-            if b.stop_grace > 0 && !b.orphaned && !b.cgroup.is_empty() {
+            if grace.unwrap_or(b.stop_grace) > 0 && !b.orphaned && !b.cgroup.is_empty() {
                 ReaperHold::new(b.pid, b.pid1_recorded)
             } else {
                 ReaperHold(None)
@@ -1155,7 +1339,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
         })
         .collect();
     for b in &targets {
-        if b.stop_grace > 0 {
+        if grace.unwrap_or(b.stop_grace) > 0 {
             let sig = if b.stop_signal > 0 {
                 b.stop_signal
             } else {
@@ -1248,7 +1432,7 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
                     libc::SIGTERM
                 },
                 // What is LEFT of this box's own grace, counted from the phase-1 signal.
-                remaining_grace_ms(b.stop_grace, signalled_at.elapsed()),
+                remaining_grace_ms(grace.unwrap_or(b.stop_grace), signalled_at.elapsed()),
                 // PHASE 1 ALREADY SENT IT. Sending it again re-enters the workload's shutdown
                 // handler: measured at 4006 ms for a 2 s handler against 2006 ms without the second
                 // send, with the box's own log showing the trap entered twice. Phase 1 signals

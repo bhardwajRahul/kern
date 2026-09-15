@@ -497,9 +497,40 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("create" | "c") => create(&args[1..]),
         Some("ls" | "list") => {
-            crate::cli::reject_unknown_flags("volume ls", &refs, &["--json"])?;
+            crate::cli::reject_unknown_flags(
+                "volume ls",
+                &refs,
+                &["--json", "-q", "--quiet", "--filter"],
+            )?;
+            // `--filter name=<substring>`: Docker's, and the only filter a script actually writes
+            // here - Sentry's `install.sh` asks `volume ls -q --filter name=sentry-postgres` to decide
+            // whether a database volume from an older release exists. A filter kern cannot answer is
+            // refused BY NAME rather than ignored, because ignoring it answers a DIFFERENT question:
+            // the unfiltered list is never empty, so the caller would read "it exists" for everything.
+            // The value after `--filter`, or the `--filter=x` form.
+            let filter = refs.iter().enumerate().find_map(|(i, a)| {
+                a.strip_prefix("--filter=").map(str::to_string).or_else(|| {
+                    (*a == "--filter").then(|| refs.get(i + 1).map(|v| (*v).to_string()))?
+                })
+            });
+            let name_like = match filter.as_deref() {
+                None => None,
+                Some(f) => match f.split_once('=') {
+                    Some(("name", v)) => Some(v.to_string()),
+                    _ => {
+                        return Err(Error::Volume(format!(
+                            "volume ls --filter {f}: kern answers `name=<substring>` and refuses the rest rather than listing everything"
+                        )))
+                    }
+                },
+            };
             if refs.contains(&"--json") {
                 list_json()
+            } else if refs.contains(&"-q") || refs.contains(&"--quiet") {
+                // `-q`: THE NAMES, ONE PER LINE, AND NOTHING ELSE - Docker's spelling, and the form a
+                // shell loop reads. Sentry's `install.sh` pipes `docker volume ls -q` into a `grep`
+                // to decide whether its Postgres volume exists.
+                list_quiet(name_like.as_deref())
             } else {
                 list()
             }
@@ -530,22 +561,64 @@ pub fn run(args: &[String]) -> Result<(), Error> {
 
 fn create(args: &[String]) -> Result<(), Error> {
     let (mut name, mut size): (Option<&str>, Option<u64>) = (None, None);
+    // The `--name=` form owns its string (it is a slice of one argument, not an argument), so it is
+    // kept separately and resolved after the loop.
+    let mut named: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        // `--flag=value` is the same flag, and for `--name` it is the ONLY spelling Docker's own
+        // scripts use: `docker volume create --name=<vol>` is the legacy form, which Sentry's
+        // `install.sh` writes for every one of its six volumes. kern took a positional name only, so
+        // the installer created none of them and the stack then refused to start on `external:`
+        // volumes that did not exist.
+        let (key, inline) = match args[i].split_once('=') {
+            Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+            _ => (args[i].as_str(), None),
+        };
+        match key {
             "--size" | "-s" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or(Error::Usage("volume create <name> --size <N>"))?;
-                size = Some(parse_size(v)?);
+                let v = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .ok_or(Error::Usage("volume create <name> --size <N>"))?
+                            .to_string()
+                    }
+                };
+                size = Some(parse_size(&v)?);
+            }
+            // `--name <n>` / `--name=<n>`: Docker's legacy spelling of the positional.
+            "--name" => {
+                let v = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .ok_or(Error::Usage("volume create --name <name>"))?
+                            .to_string()
+                    }
+                };
+                // The borrow has to outlive this loop, and `args` is what owns the other spelling:
+                // leak-free by storing the index instead of the string.
+                if name.is_none() {
+                    named = Some(v);
+                }
             }
             s if !s.starts_with('-') && name.is_none() => name = Some(s),
             _ => return Err(Error::Usage("volume create <name> [--size <N>]")),
         }
         i += 1;
     }
-    let name = name.ok_or(Error::Usage("volume create <name> [--size <N>]"))?;
+    let owned;
+    let name = match (name, named) {
+        (Some(n), _) => n,
+        (None, Some(n)) => {
+            owned = n;
+            owned.as_str()
+        }
+        (None, None) => return Err(Error::Usage("volume create <name> [--size <N>]")),
+    };
     validate(name)?;
     let vol = volumes_dir().join(name);
     std::fs::create_dir_all(vol.join("data"))
@@ -793,6 +866,21 @@ pub(crate) fn entries() -> Vec<VolInfo> {
 /// key/value view writes `unlimited`; a machine reader gets the absence itself, so it never has to
 /// recognise a glyph or a word. `size` and `quota` are numbers in BYTES, unformatted: `2.0G` is for
 /// eyes, and a consumer that has to parse "2.0G" back into an integer is being handed prose.
+/// `volume ls -q [--filter name=<substring>]`: one name per line, for a caller that is going to grep
+/// or loop over them.
+fn list_quiet(name_like: Option<&str>) -> Result<(), Error> {
+    // THE SAME SCANNER the table and the TUI use, so a name cannot appear in one listing and not
+    // the other.
+    for e in entries() {
+        // SUBSTRING, as Docker's `name=` filter is - not a prefix and not an exact match.
+        if name_like.is_some_and(|want| !e.name.contains(want)) {
+            continue;
+        }
+        println!("{}", e.name);
+    }
+    Ok(())
+}
+
 fn list_json() -> Result<(), Error> {
     let out = kern_common::json_array(&entries(), |v| {
         // `json_str` on the NAME: it comes off the filesystem, so it is attacker-influenced wherever
@@ -1012,8 +1100,8 @@ fn usage() {
         "\
 {b}kern volume{z} - named persistent volumes
 
-    {c}create{z} <name> [--size N]   Create a volume (also auto-created by `-v name:/dest`)
-    {c}ls{z}                  List volumes with sizes
+    {c}create{z} <name|--name N> [--size N]   Create a volume (also auto-created by `-v name:/dest`)
+    {c}ls{z} [-q] [--filter name=S]   List volumes with sizes; `-q` names only
     {c}inspect{z} <name>      Show a volume's path, size and metadata
     {c}edit{z} <name> [--name NEW] [--size N|0]   Rename and/or re-quota a volume
     {c}rm{z} <name>...        Remove volume(s)

@@ -164,7 +164,13 @@ impl Error {
             // reach this function. Two wordings for one condition drift, and the older one here named
             // two of the four things a setup failure is.
             Error::Setup(_) => Some(kern_isolation::SETUP_FAILURE_HINT.into()),
-            Error::NotRunning(_) => Some("run `kern ps` to see running boxes".into()),
+            // SUPPRESSED WHEN THE MESSAGE ALREADY CARRIES ITS REPAIR, the rule `Volume` and `Compose`
+            // above follow: `inspect` now answers for an image too, and its refusal names `kern ps`,
+            // `kern images` and `kern pull` itself. A generic pointer under that reads as a fourth
+            // suggestion and sends the reader back to the one surface they already ruled out.
+            Error::NotRunning(msg) => {
+                (!msg.contains('`')).then(|| "run `kern ps` to see running boxes".into())
+            }
             Error::AlreadyRunning(_) => {
                 Some("run `kern ps` to see running boxes; `kern stop <name>` frees the name".into())
             }
@@ -193,6 +199,17 @@ impl Error {
             // instruction gets skipped. A backtick is the marker, because that is how this codebase
             // writes a key or a command inside a sentence, and a newline is the other (a
             // multi-line message brought its own fix).
+            //
+            // AND ONLY WHILE THE FORMAT IS STILL IN QUESTION. A message that names a BOX is past
+            // the file: kern read it, built that box, and the box is what failed, so telling the
+            // reader what a stack file looks like answers a question nobody asked and buries the one
+            // they have. MEASURED on Sentry's official file: `box '...-clickhouse' failed to start`
+            // and `box '...-relay': timed out after 120s waiting for '...' to become healthy` both
+            // ended with the file-format hint while the real reason sat in the box's own log.
+            //
+            // A BOX AND NOT A SERVICE, deliberately. `duplicate service 'a'` is a PARSE refusal that
+            // names a service, and the reader of that one may well be writing the wrong format.
+            Error::Compose(msg) if msg.contains("box '") => None,
             Error::Compose(msg) => (!msg.contains('`') && !msg.contains('\n')).then(|| {
                 "compose: a stack is a `docker-compose.yml` (`services:` with `image:` or \
                  `build:`) or a kern TOML (`[box.NAME]` with image/rootfs, command, depends_on)"
