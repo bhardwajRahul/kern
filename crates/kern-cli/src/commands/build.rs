@@ -921,9 +921,12 @@ fn build_run(
                 i += 1;
             }
             Instr::Expose(p) => {
+                // DECLARED, not merely announced: see `apply_declaration`. The line still says the
+                // port is not published, because that is the part a reader gets wrong.
+                apply_declaration(&mut config, &instrs[i]);
                 announce(
                     step,
-                    format!("EXPOSE {p} (informational - publish with -p at run)"),
+                    format!("EXPOSE {p} (declared by the image - publish with -p at run)"),
                 );
                 i += 1;
             }
@@ -1283,9 +1286,12 @@ fn build_layered_cached(
                 i += 1;
             }
             Instr::Expose(p) => {
+                // DECLARED, not merely announced: see `apply_declaration`. The line still says the
+                // port is not published, because that is the part a reader gets wrong.
+                apply_declaration(&mut config, &instrs[i]);
                 announce(
                     step,
-                    format!("EXPOSE {p} (informational - publish with -p at run)"),
+                    format!("EXPOSE {p} (declared by the image - publish with -p at run)"),
                 );
                 i += 1;
             }

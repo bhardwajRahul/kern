@@ -2631,6 +2631,21 @@ fn enable_subtree_controllers(parent: &std::path::Path) {
 pub const DEFAULT_MEMORY_MAX: u64 = 536_870_912;
 /// Process-count ceiling - caps fork bombs.
 const DEFAULT_PIDS_MAX: &str = "512";
+/// The task ceiling a `kern compose` SERVICE gets when its file names none.
+///
+/// PUBLIC FOR THE SAME REASON AS [`DEFAULT_MEMORY_MAX`]: compose tells the reader the figure, and a
+/// message carrying its own copy is one edit away from naming a cap that is not the one in force.
+///
+/// WHY IT IS NOT THE SANDBOX'S 512. That number is a fork-bomb ceiling for a box running a snippet,
+/// and a compose file describes servers. MEASURED on Sentry's official file: ClickHouse aborts under
+/// 512 with "Couldn't get 512 threads from global thread pool" - its background pool alone asks for
+/// exactly that many - and reaches `healthy` in 25 s at 2048, with nothing else changed. Docker
+/// imposes no ceiling at all here and podman's own default is 2048, so this is the stricter of the
+/// two references rather than a number picked for being round.
+///
+/// A CEILING REMAINS, which is the difference from Docker: a downloaded stack still cannot take the
+/// machine, and `pids_limit:` in the file overrides this in either direction.
+pub const DEFAULT_COMPOSE_PIDS_MAX: u64 = 2048;
 /// cgroup v2 CPU period (µs) for `cpu.max`; the quota is `cores * PERIOD`.
 const CPU_PERIOD_US: u64 = 100_000;
 

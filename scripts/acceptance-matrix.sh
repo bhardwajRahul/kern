@@ -188,21 +188,29 @@ done
 # Fedora 44 and Rocky 10 the same cases read `sh: cat: not found` and reported it as a kern failure.
 for a in sh nc httpd netstat cat grep; do ln -sf busybox "$RF/bin/$a"; done
 echo PAYLOAD_OK > "$RF/tmp/hello"
+# THE LISTENERS BIND 0.0.0.0, AND THAT IS NOT A DETAIL. They bound `127.0.0.1` when the default
+# wiring put every service in ONE namespace, where a peer's loopback IS your loopback. The default is
+# a bridge now - each service has its own namespace and its own `127.0.0.1` - so a loopback listener
+# is private to the service that opened it, BY DESIGN, and five cases in this file started reporting
+# that design as a failure on every host: three boards, a VPS and a laptop, identically. The script
+# was asserting the old arrangement, and a harness that encodes a superseded default manufactures a
+# red that no defect is behind. `loopback_is_private_under_the_default` below asserts the property
+# the old spelling was accidentally testing, on purpose this time.
 cat > "$D/s.toml" <<TOML
 [box.a]
 rootfs = "$RF"
 port = 7401
-command = ["/bin/busybox", "httpd", "-f", "-p", "127.0.0.1:7401", "-h", "/tmp"]
+command = ["/bin/busybox", "httpd", "-f", "-p", "0.0.0.0:7401", "-h", "/tmp"]
 
 [box.b]
 rootfs = "$RF"
 port = 7402
-command = ["/bin/busybox", "httpd", "-f", "-p", "127.0.0.1:7402", "-h", "/tmp"]
+command = ["/bin/busybox", "httpd", "-f", "-p", "0.0.0.0:7402", "-h", "/tmp"]
 
 [box.c]
 rootfs = "$RF"
 port = 7403
-command = ["/bin/busybox", "httpd", "-f", "-p", "127.0.0.1:7403", "-h", "/tmp"]
+command = ["/bin/busybox", "httpd", "-f", "-p", "0.0.0.0:7403", "-h", "/tmp"]
 TOML
 
 K() { XDG_RUNTIME_DIR=$XDG "$KERN" compose "$D/s.toml" "$@" 2>&1; }
@@ -212,6 +220,36 @@ reaches() {
     XDG_RUNTIME_DIR=$XDG "$KERN" exec "$1" -- /bin/busybox sh -c \
         "printf 'GET /hello HTTP/1.0\r\n\r\n' | /bin/busybox nc -w 3 $2 $3 2>/dev/null" 2>/dev/null \
         | grep -c PAYLOAD_OK
+}
+# THE NETWORK IS READY EVEN WHEN NOBODY IS LISTENING, and telling the two apart is the whole point of
+# this helper. `1` when the peer's address ANSWERED - with the payload, or with a refusal, which is a
+# packet that was routed, delivered and answered by its kernel. `0` only when nothing came back.
+#
+# WHY IT IS NOT ONE FUNCTION WITH `reaches`. The two failures this file has caught here are different
+# defects with different fixes: a peer whose neighbour entry is stale TIMES OUT (measured: 29.3 s of
+# them after `compose start`, closed by deriving the member's MAC from its IP), and a workload that
+# has not yet bound its port is REFUSED in about 3 ms (measured: 4 first attempts in 12, and it is
+# the window `docker start` leaves too - `start` returns when the box is started, not when the
+# application accepts). Asserting the payload on the first attempt makes the second read as the
+# first, and a harness that cannot name which defect it found is how a real one gets dismissed as
+# a flake.
+answers() {
+    out=$(XDG_RUNTIME_DIR=$XDG "$KERN" exec "$1" -- /bin/busybox sh -c \
+        "printf 'GET /hello HTTP/1.0\r\n\r\n' | /bin/busybox nc -w 3 $2 $3 2>&1" 2>&1)
+    case "$out" in
+        *PAYLOAD_OK* | *"Connection refused"*) printf '1' ;;
+        *) printf '0' ;;
+    esac
+}
+# The payload, allowing the WORKLOAD the milliseconds it needs to bind - and no more than a second in
+# total, so a service that never binds is still a failure rather than a wait.
+reaches_soon() {
+    i=0
+    while [ $i -lt 20 ]; do
+        [ "$(reaches "$1" "$2" "$3")" = "1" ] && { printf '1'; return; }
+        i=$((i + 1))
+    done
+    printf '0'
 }
 # BY PID, never by name.
 live_kern_pids() {
@@ -237,6 +275,21 @@ for MODE in --no-pod pod; do
 
     # 2. reachability, with no settling time
     [ "$(reaches a b 7402)" = "1" ] && pass "up: payload a to b, no sleep" || fail "up: payload a to b"
+    # THE OTHER HALF OF THE DEFAULT, asserted where it holds: on a bridge each service has its own
+    # `127.0.0.1`, so a listener bound there is private to the service that opened it. Started inside
+    # the box rather than as a fourth service, because every count in this file is written for three.
+    if [ "$MODE" = pod ]; then
+        XDG_RUNTIME_DIR=$XDG "$KERN" exec b -- /bin/busybox sh -c \
+            "/bin/busybox httpd -p 127.0.0.1:7404 -h /tmp" >/dev/null 2>&1
+        [ "$(reaches a b 7404)" = "0" ] \
+            && pass "a peer's loopback-only listener is NOT reachable, which is what the bridge buys" \
+            || fail "a loopback listener in one service answered another: the namespaces are shared"
+        # AND THE CONTROL: the same box, same moment, on the address it publishes. Without it a
+        # refusal proves nothing - a dead httpd would pass the case above.
+        [ "$(reaches a b 7402)" = "1" ] \
+            && pass "and the same service still answers on the address its peers use" \
+            || fail "the control failed: b answers on neither address, so the case above is void"
+    fi
     [ "$(reaches c a 7401)" = "1" ] && pass "up: payload c to a, no sleep" || fail "up: payload c to a"
 
     # 1. the output against the state, for the selector
@@ -257,13 +310,25 @@ for MODE in --no-pod pod; do
 
     K start >/dev/null 2>&1
     [ "$(running)" -eq 3 ] && pass "start: back to 3" || fail "start: not back to 3"
-    # THE ONE THE OLD TEST COULD NOT SEE: first attempt, no sleep.
-    [ "$(reaches a b 7402)" = "1" ] && pass "start: payload on the FIRST attempt after it returns" \
-        || fail "start: the stack was announced before it was reachable"
+    # KERN'S HALF, ON THE FIRST ATTEMPT AND WITH NO SLEEP: when `start` returns, the peer's address
+    # must ANSWER. A refusal counts, because it is proof the packet was routed and delivered; a
+    # timeout is the defect (a stale neighbour entry), and that is what this case caught.
+    [ "$(answers a b 7402)" = "1" ] \
+        && pass "start: the peer's address answers on the FIRST attempt after it returns" \
+        || fail "start: the stack was announced before its network was built"
+    # AND THE WORKLOAD'S HALF, bounded: the payload has to arrive, just not necessarily in the first
+    # millisecond after a process was exec'd.
+    [ "$(reaches_soon a b 7402)" = "1" ] && pass "start: and the payload arrives" \
+        || fail "start: the payload never arrived"
 
     K restart c >/dev/null 2>&1
-    [ "$(reaches a c 7403)" = "1" ] && pass "restart c: reachable with no settling time" \
+    # Same split as `start` above, for the same measured reason: the address answering is kern's
+    # promise, the payload is the workload's.
+    [ "$(answers a c 7403)" = "1" ] \
+        && pass "restart c: its address answers with no settling time" \
         || fail "restart c: unreachable right after restart"
+    [ "$(reaches_soon a c 7403)" = "1" ] && pass "restart c: and the payload arrives" \
+        || fail "restart c: the payload never arrived"
 
     # 3. what is left behind, in processes AND on disk
     before=$(live_kern_pids)

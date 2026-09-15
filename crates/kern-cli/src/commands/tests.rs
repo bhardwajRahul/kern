@@ -1731,6 +1731,156 @@ mod net_resource_tests {
     }
 
     #[test]
+    fn an_old_sidecar_is_a_complete_entry_and_only_its_config_is_stale() {
+        // The distinction this test exists for: an entry written by a kern that predates the format
+        // stamp is COMPLETE (its rootfs is fine) and its CONFIG is out of date. Reading the stamp as
+        // incompleteness sent the entry down the repair path, which clears the image dir first - and
+        // an image whose layers hold subuid-owned files (postgres, mysql, redis, nginx) cannot have
+        // that directory removed by the user that pulled it. EPERM, entry unusable until
+        // `--pull always`. Measured by a reviewer on a 66-image cache.
+        let cache = std::env::temp_dir().join(format!("kern-cfgfmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let safe = "some_image-0123456789abcdef";
+        std::fs::create_dir_all(cache.join(safe).join("bin")).unwrap();
+        std::fs::write(cache.join(safe).join("bin/sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(cache.join(format!("{safe}.ok")), b"some:image").unwrap();
+        let cfg = cache.join(format!("{safe}.image"));
+        // Exactly what an older kern wrote: fields, no `fmt` line.
+        std::fs::write(&cfg, "entrypoint\t/entrypoint.sh\nenv\tPATH=/bin\n").unwrap();
+        assert!(
+            cache_entry_complete(&cache, safe),
+            "an old sidecar must not make the entry look incomplete: that clears the rootfs"
+        );
+        assert!(!image_config_is_current(&cfg), "it IS out of date, though");
+        // What the refresh writes back round-trips through the reader without losing a field, so the
+        // offline fallback (keep the cached config, stamp it) keeps the box's identity.
+        let kept = read_image_config(&cfg);
+        write_image_config(&cfg, &kept).unwrap();
+        assert!(image_config_is_current(&cfg));
+        let after = read_image_config(&cfg);
+        assert_eq!(after.entrypoint, vec!["/entrypoint.sh".to_string()]);
+        assert_eq!(after.env, vec!["PATH=/bin".to_string()]);
+        assert!(cache_entry_complete(&cache, safe));
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn a_pod_member_keeps_its_mac_across_a_restart() {
+        // A `veth` created without an address gets a RANDOM one, so a service stopped and started
+        // came back on the same IP behind a different MAC and its peers held the old one in their
+        // neighbour caches. MEASURED on this repo's acceptance matrix, identically on a laptop, a
+        // VPS and three boards: `compose start` returns in 171 ms and the restarted service is
+        // unreachable BY ITS PEERS for 29.3 seconds, while an untouched peer keeps answering. With
+        // the address derived from the IP it is 176 ms.
+        let mac = |a, b, c, d| kern_isolation::member_mac(std::net::Ipv4Addr::new(a, b, c, d));
+        // Docker's scheme, which is what makes a stable MAC the familiar behaviour: `02:42` then the
+        // four address bytes.
+        assert_eq!(mac(10, 89, 0, 3), [0x02, 0x42, 10, 89, 0, 3]);
+        // STABLE is the whole property: same address in, same address out, every time.
+        assert_eq!(mac(10, 89, 0, 3), mac(10, 89, 0, 3));
+        // Locally administered (bit 1 of the first octet) and unicast (bit 0 clear), or a switch is
+        // entitled to ignore it.
+        let m = mac(172, 30, 5, 9);
+        assert_eq!(
+            m[0] & 0b11,
+            0b10,
+            "must be locally administered and unicast"
+        );
+        // Distinct members get distinct addresses by construction, which is what makes this usable
+        // as an identity inside the pod rather than merely deterministic.
+        assert_ne!(mac(10, 89, 0, 3), mac(10, 89, 0, 4));
+        assert_ne!(mac(10, 89, 0, 3), mac(10, 89, 1, 3));
+    }
+
+    #[test]
+    fn the_base_copy_reaches_a_directory_owned_by_a_subordinate_uid() {
+        // A Debian base ships `/var/cache/apt/archives/partial` at mode 0700, and after extraction it
+        // is owned by a SUBORDINATE uid. `cp` run as the plain user cannot traverse it, so every
+        // `build:` on such a base died in `copy_tree`: measured by an external reviewer on Sentry's
+        // official file, 21 of 57 services, before anything started. `FROM alpine` worked, which is
+        // what named the cause.
+        //
+        // THE SUBJECT IS ASKED FOR ITS CAPABILITY, not assumed to have it: without newuidmap/newgidmap
+        // and a /etc/subuid allocation there is no subordinate range on this host, so the situation
+        // cannot exist here and there is nothing to assert. That is a different statement from "the
+        // copy works", and the test says which one it made.
+        let root = std::env::temp_dir().join(format!("kern-subuidcp-{}", std::process::id()));
+        crate::commands::rootfs::remove_dir_all_ranged(&root);
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(src.join("shut")).unwrap();
+        std::fs::write(src.join("shut/secret"), b"x").unwrap();
+        std::fs::write(src.join("plain"), b"y").unwrap();
+        // Make it look like an extracted Debian layer: owned by the first subordinate uid, 0700.
+        let made = kern_isolation::with_id_mapped_userns(|ranged| {
+            let shut = src.join("shut");
+            let c = std::ffi::CString::new(shut.to_string_lossy().as_bytes()).unwrap();
+            // uid 1 inside the map IS the first subordinate uid outside it - and only when there IS
+            // a range: a single-uid map has nobody to give it to, so the situation cannot be built.
+            if !ranged {
+                return 1;
+            }
+            let owned = unsafe { libc::chown(c.as_ptr(), 1, 1) } == 0;
+            let mode = unsafe { libc::chmod(c.as_ptr(), 0o700) } == 0;
+            i32::from(!(owned && mode))
+        });
+        if !matches!(made, Ok(0)) {
+            let _ = std::fs::remove_dir_all(&root);
+            return; // no subordinate range on this host: the defect's precondition cannot be built
+        }
+        // CONTROL: the plain copy must really fail, or the test is passing for the wrong reason.
+        let plain = std::process::Command::new("cp")
+            .args(["-a", "--"])
+            .arg(format!("{}/.", src.display()))
+            .arg(root.join("control"))
+            .output()
+            .unwrap();
+        assert!(
+            !plain.status.success(),
+            "the unprivileged copy SUCCEEDED, so this host does not have the situation the fix is for"
+        );
+        crate::commands::rootfs::copy_tree(&src, &dst).expect("copy_tree must retry as ns-root");
+        assert!(dst.join("plain").exists());
+        assert!(
+            dst.join("shut").exists(),
+            "the 0700 subuid dir did not make it across"
+        );
+        crate::commands::rootfs::remove_dir_all_ranged(&root);
+    }
+
+    #[test]
+    fn every_field_the_sidecar_writes_reads_back() {
+        // THE SIDECAR IS THE ONLY COPY, so a field the writer emits and the reader drops is a field
+        // the box never sees - and it is invisible, because the file on disk looks right. That is
+        // exactly how `hcstartint` was lost: written since 14/09, absent from the reader's outer
+        // match, so it fell through to `_ => {}`. A cached image waited 300 s for its first probe
+        // while the same image pulled fresh was healthy in 6, with an IDENTICAL file on disk.
+        // Comparing the whole struct, not the fields I remember, is the point of this test.
+        let want = kern_oci::ImageConfig {
+            entrypoint: vec!["/entrypoint.sh".into(), "--flag".into()],
+            cmd: vec!["postgres".into()],
+            env: vec!["PATH=/bin".into(), "PGDATA=/var/lib/postgresql/data".into()],
+            workdir: Some("/srv".into()),
+            user: Some("999:999".into()),
+            exposed_ports: vec![(5432, false), (1194, true)],
+            stop_signal: Some("SIGQUIT".into()),
+            healthcheck: Some(kern_oci::ImageHealthcheck {
+                test: vec!["CMD-SHELL".into(), "pg_isready".into()],
+                interval_ns: Some(300_000_000_000),
+                timeout_ns: Some(5_000_000_000),
+                start_period_ns: Some(300_000_000_000),
+                start_interval_ns: Some(5_000_000_000),
+                retries: Some(3),
+            }),
+        };
+        let path =
+            std::env::temp_dir().join(format!("kern-sidecar-rt-{}.image", std::process::id()));
+        write_image_config(&path, &want).unwrap();
+        let got = read_image_config(&path);
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn layer_cache_key_helpers() {
         // Deterministic + chained: same inputs → same key; a changed repr OR a changed parent key
         // → different key (so a change busts this layer and everything after it).

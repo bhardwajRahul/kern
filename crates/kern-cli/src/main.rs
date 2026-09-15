@@ -115,6 +115,21 @@ fn main() -> ExitCode {
         if invoked == "docker-compose" {
             args.insert(0, "compose".to_string());
         }
+        // A FACT THE SHIM CAN ANSWER ITSELF, before translation: `docker version --format …`,
+        // `docker info --format …` and `docker compose version` ask what kern IS, not what it should
+        // do. See `shim::direct_reply` for why the first of those is the one that mattered.
+        if let Some(answer) = shim::direct_reply(&args) {
+            return match answer {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}", ui::scrub_message(&e.to_string()));
+                    ExitCode::FAILURE
+                }
+            };
+        }
         match shim::translate(&args) {
             Ok(translated) => args = translated,
             Err(e) => {

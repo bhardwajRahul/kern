@@ -12438,3 +12438,275 @@ fn a_taken_published_port_names_the_stack_holding_it() {
          collision:\n{foreign}"
     );
 }
+
+/// `compose pull` HONOURS `pull_policy: never`, which `up` already did and this verb did not.
+///
+/// MEASURED by an external reviewer on Sentry's official compose file: 48 of its 57 services declare
+/// `pull_policy: never` and 21 also declare `build:`, so kern went to Docker Hub for a name that only
+/// ever exists locally, failed, and ABORTED - leaving every image after it unfetched. The verb could
+/// not succeed on that file at all, while `up` on the same file honoured the key. A flag that one
+/// verb enforces and another ignores is the same defect as a cap that is accepted and not enforced.
+///
+/// NO NETWORK IS NEEDED TO SEE IT, and that is the point of this shape: the image name is one no
+/// registry can have, so reaching the registry at all IS the failure. A pull that exits 0 here is a
+/// pull that never left the machine.
+#[test]
+fn compose_pull_honours_pull_policy_never() {
+    let dir = std::env::temp_dir().join(format!("kern-it-pullnever-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("docker-compose.yml");
+    fs::write(
+        &file,
+        "services:\n  \
+           local:\n    image: kern-test-local-only-xyz\n    pull_policy: never\n    \
+           command: [\"true\"]\n  \
+           built:\n    image: kern-test-built-xyz\n    build:\n      context: .\n    \
+           command: [\"true\"]\n",
+    )
+    .unwrap();
+    fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+    let xdg = dir.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    let o = kern()
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", "-f", file.to_str().unwrap(), "pull"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        o.status.success(),
+        "`compose pull` must not fail on a file whose images are local-only:\n{said}"
+    );
+    assert!(
+        said.contains("pull_policy: never"),
+        "the skip must be SAID, not silent - a pull that quietly fetched nothing reads as a pull \
+         that fetched everything:\n{said}"
+    );
+    // The buildable one is named rather than counted, because the reader's next command depends on
+    // WHICH service is missing.
+    assert!(
+        said.contains("kern compose build") && said.contains("built"),
+        "a service that declares `build:` must be named with the command that produces it:\n{said}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `inspect` ANSWERS FOR AN IMAGE, because `docker inspect` takes a container OR an image.
+///
+/// MEASURED by an external reviewer against the docker drop-in: `docker inspect alpine` answered
+/// `no running box named 'alpine'` for a reference the machine had on disk, and he recorded it as a
+/// declared gap. The fix is in kern's own verb rather than in the translation layer: the question is
+/// the same one either spelling is asking, and a shim that answered it would be a second authority
+/// on what kern knows.
+///
+/// THREE THINGS, because each can be broken while the others work: a box still wins the name, an
+/// image is reported when no box holds it, and a name that is neither says so naming both. The JSON
+/// is Docker's shape (`RepoTags`, `Config.Cmd`), which is what a consumer of `inspect <image>` reads.
+#[test]
+fn inspect_answers_for_an_image_when_no_box_holds_the_name() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let cache = std::env::temp_dir().join(format!("kern-it-inspimg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cache);
+    let xdg = cache.join("xdg");
+    fs::create_dir_all(&xdg).expect("xdg");
+    // THE IMAGE IS BUILT, NOT PLANTED. The cache key is `sanitize_ref`'s and a test must not
+    // re-implement it: a hand-written directory under a guessed stem is a case that passes by never
+    // being found, which is the shape of a no-op assertion. `FROM scratch` needs no network, so this
+    // stays a local test while still going through the code that names the entry.
+    let ctx = cache.join("ctx");
+    fs::create_dir_all(&ctx).expect("ctx");
+    fs::write(ctx.join("payload"), b"x").expect("payload");
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM scratch\nCOPY payload /payload\nENV PATH=/bin\nWORKDIR /srv\nEXPOSE 8080\nCMD [\"/bin/sh\"]\n",
+    )
+    .expect("dockerfile");
+    let run = |args: &[&str]| -> (String, bool) {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("XDG_CACHE_HOME", &cache)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            o.status.success(),
+        )
+    };
+    // A NAME THAT IS NEITHER names both subjects. This one does not depend on the key scheme.
+    let (said, ok) = run(&["inspect", "kern-test-neither-box-nor-image"]);
+    assert!(!ok, "a name that is neither must fail:\n{said}");
+    assert!(
+        said.contains("no running box") && said.contains("image"),
+        "the refusal must name BOTH subjects, or the reader searches the wrong one:\n{said}"
+    );
+    // THE IMAGE PATH, through the key kern itself computes.
+    let (built, build_ok) = run(&[
+        "build",
+        "-t",
+        "kern-test-inspectme:1.0",
+        ctx.to_str().unwrap_or_default(),
+    ]);
+    if build_ok {
+        let (img, img_ok) = run(&["inspect", "kern-test-inspectme:1.0"]);
+        assert!(img_ok, "inspecting a cached image must work:\n{img}");
+        assert!(
+            img.contains("(image)") && img.contains("/srv"),
+            "an image must be reported as one, with the config kern stored for it:\n{img}"
+        );
+        let (js, js_ok) = run(&["inspect", "kern-test-inspectme:1.0", "--json"]);
+        assert!(js_ok, "--json on an image must work:\n{js}");
+        // DOCKER'S SHAPE, which is what a consumer of `inspect <image>` reads.
+        for key in [
+            "\"RepoTags\"",
+            "\"Config\"",
+            "\"Cmd\"",
+            "\"WorkingDir\"",
+            "\"ExposedPorts\"",
+        ] {
+            assert!(js.contains(key), "missing {key} in:\n{js}");
+        }
+        assert!(
+            js.contains("8080/tcp"),
+            "EXPOSE must round-trip into ExposedPorts:\n{js}"
+        );
+        let _ = run(&["rmi", "kern-test-inspectme:1.0"]);
+    } else {
+        eprintln!("skip: this host cannot build a scratch image: {built}");
+    }
+    // A BOX STILL WINS THE NAME.
+    let rootfs = build_rootfs(&busybox, "inspimg");
+    let (started, _) = run(&[
+        "box",
+        "inspbox",
+        "--rootfs",
+        rootfs.to_str().unwrap_or_default(),
+        "-d",
+        "--",
+        "/bin/busybox",
+        "sleep",
+        "30",
+    ]);
+    if started.contains("started") {
+        // A BOX STILL WINS THE NAME: the live thing is what a reader inspecting a name is asking
+        // about, and the image fallback must not shadow it.
+        let (box_out, box_ok) = run(&["inspect", "inspbox"]);
+        assert!(box_ok, "inspecting a live box must work:\n{box_out}");
+        assert!(
+            box_out.contains("inspbox") && !box_out.contains("(image)"),
+            "a running box must be reported as a box:\n{box_out}"
+        );
+        let _ = run(&["stop", "inspbox"]);
+    }
+    let _ = fs::remove_dir_all(&cache);
+}
+
+/// A `restart:` SERVICE ACTUALLY RESTARTS, and the pre-exec gate does not outlive its one use.
+///
+/// The gate holds a box's first exec until the launcher has built the peer network, and its write
+/// end belongs to that launcher - which releases every box and returns. A box the supervisor
+/// restarts afterwards found the descriptor at EOF and refused to exec, so `restart: always` ran the
+/// workload exactly ONCE and then logged `never started (exit 125); retrying (N/10)` until the budget
+/// ran out, while `kern ps` still showed the service as `starting`.
+///
+/// MEASURED on Sentry's `install.sh` (a service that exits once is never seen again) and reproduced
+/// here in eleven seconds: on the released binary, ONE `TICK` and three `never started`; with the
+/// gate dropped after the first attempt, a `TICK` per restart and none.
+///
+/// THE ASSERTION IS THE COUNT, not the absence of the message: a kern that stopped restarting
+/// altogether would also print no `never started`, and that is the failure this test must not pass.
+#[test]
+fn a_restart_service_restarts_after_its_first_exit() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-restart-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("dir");
+    let rootfs = build_rootfs(&busybox, "restartgate");
+    let xdg = dir.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    // TWO services, because the gate is only active for a stack that builds a peer network: one box
+    // has nothing to wait for and would pass this test without the fix.
+    let file = dir.join("stack.toml");
+    fs::write(
+        &file,
+        format!(
+            "[box.a]\nrootfs = \"{rf}\"\nrestart = true\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"echo TICK; sleep 1; exit 3\"]\n\n\
+             [box.b]\nrootfs = \"{rf}\"\n\
+             command = [\"/bin/busybox\", \"sleep\", \"60\"]\n",
+            rf = rootfs.to_str().unwrap_or_default()
+        ),
+    )
+    .expect("write stack");
+    let run = |args: &[&str]| -> String {
+        let mut v = vec!["compose", file.to_str().unwrap_or_default()];
+        v.extend_from_slice(args);
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&v)
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    let up = run(&["up", "-d"]);
+    if !up.contains("started") {
+        eprintln!("skip: the stack did not come up here: {up}");
+        let _ = run(&["down"]);
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    // Long enough for several one-second lives plus the supervisor's backoff.
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    let logs = {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["logs", "a"])
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    let _ = run(&["down"]);
+    let ticks = logs.matches("TICK").count();
+    let never = logs.matches("never started").count();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        never, 0,
+        "a restarted box must not wait on a gate whose writer is gone:\n{logs}"
+    );
+    assert!(
+        ticks >= 2,
+        "the workload must run again after it exits (saw {ticks} run(s)):\n{logs}"
+    );
+}
