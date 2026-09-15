@@ -432,6 +432,20 @@ pub fn gc(images: bool) -> Result<(), Error> {
     // Retired/staging image dirs left by `--pull always` (`<ref>.old-*` / `<ref>.pull-*`). Removed
     // ONLY when no box is running: a live box may still hold a retired dir's inodes via its overlay
     // mount (overlayfs opens lower files on demand), so deleting one under a running box would yank it.
+    // Entries no ref can reach: a key written by an older `sanitize_ref` is a directory nothing
+    // resolves, nothing refreshes and no other sweep collects. Found by an external reviewer with
+    // `alpine` under two keys, listed as two `alpine:latest`.
+    let (unreach, ufreed) = crate::commands::imagecache::sweep_unreachable_images(&cache_dir());
+    if unreach > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}removed{} {unreach} image entr{} no reference can reach, freed {}",
+            p.g,
+            p.z,
+            if unreach == 1 { "y" } else { "ies" },
+            human_bytes(ufreed)
+        );
+    }
     let retired = sweep_retired_images();
     if retired > 0 {
         let p = crate::ui::Palette::detect();

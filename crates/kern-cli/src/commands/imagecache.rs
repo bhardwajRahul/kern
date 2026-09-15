@@ -102,11 +102,31 @@ pub(crate) fn resolve_image_command(
 /// IS recognised and simply has no entrypoint, no env and no user, so the box silently falls back to
 /// a shell and the workload runs with a different identity and environment than the image declares.
 /// That is a wrong state, not lost work, and every caller now refuses rather than publishing it.
+/// The sidecar's FORMAT version, stamped on write and required on read.
+///
+/// WHY IT EXISTS, measured. `StartInterval` was added to the parser and to this sidecar on 14/09, and
+/// an external reviewer found the fix reaching a freshly pulled image and NOT an image already in the
+/// cache: same binary, same digest, 302 s against 6 s, the only difference being a sidecar written by
+/// a kern that did not know the field. A missing line is indistinguishable from an image that declares
+/// nothing, so the absence cannot be repaired by reading it harder. `kern compose pull` does not help
+/// either, because a digest-pinned ref is already satisfied.
+///
+/// So the version decides: an entry stamped with anything older has its sidecar REFRESHED once, by
+/// [`refresh_image_config`], which re-reads the config blob and leaves the rootfs alone.
+///
+/// ⛔ NOT A CACHE MISS. The first version of this treated an old stamp as an incomplete entry, which
+/// sent it down the repair path - and that path clears the image dir first. An image whose layers
+/// hold subuid-owned files (postgres, mysql, redis, nginx) cannot have that directory removed by the
+/// user that pulled it: `remove_dir_all` returns EPERM, and the entry was then unusable until
+/// `--pull always`. Measured by an external reviewer on a 66-image, 22 GB cache. The rootfs was never
+/// the stale part.
+pub(crate) const IMAGE_CFG_FMT: u32 = 2;
+
 pub(crate) fn write_image_config(
     path: &std::path::Path,
     c: &kern_oci::ImageConfig,
 ) -> std::io::Result<()> {
-    let mut s = String::new();
+    let mut s = format!("fmt\t{IMAGE_CFG_FMT}\n");
     let mut line = |k: &str, v: &str| {
         // A value with an embedded newline can't round-trip line-based; such values don't occur in
         // real image configs, so skip one defensively rather than corrupt the file.
@@ -195,7 +215,12 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
                 .get_or_insert_with(Default::default)
                 .test
                 .push(v.to_string()),
-            "hcinterval" | "hctimeout" | "hcstart" | "hcretries" => {
+            // ⛔ EVERY KEY `write_image_config` WRITES MUST BE LISTED HERE. `hcstartint` was written
+            // and not listed, so it fell through to `_ => {}` and the inner arm that parses it was
+            // unreachable: a cached image's `StartInterval` was read back as absent while the same
+            // image pulled fresh honoured it. Measured by a reviewer as 300 s against 6 s with an
+            // IDENTICAL sidecar on disk, which is what pointed at the reader instead of the writer.
+            "hcinterval" | "hctimeout" | "hcstart" | "hcstartint" | "hcretries" => {
                 // A number line WITHOUT a `hctest` line describes a check that has no command, which
                 // is not a check: `healthcheck_after` refuses an empty `Test` for the same reason.
                 if let Some(h) = c.healthcheck.as_mut() {
@@ -212,6 +237,58 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
         }
     }
     c
+}
+
+/// Is this sidecar's format the one this kern writes? A file with no `fmt` line predates the stamp.
+pub(crate) fn image_config_is_current(path: &std::path::Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    body.lines()
+        .filter_map(|l| l.strip_prefix("fmt\t"))
+        .filter_map(|v| v.trim().parse::<u32>().ok())
+        .any(|v| v >= IMAGE_CFG_FMT)
+}
+
+/// Bring a sidecar written by an older kern up to [`IMAGE_CFG_FMT`], WITHOUT touching the rootfs.
+///
+/// A config blob is a few kilobytes named by the manifest, so this is three small requests (~2 s on
+/// Docker Hub) against a re-pull of the whole image, and it is the only part that was ever stale. It
+/// is announced, because 2 s on a path that usually costs milliseconds should say why.
+///
+/// STAMPED EITHER WAY, so an entry costs at most ONE round trip. With no network the old config is
+/// written back under the current stamp and the box runs exactly as the previous kern ran it; the
+/// note names `--pull always`, which is the full repair. Retrying on every start instead would put a
+/// 10 s connect timeout in front of every `kern box --image` on a machine that is offline.
+///
+/// Lock-free like the fast path that calls it: the write goes to a temp file and is renamed over the
+/// sidecar, so a concurrent reader sees the old file or the new one, never half of one.
+fn refresh_image_config(
+    image: &str,
+    cache: &std::path::Path,
+    safe: &str,
+    cfgfile: &std::path::Path,
+) {
+    eprintln!(
+        "kern: note: image '{image}' was cached by an older kern - re-reading its config once (no layers)"
+    );
+    let scratch = cache.join(format!("{safe}.cfg-{}", std::process::id()));
+    let fetched = kern_oci::fetch_image_config(image, &scratch, None);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let config = match fetched {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "kern: note: could not re-read the config of '{image}' ({e}); keeping the cached one \
+                 - `--pull always` re-fetches the image"
+            );
+            read_image_config(cfgfile)
+        }
+    };
+    let tmp = cache.join(format!("{safe}.image-{}", std::process::id()));
+    if write_image_config(&tmp, &config).is_err() || std::fs::rename(&tmp, cfgfile).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Look up `name` in a colon-line account file (`passwd`/`group`) inside the image rootfs and return the
@@ -461,6 +538,67 @@ pub(crate) fn sweep_retired_images() -> usize {
         }
     }
     n
+}
+
+/// Image cache entries no ref can reach any more, and the bytes they hold.
+///
+/// WHAT MAKES ONE. The cache key is `sanitize_ref(<ref>)`, and that function has changed: an entry
+/// written by an older kern sits under a key today's kern never computes, so nothing resolves it,
+/// nothing refreshes it and no sweep collects it. MEASURED by an external reviewer: `alpine` under
+/// two keys, one from July and one from September, listed by `kern images` as two `alpine:latest`
+/// (56 days ago beside 4 hours ago) with only the second reachable.
+///
+/// THE TEST IS EXACT, not a heuristic: the entry's own `.ok` sentinel holds the ref it was pulled
+/// for, so re-sanitising that ref says what its key WOULD be today. If that differs from the key it
+/// actually sits under, no invocation of kern can ever name it. An entry whose sentinel is missing or
+/// unreadable is left alone - it might be mid-pull, and this must never race a writer.
+///
+/// SKIPPED ENTIRELY WHILE A BOX IS REGISTERED, for the reason `sweep_retired_images` documents: a
+/// live box holds its lower dir's inodes through an overlay mount and opens files from it lazily.
+pub(crate) fn sweep_unreachable_images(cache: &std::path::Path) -> (usize, u64) {
+    if !registry::list().is_empty() {
+        return (0, 0);
+    }
+    let (mut n, mut freed) = (0usize, 0u64);
+    let Ok(rd) = std::fs::read_dir(cache) else {
+        return (0, 0);
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(key) = name.to_str() else { continue };
+        // Only a `<key>.ok` sentinel names an entry; everything else here is a sidecar or a dir.
+        let Some(stem) = key.strip_suffix(".ok") else {
+            continue;
+        };
+        // A BUILT image is keyed by its tag and has no registry ref to re-derive, and the layer
+        // store under `L/` is swept by `sweep_orphan_layers`. Only a flat pulled entry is decided
+        // here, which is the population the key change affected.
+        if !cache.join(stem).is_dir() || cache.join(format!("{stem}.layers")).exists() {
+            continue;
+        }
+        let Ok(reference) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let reference = reference.trim();
+        if reference.is_empty() || sanitize_ref(reference) == stem {
+            continue; // reachable: this is the key kern computes for that ref today
+        }
+        let dir = cache.join(stem);
+        let bytes = dir_size(&dir);
+        // The rootfs can hold subuid-owned directories, exactly like the repair path, so it goes
+        // through the ONE hard-removal spelling: chmod what we own, then retry as root of an
+        // id-mapped namespace for what we do not.
+        let _ = crate::commands::remove_tree_mapped(&dir);
+        if dir.exists() {
+            continue; // could not reclaim it; leave every sidecar in place so the state stays whole
+        }
+        for side in [".ok", ".image", ".size", ".lock", ".diff", ".base"] {
+            let _ = std::fs::remove_file(cache.join(format!("{stem}{side}")));
+        }
+        n += 1;
+        freed += bytes;
+    }
+    (n, freed)
 }
 
 /// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Returns
@@ -951,6 +1089,10 @@ pub(crate) fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool 
     if !cache.join(format!("{safe}.ok")).exists() || !cache.join(format!("{safe}.image")).exists() {
         return false;
     }
+    // The sidecar's FORMAT is deliberately NOT part of this: an old stamp means the config must be
+    // re-read (`refresh_image_config`), never that the rootfs must be re-extracted. Answering "not
+    // complete" here sends the entry to the repair path, which clears the image dir - EPERM on any
+    // image whose layers hold subuid-owned files. See `IMAGE_CFG_FMT`.
     let dir = cache.join(safe);
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return false; // not a directory, or unreadable: not something to hand to overlayfs
@@ -1005,6 +1147,11 @@ pub(crate) fn pull_to_cache(
     // repairs it, once, without the user having to know that `--pull always` was the way out.
     if policy != PullPolicy::Always && cache_entry_complete(&cache, &safe) {
         // fast path: already cached (and not a forced `--pull always` re-fetch)
+        // `--pull never` means NO registry, and the refresh is a registry read: an entry kept by an
+        // older kern stays as it is under that flag, which is what the flag asks for.
+        if policy != PullPolicy::Never && !image_config_is_current(&cfgfile) {
+            refresh_image_config(image, &cache, &safe, &cfgfile);
+        }
         return Ok((
             dir.to_string_lossy().into_owned(),
             read_image_config(&cfgfile),
@@ -1152,6 +1299,21 @@ pub(crate) fn pull_to_cache(
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // AN IMAGE'S OWN LAYERS ARE OWNED BY SUBORDINATE UIDS, so the user that pulled it cannot
+            // remove its directory: postgres, mysql, redis and nginx all land here. That made a
+            // repair leave the entry unusable until `--pull always`, which is worse than the damage
+            // it was repairing. The range that created those files can delete them; it is the same
+            // helper `kern gc` already uses for a `--uid-range` box's leftovers.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                let _ = crate::commands::remove_tree_mapped(&dir);
+                if dir.exists() {
+                    return Err(Error::Oci(format!(
+                        "cannot clear the image dir {}, as this user or as root over your \
+                         subordinate uid range: {e}",
+                        dir.display()
+                    )));
+                }
+            }
             Err(e) => {
                 return Err(Error::Oci(format!(
                     "cannot clear the partial image dir {}: {e}",

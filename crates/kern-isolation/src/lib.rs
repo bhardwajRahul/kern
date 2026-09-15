@@ -104,6 +104,7 @@ pub use cgroup::box_workload_signal;
 /// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must
 /// not share a directory name. See [`cgroup::Leaf`].
 pub use cgroup::Leaf as CgroupLeaf;
+pub use cgroup::DEFAULT_COMPOSE_PIDS_MAX;
 pub use cgroup::DEFAULT_MEMORY_MAX;
 pub use real::bring_loopback_up;
 pub use real::id_range_available;
@@ -252,7 +253,7 @@ pub use real::{
     ulimit_named, username, BridgeAttach, CapSpec, OverlayDirs, RealMounts, SandboxSpec,
     TmpfsMount, UidRange, Unplaceable, VdiskMount, Volume, ULIMITS,
 };
-pub use real::{iface_set_ipv4, iface_up, pod_bridge_parts, POD_BRIDGE};
+pub use real::{iface_set_ipv4, iface_up, member_mac, pod_bridge_parts, POD_BRIDGE};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
 pub use seccomp::{denied_syscall_count, SeccompFilter};
