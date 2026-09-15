@@ -12,6 +12,39 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 
 ### Docker Compose
 
+- **Sentry's official `install.sh` completes on kern, and the 57-service stack runs.** Measured end
+  to end: every image built, the SeaweedFS key migration, the node store, Snuba's and Postgres's
+  migrations, `compose up --wait` reporting `57 service(s) ready`, the web UI answering 200
+  (`Sign In | Sentry`) and the API 200, then `down` stopping 57 of 57 with nothing left. One edit to
+  the official tree was needed and is not kern's to make: its minimum-version gate compares
+  `docker version` against Docker's numbering, and kern reports kern's version.
+- **`compose run` was missing most of what a script passes it.** `-d` detached nothing, `--name`,
+  `--entrypoint`, `-e`, `--user` and `--pull` were refused, and the one-off started none of the
+  dependencies written with a CONDITION (`service_healthy`), which is how every real file writes
+  them. It now starts them and waits for the condition, as Docker does.
+- **`compose run`'s stdout is the workload's.** kern's build lines and pod narration went to the same
+  stream, so `state=$(docker compose run --rm -T svc …)` captured three of kern's sentences ahead of
+  the answer, and an installer that tested that string could not decide what to do.
+- `compose build --build-arg`, `pull --ignore-pull-failures`, `down -t/--timeout`, `down --rmi
+  local|all`, `--quiet-pull`, and `--flag=value` everywhere: one flag written two ways is one flag.
+- `config --services` prints the service names, one per line, and nothing else. It printed the whole
+  report, and the canonical use of that verb is a shell loop over its output.
+- **A one-off on a bridge stack is wired like a member**: its own address on the bridge and its peers
+  at theirs. It used to get the pod-style hosts file, so every peer resolved to its own `127.0.0.1`.
+
+- **`compose pull` went to a registry for images the file said never to pull.** A service with
+  `pull_policy: never` is skipped and counted; one that declares `build:` and is not in a registry is
+  named with the command that produces it instead of ending the run. On Sentry's official file, 48 of
+  57 services carry the key and the verb could not succeed at all.
+- **A service with no `pids_limit:` now gets 2048 tasks, not the sandbox's 512.** ClickHouse aborts
+  under 512 - its background pool alone asks for that many - and is healthy in 25 s at 2048.
+  `pids_limit:` in the file still decides, in either direction.
+- `ulimits:` written as a one-line mapping (`nofile: {soft: N, hard: N}`) is applied. It used to
+  reach the box with the braces in the value, and the box refused the whole invocation.
+- A refusal about a box no longer ends with advice about what a compose file looks like.
+- The refusal for missing `external: true` volumes agrees with the count: "they do not exist",
+  "Create them".
+
 - Each service gets its **own** network namespace on a bridge, which is Docker's arrangement. `--pod`
   keeps one shared namespace and one `127.0.0.1`, and is faster; `kern compose <file> config` prints
   which wiring a bring-up will use.
@@ -99,6 +132,11 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 
 ### Sandbox SDKs (`kern-sandbox`, Python and Node)
 
+- **`$XDG_DATA_HOME/kern` was accepted as a mount source.** It holds `volumes/` - the contents of
+  every named volume on the host - and `builds/`. Refused now, and every kern state directory is
+  refused at both its configured and its default path, so pointing `XDG_DATA_HOME` elsewhere no
+  longer leaves the default one open.
+
 - A clean-code and security pass over the above closed four more holes: the session-reset and truncation
   notes were forgeable through the LangChain renderer (every frame is one list in the core now, and both
   surfaces recognise all of it), the LangChain shell policy built a `-v` that skipped the mount validator
@@ -184,6 +222,47 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 
 ### Runtime and CLI
 
+- **A `restart:` service never restarted after its first exit.** The pre-exec gate is released once by
+  the launcher, and every restart afterwards found that descriptor closed and refused to exec: the
+  workload ran once, then logged `never started (exit 125); retrying (N/10)` until the budget ran out
+  while `kern ps` still said `starting`. The gate is dropped after the first attempt now.
+- `kern inspect <image>` answers for an image when no box holds the name, and `--format` answers
+  Docker's `{{.State.Running}}` / `{{.State.Status}}` / `{{.State.Health.Status}}`; a field kern
+  cannot answer truthfully is refused by name.
+- `EXPOSE` in a Dockerfile reaches the image config. It was announced as informational and dropped,
+  so a built image declared no ports and kern's own wiring decision read that as "none".
+- `kern build --platform <os/arch>` is accepted when it is this machine and refused when it is not;
+  an unknown build flag names itself.
+- `volume create --name=<n>` (Docker's legacy spelling) and `volume ls -q [--filter name=S]`.
+- A box's `/sys/devices/system/cpu` carries one directory per CPU it may use, so a tool that counts
+  them instead of parsing `present` no longer reads 1 on a 28-core host.
+
+- **A service that was stopped and started again was unreachable by its peers for 29 seconds.** Its
+  `veth` got a random MAC each time, so the peers' neighbour caches held the old one until the kernel
+  expired it, while `compose start` returned in 171 ms saying the stack was up. A member's address is
+  derived from its IP now (`02:42:<the four bytes>`, Docker's own scheme), so a restart reuses it:
+  176 ms, measured on a laptop, a VPS and three ARM boards.
+- **A `build:` on a Debian or Ubuntu base could not be built at all where kern copies the base
+  rootfs.** Those images ship directories at mode 0700 owned by a subordinate uid, which the user
+  running `cp` cannot traverse. The copy retries as root over that range; it is the map the extractor
+  used to create them. Sentry's 21 builds take 1m42s on this path.
+- **`docker version --format` ignored the template and exited 0**, so a script taking
+  `$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')` got kern's version string and carried
+  on with it. Both `version` and `info` answer their templates now, with Docker's own arch spellings
+  (`amd64` for `version`, `x86_64` for `info`); a field kern cannot answer truthfully is refused by
+  name. `docker compose version` no longer reads `version` as a file name.
+- **An image cached by an older kern is refreshed, not re-fetched**: the config blob is re-read and
+  the rootfs is left alone. Re-extracting it failed on any image whose layers hold subuid-owned
+  files, and left the entry unusable until `--pull always`.
+- `hcstartint` is read back from the image config sidecar. It was written and dropped on read, so a
+  cached image waited its full `interval` for the first health probe while the same image pulled
+  fresh did not.
+- `kern gc` collects image entries no reference can reach (a key written by an older `sanitize_ref`),
+  and the cache repair path can clear a directory owned by subordinate uids.
+- `cannot start '<cmd>'` says whether the file is absent or its loader is; a failed base-rootfs copy
+  no longer asks whether `cp` is installed; `no CMD or ENTRYPOINT` is only claimed for a base that
+  cannot supply one.
+
 - `--memory 64` is 64 BYTES and the message says so instead of sending the reader in a circle.
 - `kern ps`/`top` size the NAME column from the data; `ps --json` reports paused and orphaned boxes;
   the Docker-shaped NDJSON no longer calls a paused container `running`; the orphan warning names the
@@ -198,7 +277,7 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
   `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
   `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1330 Rust, 512 Python and 110 Node tests, and the count is gated against the README.
+- 1339 Rust, 512 Python and 110 Node tests, and the count is gated against the README.
 - `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
   starts from a `docker-compose.yml` rather than from kern's own TOML.
 
