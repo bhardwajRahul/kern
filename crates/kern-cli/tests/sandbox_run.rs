@@ -12710,3 +12710,122 @@ fn a_restart_service_restarts_after_its_first_exit() {
         "the workload must run again after it exits (saw {ticks} run(s)):\n{logs}"
     );
 }
+
+/// THE ALIVE ACK IS WRITTEN BEFORE THE IMAGE IS RESOLVED, not just before the fork.
+///
+/// `KERN_ALIVE_FD` exists so an SDK can tell "the workload was slow" from "kern never reached
+/// `execvp`", and its own docstring promises the ack comes "before any box setup begins". It did not:
+/// the write sat just above the spawn, about 780 lines below the image resolution, so the LONGEST
+/// phase of a cold start was the one phase the channel could not describe. The cost was a lie to a
+/// model: on a Raspberry Pi 5 the first call spent 38 s pulling an arm64 image, the caller's deadline
+/// fired inside the pull, and the verdict read `timeout` - "your code was slow" - for a box whose code
+/// never ran.
+///
+/// This asserts the ORDER, which is the property, rather than a timing: point kern at an image
+/// reference that cannot resolve, so it fails DURING resolution and never reaches the fork. The ack
+/// must already be in the pipe. A test that measured milliseconds instead would pass on a fast disk
+/// and say nothing about the ordering it exists to protect.
+#[test]
+fn the_alive_ack_arrives_before_the_image_is_resolved() {
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (rd, wr) = (fds[0], fds[1]);
+
+    let out = kern()
+        .args([
+            "box",
+            &format!("aliveack-{}", std::process::id()),
+            "--image",
+            "ghcr.io/getkern/an-image-that-cannot-exist:0",
+            "--",
+            "/bin/true",
+        ])
+        .env("KERN_ALIVE_FD", wr.to_string())
+        .output()
+        .expect("run kern");
+    // SAFETY: closing descriptors this process owns, exactly once each.
+    unsafe { libc::close(wr) };
+
+    assert!(!out.status.success(), "the image must not resolve");
+
+    let mut byte = [0u8; 1];
+    // SAFETY: `rd` is owned here and the buffer is a live local of exactly the length passed.
+    let n = unsafe { libc::read(rd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+    unsafe { libc::close(rd) };
+    assert_eq!(
+        (n, byte[0]),
+        (1, b'A'),
+        "kern failed on the image and the alive ack was never written, so an SDK whose deadline fires \
+         during a cold image read cannot tell a box that never started from a workload that was slow"
+    );
+}
+
+/// `kern logs` ON A LIVE FOREGROUND BOX SAYS WHY THERE IS NO LOG, instead of sending the reader back
+/// to `kern ps`.
+///
+/// The two cases used to share one sentence: `no logs for box 'x'` plus the hint "run `kern ps` to
+/// see running boxes" - for a box `kern ps` was ALREADY showing. FOUND THROUGH THE SDK, where this is
+/// the normal case and not an exotic one: every `run_code` box is a foreground box whose output
+/// belongs to the caller reading it, so no log file exists at all. A user watching an agent work
+/// types `kern ps`, sees a box, types `kern logs`, and is told to type `kern ps`.
+///
+/// The control is the other half: a name that is NOT a box keeps the old sentence AND the old hint,
+/// because there the hint is the right advice.
+#[test]
+fn logs_on_a_live_foreground_box_explains_itself_instead_of_looping() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let rootfs = build_rootfs(&busybox, "logsfg");
+    let name = format!("logsfg-{}", std::process::id());
+    let mut child = kern()
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            rootfs.to_str().unwrap(),
+            "--",
+            // `build_rootfs` copies busybox and nothing else: no applet symlinks, so the command has
+            // to go through the multi-call binary. A `/bin/sleep` here exits instantly and the box is
+            // gone before `ps` is asked, which is how the first version of this test skipped itself.
+            "/bin/busybox",
+            "sleep",
+            "20",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a foreground box");
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    let listed = kern().args(["ps"]).output().expect("run kern");
+    let seen = String::from_utf8_lossy(&listed.stdout).contains(&name);
+
+    let out = kern().args(["logs", &name]).output().expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&rootfs);
+
+    if !seen {
+        eprintln!("skip: the foreground box did not register on this host");
+        return;
+    }
+    assert!(
+        err.contains("writes no log") && err.contains("-d"),
+        "a live foreground box should say why it has no log and name the flag that makes one: {err:?}"
+    );
+    assert!(
+        !err.contains("run `kern ps`"),
+        "the hint that sends the reader to `kern ps` is exactly the loop this fixes: {err:?}"
+    );
+
+    // THE CONTROL: a name that is not a box keeps the original sentence and its hint.
+    let miss = kern()
+        .args(["logs", "a-name-no-box-has"])
+        .output()
+        .expect("run kern");
+    let merr = String::from_utf8_lossy(&miss.stderr);
+    assert!(merr.contains("no logs for box"), "{merr:?}");
+}
