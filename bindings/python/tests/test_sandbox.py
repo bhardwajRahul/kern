@@ -19,6 +19,7 @@ import subprocess
 import uuid
 import time
 
+
 import pytest
 
 import kern_sandbox as kern
@@ -919,6 +920,17 @@ def _kern_runnable() -> bool:
 
 
 integration = pytest.mark.skipif(not _kern_runnable(), reason="no runnable kern (set KERN_BIN)")
+# 🔴 REPRODUCE THE CI'S MACHINE BEFORE PUSHING A NEW TEST, because this mark is decoration on a
+# developer box and load bearing in CI: here kern is always runnable, so a test that forgot the mark
+# passes locally and fails there. One command asks the question this file cannot answer by reading
+# itself:
+#
+#     env -u KERN_BIN PATH=/usr/bin:/bin python3 -m pytest -q     # must be "0 failed"
+#
+# It has already been earned once: a new test inserted BETWEEN this mark and the `def` below it took
+# the decorator with it, and a test marked for months went bare. An AST check was tried instead and
+# dropped - six tests build a Sandbox with a DELIBERATELY WRONG binary and need no kern at all, so
+# "calls Sandbox" cannot mean "needs a box" to anything that only reads the source.
 
 
 @integration
@@ -1849,6 +1861,7 @@ def test_a_nul_byte_in_a_path_is_refused_by_name():
             assert "a\x00b" in repr(str(e.value)) or "a\\x00b" in str(e.value), str(e.value)
 
 
+@integration
 def test_an_absolute_path_is_refused_and_not_reinterpreted():
     """A host path handed to a workspace call is refused, and never resolved INSIDE the workspace.
 
