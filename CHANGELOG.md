@@ -107,6 +107,17 @@ refused by name rather than answered wrongly. `EXPOSE` reaches the image config.
 BYTES and the message says so. A FIFO as a volume source is refused instead of hanging the box
 forever.
 
+**`kern logs -t` prints when each line was written.** Docker has had `--timestamps` since
+forever and a reader comparing a box's output against anything else needed it. The time comes from a
+`<log>.idx` sidecar the log pump writes beside each log, so the log file itself stays byte-for-byte
+what the box printed and the pump keeps its zero-copy `splice` path: nothing is parsed or reframed on
+the way through. A mark is recorded at most every 100 ms, so a stamp is the start of the
+bucket a line falls in and never later than the line itself. The index is bounded at a sixteenth of
+the log's own cap: past that its marks are thinned by half and the interval doubles, so a box that
+runs for days loses resolution instead of growing a file without limit. A log written by an older
+kern has no index and prints `-` in the time column rather than a time nobody recorded, and so does a
+rotated generation, because rotation makes every offset in the index mean a different byte.
+
 **The compatibility rate ships with its corpus and its definition.** The v0.9.32 claim of "14% to
 94%" was the CEILING under a permissive definition; the strict one measures 35% on the same 259
 files. Both numbers are in [DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) with the census scripts that
