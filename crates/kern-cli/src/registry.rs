@@ -1371,10 +1371,16 @@ pub fn rename(old: &str, new: &str, pid: i32) -> io::Result<()> {
         return Err(e);
     }
     if let Ok(l) = logs_dir() {
-        let _ = fs::rename(
-            l.join(format!("{old}-{pid}.log")),
-            l.join(format!("{new}-{pid}.log")),
-        );
+        // THE LOG IS NO LONGER ONE FILE. It has a rotated generation (`.log.1`) and a time index
+        // (`.log.idx`), and a rename that moved only the head would leave `kern logs` reading the new
+        // name's log with the old name's index sitting beside it - orphaned for the sweep, and gone
+        // as far as `logs -t` is concerned. Every suffix moves together or the set stops agreeing.
+        for suffix in ["", ".idx", ".1", ".1.idx"] {
+            let _ = fs::rename(
+                l.join(format!("{old}-{pid}.log{suffix}")),
+                l.join(format!("{new}-{pid}.log{suffix}")),
+            );
+        }
     }
     if let Ok(h) = health_dir() {
         let _ = fs::rename(
@@ -2301,8 +2307,15 @@ pub fn prune() -> (usize, u64) {
     let mut freed = 0u64;
     let instances = dir().ok(); // for the concurrent-start re-check in the sweep
     let inst = instances.as_deref();
-    sweep_orphans(logs_dir(), ".log", &live, inst, &mut removed, &mut freed);
-    sweep_orphans(health_dir(), "", &live, inst, &mut removed, &mut freed);
+    sweep_orphans(logs_dir(), log_key, &live, inst, &mut removed, &mut freed);
+    sweep_orphans(
+        health_dir(),
+        health_key,
+        &live,
+        inst,
+        &mut removed,
+        &mut freed,
+    );
     // `kern wait` exit sidecars of boxes whose supervisor is gone (dead-pid). Reaped here too, not
     // only in `gc`, so `prune` - the routine cleanup - bounds this dir (it would otherwise leak one
     // tiny file per never-waited detached box). A wait consumes its own sidecar within ~100 ms of the
@@ -2335,12 +2348,36 @@ pub fn prune() -> (usize, u64) {
     (removed, freed)
 }
 
-/// Remove files in `target` whose name (minus `suffix`) is not a live-box key. `instances` is the
-/// instances dir, used to spare a sidecar whose box registered after the live-set snapshot.
-/// Best-effort.
+/// The box key a file in the logs dir belongs to: `<key>.log`, its rotated generation `<key>.log.1`
+/// and either one's time index `<key>.log.idx`.
+///
+/// A KEY, NOT A SUFFIX, because the log stopped being a single file and the sweep that only knew
+/// `<key>.log` silently kept everything else forever: a box that ran for an hour left its index
+/// behind at 16 bytes per 100 ms, and a rotated generation left a whole capped log. `None` means
+/// "not this directory's business" and the file is left alone rather than force-removed.
+fn log_key(fname: &str) -> Option<&str> {
+    let base = fname.strip_suffix(".idx").unwrap_or(fname);
+    // `.log.<n>` is a rotated generation; `<n>` is always digits, so no box name is mistaken for one.
+    let base = match base.rsplit_once('.') {
+        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => base,
+    };
+    base.strip_suffix(".log")
+}
+
+/// The box key a file in the health dir belongs to: the whole name.
+///
+/// A stray `.log` there is not a health key and is skipped rather than force-removed - the dirs are
+/// separate, and a file in the wrong one is a symptom to leave visible, not to delete.
+fn health_key(fname: &str) -> Option<&str> {
+    (!fname.ends_with(".log")).then_some(fname)
+}
+
+/// Remove files in `target` whose box key (per `key_of`) is not live. `instances` is the instances
+/// dir, used to spare a sidecar whose box registered after the live-set snapshot. Best-effort.
 fn sweep_orphans(
     target: io::Result<PathBuf>,
-    suffix: &str,
+    key_of: fn(&str) -> Option<&str>,
     live: &std::collections::HashSet<String>,
     instances: Option<&Path>,
     removed: &mut usize,
@@ -2353,14 +2390,9 @@ fn sweep_orphans(
         let Some(fname) = fname.to_str() else {
             continue;
         };
-        // A log is `<key>.log`; a health sidecar is `<key>` (empty suffix). A file not matching the
-        // expected suffix (e.g. a `.log` in the health dir) is skipped, not force-removed.
-        let Some(key) = fname.strip_suffix(suffix) else {
+        let Some(key) = key_of(fname) else {
             continue;
         };
-        if suffix.is_empty() && fname.ends_with(".log") {
-            continue; // defensive: never treat a stray `.log` as a health key
-        }
         if live.contains(key) {
             continue;
         }
@@ -4098,6 +4130,40 @@ mod tests {
         // a SIBLING sharing a name prefix, and unrelated paths → no path overlap (identity check next).
         assert_eq!(refuse("/run/user/1000/kern-other"), None);
         assert_eq!(refuse("/tmp/project"), None);
+    }
+}
+
+#[cfg(test)]
+mod sweep_key_tests {
+    use super::{health_key, log_key};
+
+    /// Every file the log pump can leave behind maps back to the box key that owns it.
+    ///
+    /// THE LIST IS THE POINT. The sweep deletes a file only when it can name the box it belongs to,
+    /// so a shape missing here is not an error, it is a file that lives forever: before the time
+    /// index existed the sweep knew `<key>.log` and nothing else, and both the rotated generation
+    /// and the index accumulated in `$XDG_RUNTIME_DIR` with nothing reporting it. Each row below is a
+    /// file the pump or a rotation actually writes.
+    #[test]
+    fn every_shape_the_log_pump_writes_maps_back_to_its_box() {
+        for f in [
+            "web-1234.log",
+            "web-1234.log.1",
+            "web-1234.log.idx",
+            "web-1234.log.1.idx",
+        ] {
+            assert_eq!(log_key(f), Some("web-1234"), "{f}");
+        }
+        // A name with dots in it is still one key: only a run of DIGITS after `.log` is a generation.
+        assert_eq!(log_key("a.b.c-7.log.idx"), Some("a.b.c-7"));
+        // Not this directory's business: left alone rather than force-removed.
+        assert_eq!(log_key("web-1234"), None);
+        assert_eq!(log_key("notes.txt"), None);
+        assert_eq!(log_key("web-1234.logged"), None);
+
+        // The health dir is keyed by the whole name, and a stray log there is not a health key.
+        assert_eq!(health_key("web-1234"), Some("web-1234"));
+        assert_eq!(health_key("web-1234.log"), None);
     }
 }
 

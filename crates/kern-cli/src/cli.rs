@@ -442,6 +442,9 @@ pub enum Command {
         name: String,
         tail: Option<usize>,
         follow: bool,
+        /// Prefix each line with the recorded time of the mark it falls after. See
+        /// `boxlog::MARK_EVERY` for why that is a bucket and not a per-line instant.
+        timestamps: bool,
     },
     /// `kern inspect <name> [--json]`: full detail for one running box (identity + resources).
     Inspect {
@@ -1187,10 +1190,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `logs <name> [--tail N] [-f|--follow]`: a box's captured output.
         Some("logs") => {
             let (mut lname, mut tail, mut follow) = (None, None, false);
+            let mut timestamps = false;
             let mut i = 1;
             while i < rest.len() {
                 match rest[i] {
                     "-f" | "--follow" => follow = true,
+                    "-t" | "--timestamps" => timestamps = true,
                     "--tail" => {
                         let v = rest
                             .get(i + 1)
@@ -1206,13 +1211,26 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                             lname = Some(s.to_string());
                         }
                     }
-                    _ => return Err(Error::Usage("logs <name> [--tail N] [-f|--follow]")),
+                    _ => {
+                        return Err(Error::Usage(
+                            "logs <name> [--tail N] [-f|--follow] [-t|--timestamps]",
+                        ))
+                    }
                 }
                 i += 1;
             }
             match lname {
-                Some(name) => Command::Logs { name, tail, follow },
-                None => return Err(Error::Usage("logs <name> [--tail N] [-f|--follow]")),
+                Some(name) => Command::Logs {
+                    name,
+                    tail,
+                    follow,
+                    timestamps,
+                },
+                None => {
+                    return Err(Error::Usage(
+                        "logs <name> [--tail N] [-f|--follow] [-t|--timestamps]",
+                    ))
+                }
             }
         }
         // `inspect <name> [--json] [--format <tmpl>]`: full detail for one box or image.
@@ -4222,7 +4240,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             format.as_deref(),
         ),
         Command::Stats { json, names } => commands::stats(json, &names),
-        Command::Logs { name, tail, follow } => commands::logs(&name, tail, follow),
+        Command::Logs {
+            name,
+            tail,
+            follow,
+            timestamps,
+        } => commands::logs(&name, tail, follow, timestamps),
         Command::Inspect { name, json, format } => {
             commands::inspect_formatted(&name, json, format.as_deref())
         }

@@ -1,3 +1,9 @@
+// AN INTEGRATION TEST BINARY, which is its own crate and does not share a process with the unit
+// tests: it SPAWNS kern rather than calling into it, so the environment it reads is its own and
+// the chokepoints in `main.rs` are not reachable from here. Exempted explicitly for that reason,
+// not because the rule is optional.
+#![allow(clippy::disallowed_methods)]
+
 //! Real-syscall sandbox correctness (level 4). Runs an actual command inside a `kern box`
 //! sandbox and asserts isolation + exit-code propagation. **Skip-graceful**: if unprivileged
 //! user namespaces or a static busybox are unavailable (e.g. a locked-down CI runner), the
@@ -3754,6 +3760,168 @@ fn box_logs_capture_output_and_stats_list_the_box() {
         "logs should survive the box exiting"
     );
 
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
+/// `kern logs -t` stamps every line from the sidecar index, and `--tail` stamps the SAME line the
+/// same way.
+///
+/// THE TAIL IS THE CONTROL, not an extra case. A stamp is looked up by a line's ABSOLUTE offset in
+/// the file, and `--tail N` hands the printer a window from the middle of it; the printer recovers
+/// the window's base by subtracting its length from the file's. Get that subtraction wrong and the
+/// full listing still looks perfectly plausible - every line stamped, times ascending, nothing to
+/// see - while the tail silently reports a different instant for the same bytes. Asserting the two
+/// AGREE is what makes the base measurable instead of merely believable.
+///
+/// It also pins the two things a wrong epoch conversion breaks without looking broken: the stamps
+/// must sit near this process's own clock (a formatter off by a leap-year rule prints a confident
+/// wrong date), and consecutive lines must differ, which they only do if the index is actually
+/// growing while the box runs rather than being read once at open.
+#[test]
+fn logs_timestamps_stamp_every_line_and_the_tail_agrees() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "logts");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-xdg-logts-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+
+    // Four lines 150 ms apart: more than one 100 ms mark interval, so the marks must advance.
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "logts",
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "for i in 1 2 3 4; do echo riga-$i; /bin/busybox sleep 0.15; done",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "detached start should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1400));
+
+    let read = |args: &[&str]| -> String {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let full = read(&["logs", "logts", "-t"]);
+    let lines: Vec<&str> = full.lines().filter(|l| l.contains("riga-")).collect();
+    // The box may still be mid-loop on a slow host; three of the four is enough to compare.
+    assert!(
+        lines.len() >= 3,
+        "expected the box's lines, got {full:?} (box output missing?)"
+    );
+
+    // Every line carries a real stamp, not the `-` that means "before the first mark".
+    let stamp = |l: &str| l.split_whitespace().next().unwrap_or("").to_string();
+    for l in &lines {
+        let s = stamp(l);
+        assert!(
+            s.starts_with("20") && s.ends_with('Z') && s.len() == 24,
+            "every line should be stamped, got {s:?} in {l:?}\nfull:\n{full}"
+        );
+    }
+
+    // The stamps are this machine's clock, not an arbitrary epoch: same day, within a minute.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let parse = |s: &str| -> u64 {
+        // `2026-09-16T17:20:28.538Z` -> seconds, via the two fields that must line up.
+        let (date, rest) = s.split_once('T').expect("date and time");
+        let hms: Vec<u64> = rest
+            .trim_end_matches('Z')
+            .split(':')
+            .map(|p| p.split('.').next().unwrap().parse().unwrap_or(0))
+            .collect();
+        let d: Vec<i64> = date.split('-').map(|p| p.parse().unwrap_or(0)).collect();
+        // Days from civil, the inverse of what the formatter does.
+        let (y, m, day) = (d[0], d[1], d[2]);
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = if m > 2 { m - 3 } else { m + 9 };
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        (days * 86_400) as u64 + hms[0] * 3600 + hms[1] * 60 + hms[2]
+    };
+    let last = parse(&stamp(lines[lines.len() - 1]));
+    assert!(
+        now.abs_diff(last) < 60,
+        "the stamp should be this clock: {last} vs {now} ({:?})",
+        stamp(lines[lines.len() - 1])
+    );
+
+    // Consecutive lines are 150 ms apart, so at 100 ms buckets they cannot all share one mark.
+    let first = parse(&stamp(lines[0]));
+    assert!(
+        stamp(lines[0]) != stamp(lines[lines.len() - 1]) && first <= last,
+        "the index must advance while the box writes: {full}"
+    );
+
+    // THE CONTROL: the same line, reached through a tail window, gets the same stamp.
+    let tail = read(&["logs", "logts", "-t", "--tail", "2"]);
+    let tail_lines: Vec<&str> = tail.lines().filter(|l| l.contains("riga-")).collect();
+    let want = lines[lines.len() - 1];
+    assert!(
+        tail_lines.last() == Some(&want),
+        "--tail must stamp the same bytes the same way:\n tail {:?}\n full {want:?}",
+        tail_lines.last()
+    );
+
+    // A log with no index (an older kern's, or a rotated generation) prints, and says `-`.
+    let logdir = xdg.join("kern/logs");
+    let idx: Vec<_> = fs::read_dir(&logdir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".log.idx"))
+        .collect();
+    assert_eq!(idx.len(), 1, "the pump should write exactly one index");
+    let _ = fs::remove_file(&idx[0]);
+    let bare = read(&["logs", "logts", "-t"]);
+    assert!(
+        bare.contains("riga-1")
+            && bare
+                .lines()
+                .all(|l| !l.contains("riga-") || l.starts_with('-')),
+        "without an index every line is honestly unattributed: {bare:?}"
+    );
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "logts"])
+        .output();
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
 }
@@ -7885,6 +8053,18 @@ fn compose_full_schema_brings_box_up() {
         "the composed box should appear in ps (all mirror flags accepted)"
     );
 
+    // TEAR THE STACK DOWN, DO NOT JUST DELETE ITS DIRECTORY. Removing the isolated
+    // `XDG_RUNTIME_DIR` leaves the pod HOLDER running: it is reparented to the user session and
+    // keeps its network namespace alive for as long as the machine is up. Counted after a day of
+    // running these suites: 21 `__pod-holder` processes against 2 live pods, six of them from this
+    // test's own binary, while `kern ps` showed nothing because none of them is in the real
+    // registry. Nothing a user hits (the dirs are this test's own), but a test that leaks a process
+    // per run is a test that makes every later residue census read wrong.
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", toml.to_str().unwrap(), "down"])
+        .output();
+
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::remove_file(&toml);
@@ -10569,9 +10749,27 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
         return;
     }
     let err = String::from_utf8_lossy(&out.stderr);
+    // 137 IS NOT PROOF OF WHOSE KILL IT WAS, and on a small host it may not be kern's. An external
+    // reviewer saw this fail 1 run in 10 on a 7 GB WSL2 machine running the whole suite in parallel,
+    // and it does not reproduce on 31 GB (0 in 6 full runs, 0 in 15 of this test alone). The
+    // hypothesis that fits both observations is the HOST's OOM killer taking the box while the suite
+    // is at its peak, which produces the same 137 with nothing for kern to say. Unproven either way,
+    // so the message carries what a remote report needs instead of asserting a cause: the host's
+    // global OOM counter, which moves only when the kernel kills something.
+    let host_ooms = std::fs::read_to_string("/proc/vmstat")
+        .ok()
+        .and_then(|v| {
+            v.lines()
+                .find(|l| l.starts_with("oom_kill "))
+                .map(|l| l.to_string())
+        })
+        .unwrap_or_else(|| "oom_kill unavailable".to_string());
     assert!(
         err.contains("OOM killer"),
-        "a 137 from kern's own cap must be explained, not left as a bare signal: {err:?}"
+        "a 137 from kern's own cap must be explained, not left as a bare signal.\n  \
+         kern said: {err:?}\n  host counter: {host_ooms}\n  \
+         If the host counter moved during this run, the kill may be the HOST's and not kern's cap, \
+         which is a defect in this test rather than in kern; report both lines either way."
     );
 }
 

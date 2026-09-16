@@ -7237,7 +7237,9 @@ fn run_terminal_verb(
                 }
                 // A service that never started (or already exited) has no log: report it and keep
                 // going, so one missing service can't hide the others' output.
-                if let Err(e) = logs(name, tail, follow) {
+                // `false`: `compose logs` has no `-t` yet, and passing one here silently would be a flag
+                // the compose parser refuses. One surface at a time.
+                if let Err(e) = logs(name, tail, follow, false) {
                     eprintln!("compose logs: {name}: {e}");
                 }
             }

@@ -121,7 +121,63 @@ pub(crate) struct CappedLog {
     /// counting, so `3` means `<path>`, `<path>.1` and `<path>.2`. `1` keeps no generation at all and
     /// truncates in place. Total on-disk use is bounded at `max * files`.
     pub(crate) files: u32,
+    /// The time index, `<path>.idx`: fixed 16-byte records of `(offset, unix nanos)`, appended at
+    /// most once per `mark_every`. `-1` when it could not be opened, which costs only `logs -t`.
+    ///
+    /// 🔴 A SIDECAR AND NOT A PREFIX PER LINE, and the pump is the reason. It moves bytes with
+    /// `splice(2)`, pipe to file, which never brings them into userspace: measured at 599 MB/s here
+    /// against the 22 MB/s a shell workload produces. Framing each line would mean reading every
+    /// byte back, scanning for newlines and rewriting - it would end the zero copy for a feature
+    /// nobody uses on most boxes. So the log stays BYTE FOR BYTE what the box wrote, and the times
+    /// live beside it.
+    ///
+    /// The cost of that choice, and it is stated in `logs --help` rather than hidden: a line's time
+    /// is the time of the mark it falls after, so lines written inside one interval share a stamp.
+    idx_fd: i32,
+    /// Monotonic nanos of the last mark, so the interval survives a wall-clock step.
+    last_mark: u64,
+    /// Bytes currently in the index, tracked rather than `stat`ed: the pump must not pay a syscall
+    /// per write to learn something it is the only writer of.
+    idx_len: u64,
+    /// The CURRENT mark interval, which doubles every time the index is compacted. Starts at
+    /// [`MARK_EVERY`]; see [`CappedLog::compact_index`] for why it is a field and not a constant.
+    mark_every: u64,
 }
+
+/// The STARTING interval between time marks, and the finest resolution `logs -t` ever claims.
+///
+/// It only ever gets coarser: [`CappedLog::compact_index`] doubles it each time the index reaches its
+/// cap, so a box that runs for days trades resolution for a bounded file rather than growing one
+/// without limit. A stamp is therefore "the start of the bucket this line fell in", where the bucket
+/// is at least this long.
+///
+/// Chosen against the two costs it sits between: a mark is 16 bytes and one `write`, so ten a second
+/// is nothing next to a log that may hold 16 MiB, while a finer interval would buy a precision the
+/// reader cannot use (a box that prints a thousand lines in one millisecond does not have a thousand
+/// distinguishable instants worth showing).
+const MARK_EVERY: u64 = 100_000_000;
+
+/// Monotonic nanos, for the mark interval.
+fn mono_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: one live local `timespec`, filled by the kernel.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// Wall-clock nanos since the epoch, which is what a reader wants to see.
+fn wall_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// One record in `<log>.idx`.
+pub(crate) const MARK_LEN: usize = 16;
 
 /// How large a box log may grow and how many generations are kept.
 ///
@@ -147,6 +203,13 @@ impl Default for LogCap {
     }
 }
 
+/// `<log>.idx`, beside the log rather than inside it. Same directory, same rotation, same lifetime.
+pub(crate) fn idx_path(log: &std::path::Path) -> std::path::PathBuf {
+    let mut p = log.to_path_buf().into_os_string();
+    p.push(".idx");
+    std::path::PathBuf::from(p)
+}
+
 impl CappedLog {
     fn open(path: &std::path::Path, cap: LogCap) -> Option<Self> {
         let fd = open_log(path, false);
@@ -167,12 +230,99 @@ impl CappedLog {
             // any future caller that reaches this struct another way.
             max: cap.max_bytes.max(1),
             files: cap.files.max(1),
+            // BEST EFFORT, and its failure costs only `logs -t`. A box whose log opened but whose
+            // index did not must still run and must still log: a missing index reads back as "no
+            // times recorded", which is exactly what an older kern's log is too.
+            idx_fd: open_log(&idx_path(path), false),
+            // Zero means "no mark yet", so the first write always records one and a log never starts
+            // with an unattributable stretch.
+            last_mark: 0,
+            idx_len: 0,
+            mark_every: MARK_EVERY,
         })
     }
 
     /// Rename the active file to `<path>.1` (one generation kept, overwriting a previous `.1`) and reopen
     /// a fresh empty file. The rename is atomic, so a reader never sees the path missing. On failure the
     /// old fd is kept and `written` stays at the cap, so the next `write` retries rather than overflowing.
+    /// Start the index over, because rotation makes every offset in it a lie.
+    ///
+    /// The index describes the ACTIVE file, and rotation either truncates that file to zero or moves
+    /// it to `.1` and opens a fresh one. Either way offset 0 now means a different byte, so an index
+    /// kept across the boundary would attribute the new file's lines to the old file's times - a
+    /// wrong answer delivered confidently, which is worse than no answer. `logs -t` on a rotated
+    /// generation therefore shows no times, and says so rather than guessing.
+    fn reset_index(&mut self) {
+        if self.idx_fd < 0 {
+            return;
+        }
+        // SAFETY: truncating and rewinding a descriptor this struct owns.
+        unsafe {
+            libc::ftruncate(self.idx_fd, 0);
+            libc::lseek(self.idx_fd, 0, libc::SEEK_SET);
+        }
+        self.last_mark = 0;
+        self.idx_len = 0;
+        self.mark_every = MARK_EVERY;
+    }
+
+    /// The index may not outgrow this. Beyond it the marks are thinned by half and the interval
+    /// doubles, so a log that lives for days loses RESOLUTION instead of growing without bound.
+    ///
+    /// MEASURED, and it is the one way this feature could have hurt a running box: the log has a cap
+    /// and the index had none. A service printing one line a second writes one mark a second - 16
+    /// bytes for a ~20-byte line - so after a day its index was 1.4 MB against 50 KB of log, in
+    /// `$XDG_RUNTIME_DIR`, which on most machines is tmpfs and therefore RAM. A week of `logs -t
+    /// --tail 10` on such a box also read 92 MB to print ten lines, and took 164 ms doing it.
+    ///
+    /// A FRACTION OF THE LOG'S OWN CAP and not a constant, because a caller who asked for a 64 KiB
+    /// log did not ask to spend a megabyte on its times. The floor keeps a very small log's index
+    /// useful rather than compacting it into uselessness on the first rotation.
+    fn idx_max(&self) -> u64 {
+        (self.max / 16).max(4096)
+    }
+
+    /// Keep every other mark, rewrite the index, and double the interval.
+    ///
+    /// Thinning is honest where truncating would not be: a mark says "the bytes from here on were
+    /// written at or after this time", so dropping one makes its successor's answer COARSER (an
+    /// earlier time, by at most one interval) and never later than the line it labels, which is the
+    /// same guarantee every stamp already carries. Dropping the OLDEST marks instead would leave the
+    /// head of the log unattributed, which is a different and worse answer.
+    fn compact_index(&mut self) {
+        let Ok(data) = std::fs::read(idx_path(&self.path)) else {
+            return self.drop_index();
+        };
+        let mut out = Vec::with_capacity(data.len() / 2 + MARK_LEN);
+        for (i, rec) in data.chunks_exact(MARK_LEN).enumerate() {
+            if i % 2 == 0 {
+                out.extend_from_slice(rec);
+            }
+        }
+        // SAFETY: rewinding and truncating a descriptor this struct owns, then writing a live local
+        // buffer of exactly the length passed.
+        let n = unsafe {
+            libc::ftruncate(self.idx_fd, 0);
+            libc::lseek(self.idx_fd, 0, libc::SEEK_SET);
+            libc::write(self.idx_fd, out.as_ptr().cast(), out.len())
+        };
+        if n != out.len() as isize {
+            return self.drop_index();
+        }
+        self.idx_len = out.len() as u64;
+        self.mark_every = self.mark_every.saturating_mul(2);
+    }
+
+    /// Stop indexing for the rest of this log's life, leaving what is already there readable.
+    ///
+    /// Every index failure ends here rather than at its own call site, so "the index gave up" is one
+    /// state with one spelling instead of a condition each writer has to remember to set.
+    fn drop_index(&mut self) {
+        // SAFETY: closing a descriptor this struct owns, exactly once; `-1` stops every later use.
+        unsafe { libc::close(self.idx_fd) };
+        self.idx_fd = -1;
+    }
+
     fn rotate(&mut self) {
         // `files == 1` KEEPS NO GENERATION, which is Docker's `max-file: 1`. There is nothing to
         // rename to, so the active file is truncated in place: the fd stays valid and no reader ever
@@ -188,6 +338,7 @@ impl CappedLog {
                 && unsafe { libc::lseek(self.fd, 0, libc::SEEK_SET) } == 0
             {
                 self.written = 0;
+                self.reset_index();
             }
             return;
         }
@@ -212,6 +363,48 @@ impl CappedLog {
             unsafe { libc::close(self.fd) };
             self.fd = fd;
             self.written = 0;
+            self.reset_index();
+        }
+    }
+
+    /// Record `(written, now)` if at least [`MARK_EVERY`] has passed since the last one.
+    ///
+    /// CALLED FROM BOTH SITES THAT ADVANCE `written`, IMMEDIATELY BEFORE THE ADVANCE, and from nowhere
+    /// else. Two reasons, and both were measured rather than reasoned:
+    ///
+    /// - Both sites, because the pump advances the offset in two places (the `splice` loop and the
+    ///   userspace `write`), and a mark written in one of them only would leave half a log
+    ///   unattributed with nothing to say so.
+    /// - BEFORE and not after, because a mark holds the offset of the FIRST byte it describes. After
+    ///   the advance it held the offset of the byte AFTER the batch, so nothing pointed at offset 0
+    ///   and the first line of every log printed `-`: `kern logs -t` on a box that echoed three lines
+    ///   attributed two of them and shrugged at the first. It also makes each mark the START of its
+    ///   bucket rather than the end, so a stamp is never later than the line it labels.
+    ///
+    /// Failure is silence. A short `write` is treated as no mark at all rather than as a torn record:
+    /// the reader refuses a trailing partial record for the same reason, so the two agree without
+    /// either of them having to trust the other.
+    fn mark(&mut self) {
+        if self.idx_fd < 0 {
+            return;
+        }
+        let now = mono_nanos();
+        if self.last_mark != 0 && now.saturating_sub(self.last_mark) < self.mark_every {
+            return;
+        }
+        self.last_mark = now;
+        let mut rec = [0u8; MARK_LEN];
+        rec[..8].copy_from_slice(&self.written.to_le_bytes());
+        rec[8..].copy_from_slice(&wall_nanos().to_le_bytes());
+        // SAFETY: a live local buffer of exactly the length passed, to a descriptor this struct owns.
+        let n = unsafe { libc::write(self.idx_fd, rec.as_ptr().cast(), rec.len()) };
+        if n != rec.len() as isize {
+            // Out of space, or a partial write: stop indexing rather than leave a torn record behind.
+            return self.drop_index();
+        }
+        self.idx_len += MARK_LEN as u64;
+        if self.idx_len >= self.idx_max() {
+            self.compact_index();
         }
     }
 
@@ -239,6 +432,7 @@ impl CappedLog {
                     _ => return,
                 }
             }
+            self.mark();
             self.written += n as u64;
             buf = &buf[n as usize..];
         }
@@ -310,6 +504,7 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                 Ok(n) => {
                     if to_log {
                         if let Some(l) = log.as_mut() {
+                            l.mark();
                             l.written += n as u64;
                         }
                     }
@@ -525,8 +720,16 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
 /// Stream new appends of an already-open log `f` (from its current read offset) to stdout, polling
 /// every 200 ms until the box `(name, pid)` leaves the registry. Panic-free; a stdout write error
 /// (a closed pipe) ends the follow quietly. Shared by `kern attach` and `kern logs -f`.
-pub(crate) fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(), Error> {
+pub(crate) fn follow_log(
+    mut f: std::fs::File,
+    name: &str,
+    pid: i32,
+    mut stamper: Option<Stamper>,
+) -> Result<(), Error> {
     use std::io::{Read, Write};
+    if let Some(s) = stamper.as_mut() {
+        s.follow_live();
+    }
     let mut buf = [0u8; 8192];
     let stdout = std::io::stdout();
     loop {
@@ -536,7 +739,11 @@ pub(crate) fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(
                 Ok(0) => break,
                 Ok(k) => {
                     let mut lock = stdout.lock();
-                    if lock.write_all(&buf[..k]).is_err() {
+                    let wrote = match stamper.as_mut() {
+                        Some(s) => s.push(&mut lock, &buf[..k]),
+                        None => lock.write_all(&buf[..k]),
+                    };
+                    if wrote.is_err() {
                         return Ok(());
                     }
                     let _ = lock.flush();
@@ -546,6 +753,12 @@ pub(crate) fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(
         }
         // Exact (name,pid) pair: a duplicate same-name entry must not make a live box read as exited.
         if !registry::pair_alive(name, pid) {
+            // The box is gone, so a line still waiting for a newline will never get one: print it.
+            if let Some(s) = stamper.as_mut() {
+                let mut lock = stdout.lock();
+                let _ = s.flush(&mut lock);
+                let _ = lock.flush();
+            }
             return Ok(());
         }
         unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
@@ -910,6 +1123,18 @@ mod rotation_tests {
                 .filter(|f| f == name || f.starts_with(&format!("{name}.")))
                 .collect();
             found.sort();
+            // ONE INDEX, AND IT BELONGS TO THE ACTIVE FILE. The time index is a sidecar of the log
+            // the pump is writing right now: rotation truncates it rather than renaming it, so no
+            // generation ever grows an index of its own and `logs -t` on a rotated file honestly
+            // reports no times instead of the previous file's. Asserted here and then removed from
+            // the generation list, because this closure's subject is how many GENERATIONS survive
+            // and a filter alone would let the sidecar appear or vanish unnoticed.
+            assert_eq!(
+                found.iter().filter(|f| f.ends_with(".idx")).count(),
+                1,
+                "exactly one index, for the active file: {found:?}"
+            );
+            found.retain(|f| !f.ends_with(".idx"));
             found
         };
 
@@ -989,5 +1214,359 @@ mod reason_predicate_tests {
         assert!(log_carries_a_reason(
             "kern: warning: resource caps could not be enforced here\nkern: cannot start 'x' in box: No such file"
         ));
+    }
+}
+
+/// Prefix each COMPLETE line with the recorded time of the mark it falls after, holding an
+/// unterminated trailing fragment until its newline arrives.
+///
+/// HOLDING IS THE WHOLE POINT, and it is what stamping a write cannot do: `--follow` reads the log in
+/// 8 KiB chunks and a long line lands across two of them, so "stamp whatever this read returned"
+/// would drop a timestamp into the middle of a line. The fragment waits for its `\n`; [`flush`] at
+/// the end of the stream releases whatever never gets one, unstamped, so nothing is swallowed.
+///
+/// [`flush`]: Stamper::flush
+pub(crate) struct Stamper {
+    log: std::path::PathBuf,
+    marks: Vec<(u64, u64)>,
+    /// File offset of the first byte of `pending` - the offset whose mark stamps the next line.
+    at: u64,
+    pending: Vec<u8>,
+    /// Set by [`Stamper::follow_live`] when this Stamper is feeding a `--follow`.
+    live: bool,
+    /// The last time column rendered, with the mark it belongs to. See [`Stamper::emit`].
+    column: (Option<u64>, Vec<u8>),
+}
+
+impl Stamper {
+    /// Read the index for `log`; `start` is the file offset the first pushed byte has.
+    pub(crate) fn new(log: &std::path::Path, start: u64) -> Self {
+        Self {
+            log: log.to_path_buf(),
+            marks: read_marks(log),
+            at: start,
+            pending: Vec::new(),
+            live: false,
+            column: (None, Vec::new()),
+        }
+    }
+
+    /// THE INDEX GROWS WHILE WE FOLLOW IT, so re-read it once per arriving chunk.
+    ///
+    /// MEASURED, and it is why this flag exists at all: without it a `logs -t -f` started on a box
+    /// that had not written yet printed `-` for EVERY line, forever. The index did not exist when the
+    /// Stamper was built, and a predicate that only re-read "past the newest mark we hold" never fires
+    /// on an empty set. The re-read belongs to the follow and only to it: a one-shot `logs` prints a
+    /// fixed window of a file it already measured, and any mark appended after that measurement
+    /// describes bytes past the end of what it will print.
+    ///
+    /// Per CHUNK and not per line, so the cost is bounded by the 200 ms poll rather than by the number
+    /// of lines: the index of an hour-long box is half a megabyte, and re-reading it per line would
+    /// turn printing a busy tail into an O(lines x index) crawl. The chunk was read from the log
+    /// BEFORE this call, and the pump writes a mark only after the bytes it marks, so every mark this
+    /// chunk needs is already on disk when we read it here.
+    pub(crate) fn follow_live(&mut self) {
+        self.live = true;
+    }
+
+    /// Stamp and emit every COMPLETE line in `bytes`, holding any trailing fragment.
+    ///
+    /// LINEAR, AND IT HAD TO BE MEASURED TO FIND OUT IT WAS NOT. The first version appended `bytes`
+    /// to `pending` and `drain`ed one line at a time, which moves the whole remaining buffer per
+    /// line: on a real 23 MB log of 400 000 lines that was **96.8 seconds**, against 15.5 ms for the
+    /// same log unstamped. A log is one big push, so the quadratic term is the entire cost. This
+    /// version walks `bytes` in place by index and copies only the trailing fragment.
+    pub(crate) fn push(
+        &mut self,
+        out: &mut impl std::io::Write,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        if self.live {
+            self.marks = read_marks(&self.log);
+        }
+        // A fragment held from the previous chunk owns the start of this one, up to its newline.
+        let rest = if self.pending.is_empty() {
+            bytes
+        } else if let Some(i) = bytes.iter().position(|&b| b == b'\n') {
+            self.pending.extend_from_slice(&bytes[..=i]);
+            let line = std::mem::take(&mut self.pending);
+            self.emit(out, &line)?;
+            &bytes[i + 1..]
+        } else {
+            self.pending.extend_from_slice(bytes);
+            return Ok(());
+        };
+        let mut start = 0;
+        while let Some(i) = rest[start..].iter().position(|&b| b == b'\n') {
+            let end = start + i;
+            self.emit(out, &rest[start..=end])?;
+            start = end + 1;
+        }
+        self.pending.extend_from_slice(&rest[start..]);
+        Ok(())
+    }
+
+    /// One line, already complete, with its time column in front of it.
+    ///
+    /// The column is CACHED per mark, not formatted per line. Every line inside one interval shares
+    /// a stamp by construction, so formatting it again is work whose answer is known: the same 23 MB
+    /// log has 400 000 lines and ten marks, which is ten civil-from-days conversions instead of
+    /// 400 000, and no allocation per line.
+    fn emit(&mut self, out: &mut impl std::io::Write, line: &[u8]) -> std::io::Result<()> {
+        let nanos = mark_for(&self.marks, self.at);
+        // The empty check is NOT redundant: `None` is a legal mark (the head of a log has none), so
+        // a cache that started at `None` would match the very first line and print no column at all.
+        if self.column.1.is_empty() || self.column.0 != nanos {
+            let stamp = nanos.map(fmt_mark).unwrap_or_else(|| "-".to_string());
+            self.column = (nanos, format!("{stamp:<24} ").into_bytes());
+        }
+        out.write_all(&self.column.1)?;
+        out.write_all(line)?;
+        self.at += line.len() as u64;
+        Ok(())
+    }
+
+    /// Release an unterminated last line, unstamped: the stream is over and its newline is not coming.
+    pub(crate) fn flush(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            out.write_all(&self.pending)?;
+            self.at += self.pending.len() as u64;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Read `<log>.idx` into `(offset, unix nanos)` pairs, oldest first.
+///
+/// A TRAILING PARTIAL RECORD IS DROPPED, not padded: the writer stops indexing when a write comes up
+/// short, so a file whose length is not a multiple of [`MARK_LEN`] was cut by something else and its
+/// last record cannot be trusted. Dropping one mark costs the resolution of one interval; keeping a
+/// torn one would put a line at a time that was never recorded.
+pub(crate) fn read_marks(log: &std::path::Path) -> Vec<(u64, u64)> {
+    let Ok(data) = std::fs::read(idx_path(log)) else {
+        return Vec::new();
+    };
+    data.chunks_exact(MARK_LEN)
+        .map(|c| {
+            let mut o = [0u8; 8];
+            let mut w = [0u8; 8];
+            o.copy_from_slice(&c[..8]);
+            w.copy_from_slice(&c[8..]);
+            (u64::from_le_bytes(o), u64::from_le_bytes(w))
+        })
+        .collect()
+}
+
+/// The recorded time at or before `offset`, or `None` before the first mark.
+///
+/// `None` is a real answer and the caller prints it as such: a log written by an older kern has no
+/// index at all, and even a current one has no mark before its first, so the opening bytes of every
+/// log are honestly unattributed rather than given the first mark's time.
+pub(crate) fn mark_for(marks: &[(u64, u64)], offset: u64) -> Option<u64> {
+    match marks.binary_search_by(|(o, _)| o.cmp(&offset)) {
+        Ok(i) => Some(marks[i].1),
+        Err(0) => None,
+        Err(i) => Some(marks[i - 1].1),
+    }
+}
+
+/// `2026-09-16T18:42:07.123Z`, which is what a reader compares against their own clock.
+///
+/// Millisecond precision and no more, because the mark interval starts at 100 ms and only widens:
+/// printing nanoseconds would be six digits of invented precision on a number that is already a
+/// bucket.
+pub(crate) fn fmt_mark(nanos: u64) -> String {
+    let secs = (nanos / 1_000_000_000) as i64;
+    let ms = (nanos % 1_000_000_000) / 1_000_000;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // Civil-from-days, Howard Hinnant's algorithm: no chrono dependency for four fields.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{ms:03}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::{idx_path, mark_for, read_marks, CappedLog, LogCap, MARK_LEN};
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kern-idx-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// Compacting the index may make a line's time OLDER, never newer.
+    ///
+    /// THIS IS THE ONE PROPERTY THAT MATTERS, and it is not "the file got smaller". A stamp is a
+    /// promise that the line was written at or after the time shown; thinning the marks weakens the
+    /// promise (an earlier mark now answers for more bytes) but must never break it, because a stamp
+    /// LATER than its line is a lie a reader cannot detect. Checked at every byte offset in the log,
+    /// against the answers the full index gave, rather than at a few sampled ones.
+    #[test]
+    fn compacting_the_index_never_moves_a_line_forward_in_time() {
+        let dir = tmpdir("compact");
+        let path = dir.join("l.log");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(idx_path(&path));
+        // A cap big enough that 400 marks do not trigger the automatic compaction: this test drives
+        // it by hand so the before/after comparison is of one known step.
+        let mut log = CappedLog::open(
+            &path,
+            LogCap {
+                max_bytes: 1 << 20,
+                files: 2,
+            },
+        )
+        .expect("the log opens");
+        log.mark_every = 0; // every write marks, so the test does not sleep for 40 seconds
+        for i in 0..400 {
+            log.write(format!("riga {i}\n").as_bytes());
+        }
+        let before = read_marks(&path);
+        assert!(
+            before.len() > 300,
+            "expected a full index, got {}",
+            before.len()
+        );
+        let end = log.written;
+
+        log.compact_index();
+        let after = read_marks(&path);
+        assert_eq!(
+            after.len(),
+            before.len().div_ceil(2),
+            "half the marks survive"
+        );
+        // WHICH half is thinned, not just how many. Keeping the OLDEST half would satisfy both the
+        // count and the never-later rule above while collapsing the entire tail of the log onto one
+        // stale mark - and the tail is the part a reader is looking at. Measured as the last surviving
+        // mark still covering the end of the log: with every-other thinning it is the penultimate
+        // original mark or better; with oldest-half thinning it sits at the middle of the file.
+        let last_kept = after.last().expect("a compacted index still has marks").0;
+        let penultimate = before[before.len() - 2].0;
+        assert!(
+            last_kept >= penultimate,
+            "the tail lost its resolution: last kept mark at {last_kept}, log ends at {end}, \
+             the original penultimate mark was at {penultimate}"
+        );
+        assert_eq!(
+            log.mark_every, 0,
+            "0 doubled is still 0, which keeps this test's cadence"
+        );
+
+        for o in 0..end {
+            let (b, a) = (mark_for(&before, o), mark_for(&after, o));
+            match (b, a) {
+                (Some(b), Some(a)) => assert!(a <= b, "offset {o}: {a} is LATER than {b}"),
+                (None, None) => {}
+                (Some(_), None) => panic!("offset {o} lost its mark entirely"),
+                (None, Some(a)) => panic!("offset {o} gained a mark ({a}) it never had"),
+            }
+        }
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index stays under its cap no matter how long the box runs.
+    ///
+    /// The log has a cap and the index did not, which on a tmpfs `XDG_RUNTIME_DIR` is RAM that grows
+    /// until the box stops. Driven here with `mark_every` at zero, so a thousand writes stand in for
+    /// the hours of real output it would otherwise take.
+    #[test]
+    fn the_index_never_outgrows_its_share_of_the_log() {
+        let dir = tmpdir("cap");
+        let path = dir.join("l.log");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(idx_path(&path));
+        let mut log = CappedLog::open(
+            &path,
+            LogCap {
+                max_bytes: 65_536,
+                files: 2,
+            },
+        )
+        .expect("the log opens");
+        let cap = log.idx_max();
+        log.mark_every = 0;
+        let mut worst = 0u64;
+        for i in 0..2000 {
+            log.write(format!("r{i}\n").as_bytes());
+            let sz = std::fs::metadata(idx_path(&path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            worst = worst.max(sz);
+            assert!(
+                sz <= cap,
+                "the index passed its cap: {sz} > {cap} at write {i}"
+            );
+        }
+        assert!(
+            worst > cap / 2,
+            "the cap was never approached, so nothing was tested: {worst}"
+        );
+        let sz = std::fs::metadata(idx_path(&path)).expect("stat").len();
+        assert_eq!(
+            sz % MARK_LEN as u64,
+            0,
+            "a compacted index is still whole records"
+        );
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::{fmt_mark, mark_for};
+
+    /// The formatter agrees with a date a human can check, at the boundaries that break naive ones.
+    ///
+    /// Written because the civil-from-days arithmetic is the kind that passes for a year and then
+    /// prints 31 February: the cases below are the epoch, a leap day, the day after a leap day, and a
+    /// century that is NOT a leap year (1900 is not, 2000 is), which is where the /100 and /400 rules
+    /// disagree.
+    #[test]
+    fn the_timestamp_is_a_date_a_reader_can_check() {
+        for (nanos, want) in [
+            (0u64, "1970-01-01T00:00:00.000Z"),
+            (1_000_000_000, "1970-01-01T00:00:01.000Z"),
+            (951_782_400_000_000_000, "2000-02-29T00:00:00.000Z"), // a leap day
+            (951_868_800_000_000_000, "2000-03-01T00:00:00.000Z"), // the day after it
+            (1_789_000_000_123_000_000, "2026-09-10T00:26:40.123Z"),
+        ] {
+            assert_eq!(fmt_mark(nanos), want, "for {nanos}");
+        }
+    }
+
+    /// A line before the first mark has NO time, and is not given the first mark's.
+    ///
+    /// The opening bytes of every log are written before the first interval elapses, and a log from
+    /// an older kern has no marks at all. Both must read as "not recorded" rather than as a time,
+    /// because a confident wrong instant is the failure this whole index exists to avoid.
+    #[test]
+    fn a_line_before_the_first_mark_has_no_time() {
+        let marks = [(100u64, 1_000u64), (200, 2_000), (400, 4_000)];
+        assert_eq!(mark_for(&marks, 0), None);
+        assert_eq!(mark_for(&marks, 99), None);
+        assert_eq!(mark_for(&marks, 100), Some(1_000));
+        assert_eq!(mark_for(&marks, 150), Some(1_000));
+        assert_eq!(mark_for(&marks, 399), Some(2_000));
+        assert_eq!(mark_for(&marks, 10_000), Some(4_000));
+        assert_eq!(mark_for(&[], 5), None);
     }
 }

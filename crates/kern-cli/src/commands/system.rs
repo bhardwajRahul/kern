@@ -46,7 +46,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-    {c}logs{z} <name> [--tail N] [-f|--follow]                           Show a box's output
+    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output (-t: recorded time, bucketed from 100 ms; `-` if none was recorded)
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
   {d}Images{z}
