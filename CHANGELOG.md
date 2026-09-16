@@ -225,7 +225,15 @@ and why the fix is shaped that way is in the commit it came from (`git log v0.9.
 - **A `restart:` service never restarted after its first exit.** The pre-exec gate is released once by
   the launcher, and every restart afterwards found that descriptor closed and refused to exec: the
   workload ran once, then logged `never started (exit 125); retrying (N/10)` until the budget ran out
-  while `kern ps` still said `starting`. The gate is dropped after the first attempt now.
+  while `kern ps` still said `starting`. The gate is dropped after the first attempt that RAN a
+  workload, which is the distinction the next line is about.
+- **A service whose `condition:` dependency failed was held back and then started anyway.** With
+  `service_completed_successfully` on a dependency that exits 1, the gate refused the exec and the box
+  logged `never released`; one second later the restart path, running without that gate, exec'd the
+  workload. A box that never started is not retried past a gate the launcher has closed: the pipe says
+  which of the two cases it is (a release byte still buffered means the attempt died before reading
+  it, and that retry is allowed), so the workload does not run and the log says so once instead of ten
+  times.
 - `kern inspect <image>` answers for an image when no box holds the name, and `--format` answers
   Docker's `{{.State.Running}}` / `{{.State.Status}}` / `{{.State.Health.Status}}`; a field kern
   cannot answer truthfully is refused by name.
