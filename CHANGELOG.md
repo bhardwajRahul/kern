@@ -70,7 +70,8 @@ advice about how to write a compose file.
 bump.** An external `kern stop` was `oom` and is now `killed`; a workload that CHOOSES `exit 137` is
 no longer a fault; a crash is `fault=None` with `128+signal`; a `KERN_BIN` that is not kern raises
 instead of reporting success. `fault` is read from kern's own descriptor, so a cell cannot forge a
-verdict from its output. 0.2.0 through 0.2.20 are on PyPI and npm.
+verdict from its output. 0.2.0 through 0.2.22 are on PyPI and npm, and 0.2.22 is what a bare
+`pip install kern-sandbox` or `npm i kern-sandbox` resolves to today.
 
 **A box that never started is a verdict of its own, not an exit code to guess at.** It is
 `fault.type == "startup_failed"` from `run_code`/`run` and raises from `kernel()`. Branch on
