@@ -7,287 +7,115 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
-Docker Compose, the sandbox SDKs and the MCP server. Each line is the change; how a defect was found
-and why the fix is shaped that way is in the commit it came from (`git log v0.9.32..HEAD`).
+**Not in any binary yet.** These changes are on `main`, in the source. The latest RELEASED version
+is v0.9.32, which is what `install.sh` serves and what every downloaded binary is; to run what is
+below, build from this tree. Each line is the change; how a defect was found and why the fix is
+shaped that way is in the commit it came from (`git log v0.9.32..HEAD`).
 
-### Docker Compose
+**Sentry's official `install.sh` completes on kern, and the 57-service stack runs.** Measured end to
+end against `getsentry/self-hosted` at 26.8.0: every image built, the migrations, `compose up
+--wait` reporting `57 service(s) ready`, the web UI answering 200 and the API 200, then `down`
+stopping 57 of 57 with nothing left. One edit to the official tree was needed and is not kern's to
+make: its minimum-version gate compares `docker version` against Docker's numbering, and kern
+reports kern's version. Twenty-one defects were fixed to get there, and fourteen of them are in the
+`docker` and `compose` surfaces rather than in the sandbox.
 
-- **Sentry's official `install.sh` completes on kern, and the 57-service stack runs.** Measured end
-  to end: every image built, the SeaweedFS key migration, the node store, Snuba's and Postgres's
-  migrations, `compose up --wait` reporting `57 service(s) ready`, the web UI answering 200
-  (`Sign In | Sentry`) and the API 200, then `down` stopping 57 of 57 with nothing left. One edit to
-  the official tree was needed and is not kern's to make: its minimum-version gate compares
-  `docker version` against Docker's numbering, and kern reports kern's version.
-- **`compose run` was missing most of what a script passes it.** `-d` detached nothing, `--name`,
-  `--entrypoint`, `-e`, `--user` and `--pull` were refused, and the one-off started none of the
-  dependencies written with a CONDITION (`service_healthy`), which is how every real file writes
-  them. It now starts them and waits for the condition, as Docker does.
-- **`compose run`'s stdout is the workload's.** kern's build lines and pod narration went to the same
-  stream, so `state=$(docker compose run --rm -T svc …)` captured three of kern's sentences ahead of
-  the answer, and an installer that tested that string could not decide what to do.
-- `compose build --build-arg`, `pull --ignore-pull-failures`, `down -t/--timeout`, `down --rmi
-  local|all`, `--quiet-pull`, and `--flag=value` everywhere: one flag written two ways is one flag.
-- `config --services` prints the service names, one per line, and nothing else. It printed the whole
-  report, and the canonical use of that verb is a shell loop over its output.
-- **A one-off on a bridge stack is wired like a member**: its own address on the bridge and its peers
-  at theirs. It used to get the pod-style hosts file, so every peer resolved to its own `127.0.0.1`.
+**Each service gets its OWN network namespace on a bridge, which is Docker's arrangement.** A port a
+service binds on its `127.0.0.1` stays private to it. `--pod` keeps the old single shared namespace,
+which is faster and makes every loopback port reachable by every peer, and `kern compose <file>
+config` prints which wiring a bring-up will use.
 
-- **`compose pull` went to a registry for images the file said never to pull.** A service with
-  `pull_policy: never` is skipped and counted; one that declares `build:` and is not in a registry is
-  named with the command that produces it instead of ending the run. On Sentry's official file, 48 of
-  57 services carry the key and the verb could not succeed at all.
-- **A service with no `pids_limit:` now gets 2048 tasks, not the sandbox's 512.** ClickHouse aborts
-  under 512 - its background pool alone asks for that many - and is healthy in 25 s at 2048.
-  `pids_limit:` in the file still decides, in either direction.
-- `ulimits:` written as a one-line mapping (`nofile: {soft: N, hard: N}`) is applied. It used to
-  reach the box with the braces in the value, and the box refused the whole invocation.
-- A refusal about a box no longer ends with advice about what a compose file looks like.
-- The refusal for missing `external: true` volumes agrees with the count: "they do not exist",
-  "Create them".
+**Two networking defects that only some machines could see.** On a home or edge network a box had
+internet and could not resolve a name, because pasta copies the host's nameserver into the box and
+on such a network that address is the LAN router, which is also the gateway pasta impersonates; kern
+passes `--dns-forward` now. And on every host whose NIC is called `eth0` (WSL2, most cloud VMs) a
+multi-service stack had no outbound at all, a regression against v0.9.32: pasta named its tap after
+the host's interface and collided with the name kern gives the workload's. kern names that interface
+itself now, per namespace.
 
-- Each service gets its **own** network namespace on a bridge, which is Docker's arrangement. `--pod`
-  keeps one shared namespace and one `127.0.0.1`, and is faster; `kern compose <file> config` prints
-  which wiring a bring-up will use.
-- **A box on a home or edge network had internet and could not resolve a name.** pasta copies the
-  host's nameserver into the box, and on such a network that address is the LAN router, which is also
-  the gateway pasta impersonates inside the namespace; pasta does not forward DNS queries unless it is
-  told to, so they died there. MEASURED on a Raspberry Pi 5: `nc 1.1.1.1:443` connected and not one
-  name resolved, silently. kern passes `--dns-forward` for a real (non-loopback) host resolver now. A
-  laptop resolving through a `127.0.0.53` stub was never affected, which is why this was invisible
-  until the board ran it.
-- **A multi-service stack had no outbound on every host whose NIC is called `eth0`** (WSL2, most cloud
-  VMs), while the same file on v0.9.32 reached the internet. kern renames the bridge veth to `eth0` for
-  the workload's benefit, and pasta, told only `--config-net`, names its own tap after the HOST's
-  interface: on those machines the two are the same name and pasta dies with `TUNSETIFF failed: Invalid
-  argument`. kern names that interface itself now, and names it per namespace: `kern0` beside the veth
-  on the bridge, and `eth0` where nothing is holding it (a pod's shared namespace). The second half is
-  a fix of its own: that name used to be the host's, so a box saw `eth0` on a cloud VM and `wlp4s0` on
-  a laptop, and anything looking for `eth0` inside a box worked on some machines and not others.
-- Peers resolve by service name, by `networks.<net>.aliases` and by the name a service announces.
-  `external: true` joins a network shared between projects, `network_mode: service:X` gets that
-  service's namespace, and a bridge service has outbound and a resolver.
-- Verbs: `run`, `cp`, `exec` (with the `--` Docker users type), `logs -f` over the whole stack,
-  `ps -q`/`--services`/`--format json` (Docker's field names beside kern's, plus `Publishers`),
-  `config`, and `systemd`.
-- Flags: `-d`, `up --wait`/`--wait-timeout`, `--exit-code-from`, `--abort-on-container-exit`,
-  `--no-deps`, `--build` (`--no-build` refused), `down -v`, `down --remove-orphans`, `--env-file`.
-- Files: `docker-compose.override.yml`, `extends: {file: ...}`, `.env` interpolation, `env_file:` long
-  form, anonymous volumes in long form, named volumes scoped to the project, secrets from an
-  environment variable.
-- Keys honoured: `cpu_shares`, `memswap_limit` (a total, unlike cgroup v2's field), `ulimit`,
-  `runtime:`, `ipv4_address:`, `depends_on` conditions, an image's `HEALTHCHECK`/`STOPSIGNAL`/`Cmd`/
-  `Entrypoint`/`Env`, a healthcheck in exec form, `--tmpfs uid=`/`gid=`.
-- `network_mode: host` is applied, as Docker applies it, and now SAYS so: it removes the service's
-  network isolation (the host's interfaces, loopback and sysctls become the service's), its peers stop
-  resolving it by name, and any `ports:` it declares is a no-op. It was the one posture change in the
-  file that happened in silence.
-- Keys refused or named rather than ignored: an unknown service key (with the near-miss suggestion),
-  `deploy.replicas`/`mode`/`placement`/`update_config`/`rollback_config`/`endpoint_mode`,
-  `deploy.restart_policy`, and `deploy.resources.reservations` - a GPU request now says the service
-  runs WITHOUT the device and where a device comes from.
-- A dependency that never becomes healthy fails in a second naming the box, and the error now carries its
-  own repair (`kern logs <box>`, and the three `healthcheck:` fields to look at). Without one it was
-  getting the generic "a stack is a docker-compose.yml or a kern TOML" pointer: advice about writing the
-  file, under a failure that had nothing to do with the file.
-- Teardown stops dependents before dependencies and waits; an init that ignores the stop signal gets
-  its grace; `down` stops a stack's NATs; a refused first service leaves no empty pod; a pod holder
-  stops holding when its pod stops existing.
-- A privileged port is moved once for the whole stack, before anything starts, and the message says
-  what the move costs an ACME client. kern names the sysctl that keeps the port where the file wrote it.
-- Inside a box: `localhost` resolves to something listening, `HOME` follows the user, a workload gets
-  its image's groups, a command knows the box's name, a box name may be 200 characters, and a box that
-  dies against its `pids` cap says so.
-- **CLI, additive:** `--health-start-interval <sec>`, the flag behind Docker 25+'s `start_interval`.
-  Nothing is renamed or removed; a box that does not pass it behaves exactly as before. `kern compose`
-  sets it from `healthcheck.start_interval:`, which until now was read by nobody and dropped in
-  silence.
-- **A database that was ready in ten seconds reported `starting` for five minutes.** Docker 25+ splits
-  the probe cadence in two: `Interval` for the steady state and `StartInterval` for the start period.
-  kern read only the first, so an image declaring `Interval 300s, StartPeriod 300s, StartInterval 5s`
-  (Immich's postgres) had its FIRST probe land 300 seconds in, and everything gated on
-  `depends_on: condition: service_healthy` waited with it. Both are honoured now, from the image config
-  and from a Dockerfile's `HEALTHCHECK --start-interval`, which kern used to accept with a printed
-  apology for not applying it.
-- **A failed `up` left its surviving boxes rebuilding forever.** `restart: always` is a promise about a
-  workload, and a box that never started has none: it exits 125 (kern's box-not-started code, and
-  Docker's), logs "never released: the launcher closed the pre-exec gate", and was restarted without a
-  cap. Measured on a real stack: 26 rounds for one service, 15 for another. That case is budgeted now
-  like `on-failure` is, it counts out loud (`never started (exit 125); retrying (3/10)`), and it says
-  why it stopped. A workload that exits keeps Docker's uncapped contract, unchanged.
-- **An explicit `docker.io/` prefix broke every pull**, and it is not an exotic spelling: it is
-  Podman's recommended style and what Immich's official compose file ships. Docker Hub's API is at
-  `registry-1.docker.io`, so kern was asking `docker.io` for a manifest and getting a document that is
-  not one: unpinned it read as "no layers in manifest", pinned it read as a digest mismatch against a
-  digest that does not exist in the repository. `docker.io` and `index.docker.io` resolve to the API
-  host now, and `docker.io/alpine` means `library/alpine` exactly as bare `alpine` does.
-- A relay test reported a phantom defect on a host that runs kern outside a delegated cgroup tree,
-  which kern's own message calls "an ordinary ssh session on most distributions": the stack came up,
-  the relay carried, and `exec` fail-closed because the command could not be put in the box's cgroup.
-  The test threw away that stderr and the 126, so it could only say `Got: ""`. It reports both now,
-  and the shared "this host cannot run the fixture" predicate knows that refusal, so such a host skips
-  instead of going red.
-- The compatibility rate ships with its corpus and its definition. The v0.9.32 claim of "14% to 94%"
-  was the CEILING under a permissive definition; the strict one measures 35% on the same 259 files, and
-  both numbers are in `docs/DOCKER-COMPAT.md` with the census scripts that produce them.
+**`compose run` was missing most of what a script passes it.** `-d` detached nothing; `--name`,
+`--entrypoint`, `-e`, `--user` and `--pull` were refused; the one-off started none of the
+dependencies written with a `condition:`, which is how every real file writes them, and did not wait
+for them. Its stdout is the workload's now, too: kern's build lines and pod narration went to the
+same stream, so `state=$(docker compose run --rm -T svc ...)` captured kern's sentences ahead of the
+answer.
 
-### Sandbox SDKs (`kern-sandbox`, Python and Node)
+**A service whose dependency failed was held back and then started anyway.** With a `condition:` on
+a dependency that fails, the pre-exec gate refused the exec, and one second later the restart path,
+running without that gate, ran the workload. In the same area: a `restart:` service never restarted
+after its first exit, and a failed `up` left its surviving boxes rebuilding forever. A box that
+never started is not a workload that exited, and the three cases are now told apart.
 
-- **`$XDG_DATA_HOME/kern` was accepted as a mount source.** It holds `volumes/` - the contents of
-  every named volume on the host - and `builds/`. Refused now, and every kern state directory is
-  refused at both its configured and its default path, so pointing `XDG_DATA_HOME` elsewhere no
-  longer leaves the default one open.
+**A database that was ready in ten seconds reported `starting` for five minutes.** Docker 25+ splits
+the probe cadence in two, `Interval` for the steady state and `StartInterval` for the start period,
+and kern read only the first: an image declaring `Interval 300s, StartPeriod 300s, StartInterval 5s`
+had its first probe land 300 seconds in, and everything gated on `service_healthy` waited with it.
+Both are honoured now, from the image config and from a Dockerfile's `HEALTHCHECK --start-interval`,
+and `kern box --health-start-interval <sec>` exposes it.
 
-- A clean-code and security pass over the above closed four more holes: the session-reset and truncation
-  notes were forgeable through the LangChain renderer (every frame is one list in the core now, and both
-  surfaces recognise all of it), the LangChain shell policy built a `-v` that skipped the mount validator
-  (workspace and `extra_box_args` both go through it), Node's `writeFile` opened its leaf by path after an
-  `lstat` pre-check and now opens it through a pinned parent fd with the same `/proc/self/fd` backstop
-  `readFile` had, and `restore()` re-implemented workspace containment instead of calling it. A workspace
-  under a credential directory is also refused BEFORE it is created, rather than after.
+**An explicit `docker.io/` prefix broke every pull**, and it is not an exotic spelling: it is
+Podman's recommended style and what Immich's official compose file ships. `docker.io` and
+`index.docker.io` resolve to Docker Hub's API host now, and `docker.io/alpine` means
+`library/alpine` exactly as bare `alpine` does.
 
-- Published 0.2.0 through 0.2.20 on PyPI and npm. **0.2.0 was a MINOR bump because `fault.type`
-  changes value for the same event**: an external `kern stop` was `oom` and is now `killed`, a workload
-  that CHOOSES `exit 137` is no longer a fault, a crash is `fault=None` with `128+signal`, and a
-  `KERN_BIN` that is not kern raises instead of reporting success.
-- `fault` is read from kern's own descriptor, so a cell cannot forge a verdict from its output, and the
-  taxonomy does not depend on the workload's language (measured on Node and Go, compiler included).
-- A box that never started is `fault.type == "startup_failed"` returned by `run_code`/`run`, and RAISES
-  from `kernel()`, where the box is the session rather than one call. Branch on `fault`, not on
-  `exit_code`: a box that never ran exits 1 exactly like a script that did. **Every** error kern reports
-  before the box exists is now one, decided from kern's own prefix at column 0 rather than from a list of
-  message openings that had to be extended each time a caller met a new one: a missing `profiles=` name
-  (`error: config:`) and an empty `image=` (`error: bad image reference:`) were both coming back
-  `exit_code 1` with no fault. The verdict is refused whenever kern signalled that the box started or
-  the box printed anything, so a workload writing kern's prefix cannot claim it never ran.
-- A kernel a cell killed now names what ended it and what survived: "a prior cell ended it (oom). Files
-  written to the workspace are still there; names and imports from the earlier cells are gone".
-- Workspace I/O refuses what it cannot contain, and says which: an absolute path (it is never
-  reinterpreted as workspace-relative), a `..` escape, a symlinked component at any depth (named as a
-  symlink, not as `ELOOP`), a FIFO or device planted at the name, and a file over `max_bytes`.
-- Mounts refuse the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
-  `$HOME`, the docker socket), any path with a credential directory in it (`.ssh`, `.aws`, `.gnupg`,
-  `.kube`, `.docker`, `.azure`, `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`)
-  and **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir). There is no
-  opt-out, deliberately: a job that needs one credential should be given that one file in the workspace.
-- `setup=` is refused at construction unless it is a shell command string, and a `tmpfs` larger than
-  `memory_mb` is refused because `df` would report space the cap will not allow.
-- `egress_allow` is a route-level boundary: a raw socket to an IP is `ENETUNREACH` and DNS does not
-  resolve, so only clients that speak to the HTTP proxy get out. A database does not.
-- Both `SANDBOX-NOTES.md` pages carry what a box does that surprises people: the workspace is not
-  capped, `df` and `nproc` report the host, a fault ends a `kernel()`, `network=True` shares the host's
-  loopback, an image pinned by digest is reproducible and a tag is not.
+**Defaults and refusals a real file runs into.** A service with no `pids_limit:` gets 2048 tasks,
+not the sandbox's 512, because ClickHouse aborts under 512. `compose pull` no longer goes to a
+registry for images the file said never to pull. `ulimits:` written as a one-line mapping is applied
+instead of reaching the box with its braces. `network_mode: host` is applied as Docker applies it
+and now SAYS what it removes. A GPU reservation says the service runs WITHOUT the device. A
+dependency that never becomes healthy fails naming the box and carrying its own repair, rather than
+advice about how to write a compose file.
 
-- **On the binary `install.sh` serves today, the fallback sentence asserted something it could not know.**
-  0.9.32 writes 2 of the 4 teardown bytes, so a resident `kernel()` cell that SEGFAULTED and one whose
-  syscall the seccomp filter refused both came back `killed` with "an external kill (`kern stop`, a
-  signal, or the host running out of memory)", which is false for both. The verdict cannot improve
-  without the byte; the sentence now names the bound and says a newer kern separates the three. The
-  taxonomy battery skips those two cases on a two-byte binary with the evidence, instead of failing an
-  SDK that has nothing to decide from: measured, the released pair is 20 ok / 0 failed / 5 skipped and a
-  current binary stays 27 / 0 / 0.
+**The sandbox SDKs: `fault.type` changes value for the same event, which is why 0.2.0 was a MINOR
+bump.** An external `kern stop` was `oom` and is now `killed`; a workload that CHOOSES `exit 137` is
+no longer a fault; a crash is `fault=None` with `128+signal`; a `KERN_BIN` that is not kern raises
+instead of reporting success. `fault` is read from kern's own descriptor, so a cell cannot forge a
+verdict from its output. 0.2.0 through 0.2.20 are on PyPI and npm.
 
-### MCP server (`kern-mcp`)
+**A box that never started is a verdict of its own, not an exit code to guess at.** It is
+`fault.type == "startup_failed"` from `run_code`/`run` and raises from `kernel()`. Branch on
+`fault`, not on `exit_code`: a box that never ran exits 1 exactly like a script that did.
 
-- **Every `run_code` reply names the kern that ran it** (`[exit 0 in kern 0.9.32]`), and the tool
-  description leads with what a client's own shell cannot do (seccomp, no capabilities, read-only root,
-  its own `/dev`, no host filesystem) instead of with "on the user's own machine". A reviewer wired the
-  server into Cursor correctly and the agent answered "the sandbox run completed successfully" from its
-  own python, never calling the tool: the description had described the client's terminal too, and
-  nothing in a reply could contradict a run that never happened.
-- An argument a tool does not have is refused rather than dropped: every schema is
-  `additionalProperties: false` and the server checks what it was sent against what it advertised, so a
-  call carrying `image` or `network` gets `-32602` naming it, and nothing runs. It used to run the code
-  under the server's own posture and answer `[exit 0]`, which tells a model its request succeeded.
-- Box output is untrusted text on its way into a model: terminal escapes and control bytes are
-  stripped, and **both** surfaces' framing is neutralised, this server's (`[exit N]`, `[stderr]`,
-  `[rich result]`, the truncation and session-reset notes) and the LangChain renderer's
-  (`[sandbox: ...]`), so a forged marker reads `[printed by the code, not the sandbox: ...]`.
-- The `run_code` description states the image and exactly one contract about state: a fresh box per
-  call, or one warm interpreter under `KERN_MCP_KERNEL=1`. In kernel mode a fault ends the interpreter,
-  and the reply for the cell that died says so once.
-- `docs/MCP.md` documents what a client can and cannot reach, measured: the server's environment does
-  not enter the box and there is no knob to pass it in, there is no mount knob, calls are serialised,
-  two clients get two workspaces, `KERN_MCP_QUIET` never hides a verdict, and `KERN_MCP_SETUP` is paid
-  once.
+**The SDKs refuse a mount that would hand the box the sandbox's own control plane.** kern's state
+(`$XDG_RUNTIME_DIR/kern`, `$XDG_DATA_HOME/kern`, the image cache, the config dir), the host's own
+sources (`/`, `/etc`, `$HOME`, the docker socket) and any path with a credential directory in it
+(`.ssh`, `.aws`, `.kube`, `.npmrc` and the rest). There is no opt-out, deliberately: a job that
+needs one credential should be given that one file in the workspace. Workspace I/O refuses what it
+cannot contain and says which: an absolute path, a `..` escape, a symlinked component at any depth,
+a device planted at the name, a file over `max_bytes`.
 
-### `kern-pi` (the pi coding agent's extension)
+**The MCP server names the kern that ran the code** (`[exit 0 in kern 0.9.32]`), and its tool
+description leads with what a client's own shell cannot do. A reviewer wired the server into Cursor
+correctly and the agent answered from its own python, never calling the tool. An argument a tool
+does not have is refused with `-32602` rather than dropped, and box output reaching a model has
+terminal escapes stripped and both surfaces' framing neutralised, so a forged marker reads `[printed
+by the code, not the sandbox: ...]`.
 
-- **1.0.1 on npm.** 1.0.0 asked for `kern-sandbox: ^0.1.41`, and for a zero-major version a caret range
-  stops at the next MINOR, so it resolved 0.1.x and never 0.2.x: a Pi user's model was reading the fault
-  verdicts from before this year's chain, because the extension writes `[kern: <fault.type>]` into the
-  stream the agent reads. The range is `^0.2.12` now. Verified by installing it: `npm i kern-pi` pulls
-  0.2.12, the package loads, and its file tools refuse `/etc/passwd`, a symlink planted in the workspace
-  (named as a symlink) and a relative path from the agent, while a legitimate write lands.
-- The README gives the npm route first and the clone second.
+**`kern-pi` 1.0.1 on npm.** 1.0.0 asked for `kern-sandbox: ^0.1.41`, and for a zero-major version a
+caret range stops at the next minor, so a Pi user's model was reading fault verdicts from before
+this year's chain.
 
-### Runtime and CLI
+**Runtime and CLI.** A service stopped and started again was unreachable by its peers for 29
+seconds, because its `veth` got a random MAC each time; a member's address is derived from its IP
+now, as Docker's is, and the same restart takes 176 ms. A `build:` on a Debian or Ubuntu base could
+not be built at all, because those images ship directories at mode 0700 owned by a subordinate uid.
+`docker version --format` ignored its template and exited 0, so a script reading it carried on with
+the wrong string. An image cached by an older kern is refreshed rather than re-fetched. `kern
+inspect <image>` answers for an image, and a `--format` field kern cannot answer truthfully is
+refused by name rather than answered wrongly. `EXPOSE` reaches the image config. `--memory 64` is 64
+BYTES and the message says so. A FIFO as a volume source is refused instead of hanging the box
+forever.
 
-- **A `restart:` service never restarted after its first exit.** The pre-exec gate is released once by
-  the launcher, and every restart afterwards found that descriptor closed and refused to exec: the
-  workload ran once, then logged `never started (exit 125); retrying (N/10)` until the budget ran out
-  while `kern ps` still said `starting`. The gate is dropped after the first attempt that RAN a
-  workload, which is the distinction the next line is about.
-- **A service whose `condition:` dependency failed was held back and then started anyway.** With
-  `service_completed_successfully` on a dependency that exits 1, the gate refused the exec and the box
-  logged `never released`; one second later the restart path, running without that gate, exec'd the
-  workload. A box that never started is not retried past a gate the launcher has closed: the pipe says
-  which of the two cases it is (a release byte still buffered means the attempt died before reading
-  it, and that retry is allowed), so the workload does not run and the log says so once instead of ten
-  times.
-- `kern inspect <image>` answers for an image when no box holds the name, and `--format` answers
-  Docker's `{{.State.Running}}` / `{{.State.Status}}` / `{{.State.Health.Status}}`; a field kern
-  cannot answer truthfully is refused by name.
-- `EXPOSE` in a Dockerfile reaches the image config. It was announced as informational and dropped,
-  so a built image declared no ports and kern's own wiring decision read that as "none".
-- `kern build --platform <os/arch>` is accepted when it is this machine and refused when it is not;
-  an unknown build flag names itself.
-- `volume create --name=<n>` (Docker's legacy spelling) and `volume ls -q [--filter name=S]`.
-- A box's `/sys/devices/system/cpu` carries one directory per CPU it may use, so a tool that counts
-  them instead of parsing `present` no longer reads 1 on a 28-core host.
+**The compatibility rate ships with its corpus and its definition.** The v0.9.32 claim of "14% to
+94%" was the CEILING under a permissive definition; the strict one measures 35% on the same 259
+files. Both numbers are in [DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) with the census scripts that
+produce them.
 
-- **A service that was stopped and started again was unreachable by its peers for 29 seconds.** Its
-  `veth` got a random MAC each time, so the peers' neighbour caches held the old one until the kernel
-  expired it, while `compose start` returned in 171 ms saying the stack was up. A member's address is
-  derived from its IP now (`02:42:<the four bytes>`, Docker's own scheme), so a restart reuses it:
-  176 ms, measured on a laptop, a VPS and three ARM boards.
-- **A `build:` on a Debian or Ubuntu base could not be built at all where kern copies the base
-  rootfs.** Those images ship directories at mode 0700 owned by a subordinate uid, which the user
-  running `cp` cannot traverse. The copy retries as root over that range; it is the map the extractor
-  used to create them. Sentry's 21 builds take 1m42s on this path.
-- **`docker version --format` ignored the template and exited 0**, so a script taking
-  `$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')` got kern's version string and carried
-  on with it. Both `version` and `info` answer their templates now, with Docker's own arch spellings
-  (`amd64` for `version`, `x86_64` for `info`); a field kern cannot answer truthfully is refused by
-  name. `docker compose version` no longer reads `version` as a file name.
-- **An image cached by an older kern is refreshed, not re-fetched**: the config blob is re-read and
-  the rootfs is left alone. Re-extracting it failed on any image whose layers hold subuid-owned
-  files, and left the entry unusable until `--pull always`.
-- `hcstartint` is read back from the image config sidecar. It was written and dropped on read, so a
-  cached image waited its full `interval` for the first health probe while the same image pulled
-  fresh did not.
-- `kern gc` collects image entries no reference can reach (a key written by an older `sanitize_ref`),
-  and the cache repair path can clear a directory owned by subordinate uids.
-- `cannot start '<cmd>'` says whether the file is absent or its loader is; a failed base-rootfs copy
-  no longer asks whether `cp` is installed; `no CMD or ENTRYPOINT` is only claimed for a base that
-  cannot supply one.
-
-- `--memory 64` is 64 BYTES and the message says so instead of sending the reader in a circle.
-- `kern ps`/`top` size the NAME column from the data; `ps --json` reports paused and orphaned boxes;
-  the Docker-shaped NDJSON no longer calls a paused container `running`; the orphan warning names the
-  directory it looked in and both causes before it suggests anything destructive.
-- Every verb the parser accepts appears in `--help`, with aliases in the description column.
-- A FIFO as a volume source is refused instead of hanging the box forever; a refused `-v` says what is
-  under the source; `kern box --ip <addr>`; a pod bridge is validated against the host's routes and the
-  loopback range; pods work on a host with no systemd and no elogind.
-
-### Tests, gates and examples
-
-- New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases), `docker-vocabulary.py`,
-  `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`, `build-corpus-census.py`,
-  `declared-bind-census.py`, and a `loopback-census.py` whose zero means something.
-- 1339 Rust, 512 Python and 110 Node tests, and the count is gated against the README.
-- `examples/` moved from 103 flat files into eight directories, nothing deleted, with one example that
-  starts from a `docker-compose.yml` rather than from kern's own TOML.
+**Tests, gates and examples.** 1340 Rust, 512 Python and 110 Node tests, with the count gated
+against the README. New batteries and gates, all in CI: `fault-taxonomy-battery.py` (27 cases),
+`docker-vocabulary.py`, `md-links.py`, `launch-dryrun.py`, `e2e-semantic.py`,
+`build-corpus-census.py`, `declared-bind-census.py`, and a `loopback-census.py` whose zero means
+something. `examples/` moved from 103 flat files into eight directories, nothing deleted.
 
 
 ## v0.9.32 - 2026-09-09
@@ -300,8 +128,8 @@ from the host. `[kern] publish_bind` in `kern.toml` is a ceiling no file can wid
 
 **Docker Compose compatibility went from 14% to 94%**, measured before and after on the same neutral
 corpus of 259 files, one per repository, sampled across 733 repositories: the share of files kern
-runs with no behavioural difference from what the file says. [CORRECTED: see "Corrected" under
-Unreleased. 94% is the ceiling, not this definition, which measures 35% on the same corpus.] What remains is dominated by keys asking
+runs with no behavioural difference from what the file says. [Corrected under Unreleased: 94% is the
+ceiling, and this definition measures 35% on the same corpus.] What remains is dominated by keys asking
 kern to be less confining than it is (`privileged: true`, `security_opt`) and by `network_mode: host`,
 which one namespace per stack cannot express. The earlier "15% irreducible" was an artefact of a
 corpus weighted toward those keys.

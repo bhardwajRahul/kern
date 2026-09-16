@@ -336,6 +336,26 @@ manual on purpose.
 | `start` (resume a stopped container) | *(none)* | a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume |
 | `login` / `logout` | `login` / `logout` | `kern login [registry] [--username U]`, and see below |
 
+### Every `docker compose` verb and flag kern accepts
+
+| | |
+|---|---|
+| **Verbs** | `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`, `pull`, `config`, `watch`, `port`, `systemd`, `run`, `cp`, `exec` (with the `--` Docker users type) |
+| **`up`** | `-d`, `--wait`, `--wait-timeout`, `--exit-code-from`, `--abort-on-container-exit`, `--no-deps`, `--build` (`--no-build` is refused, not ignored), `--quiet-pull` |
+| **`down`** | `-v`, `--remove-orphans`, `-t`/`--timeout`, `--rmi local\|all` |
+| **`run`** | `-d`, `--rm`, `-T`, `--name`, `--entrypoint`, `-e`, `--user`, `--pull`, `--no-deps` |
+| **`ps`** | `-q`, `--services`, `--format json` (Docker's field names beside kern's, plus `Publishers`) |
+| **`build` / `pull`** | `--build-arg`, `--ignore-pull-failures` |
+| **`config`** | `--services` prints the names one per line and nothing else |
+| **Everywhere** | `-p`, `--env-file`, `--profile`, and `--flag=value` wherever `--flag value` works |
+| **Files read** | `docker-compose.override.yml`, `extends: {file: ...}`, the project `.env`, `env_file:` long form, anonymous volumes in long form, named volumes scoped to the project, a secret from an environment variable |
+| **Keys applied** | `cpu_shares`, `memswap_limit` (a total, unlike cgroup v2's field), `ulimits` (including the one-line mapping form), `runtime:`, `ipv4_address:`, `depends_on` conditions, `network_mode: service:X`, an image's own `HEALTHCHECK` / `STOPSIGNAL` / `Cmd` / `Entrypoint` / `Env`, a healthcheck in exec form, `--tmpfs uid=`/`gid=` |
+| **Keys named, not dropped** | an unknown service key (with the near-miss suggestion), `deploy.replicas` / `mode` / `placement` / `update_config` / `rollback_config` / `endpoint_mode`, `deploy.restart_policy`, and `deploy.resources.reservations`: a GPU request says the service runs WITHOUT the device and where a device comes from |
+| **`network_mode: host`** | applied as Docker applies it, and stated: it removes the service's network isolation, its peers stop resolving it by name, and any `ports:` it declares is a no-op |
+
+Peers resolve each other by service name, by `networks.<net>.aliases` and by the name a service
+announces. `external: true` joins a network shared between projects.
+
 What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
 that attaches to it. Nor does `--gpus`: kern ships no GPU cap and says why in
 [GPU-CLAIMS.md](GPU-CLAIMS.md), so a workload that needs the whole card gets the whole card and there
