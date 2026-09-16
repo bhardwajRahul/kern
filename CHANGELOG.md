@@ -5,12 +5,14 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.9.35 - 2026-09-17
 
-**Not in any binary yet.** These changes are on `main`, in the source. The latest RELEASED version
-is v0.9.32, which is what `install.sh` serves and what every downloaded binary is; to run what is
-below, build from this tree. Each line is the change; how a defect was found and why the fix is
-shaped that way is in the commit it came from (`git log v0.9.32..HEAD`).
+Eight days of work since v0.9.32. Each line is the change; how a defect was found and why the fix is
+shaped that way is in the commit it came from (`git log v0.9.32..v0.9.35`).
+
+**Read these first if you are upgrading:** a published port now binds `0.0.0.0` rather than
+`127.0.0.1`, each compose service gets its own network namespace on a bridge, and `fault.type` reports
+a different value for four events. Every one of them is described below.
 
 **Sentry's official `install.sh` completes on kern, and the 57-service stack runs.** Measured end to
 end against `getsentry/self-hosted` at 26.8.0: every image built, the migrations, `compose up
