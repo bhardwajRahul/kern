@@ -5,7 +5,7 @@ WHY THIS EXISTS AS A SCRIPT AND NOT AS A UNIT TEST. The pump and the reader shar
 across two processes, and the interesting states last milliseconds: an index truncated between the
 reader's `read_marks` and its next line, a compaction halving the table under a follow that is
 mid-file. A unit test can drive `compact_index` directly - and one does - but it cannot put a real
-`kern logs -t -f` in front of a real pump. An external reviewer put this at the top of the residual
+`kern logs -t -f` in front of a real pump. An independent test put this at the top of the residual
 risk after round 19, with the right reason: everything I had said about it was reasoning.
 
 It looks for the three ways this can LIE, not for a crash:
@@ -225,8 +225,8 @@ shutil.rmtree(XDG, ignore_errors=True)
 # ---------------------------------------------------------------------------------------------
 # FASE 3: lo stamp FORWARD attraverso una rotazione, che le due fasi sopra NON possono vedere.
 #
-# Le fasi 1 e 2 cercano il tempo che torna INDIETRO. Un revisore esterno ha predetto dal codice, e
-# poi misurato, l'errore opposto: un follower tiene un descrittore sul vecchio inode mentre l'indice
+# Le fasi 1 e 2 cercano il tempo che torna INDIETRO. L'errore opposto si predice dal codice e si
+# misura cosi': un follower tiene un descrittore sul vecchio inode mentre l'indice
 # viene azzerato e descrive il file NUOVO, quindi applica marche recenti a byte vecchi. Il sintomo e'
 # uno stamp troppo RECENTE, e ogni asserzione scritta finora passa. Un test che non puo' vedere un
 # difetto non e' una prova che il difetto non c'e'.

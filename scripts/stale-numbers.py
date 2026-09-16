@@ -422,7 +422,7 @@ def gpu_claims_agree() -> list[str]:
     WHAT THIS DOES NOT CATCH, stated because a gate mistaken for more than it is does more harm than
     no gate at all. It checks that required text is PRESENT and that forbidden words are ABSENT. It
     cannot see a sentence ADDED elsewhere on the same page that gives back what the caveat took
-    away. A reviewer produced this counterexample on 2026-08-28, and it passes every check here:
+    away. An independent test produced this counterexample on 2026-08-28, and it passes every check here:
 
         "On any host that shows TIER-HW, operators may rely on device memory limits for
          hostile multi-tenant packing without further controls."

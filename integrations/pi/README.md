@@ -220,7 +220,7 @@ applies to every verb, because it does not; that caps bind on every Linux.
 Exercised end to end against the pi binary, not only against the interfaces: 278 assertions across
 seven suites, on GNU grep and BusyBox, on Node 22 and 24, in CI. Ten versions preceded this one and
 every defect in them was found by running the thing rather than by reading it, five of them by an
-outside reviewer. Reports welcome, and they have been worth more than anything written here.
+outside independent test. Reports welcome, and they have been worth more than anything written here.
 
 ## Compatibility, precisely
 

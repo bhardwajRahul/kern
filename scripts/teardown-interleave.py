@@ -4,7 +4,7 @@
 THE CASE. `claimed_by_another_pasta` scans the other pod dirs to decide whether a pid it
 is about to signal belongs to somebody else. That scan is a `read_dir` plus a read per
 dir, and it races every `pod rm` running beside it: a dir removed mid-scan is a claim that
-was there a moment ago and is not there now. The reviewer's shape for making the harm
+was there a moment ago and is not there now. The test's shape for making the harm
 VISIBLE rather than invisible is three pods, two torn down at once, and an assertion on
 the third - because two pods tearing each other down is a harm nobody can see.
 

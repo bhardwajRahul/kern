@@ -906,7 +906,7 @@ mod tests {
                 }
             }
             // The denylist counts are cited in the same ROADMAP note (86 / 72), so pin them too - the
-            // reviewer's point: the number the docs cite for the denylist had no guard, same drift class.
+            // test's point: the number the docs cite for the denylist had no guard, same drift class.
             let deny = build_filter(nesting).len();
             assert!(
                 deny < 4096,

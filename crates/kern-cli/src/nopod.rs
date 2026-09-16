@@ -265,7 +265,7 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         // included. So a call to the peer BY NAME connected to the caller ITSELF and returned the
         // caller's own response.
         //
-        // MEASURED, twice, by an outside reviewer on the released binary and again here: two
+        // MEASURED, twice, by an outside independent test on the released binary and again here: two
         // services both binding 8080, the client fetches `srv:8080` and reads back its own body,
         // while from outside `:9201` serves one and `:9202` serves the other, so neither is broken.
         // The stack reports the pair on a `kern: unreachable:` line, and the word is wrong: the
@@ -890,7 +890,7 @@ mod tests {
     /// cannot resolve the caller.
     /// A PEER THAT DECLARES A PORT THIS SERVICE ALSO DECLARES MUST NOT RESOLVE.
     ///
-    /// FOUND ON THE RELEASED BINARY BY AN OUTSIDE REVIEWER, and reproduced here before anything was
+    /// FOUND ON THE RELEASED BINARY BY AN INDEPENDENT TEST, and reproduced here before anything was
     /// changed. Two services both binding 8080: kern deliberately does not bind the peer's alias
     /// (the workload's own bind would fail), the alias is in `127.0.0.0/8` and therefore local
     /// anyway, and the caller's `0.0.0.0` listener owns every local address on that port. So a

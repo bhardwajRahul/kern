@@ -123,7 +123,7 @@ fn check_scope_toll() -> R {
         // exec` joining a box's cgroup: cgroup v2 delegation containment needs write access to the
         // `cgroup.procs` of the COMMON ANCESTOR, and from outside the user manager's tree that is the
         // root cgroup. So `kern exec` refuses, and the refusal points HERE to tell the two causes
-        // apart. An outside reviewer, on WSL2 with `systemd=true`, reported that the pointer resolved
+        // apart. An outside independent test, on WSL2 with `systemd=true`, reported that the pointer resolved
         // to a row which did not name the way through; this is that gap.
         //
         // The health probe is named for the opposite reason: it does NOT refuse, it runs outside the
@@ -912,7 +912,7 @@ fn check_max_userns() -> R {
 /// than none, because the reader spends the attempt and concludes kern is broken rather than
 /// undelegated.
 fn delegation_hint() -> String {
-    // Every branch ends with the same CHECK, because a reviewer who saw this warning and a 137 from a
+    // Every branch ends with the same CHECK, because an independent test who saw this warning and a 137 from a
     // `--memory` box on the same host had no way to tell which of the two was describing kern's cap.
     // `memory_max_enforced` is read back from the box's own cgroup, so `null` there agrees with this
     // row and a number contradicts it; and a kill by kern's OWN cap always prints kern's OOM line,
@@ -1049,7 +1049,7 @@ fn check_cgroup() -> R {
 
 /// The directories the `--memory` probe actually wrote into, formatted for a report row.
 ///
-/// An outside reviewer held a release on this row: doctor said a `--memory` write "silently never
+/// An outside independent test held a release on this row: doctor said a `--memory` write "silently never
 /// bites" while a box on the same host exited 137 under `--memory`, and the sentence named no
 /// directory, so neither of us could tell whether the two statements were even about the same cgroup.
 /// Their box's PID 1 sat in `0::/`. A verdict about a cgroup that does not say WHICH cgroup cannot be
@@ -1434,7 +1434,7 @@ fn which(bin: &str) -> bool {
 mod tests {
     /// EVERY NEGATIVE MEMORY-CAP ROW MUST NAME THE DIRECTORY IT PROBED.
     ///
-    /// An outside reviewer refused a release on this. doctor printed that a `--memory` write
+    /// An outside independent test refused a release on this. doctor printed that a `--memory` write
     /// "silently never bites", and on the same host a `--memory 64m` box exited 137 through `exec`.
     /// The sentence named no cgroup and their box's PID 1 sat in `0::/`, so nothing in the output
     /// said whether the two statements were even about the same directory - and the verdict could
@@ -1476,7 +1476,7 @@ mod tests {
             assert!(
                 row.contains("memory_probe_sites_phrase()"),
                 "the row saying {d:?} states a cap does not bind without naming the cgroup it \
-                 probed; a reviewer cannot check that against /proc/<pid1>/cgroup"
+                 probed; an independent test cannot check that against /proc/<pid1>/cgroup"
             );
         }
         // POSITIVE CONTROL: the search above must be capable of failing. A verdict that is NOT a

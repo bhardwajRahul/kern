@@ -3,7 +3,7 @@
 #
 # `boot` absent and `boot` equal to this boot both answer `Attributable`: absence means a dir written
 # before the record existed, and neither is a reason to refuse. So the two rows must agree on every
-# run. An external reviewer measured them DIFFERING on WSL2 (absent -> survived, current -> killed),
+# run. An independent test measured them DIFFERING on WSL2 (absent -> survived, current -> killed),
 # which is either non-determinism or a fixture that varied more than the one file. This runs both
 # rows N times and reports the split.
 set -u

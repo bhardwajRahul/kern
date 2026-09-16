@@ -21,7 +21,7 @@ Design, the "middle way" (validated with review):
     model kern isn't built for.
   * ONE class (`Sandbox`). `run_code(...)` at module level is literally a throwaway session
     (`with Sandbox() as s: return s.run_code(...)`), so there is a single, tested security code path -
-    not two Sandbox-like surfaces that drift apart. (# DECISION, reviewer-ratified.)
+    not two Sandbox-like surfaces that drift apart. (# DECISION, independent test-ratified.)
   * I/O is HOST-DIRECT: the workspace is a host dir and single-uid maps box-root to the host user, so
     files the box creates are host-owned - write_file/read_file are plain host filesystem I/O, no
     `kern cp`, no in-box shim. (`--uid-range` breaks this ownership and is OUT of v1 scope. # DECISION.)
@@ -71,7 +71,7 @@ __version__ = "0.2.24"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
-# building+hosting our own (reviewer-ratified FLAG 4). Ship a datascience default when demand justifies.
+# building+hosting our own (independent test-ratified FLAG 4). Ship a datascience default when demand justifies.
 _DEFAULT_IMAGE = "python:3.12-slim"
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
@@ -502,7 +502,7 @@ _REFUSED_MOUNT_SOURCES = {
 #
 # NO ESCAPE HATCH, the same as `/etc`: what a job legitimately needs is ONE credential, and the way to
 # give it one is to write that file into the workspace (or mount a directory holding only it), which is
-# also the only shape a reviewer can check.
+# also the only shape an independent test can check.
 _REFUSED_MOUNT_COMPONENTS = {
     ".ssh",
     ".aws",
@@ -624,7 +624,7 @@ _KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
 # (`error: pull:`, `error: box:`, `error: config:` ...). Every one of them was added after a caller
 # measured a call that came back `fault=None`, because a whitelist of openings is an attempt to
 # enumerate the error TEXTS of a binary that has hundreds of them behind a single printer, and it can
-# never be closed. An external reviewer closed the argument in one command: `image=""` prints
+# never be closed. An independent test closed the argument in one command: `image=""` prints
 # `error: bad image reference: empty`, which is not in any of the eleven, so a box that never existed
 # came back indistinguishable from a script that exited 1.
 _KERN_SPEAKING = ("error: ", "kern:")
@@ -942,7 +942,7 @@ class ExecutionResult:
         :attr:`runtime_notes`: it cannot use the trick to inject text into this field, only to remove
         its own from it.
 
-        THE OTHER DIRECTION, which the sentence above does not cover and a reviewer named: the split
+        THE OTHER DIRECTION, which the sentence above does not cover and an independent test named: the split
         works on lines, so it holds only for LINE-ALIGNED output. A workload that writes a partial line
         with no trailing newline, and is then interleaved with a `kern: warning:` on the shared stderr,
         produces ONE line that begins with the workload's text. That line does not match a prefix, so
@@ -1109,7 +1109,7 @@ def _verify_is_kern(path: str) -> str:
     """Refuse a binary that does not IDENTIFY ITSELF as kern, and return the version line it answered
     with. Raises :class:`SandboxError` if it does not identify itself.
 
-    MEASURED, AND IT WAS FOUND BY A REVIEWER RUNNING MY OWN POSITIVE CONTROL: with ``KERN_BIN=/bin/true``
+    MEASURED, AND IT WAS FOUND BY RUNNING MY OWN POSITIVE CONTROL ELSEWHERE: with ``KERN_BIN=/bin/true``
     a call returned ``success=True, exit_code=0, fault=None`` and an empty stdout. The code never ran and
     the caller was told it had. Any `kern` on PATH that is not kern does this: a leftover wrapper, a
     shim, a no-op someone dropped earlier in the search order. An agent loop reads `success` and moves
@@ -1262,7 +1262,7 @@ def _kern_state_dirs() -> "dict[str, str]":
 
     EACH DIRECTORY IS LISTED TWICE: where the environment says it is, AND where XDG says it is by
     default. The runtime dir was already spelled both ways; the other three were not, and an external
-    reviewer measured the consequence in one process: with `XDG_DATA_HOME=/tmp/xdh2`, the path
+    independent test measured the consequence in one process: with `XDG_DATA_HOME=/tmp/xdh2`, the path
     `~/.local/share/kern` was ACCEPTED and still held `builds` and `volumes`. The variable answers
     "which kern will this SDK spawn", which is the right input for the guard, but the data a previous
     run left on disk does not move when the variable does.
@@ -1280,7 +1280,7 @@ def _kern_state_dirs() -> "dict[str, str]":
          "kern's image cache (a box that writes it poisons the rootfs a later box runs)"),
         (os.environ.get("XDG_CONFIG_HOME"), os.path.join(home, ".config"),
          "kern's configuration (the profiles a later box may be given)"),
-        # THE THIRD SIBLING, and the one the list missed. Found by an external reviewer who took the
+        # THE THIRD SIBLING, and the one the list missed. Found by an independent test who took the
         # two that WERE refused as the shape of the rule and looked for the rest: this holds
         # `volumes/` (the contents of every named volume on the host, which is every compose stack's
         # database) and `builds/` (the build records a later image is assembled from). Refusing the
@@ -1951,7 +1951,7 @@ class Sandbox:
         named after a box that will never exist would both litter the workspace and collide with itself.
         A dry argv is for COMPARING, never for running."""
         if not dry:
-            # IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an external reviewer is the
+            # IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an independent test is the
             # reason. He overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was
             # open: the next call correctly refused to report an empty run as a success, and the message
             # it refused with quoted the version from the FIRST verification - so it stated that a file
@@ -2751,7 +2751,7 @@ class Sandbox:
     # -- setup (the only network window) -------------------------------------------------------------
 
     def _run_setup(self, cmd: str) -> None:
-        # DECISION (reviewer-ratified C): the network is ON only here, in a SEPARATE setup box that
+        # DECISION (independent test-ratified C): the network is ON only here, in a SEPARATE setup box that
         # dies at the end. It installs into <workspace>/.deps; every run_code box is network-off.
         install = f"pip install --target {_WORKSPACE}/{_DEPS_DIR} --no-cache-dir --disable-pip-version-check"
         # If the caller gave a bare `pip install X`, route it to the deps dir; else run as-is (net-on).

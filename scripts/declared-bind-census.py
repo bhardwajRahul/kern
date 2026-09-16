@@ -3,7 +3,7 @@
 
 WHY. `loopback-census.py` answers the shared-loopback question by running a stack and reading what
 it listens on, which needs an image. 94 of the 136 files that carry the note declare `build:` and
-carry no build context in this corpus, so they cannot be run here at all. Two reviewers, asked how
+carry no build context in this corpus, so they cannot be run here at all. Two independent tests, asked how
 to close the question without them, gave the same two answers independently, and this is both:
 
   1. A COLLISION THE FILE ITSELF DECLARES. Two services naming the same container port in `ports:`

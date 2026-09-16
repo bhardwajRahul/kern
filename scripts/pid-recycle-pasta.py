@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does a teardown signal a STRANGER that inherited a recorded pasta's pid?
 
-THE CASE, which an external reviewer named and no test reached. `pasta_to_signal`'s
+THE CASE, which an independent test named and no test reached. `pasta_to_signal`'s
 fallback - taken by a pod dir with no `pasta.id`, i.e. one written by an older kern -
 decides on `comm` plus a scan of the other pod dirs. Neither can tell kern's pasta from
 somebody else's: `comm` is `pasta` for every pasta on the host, and the cross-pod scan

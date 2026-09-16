@@ -46,7 +46,7 @@ says_loopback_only() { printf '%s' "$1" | grep -q 'loopback-only'; }
 # reason matters because it names the operation a policy refused; reporting only the second would
 # hide it.
 #
-# The last clause is the one an external reviewer asked for, and he was right: both substrings come
+# The last clause is the one an independent test asked for, and he was right: both substrings come
 # from kern's own TEMPLATE, not from pasta, so if `pasta_reason` ever returned "" the message would
 # read "...; retried without the netns watch and it also failed: " with nothing after the colon and
 # both greps would still pass. The predicate would then be confirming that the template fired, which
@@ -281,7 +281,7 @@ echo "  pasta: $REAL_PASTA"
 echo "  target: $TARGET_HOST ($TARGET_IP)"
 
 # --- THE PREDICATE AGAINST THE REAL BINARY, NOT AGAINST THIS SCRIPT --------------------------------
-# THE CIRCULARITY THIS CLOSES, pointed out by an external reviewer: the stub below writes the very
+# THE CIRCULARITY THIS CLOSES, pointed out by an independent test: the stub below writes the very
 # string `is_netns_dir_denial` matches, so every case using it certifies kern against text this
 # script authored, not against passt's. If passt reworded the message, the whole battery would stay
 # green while the retry silently stopped firing on real hosts.

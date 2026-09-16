@@ -22,7 +22,7 @@ export const GUEST_WORKSPACE = "/workspace";
  * are load-bearing: with neither, `npm install express` exits 2; with `HOME` alone and no writable
  * `/tmp`, it still exits 2; with both, it exits 0.
  *
- * It points at the WORKSPACE, and a reviewer argued it should point at the scratch instead: a cache
+ * It points at the WORKSPACE, and an independent test argued it should point at the scratch instead: a cache
  * is not a project artifact, and `npm install express` leaves **7.7 MB in `/workspace/.npm` on the
  * host**, where nothing bounds it, plus a `.npm` directory in the user's project. Both facts are
  * true and measured. The recommendation was still tried and REFUTED, by measuring the premise

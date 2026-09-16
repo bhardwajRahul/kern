@@ -742,7 +742,7 @@ def test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback():
 def test_the_binary_identity_is_re_asserted_per_box_not_once_per_sandbox(tmp_path):
     """The binary about to run must be the binary that was checked, and it was not.
 
-    FOUND BY AN EXTERNAL REVIEWER attacking the memoisation: he overwrote the verified binary IN PLACE
+    FOUND BY TESTING ON A HOST THIS ONE IS NOT attacking the memoisation: he overwrote the verified binary IN PLACE
     with `/bin/true` while a Sandbox was open. The verdict held (no `success=True` for code that never
     ran) but the refusal MESSAGE quoted the version from the first verification, so it stated that a file
     which now prints `true (GNU coreutils) 9.4` had "reported 'kern v0.9.32-48-gb578943'", and then
@@ -826,7 +826,7 @@ def test_any_error_kern_prints_before_the_box_exists_is_a_startup_failure():
     """The class, after three patches that each closed one member of it.
 
     `error: config:` was added because a caller measured it; before that `error: image:`, before that
-    `error: pull:`. An external reviewer then ran `image=""` and got
+    `error: pull:`. An independent test then ran `image=""` and got
     `error: bad image reference: empty`, in none of the eleven openings the list had grown to, so a box
     that never existed came back `fault=None` again. The list was the defect: kern reports every error
     through ONE `eprintln!("error: {}", ...)` in `kern-cli/src/main.rs` and there are hundreds of
@@ -838,7 +838,7 @@ def test_any_error_kern_prints_before_the_box_exists_is_a_startup_failure():
     """
     s = _cfg()
     for line in (
-        "error: bad image reference: empty\n",           # the reviewer's command, verbatim
+        "error: bad image reference: empty\n",           # the test's command, verbatim
         "error: sandbox: need --rootfs or --image\n",    # its neighbour, reachable the same way
         "error: banana: a domain nobody has written yet\n",
     ):
@@ -1043,7 +1043,7 @@ def test_a_scratch_bigger_than_the_cap_is_refused_and_the_default_is_clamped_to_
     assert _cfg(memory_mb=1)._tmpfs_args == ["--tmpfs", "/tmp:1m"]        # the floor, never "0m"
     assert _cfg(memory_mb=None)._tmpfs_args == ["--tmpfs", "/tmp:64m"]    # no cap, nothing to resolve
     # DIRECTION: the clamp only ever reduces. `min(64, cap/2)` cannot exceed 64, so a big box does not
-    # get a big default. A reviewer read "clamped to half" as a formula that applies both ways and
+    # get a big default. An independent test read "clamped to half" as a formula that applies both ways and
     # flagged 512 -> 256m as the consequence; it is 64m, and this is the assertion that says so.
     for cap in (128, 256, 512, 1024, 4096):
         assert _cfg(memory_mb=cap)._tmpfs_args == ["--tmpfs", "/tmp:64m"], cap
@@ -1075,7 +1075,7 @@ def test_the_clamped_default_fails_with_ENOSPC_instead_of_killing_the_box():
 
 @integration
 def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
-    """The general form of a defect a reviewer had to predict for us.
+    """The general form of a defect an independent test had to predict for us.
 
     `security_profile="untrusted"` gave a read-only /tmp in 0.1.35. A default added in the BINDING
     would have handed it a writable, executable one in 0.1.36: a hardening bundle defined by the
@@ -1315,7 +1315,7 @@ def test_a_kernel_is_the_exception_to_the_scratch_lifetime(tmp_path):
     """The README premise this branch added is true for `run_code` and FALSE for `kernel()`, and the
     unqualified sentence was ours. A kernel is ONE long-lived box, so its /tmp persists across cells
     and the size is cumulative: the same ten writes pass ten times through `run_code`, which gets a
-    fresh box each call, and run out of space in a kernel. Found by a reviewer's scenario, not by an
+    fresh box each call, and run out of space in a kernel. Found by a test's scenario, not by an
     option test, because it needs the two execution paths compared against each other."""
     step = "open('/tmp/c{i}','wb').write(b'\\0' * 10 * 1024 * 1024)"
     with Sandbox(workspace=str(tmp_path), timeout_s=120) as s:
@@ -1542,7 +1542,7 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     dir holds the profiles a later box may be given. Same reason the docker socket is refused, which was
     already in the list while these were not.
 
-    The DATA dir was missing from that list until an external reviewer took the refused two as the shape
+    The DATA dir was missing from that list until an independent test took the refused two as the shape
     of the rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, which is the CONTENT of
     every named volume on the host (every compose stack's database), and `builds/`. On his machine a
     sandbox could be handed all of them, read-write, while its two siblings were refused by name.
@@ -1566,7 +1566,7 @@ def test_kerns_own_state_is_refused_as_a_mount_source(monkeypatch, tmp_path):
     with pytest.raises(MountRefused):
         kern._validate_mount(str(other / "kern"), "/x")
     # THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    # reviewer, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
+    # independent test, in one process: with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED and
     # still held `builds` and `volumes`, because the guard protected the CONFIGURED directory while the
     # data a previous run wrote sat at the default one. Both spellings are in the list now.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "elsewhere"))
@@ -3525,7 +3525,7 @@ def test_the_alive_probe_never_invents_a_startup_failure():
 def test_a_binary_that_is_not_kern_is_refused_before_any_code_runs():
     """`KERN_BIN` pointing at anything that is not kern must RAISE, never return a clean result.
 
-    MEASURED, and found by an external reviewer running the positive control this project wrote for
+    MEASURED, and found by an independent test running the positive control this project wrote for
     him: with `KERN_BIN=/bin/true` a call returned `success=True, exit_code=0, fault=None` and an empty
     stdout. The code never ran and the caller was told it had. Both bindings did it. Any `kern` earlier
     in `PATH` that is not kern reaches this: a leftover wrapper, a shim, a no-op. An agent loop reads
@@ -3705,7 +3705,7 @@ def test_a_box_that_printed_is_never_a_box_that_never_started():
 def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
     """Answering `kern <version>` is not behaving like kern, and this is the layer that says so.
 
-    MEASURED, and found by a reviewer attacking the design of the gate rather than the code: a two-line
+    MEASURED, and found by an independent test attacking the design of the gate rather than the code: a two-line
     script that prints `kern v9.9.9-fake` for `--version` and then exits 0 passed `_verify_is_kern` and
     the call came back `success=True, exit_code=0, fault=None` with an empty stdout. The original defect,
     one layer down.

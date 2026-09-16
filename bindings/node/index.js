@@ -458,12 +458,12 @@ function kernStateDirs() {
   const uid = process.getuid();
   const home = os.homedir();
   // EACH DIRECTORY TWICE: where the environment says it is, AND where XDG says it is by default. The
-  // runtime dir was already spelled both ways; the other three were not, and a reviewer measured the
+  // runtime dir was already spelled both ways; the other three were not, and an independent test measured the
   // consequence in one process - with `XDG_DATA_HOME=/tmp/xdh2`, `~/.local/share/kern` was ACCEPTED
   // and still held `builds` and `volumes`. The variable answers "which kern will this SDK spawn",
   // which is the right input for the guard, but data a previous run left on disk does not move with it.
   //
-  // The DATA dir itself joined the list after the same reviewer took the refused two as the shape of
+  // The DATA dir itself joined the list after the same independent test took the refused two as the shape of
   // the rule and looked for the rest: it holds `volumes/`, the CONTENT of every named volume on this
   // host, and `builds/`, the records a later image is assembled from.
   const known = [
@@ -641,7 +641,7 @@ const VERIFIED_KERN = new Set();
 
 /** Refuse a binary that does not IDENTIFY ITSELF as kern. Throws `SandboxError` if it does not.
  *
- * MEASURED, and found by an external reviewer running the positive control this project wrote for him:
+ * MEASURED, and found by an independent test running the positive control this project wrote for him:
  * with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
  * stdout. The code never ran and the caller was told it had. Any `kern` earlier in `PATH` that is not
  * kern does this: a leftover wrapper, a shim, a no-op. An agent loop reads `success` and every
@@ -1130,7 +1130,7 @@ function kernReportedOom(stderr) {
  *
  * WHAT THIS REPLACED: a list of eleven message OPENINGS, each added after a caller measured a
  * `fault: null`. Enumerating the error texts of a binary with hundreds of them behind one printer cannot
- * be finished, and an external reviewer ended the argument with `image: ""`, whose
+ * be finished, and an independent test ended the argument with `image: ""`, whose
  * `error: bad image reference: empty` was in none of the eleven. */
 const KERN_SPEAKING = ["error: ", "kern:"];
 
@@ -1569,7 +1569,7 @@ class Sandbox {
    * that will never exist would both litter the workspace and collide with itself. A dry argv is for
    * COMPARING, never for running. */
   _baseArgv(name, { network, timeoutS, isSetup = false, dry = false }) {
-    // IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an external reviewer is the reason. He
+    // IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an independent test is the reason. He
     // overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was open: the next call
     // correctly refused to call an empty run a success, and the message it refused with quoted the
     // version from the FIRST verification - stating that a file which now prints `true (GNU coreutils)

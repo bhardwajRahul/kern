@@ -1163,7 +1163,7 @@ const SCOPE_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(1
 /// them: `(kern.slice, the caller's own cgroup)`. Either may be `None`.
 ///
 /// Public so `kern doctor` can NAME the places it probed instead of asserting an unlocated verdict.
-/// An outside reviewer refused a release over exactly that gap: doctor said a `--memory` write
+/// An outside independent test refused a release over exactly that gap: doctor said a `--memory` write
 /// "silently never bites" while a box on the same host exited 137, and the sentence pointed at no
 /// directory, so neither of us could tell whether doctor or the 137 was describing kern's cap. A
 /// claim about a cgroup that does not say WHICH cgroup cannot be checked against `/proc/<pid>/cgroup`.
@@ -1186,7 +1186,7 @@ pub fn memory_cap_state() -> MemoryCapState {
     // where the slice EXISTS but boxes do not use it, this probed the slice and reported on a
     // directory no box goes near.
     //
-    // MEASURED by an outside reviewer, uid 0, no user manager: `kern doctor` printed "the `memory`
+    // MEASURED by an outside independent test, uid 0, no user manager: `kern doctor` printed "the `memory`
     // controller is listed but NOT delegated to a child cgroup - a `--memory` write is accepted and
     // silently never bites", and on the same host in the same session a box started with
     // `--memory 64m` reported `memory_max = 67108864` and an `exec` that overran it exited 137.
@@ -1596,7 +1596,7 @@ fn kern_slice_path() -> Option<PathBuf> {
     // THE DELEGATION ROOT IS NOT ALWAYS AN ANCESTOR OF THE CALLER, and assuming it was made the
     // direct cap path unreachable on a whole class of hosts.
     //
-    // MEASURED by an outside reviewer on WSL2 with `systemd=true`, 2026-09-09: a user manager IS
+    // MEASURED by an outside independent test on WSL2 with `systemd=true`, 2026-09-09: a user manager IS
     // running, and the login shell sits in `0::/init.scope`, whose only ancestors are `/init.scope`
     // and the root. Neither matches, so this returned `None`, `direct_caps_available()` was false,
     // and every `kern run` there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms
@@ -1969,7 +1969,7 @@ pub fn live_box_cgroups() -> Vec<(String, u32)> {
 /// per-box cgroup to ask about.
 ///
 /// WHY A SECOND CHANNEL EXISTS AT ALL. `live_box_cgroups` reads `kern.slice`, and on a host without
-/// cgroup delegation there is no `kern-box-*` directory to read: an independent reviewer ran the
+/// cgroup delegation there is no `kern-box-*` directory to read: an independent test ran the
 /// registry-wipe case as uid 0 with no systemd and reported THREE live `kern box g1` processes,
 /// absent from `ps`, unreachable by `stop`, untouched by `gc` - and the warning could not fire,
 /// because its evidence did not exist. That is the host where the defect is MOST likely and where it
@@ -2285,7 +2285,7 @@ pub fn box_cgroup_dir_for_exec(pid1: i32) -> Option<PathBuf> {
 /// refused on a host with no delegation, where `apply_limits` returns `None`, the box sits in the
 /// caller's own cgroup, `box_cgroup_dir_for_exec` answers `None` and the placement therefore has
 /// nothing to place. The command was refused for a loss that did not happen, with a message naming
-/// caps that did not exist. Reported by an outside reviewer on a box that was not at its pids limit.
+/// caps that did not exist. Reported by an outside independent test on a box that was not at its pids limit.
 ///
 /// A pure function of two bools so all four combinations are asserted without a cgroup filesystem,
 /// which is the same treatment `supervisor_needs_leaf` and `caps_gate_satisfied` get for the same
@@ -2334,7 +2334,7 @@ pub fn sweep_orphans_off_hot_path() {
     // BOTH DIRECTORIES A LEAF CAN BE BUILT IN, which is the same pair `gc_orphan_box_cgroups` reaps.
     // It used to be `kern.slice` alone, and that is the directory a host WITHOUT a systemd user
     // manager never has: there the leaf is built in the caller's own cgroup, so nothing on this path
-    // ever swept anything. MEASURED by an outside reviewer on WSL2 with no user manager, 2026-09-09:
+    // ever swept anything. MEASURED by an outside independent test on WSL2 with no user manager, 2026-09-09:
     // 200 sequential `kern run` left 201 directories, cleared only by an explicit `kern gc`. That is
     // the shipped WSL rootfs's own configuration, so it was the documented Windows install path that
     // accumulated them.
@@ -2367,7 +2367,7 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
     // which is what "can this cap" means. It is not what "can this cap US" means, and the difference
     // is a whole class of host.
     //
-    // MEASURED by an outside reviewer on WSL2 with `systemd=true`, 2026-09-09, after an earlier
+    // MEASURED by an outside independent test on WSL2 with `systemd=true`, 2026-09-09, after an earlier
     // version of this file learned to FIND the slice there: the leaf was created, `memory.max` and
     // `pids.max` were written and read back, and then both `clone3(CLONE_INTO_CGROUP)` and the
     // `cgroup.procs` write FAILED, because cgroup v2's delegation containment rule needs write access
@@ -3408,7 +3408,7 @@ fn cgroup_dir_from_proc_line(raw: &str) -> Option<std::path::PathBuf> {
     // cap that truly failed to apply is caught by its fail-closed read-back and by
     // `--require-limits`, neither of which routes through here.
     //
-    // Found by an external reviewer reading the function, with no host and no binary. It is a
+    // Found by an independent test reading the function, with no host and no binary. It is a
     // property of the code, not of a machine, which is why it did not need one.
     if rel == "/" {
         return None;
@@ -3695,7 +3695,7 @@ mod tests {
 
     /// The `/proc` channel finds a live box, and it does not use `kern.slice` to do it.
     ///
-    /// This exists because an independent reviewer ran the registry-wipe case on a host with NO
+    /// This exists because an independent test ran the registry-wipe case on a host with NO
     /// cgroup delegation - uid 0, no systemd - and measured three live `kern box` processes that
     /// `ps` could not report, `stop` could not reach and `gc` would not touch. The cgroup channel had
     /// nothing to read there, so the warning could not fire on the host where the defect is most
@@ -3768,7 +3768,7 @@ mod tests {
     /// here" about a box that may be capped exactly as asked. A guaranteed false RED for anyone who
     /// cannot locate themselves.
     ///
-    /// Found by an external reviewer reading the function with no host, no repo and no binary. The
+    /// Found by an independent test reading the function with no host, no repo and no binary. The
     /// asymmetry is the reason it is worth a test rather than a comment: a false red is loud and
     /// annoying, a false green is silent, and this module's stated policy already picks silence
     /// when it cannot tell.
@@ -4313,7 +4313,7 @@ mod tests {
     fn a_box_in_the_cgroup_root_has_no_cgroup_of_its_own_to_report() {
         // THE PIN FOR A REPORTING DEFECT, and the reason it belongs here rather than in the CLI.
         //
-        // `kern inspect` echoes the `--memory` the box was STARTED with. An outside reviewer measured
+        // `kern inspect` echoes the `--memory` the box was STARTED with. An outside independent test measured
         // `"memory_max": 67108864` on a box whose PID 1 sat in `0::/`, the cgroup-v2 ROOT, which has
         // no `memory.max` file at all: a cap reported as a fact where the kernel holds none. Their
         // `kern doctor` said so correctly on the same host, and the two readings disagreed.
@@ -4371,14 +4371,14 @@ mod tests {
         // reaches the second only when the first is `None`: on a host where the slice EXISTS but
         // boxes do not use it, it reported on a directory no box goes near.
         //
-        // MEASURED by an outside reviewer, uid 0 with no user manager: doctor said a `--memory` write
+        // MEASURED by an outside independent test, uid 0 with no user manager: doctor said a `--memory` write
         // "silently never bites" while a box on the same host held `memory_max = 67108864` and an
         // exec that overran it was killed with 137.
         //
         // ON THE REAL HOST, because the defect is about WHICH directory is asked and a fake one
         // cannot have that property. This asserts the invariant that survives either answer: the
         // verdict must not be worse than what the caller's own cgroup alone would give, which is the
-        // directory the reviewer's boxes actually used and the one `or_else` skipped.
+        // directory the test's boxes actually used and the one `or_else` skipped.
         let combined = memory_cap_state();
         let own = current_v2_cgroup();
         if combined == MemoryCapState::Unknown {
@@ -4474,7 +4474,7 @@ mod tests {
             exec_join_outcome_after_failure(&open()),
             ExecCgroupJoin::Unbounded
         ));
-        // And a real pids ceiling alone, which is the case an outside reviewer reproduced with a
+        // And a real pids ceiling alone, which is the case an outside independent test reproduced with a
         // saturated `--pids-limit` and the one that must keep refusing.
         std::fs::write(d.join("memory.max"), "max\n").unwrap();
         std::fs::write(d.join("pids.max"), "4\n").unwrap();
@@ -4489,7 +4489,7 @@ mod tests {
     fn placement_is_gated_on_the_common_ancestor_and_not_on_the_destination() {
         // THE RULE THIS PINS, and the defect it was written after. cgroup v2 delegation containment
         // needs write access to the `cgroup.procs` of the COMMON ANCESTOR of the source and the
-        // destination, not just of the destination. A reviewer measured the consequence on WSL2 with
+        // destination, not just of the destination. An independent test measured the consequence on WSL2 with
         // `systemd=true`, where the shell sits in `/init.scope`: kern found a delegated, writable,
         // correctly capped `kern.slice`, created a leaf in it, wrote and read back both caps, and
         // then could not put the process in, because the common ancestor of `/init.scope` and

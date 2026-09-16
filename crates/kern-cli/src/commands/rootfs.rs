@@ -1255,7 +1255,7 @@ pub(crate) fn supports_reflink(dir: &std::path::Path) -> Option<bool> {
 /// TWO ATTEMPTS, because the plain user cannot read every base image. A Debian or Ubuntu base ships
 /// directories like `/var/cache/apt/archives/partial` at mode 0700, and after extraction they are
 /// owned by a SUBORDINATE uid, which the user running `cp` cannot traverse. MEASURED by an external
-/// reviewer on Sentry's official compose file: every `build:` on a Debian base died here, 21 of 57
+/// independent test on Sentry's official compose file: every `build:` on a Debian base died here, 21 of 57
 /// services, before anything started. `FROM alpine` built fine, which is what named the cause.
 ///
 /// So a failed copy is retried as ns-root over the subordinate range, where those directories are

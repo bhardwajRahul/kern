@@ -1,7 +1,7 @@
 """A test double for the `kern` binary, for the unit tests that need a Sandbox and not a box.
 
 WHY IT IS NOT `/bin/true` ANY MORE. The binding now REFUSES a binary that does not identify itself as
-kern, and the reason is a defect an external reviewer found by running the positive control this project
+kern, and the reason is a defect an independent test found by running the positive control this project
 had written for him: with `KERN_BIN=/bin/true` a call came back `success=True, exit_code=0, fault=None`
 and an empty stdout. The code never ran and the caller was told it had.
 

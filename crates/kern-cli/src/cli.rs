@@ -1654,7 +1654,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--allow-privileged" => allow_privileged = true,
                     // `-f` IS DOCKER'S FILE FLAG BEFORE THE VERB AND ITS FOLLOW FLAG AFTER `logs`,
                     // and reading it as `--follow` everywhere is how `kern compose -f
-                    // docker-compose.yml logs web` came to hang. MEASURED by an external reviewer,
+                    // docker-compose.yml logs web` came to hang. MEASURED by an independent test,
                     // who lost half an hour to a job parked on it, and reproduced here in one pair:
                     // `compose docker-compose.yml logs a` prints and exits, `compose -f
                     // docker-compose.yml logs a` never returns. It is also the invocation in every
@@ -4683,7 +4683,7 @@ mod tests {
     /// A `--` AFTER THE SERVICE IS THE SEPARATOR EVERY DOCKER USER TYPES, and it must not become the
     /// program to run.
     ///
-    /// FOUND BY AN EXTERNAL REVIEWER, executing: `compose f.yml exec -T web -- echo hi` died with
+    /// FOUND BY TESTING ON A HOST THIS ONE IS NOT, executing: `compose f.yml exec -T web -- echo hi` died with
     /// `execvp failed: No such file or directory` and exit 127, while the same line without `--`
     /// printed `hi`. `docker compose` accepts it and drops it, and `kern exec <box> -- cmd` has
     /// always worked, so the two kern verbs disagreed with each other and with the reference.

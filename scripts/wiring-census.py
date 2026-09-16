@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Which wiring does kern actually select, over the whole corpus?
 
-The relay wiring is the one an outside reviewer guessed has no population. `kern compose <f> config`
+The relay wiring is the one an outside independent test guessed has no population. `kern compose <f> config`
 announces its choice on stderr, so this counts the announcements rather than re-deriving the rule:
 It reads the `wiring:` FIELD that `compose config` prints on stdout, which is one token and says
 nothing else: `pod`, `bridge` or `relay`. The `wiring-source:` line beside it says whether kern chose

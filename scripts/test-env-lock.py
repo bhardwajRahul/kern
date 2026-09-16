@@ -10,7 +10,7 @@ WHO CHECKS WHAT, because this file used to try to do all of it and could not:
     `disallowed-methods` in `clippy.toml`. Clippy resolves the path, so `use std::env;` then
     `env::set_var(..)`, `use std::env::set_var as sv;`, a name held in a binding, and spaces around
     the `::` are all the same call to it. They were four separate holes in the regex that used to
-    live here, found by an external reviewer in one sitting, on the second version of this gate.
+    live here, found by an independent test in one sitting, on the second version of this gate.
   * THIS FILE checks the only thing left: that the list of crates and files exempted from that lint
     is the one written below. An exemption is a whole crate going unwatched, it is one line to add,
     and nothing else would notice.
@@ -27,7 +27,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # ANY ATTRIBUTE THAT COULD SWITCH THE LINT OFF, not the one spelling we happen to use.
 #
 # 🪤 The first version of this matched `#![allow(clippy::disallowed_methods)]` exactly, and an
-# external reviewer disarmed the lint three ways it could not see: `expect` instead of `allow`, a
+# independent test disarmed the lint three ways it could not see: `expect` instead of `allow`, a
 # second lint in the same list, and `allow(clippy::all)`, which never names this lint at all and so
 # defeats any regex keyed on its name. The question is not "is this the attribute we write", it is
 # "could this attribute turn the lint off": `disallowed_methods` by name, the group that contains it,

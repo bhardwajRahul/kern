@@ -437,7 +437,7 @@ mod tests {
     /// readings of one field and therefore a drift surface: a change to how a mapping is rendered
     /// that the parser cannot read back would make `compose port` answer for a box that publishes.
     ///
-    /// The alternative a reviewer proposed was to store the structured value and format at display
+    /// The alternative an independent test proposed was to store the structured value and format at display
     /// time, deleting the parser. It is not available: `fmt`'s output IS the only wire format there
     /// is, so a decoder for it is `parse_display` under another name, and adding a SECOND structured
     /// field would duplicate state rather than remove a parser, while changing the existing field's

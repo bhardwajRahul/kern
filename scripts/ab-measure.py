@@ -144,7 +144,7 @@ def main() -> int:
     print(f"B  {args.b}\n   mediana {med_b:9.1f} us   n={len(samples_b)}")
     print(f"B - A  {med_d:+9.1f} us   intervallo 95% [{lo:+.1f}, {hi:+.1f}]")
 
-    # L'ASSERZIONE CHE UN REVISORE HA CHIESTO DI MECCANIZZARE.
+    # L'ASSERZIONE CHE VA MECCANIZZATA E NON LETTA A OCCHIO.
     #
     # Una differenza identicamente nulla su OGNI coppia non e' "nessun costo aggiunto": su un banco
     # vero il rumore da solo la renderebbe diversa da zero, quindi uno zero esatto ripetuto e'

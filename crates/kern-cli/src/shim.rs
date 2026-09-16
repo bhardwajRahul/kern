@@ -221,7 +221,7 @@ fn reject_leading_dash(role: &'static str, value: &str) -> Result<(), ShimError>
 /// WHY THIS EXISTS, MEASURED. `docker version --format '{{.Server.Os}}/{{.Server.Arch}}'` dropped the
 /// template and printed kern's version string with exit 0, so a script doing
 /// `PLATFORM=$(docker version --format …)` got `kern 0.9.32-review.5` where it expected
-/// `linux/amd64` and carried on with it. An external reviewer traced Sentry's `install.sh` stopping
+/// `linux/amd64` and carried on with it. An independent test traced Sentry's `install.sh` stopping
 /// at "Detecting Docker platform" to exactly that. Every other gap in this surface fails CLOSED -
 /// exit 1, the caller takes its error branch - and this one failed OPEN, which is the only kind that
 /// corrupts a result instead of stopping it.
@@ -1267,7 +1267,7 @@ mod fuzz_robustness {
         // THE ONLY GAP IN THIS SURFACE THAT FAILED OPEN. `docker version --format
         // '{{.Server.Os}}/{{.Server.Arch}}'` dropped the template and printed kern's version with
         // exit 0, so `PLATFORM=$(docker version --format …)` took `kern 0.9.32-review.5` for
-        // `linux/amd64` and the script carried on with it. MEASURED by an external reviewer as the
+        // `linux/amd64` and the script carried on with it. MEASURED by an independent test as the
         // exact step Sentry's `install.sh` stops at. Every other gap here exits 1.
         let sv = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
         let d = |a: &[&str]| super::direct_reply(&sv(a));

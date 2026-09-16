@@ -1731,7 +1731,7 @@ mod net_resource_tests {
         // incompleteness sent the entry down the repair path, which clears the image dir first - and
         // an image whose layers hold subuid-owned files (postgres, mysql, redis, nginx) cannot have
         // that directory removed by the user that pulled it. EPERM, entry unusable until
-        // `--pull always`. Measured by a reviewer on a 66-image cache.
+        // `--pull always`. Measured by an independent test on a 66-image cache.
         let cache = std::env::temp_dir().join(format!("kern-cfgfmt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         let safe = "some_image-0123456789abcdef";
@@ -1790,7 +1790,7 @@ mod net_resource_tests {
     fn the_base_copy_reaches_a_directory_owned_by_a_subordinate_uid() {
         // A Debian base ships `/var/cache/apt/archives/partial` at mode 0700, and after extraction it
         // is owned by a SUBORDINATE uid. `cp` run as the plain user cannot traverse it, so every
-        // `build:` on such a base died in `copy_tree`: measured by an external reviewer on Sentry's
+        // `build:` on such a base died in `copy_tree`: measured by an independent test on Sentry's
         // official file, 21 of 57 services, before anything started. `FROM alpine` worked, which is
         // what named the cause.
         //
@@ -2711,7 +2711,7 @@ stopsignal	SIGTERM
     #[test]
     #[cfg(unix)]
     fn copy_from_stage_preserves_inner_symlinks_no_follow() {
-        // The double-copy escape class (reviewer 2a): copying a DIR out of a stage that CONTAINS an
+        // The double-copy escape class (independent test 2a): copying a DIR out of a stage that CONTAINS an
         // absolute symlink to a host file must PRESERVE the symlink (cp -a no-follow), never dereference
         // it and copy the host file's bytes at build time. The symlink resolves only later, inside the
         // box, against the box's own rootfs - so a `→ /etc/passwd` reads the box's passwd, not the host's.
@@ -2743,7 +2743,7 @@ stopsignal	SIGTERM
     #[test]
     #[cfg(unix)]
     fn copy_from_stage_preserves_relative_symlink_no_host_read() {
-        // Reviewer 2a residual vector: a RELATIVE symlink inside a copied dir whose target ESCAPES the
+        // Independent test 2a residual vector: a RELATIVE symlink inside a copied dir whose target ESCAPES the
         // stage rootfs (many `..` → a host file). It must arrive as a verbatim symlink, its host target
         // NEVER read at build time (canary check), and stay dangling once inside the box. This is the
         // one case the absolute-symlink test didn't exercise; `cp -a` is no-follow so it's preserved.
@@ -3716,7 +3716,7 @@ mod bring_up_check_tests {
         // (a wrong command that printed help and returned 0, a config that made it terminate cleanly)
         // does NOT, because nobody declared it was allowed to end.
         //
-        // A reviewer read the simplified rule as "any exit 0 is legitimate", which would have left
+        // An independent test read the simplified rule as "any exit 0 is legitimate", which would have left
         // exactly that case silent. It does not, and this test pins the distinction so a future
         // simplification cannot quietly widen it.
         let pod = "p";
@@ -3993,7 +3993,7 @@ mod pod_global_tests {
 
     #[test]
     fn same_container_port_is_a_conflict_even_with_different_host_ports() {
-        // The case a reviewer's premise said was rare: two DIFFERENT services on the same INTERNAL
+        // The case a test's premise said was rare: two DIFFERENT services on the same INTERNAL
         // port, published on different host ports. Common by default, because every framework has one
         // canonical port. Before this, both boxes started, one died with EADDRINUSE, and `up` exited 0.
         let mut a = svc("api");
@@ -6183,7 +6183,7 @@ mod scratch_placement_tests {
 fn run_forks_only_when_it_has_both_a_cgroup_to_enter_and_nobody_else_supervising() {
     use crate::commands::start::run_should_fork;
     // A capped leaf exists and nothing outside owns the workload: fork, because otherwise the leaf
-    // outlives every process that knows its name. This is the case an outside reviewer measured on
+    // outlives every process that knows its name. This is the case an outside independent test measured on
     // WSL2 with no systemd user manager: 200 sequential `kern run` left 201 directories behind.
     assert!(run_should_fork(false, true));
     // An outer enforcer already waits, reports and cleans up (kern's own scope proxy, a `--restart`

@@ -220,7 +220,7 @@ pub use outcome::{Outcome, OutputView, ResourceSource};
 /// beside either of its readers. A setup failure is reported from two places that cannot share a
 /// function: `report_exec_failure` prints it from inside the FORKED CHILD and then `_exit`s, so the
 /// error never reaches the CLI, and the CLI prints it for every setup failure that fails before the
-/// fork. An outside reviewer measured the consequence - `kern: sandbox setup failed: mount(overlay)
+/// fork. An outside independent test measured the consequence - `kern: sandbox setup failed: mount(overlay)
 /// failed: Invalid argument (os error 22)` arriving with NO hint at all, because the child's path had
 /// none and could not borrow the CLI's.
 ///

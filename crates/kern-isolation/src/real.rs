@@ -1557,7 +1557,7 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
         } else if io.kind() == std::io::ErrorKind::NotFound && cmd.starts_with('/') {
             // THREE CAUSES SHARE ONE ERRNO, and the old hint recited all three at once, so the reader
             // had to work out which. We are inside the box's mount namespace here, so ONE `stat`
-            // decides between them. Measured cost of not deciding: an external reviewer met
+            // decides between them. Measured cost of not deciding: an independent test met
             // `cannot start 'tini' in box: No such file or directory` on a cached image whose rootfs
             // was missing `/sbin/tini`, and the hint sent him to check the path and the libraries of
             // a command whose file simply was not there.
@@ -1596,7 +1596,7 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
     } else {
         // AND IT CARRIES ITS OWN REMEDY, because nothing downstream can add one. This branch runs in
         // the FORKED CHILD, which `_exit`s on the next line, so the error never reaches the CLI's hint
-        // function and no match arm there can ever help it. An outside reviewer measured exactly that:
+        // function and no match arm there can ever help it. An outside independent test measured exactly that:
         // `kern: sandbox setup failed: mount(overlay) failed: Invalid argument (os error 22)`, with no
         // hint line under it, while every neighbouring branch in this function carries one.
         //
@@ -2074,7 +2074,7 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         // The `:ro` argument is NOT the reason, and saying so out loud is the point of this
         // paragraph. This comment used to lead with "the RO remount is per-mount, so a recursive
         // bind would leave the cloned submounts writable under a `:ro` volume". True on the mount
-        // API kern uses, and an outside reviewer pointed out that it stops being true the moment
+        // API kern uses, and an outside independent test pointed out that it stops being true the moment
         // anyone reaches for `mount_setattr(MOUNT_ATTR_RDONLY, AT_RECURSIVE)`, which has covered
         // submounts since 5.12. An argument with an expiry date is the wrong one to build a refusal
         // on, and the wrong one to put in the operator's error message.
@@ -2432,7 +2432,7 @@ fn setup_dev(
     //
     // What IS wrong is what happens next. `/dev` is a tmpfs the box's root owns, so `> /dev/tty`
     // CREATES a regular file: a program that writes a prompt there gets no error and the operator sees
-    // nothing, and a later reader opens the file instead of failing. Reported by an outside reviewer
+    // nothing, and a later reader opens the file instead of failing. Reported by an outside independent test
     // and reproduced here, `-rw-rw-r-- 2 bytes` where the host has `crw-rw-rw- 5, 0`. That is the
     // silent-success shape this codebase refuses everywhere else.
     //
@@ -6090,7 +6090,7 @@ fn hold_until_the_pod_is_gone() -> ! {
         missing_in_a_row = next;
         // AND THE MEMBERS DECIDE, NOT ONLY THE DIRECTORY.
         //
-        // A reviewer found the case this needs: on a systemd host WITHOUT `loginctl enable-linger`,
+        // An independent test found the case this needs: on a systemd host WITHOUT `loginctl enable-linger`,
         // logind removes `/run/user/<uid>` on the last logout while leaving the user's processes
         // running (the default `KillUserProcesses=no`). The pod's directory is then genuinely gone,
         // the rule above is satisfied, and the holder would release the namespaces of a stack that
@@ -6302,7 +6302,7 @@ fn exec_fail_closed(reason: &str) -> ! {
 /// CAUSE TWO, the host layout forbids the migration: cgroup v2 delegation containment needs write
 /// access to the `cgroup.procs` of the COMMON ANCESTOR of the source and destination, and from a
 /// shell in `/init.scope` that ancestor is the root cgroup. MEASURED on WSL2 with `systemd=true` by
-/// an outside reviewer: `kern exec` refused every single time, on a host where nothing was wrong
+/// an outside independent test: `kern exec` refused every single time, on a host where nothing was wrong
 /// with the box. No implementation fixes that one. A process in `/init.scope` cannot reach the
 /// user's delegated tree, and it cannot move itself there either, because that migration needs the
 /// same permission on the same root.
@@ -6588,7 +6588,7 @@ pub fn exec_in_box(
     // `exec_join_outcome_after_failure`, which is the function that answers exactly this question,
     // and nothing consulted the answer.
     //
-    // WHAT THAT COST, reported by an outside reviewer on a host with no delegation: `kern exec`
+    // WHAT THAT COST, reported by an outside independent test on a host with no delegation: `kern exec`
     // refused with 126 on a box that was NOT at its pids limit, saying the command "would run
     // outside its --memory/--pids caps" on a box that HAD no caps. `apply_limits` returns `None`
     // where nothing can be delegated, so the box sits in the caller's own cgroup,
@@ -6651,7 +6651,7 @@ pub fn exec_in_box(
         // escape the pre-`setns` migration was put back to close.
         if !born && escaping_a_real_cap {
             // AND IT NAMES THE TWO CAUSES, because a refusal that states only the consequence leaves
-            // the reader with nothing to do. An outside reviewer hit this on WSL2 with `systemd=true`:
+            // the reader with nothing to do. An outside independent test hit this on WSL2 with `systemd=true`:
             // `kern exec` refused every time, on a host where the previous release ran the command
             // uncapped and said so, and the message gave no way to tell a full box from a host layout
             // that can never work. The two causes need opposite actions and only the reader can tell
@@ -7026,7 +7026,7 @@ mod setup_window_sequence_tests {
     /// entering the user namespace and the filter being in force. A hand grep proved that once; this
     /// makes it a permanent guard. A future edit that forks or execs a process in the setup window -
     /// before `crate::seccomp::install(...)` - FAILS the build instead of silently opening the window
-    /// (the exact gap a reviewer flagged as having no automated cancello).
+    /// (the exact gap an independent test flagged as having no automated cancello).
     ///
     /// The test reads its own source and asserts no process-launching token appears inside
     /// `child_setup_and_exec` BEFORE the install call: the CALL SYNTAX (with a `(`) for the ways a

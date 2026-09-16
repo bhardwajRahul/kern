@@ -584,7 +584,7 @@ test("the OOM byte is the authority and the stderr sentence is the fallback", ()
 });
 
 test("the binary identity is re-asserted per box, not once per Sandbox", () => {
-  // FOUND BY AN EXTERNAL REVIEWER attacking the memoisation: he overwrote the verified binary IN PLACE
+  // FOUND BY TESTING ON A HOST THIS ONE IS NOT attacking the memoisation: he overwrote the verified binary IN PLACE
   // with `/bin/true` while a Sandbox was open. The verdict held (no success for code that never ran) but
   // the refusal MESSAGE quoted the version from the FIRST verification, so it stated that a file now
   // printing `true (GNU coreutils) 9.4` had "reported 'kern v0.9.32-48-gb578943'". A true verdict with a
@@ -1250,7 +1250,7 @@ test("a reply without a usable exit code is a fault, not a success", () => {
 });
 
 test("a binary that is not kern is refused before any code runs", async () => {
-  // MEASURED, and found by an external reviewer running the positive control this project wrote for him:
+  // MEASURED, and found by an independent test running the positive control this project wrote for him:
   // with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
   // stdout. The code never ran and the caller was told it had. Both bindings did it.
   const prev = process.env.KERN_BIN;
@@ -2154,7 +2154,7 @@ test("kern's own state is refused as a mount source", () => {
   // is the same class one step removed (write it and the rootfs a LATER box runs is yours). Same reason
   // the docker socket is refused, which was in the list while these were not.
   //
-  // The DATA dir joined the list after an external reviewer took the refused two as the shape of the
+  // The DATA dir joined the list after an independent test took the refused two as the shape of the
   // rule and looked for the rest: `$XDG_DATA_HOME/kern` holds `volumes/`, the CONTENT of every named
   // volume on the host, and `builds/`. Its two siblings were refused by name and it was not.
   const prev = { kb: process.env.KERN_BIN, rt: process.env.XDG_RUNTIME_DIR,
@@ -2177,7 +2177,7 @@ test("kern's own state is refused as a mount source", () => {
       }
     }
     // THE DEFAULT LOCATION STAYS REFUSED WHILE THE VARIABLE POINTS ELSEWHERE. Measured by the same
-    // reviewer, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
+    // independent test, in one process: with `XDG_DATA_HOME` pointed at a scratch dir, `~/.local/share/kern`
     // was ACCEPTED and still held `builds` and `volumes`. Both spellings are in the list now, so the
     // guard covers where kern WILL write and where a previous run already did.
     {
@@ -2362,7 +2362,7 @@ test("a box that printed is never a box that never started", async () => {
 
 test("any error kern prints before the box exists is a startup failure", () => {
   // The CLASS, after three patches that each closed one member of it. `error: config:` was added because
-  // a caller measured it, `error: image:` before that, `error: pull:` before that. An external reviewer
+  // a caller measured it, `error: image:` before that, `error: pull:` before that. An independent test
   // then ran `image: ""` and got `error: bad image reference: empty`, in none of the eleven openings the
   // list had grown to. The list was the defect: kern reports every error through ONE
   // `eprintln!("error: {}", ...)` and there are hundreds of messages behind it.
@@ -2375,7 +2375,7 @@ test("any error kern prints before the box exists is a startup failure", () => {
     const s = new Sandbox();
     const cl = (stderr) => s._classify(1, null, stderr, false, 30);
     for (const line of [
-      "error: bad image reference: empty\n",          // the reviewer's command, verbatim
+      "error: bad image reference: empty\n",          // the test's command, verbatim
       "error: sandbox: need --rootfs or --image\n",   // its neighbour, reachable the same way
       "error: banana: a domain nobody has written yet\n",
     ])

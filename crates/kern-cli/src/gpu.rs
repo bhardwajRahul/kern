@@ -641,7 +641,7 @@ mod tests {
 
     /// THE HARDWARE PATH, FORCED. kern has never run on MIG or SR-IOV hardware, so `TIER-HW` is a
     /// branch no test could reach end to end and its fail-closed behaviour was a property asserted in
-    /// a comment rather than measured. A reviewer's point on 2026-08-28: "fail-closed by design"
+    /// a comment rather than measured. A test's point on 2026-08-28: "fail-closed by design"
     /// becomes "fail-closed measured" the moment something drives the path with a synthetic device
     /// directory, and that costs nothing but a temp dir.
     ///

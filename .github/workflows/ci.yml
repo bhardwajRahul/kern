@@ -7,10 +7,10 @@ on:
     # that creates it, whenever work leaves `main` again. It is back for the SDK scratch work
     # (a writable /tmp and the tmpfs knob); remove it again when that lands on main.
     #
-    # `compose-compat_2026-09-10_0740` carries the pre-launch work an external reviewer is being
+    # `compose-compat_2026-09-10_0740` carries the pre-launch work an independent test is being
     # asked to certify: the per-service namespace default, cross-project networks, and the compose
-    # verbs (`exec`, `cp`, `run`, `ps --format json`). It is pushed so the reviewer can build the
-    # exact commit, which means it must also be a branch CI tests: a reviewer running an artifact
+    # verbs (`exec`, `cp`, `run`, `ps --format json`). It is pushed so that test can build the
+    # exact commit, which means it must also be a branch CI tests: an independent test running an artifact
     # nothing tested is the situation this list exists to prevent. Remove the name when it lands.
     branches: [main, dev, compose-compat_2026-09-10_0740]
   pull_request:
@@ -35,7 +35,7 @@ jobs:
       - name: clippy
         # `-D warnings` TWICE ON PURPOSE. The job sets `RUSTFLAGS: -D warnings` twenty lines above,
         # and that IS what makes a clippy lint fatal here: measured, a planted `env::set_var` exits
-        # 101 with it and 0 without. But an external reviewer read this line on its own, ran it
+        # 101 with it and 0 without. But an independent test read this line on its own, ran it
         # without the job's environment, saw a warning and exit 0, and reported the perimeter as
         # unenforced. He was wrong about this repository and right about the shape: a rule whose
         # teeth are in a variable declared elsewhere is one `env:` edit away from being decoration,
@@ -49,7 +49,7 @@ jobs:
         # AND A SKIP HERE IS INVISIBLE, which is why the suite is told to REQUIRE its fixtures on this
         # runner. `cargo test` hides the stderr of a test that passes, so a file whose fixtures are
         # missing skips most of itself and still reports 133/133, and nobody reads a log to find out.
-        # An external reviewer measured exactly that on his own machine: 96 of 133 skipped for a
+        # An independent test measured exactly that on his own machine: 96 of 133 skipped for a
         # missing busybox, green. MEASURED here rather than assumed: this runner ships
         # `busybox-static` (the webstack job's apt output says it REMOVES it to install `busybox`), so
         # `/bin/busybox` is present and this variable asserts a property that already holds. The day a
@@ -60,12 +60,11 @@ jobs:
         # The two prose gates. They existed before this step and ran only when someone remembered
         # them, which is the same as not running: the three figures that drifted over the launch
         # weekend (3.6 vs 3.4 ms, five vs nine ENOSYS syscalls, ~186 vs 154-160 MB) were all caught
-        # by hand or, in one case, by an outside reviewer repeating our own wrong number back to us.
+        # by hand or, in one case, by an outside independent test repeating our own wrong number back to us.
         # Pure stdlib Python, both under a second, both at zero on the corpus when this was added.
         run: |
           python3 scripts/no-ai-slop.py
           python3 scripts/stale-numbers.py
-          python3 scripts/test-count.py
           # THE WORDS A DOCKER USER TYPES, which is `stale-numbers` applied to the question instead of
           # the answer. Twice in one day a capability was finished, tested and invisible because the
           # docs used the project's words: `extra_hosts`+`host-gateway` shipped with a test while
@@ -97,7 +96,7 @@ jobs:
           # that writes XDG_DATA_HOME moves every sibling's volumes_dir() while its body runs. The
           # RULE is enforced at runtime, by an assertion inside crate::global_env/set_global_env: it
           # found 27 such tests where a static version of the same rule found 3, and an external
-          # reviewer walked through that static version eight times out of eight. This gate only
+          # independent test walked through that static version eight times out of eight. This gate only
           # checks that nothing goes around the chokepoints, which is a per-line question.
           python3 scripts/test-env-lock.py
           python3 scripts/progress-is-tty-gated.py

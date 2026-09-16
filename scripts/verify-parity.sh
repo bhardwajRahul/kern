@@ -85,7 +85,7 @@ if XDG_RUNTIME_DIR=$XDG "$KERN" pod create vpx >/dev/null 2>&1; then
         ok "a pod records the boot it belongs to"
     elif [ -s "$PD/boot" ] && [ "$(cat "$PD/boot")" = "unavailable" ]; then
         # RECORDING the sentinel is right; TRUSTING it is not, and this case used to bless both.
-        # A reviewer varied only this file against a live stranger whose pid:starttime matched and
+        # An independent test varied only this file against a live stranger whose pid:starttime matched and
         # found `unavailable` was the one unknown state that authorised a kill. So the assertion is
         # no longer "the sentinel was written" but "and it refuses", which is the half that matters.
         ok "boot_id unreadable here; the pod recorded the sentinel, which now REFUSES rather than trusts"

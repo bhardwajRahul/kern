@@ -254,7 +254,7 @@ run phase no network, `network=True` gives it the host's, and an allowlist gives
 
 **`network=True` includes the host's LOOPBACK, which is where unauthenticated services live.** It
 puts the box in the host's network namespace, so `127.0.0.1` inside the box is the host's
-`127.0.0.1`: a reviewer's cell connected to `127.0.0.1:22` and read back `SSH-2.0-OpenSSH_9.6p1`,
+`127.0.0.1`: a test's cell connected to `127.0.0.1:22` and read back `SSH-2.0-OpenSSH_9.6p1`,
 and a developer's laptop is where a database, a Redis and a dashboard sit bound to localhost with no
 password. The same connect is refused under the default `network=False`, and `egress_allow` refuses
 it too, because that one goes through kern's proxy rather than through the host's stack.

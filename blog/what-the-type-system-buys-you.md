@@ -145,7 +145,7 @@ gone because CI proves it. For security-critical sequencing, that's a good trade
 structs and a `PhantomData` in exchange for an invariant you cannot forget to check.
 
 The lesson isn't "use typestates everywhere." It's this: when the *order* of a sequence is
-load-bearing for safety, the order is something the type system can hold for you, so a reviewer,
+load-bearing for safety, the order is something the type system can hold for you, so an independent test,
 and every future contributor, doesn't have to.
 
 ---

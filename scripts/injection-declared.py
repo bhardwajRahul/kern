@@ -64,7 +64,7 @@ DECL = re.compile(r"^\s*Injection:\s*(verified|manual|none)\b", re.IGNORECASE)
 GRANDFATHERED = (
     "**Final validation: eight sentences narrowed",
     "**Closing the GPU phase: a shell payload",
-    "**A second review round: a lying exit code",
+    "**A second pass: a lying exit code",
     "**The hardware tier now claims what it proved",
     "**A fifth adversarial suite, and it publishes a defeat.**",
     "**`kern doctor` now reports what a VRAM cap",

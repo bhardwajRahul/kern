@@ -27,7 +27,7 @@ pub(crate) static ENV_LOCK_HOLDERS: std::sync::Mutex<Vec<std::thread::ThreadId>>
 ///
 /// 🔴 EVERY TEST THAT TOUCHES THE ENVIRONMENT CALLS THIS, and [`global_env`] panics at the point of
 /// use if it did not. That is the whole design: a static check of this rule was walked through EIGHT
-/// TIMES OUT OF EIGHT by an external reviewer (a comment mentioning the lock satisfied it, an alias
+/// TIMES OUT OF EIGHT by an independent test (a comment mentioning the lock satisfied it, an alias
 /// renamed a resolver out of sight, a variable held the variable's name, a resolver was passed as a
 /// function pointer, attributes pushed `#[test]` out of the lookback, and a helper one hop away hid
 /// the rest), and two more holes were mine: parsing Rust with regular expressions is a losing game

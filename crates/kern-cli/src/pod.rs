@@ -394,7 +394,7 @@ fn claimed_by_another_pod(pid: i32, except: &str) -> bool {
 /// WHERE ONE CAN COME FROM, checked by opening every writer rather than assumed: `create` is the
 /// only production writer and it always writes `pid:starttime`, so this version cannot produce
 /// one. A bare marker therefore means an older kern within this session, a hand edit, or a WRITE
-/// THAT WAS TRUNCATED, which an external reviewer pointed out and which "an older kern" did not
+/// THAT WAS TRUNCATED, which an independent test pointed out and which "an older kern" did not
 /// cover. The last of those is the uncomfortable one: a torn write reaches the forgeable argv path
 /// without anybody upgrading anything. It stays anyway, because the alternative is refusing to
 /// reap and leaking the holder for certain, and the forgery still requires the attacker to hold
@@ -454,7 +454,7 @@ enum PodBoot {
     /// cannot evaluate the guard should not lose the ability to tear pods down. But it makes the
     /// state in which kern knows the LEAST the only one that authorises a kill on `pid:starttime`
     /// alone - and both of those fields are boot-relative, which is the entire reason this record
-    /// exists. Measured by an external reviewer on WSL2, varying only this file against a live
+    /// exists. Measured by an independent test on WSL2, varying only this file against a live
     /// stranger whose `pid:starttime` matched: every unknown state was conservative except the one
     /// string kern writes itself, and there the stranger was killed in three runs out of three.
     ///
@@ -1078,7 +1078,7 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 ///   forcing this constant to `eth0`.
 ///
 /// Which one is chosen belongs to the CALLER, because only the caller knows which namespace it is
-/// attaching to. An external reviewer caught the first version of this fix using the bridge name
+/// attaching to. An independent test caught the first version of this fix using the bridge name
 /// everywhere, which renamed the interface on two paths that never had the collision.
 const PASTA_IF_ALONE: &str = "eth0";
 const PASTA_IF_ON_BRIDGE: &str = "kern0";
@@ -1120,7 +1120,7 @@ fn host_resolver_to_forward() -> Option<String> {
 /// the sequence. That open is what a Fedora 43 host under Lima refused with `netns dir open:
 /// Permission denied, exiting`, leaving the pod loopback-only (#6).
 ///
-/// "AND NOTHING ELSE" WAS WRONG, and it said so here until an external reviewer asked for the trace
+/// "AND NOTHING ELSE" WAS WRONG, and it said so here until an independent test asked for the trace
 /// that was never taken: the first pass filtered on `openat`, so it could only ever have found an
 /// open. Diffing the FULL syscall set of both runs, the flag removes four things, not one:
 ///
@@ -1157,7 +1157,7 @@ fn pasta_args(
     // wiring a box already has an `eth0` (the veth, renamed for the workload's benefit in
     // `kern-isolation`), so on exactly the hosts whose NIC is called `eth0` the two collide and pasta
     // dies with `TUNSETIFF failed: Invalid argument`: the box comes up, reaches its peers, and has no
-    // internet. MEASURED on WSL2 by an external reviewer, against the same file working on 0.9.32
+    // internet. MEASURED on WSL2 by an independent test, against the same file working on 0.9.32
     // (shared namespace, no veth, no collision) - a REGRESSION of the bridge default on that platform.
     a.push("-I".into());
     a.push(ns_ifname.into());
@@ -1188,7 +1188,7 @@ fn pasta_args(
 /// changes an unrelated variable; this matches pasta's own string for the single operation the flag
 /// elides, so a pod that fails for any other reason still fails once, loudly, with its own message.
 ///
-/// AN EXTERNAL REVIEWER READ THE OTHER PERMISSION STRINGS OUT OF THE BINARY and asked whether these
+/// THE OTHER PERMISSION STRINGS WERE READ OUT OF THE BINARY, raising whether these
 /// should retry too:
 ///
 ///   Couldn't open network namespace %s: %s
@@ -1293,7 +1293,7 @@ const PASTA_SPAWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10
 /// signal never lands it stays blocked forever.
 ///
 /// "Bounded because `pod create` is short-lived" was the first version of this line and it was
-/// wrong, which an external reviewer caught by reading the callers rather than this function.
+/// wrong, which an independent test caught by reading the callers rather than this function.
 /// `compose up` reaches here through `create_with_range` at `commands/compose.rs` and then keeps
 /// going: it starts every box and waits on the health gates. So the bound is THIS KERN
 /// INVOCATION, and the longest one is a compose bring-up, not a `pod create` that returns as soon
@@ -1342,7 +1342,7 @@ fn output_within(
             // THERE IS ALSO A SAFETY ARGUMENT, AND IT IS NOT SETTLED, so it is not the reason.
             // It runs: a pidfd pins a `struct pid`, so the NUMBER cannot be reused, but a process
             // GROUP is a different object, and once the group empties its number is free for a
-            // new leader while the pidfd still pins the old process. An external reviewer then
+            // new leader while the pidfd still pins the old process. An independent test then
             // pointed out that the second half may be false BECAUSE the first is true: if the
             // pidfd holds the number out of the allocator, nothing can take it as a pid, and so
             // nothing can become a leader with that pgid. Neither of us has read the allocator.
@@ -1856,7 +1856,7 @@ pub fn list() -> Result<(), Error> {
 /// NAT daemon (the bug where `comm == "pasta"` never matched → pasta survived every `pod rm`).
 ///
 /// THE FAMILY IS `<base>` OR `<base>.<variant>`, not "anything starting with pasta". A bare
-/// `starts_with` also accepts `pastafarian`, which an external reviewer pointed out, and the
+/// `starts_with` also accepts `pastafarian`, which an independent test pointed out, and the
 /// teardown now signals a recorded pid unconditionally rather than only while the holder lives, so
 /// the guard carries more weight than it did. The variant is always introduced by a `.`, so
 /// requiring that separator costs one comparison and removes the whole class of unrelated names
@@ -2227,7 +2227,7 @@ mod tests {
     #[test]
     fn a_pod_dir_from_a_previous_boot_reaps_nothing() {
         let _g = crate::env_guard();
-        // The test the reviewer said needs no reboot: write a boot id that cannot be this boot's
+        // The test that test said needs no reboot: write a boot id that cannot be this boot's
         // and assert that BOTH markers refuse, including the fallback, which is the branch a stale
         // dir would otherwise reach with a live stranger's pid in it.
         let root = pods_root();
@@ -2641,7 +2641,7 @@ mod tests {
 
     #[test]
     fn network_sentence_does_not_blame_a_refusal_that_never_happened() {
-        // THE ARM THAT WAS MISSING, found by an external reviewer reading the four arms rather
+        // THE ARM THAT WAS MISSING, found by an independent test reading the four arms rather
         // than running anything. `resolv.conf` is written only after pasta has already started, so
         // "pasta is not alive AND its resolv.conf exists" means it came up and later died: crashed,
         // OOM-killed, or caught by a racing teardown. It used to fall into the "installed but not
@@ -2703,7 +2703,7 @@ mod tests {
         }
         // A shared PREFIX is not membership of the family, and the teardown now signals a recorded
         // pid whether or not the holder is still alive, so a name that merely starts with `pasta`
-        // must not be enough. `pastafarian` was named by an external reviewer; the rest are the same
+        // must not be enough. `pastafarian` was named by an independent test; the rest are the same
         // shape. The variant separator is always `.`, so anything else after the base is a stranger.
         for no in [
             "bash",
@@ -2871,7 +2871,7 @@ mod tests {
     /// A bridge member already HAS an `eth0` (the veth, renamed for the workload), so on those hosts
     /// pasta died with `TUNSETIFF failed: Invalid argument` and every service in a multi-service stack
     /// came up with peers and no internet, while the same file on v0.9.32 (one shared namespace, no
-    /// veth) had outbound. An external reviewer measured it on WSL2; forcing the bridge constant to
+    /// veth) had outbound. An independent test measured it on WSL2; forcing the bridge constant to
     /// "eth0" reproduced it on ordinary Linux, word for word.
     ///
     /// The assertions are on the RELATIONSHIPS, never on the strings. Pinning "kern0" would pass just

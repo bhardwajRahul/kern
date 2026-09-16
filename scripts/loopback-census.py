@@ -5,7 +5,7 @@ WHY IT EXISTS. `compose-compat-rate.py` counts 136 files carrying kern's "servic
 note, 107 of them carrying nothing else, which makes it the largest single cause between the corpus
 and a clean rate. But the note is an ANNOUNCEMENT, not an observed failure: it says the stack was
 wired into one network namespace, and for most files that changes nothing a running service can
-detect. Two independent reviewers, asked whether the wiring default should change, both answered
+detect. Two independent independent tests, asked whether the wiring default should change, both answered
 that it cannot be decided until somebody measures which of the 136 are actually affected. Neither
 the config rate (34%) nor the ceiling (95%) contains that number.
 

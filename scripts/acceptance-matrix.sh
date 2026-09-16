@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run every compose lifecycle transition in BOTH network modes, and check the three things that get
-# missed. Written after four defects in one release cycle were found by an external reviewer rather
+# missed. Written after four defects in one release cycle were found by an independent test rather
 # than by this repo's own tests, and all four had the same shape.
 #
 # WHAT THE SUITE ALREADY DOES WELL, and this does not repeat: it asserts that a transition WORKS.
@@ -111,7 +111,7 @@ self_check() {
     claims_a_pod "compose stop: 1 box(es) stopped (this stack runs without a pod)" \
         && fail "the no-pod line was read as naming a pod" \
         || pass "the no-pod line is not read as naming a pod"
-    # THIS CORPUS CONTAINED NO FAILING-SYSTEM OUTPUT AT ALL, which an external reviewer read out of
+    # THIS CORPUS CONTAINED NO FAILING-SYSTEM OUTPUT AT ALL, which an independent test read out of
     # the file: every string above is a success line or a crafted near-miss, so the predicates were
     # only ever exercised against a program that works. `claims_a_pod` asks whether the text NAMES a
     # pod, and an error naming the pod answers yes. Pinned here as the predicate's DOCUMENTED limit,

@@ -220,7 +220,7 @@ state (a line naming a pod on a stack that has none is a failure, not cosmetics)
 crosses with NO settling time (a bare connect cannot see a stale relay; only bytes back can), and that
 `down` leaves nothing behind in processes OR on disk, counted by pid rather than by process name.
 
-It was written after four defects in one release cycle were found by an external reviewer rather than
+It was written after four defects in one release cycle were found by an independent test rather than
 by this repo's own tests, and all four had that shape. `--self-check` exercises its own assertions
 against fixed strings, so a matrix that cannot fail is caught before it is trusted.
 
@@ -298,7 +298,7 @@ reads the whole macro call rather than one line, because the site that first esc
 string on the following line.
 
 **It is scoped rather than global, and the scope is the judgement.** Its first version instead matched
-a set of leading markers (`->`, `OK`, `  layer `). A reviewer pointed out that this freezes today's
+a set of leading markers (`->`, `OK`, `  layer `). An independent test pointed out that this freezes today's
 punctuation rather than the rule, and they were right: rescoping it immediately found seven more
 progress lines written as `[1/3] FROM ...` and `  [cached - ...]`, plus the three unprefixed
 diagnostics. A global rule is not reachable statically, because 55 `eprintln!` calls in the workspace

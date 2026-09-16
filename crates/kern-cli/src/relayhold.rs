@@ -894,7 +894,7 @@ impl std::fmt::Display for BlockReport<'_> {
             // workload that binds `0.0.0.0` owns every local address on the port, so the alias can
             // never be bound afterwards either, and the edge never comes up.
             //
-            // WORSE, THE HEADLINE VERB WAS WRONG TOO, and an outside reviewer measured it on the
+            // WORSE, THE HEADLINE VERB WAS WRONG TOO, and an outside independent test measured it on the
             // released binary: `cannot reach` says the call will fail. It did not fail. The peer's
             // alias is in `127.0.0.0/8`, which is local without being configured, so the caller's
             // own wildcard listener answered it: a fetch of `peer:8080` returned the CALLER'S OWN

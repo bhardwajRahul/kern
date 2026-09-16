@@ -85,7 +85,7 @@ async function main() {
 		else process.env.KERN_PI_SCRATCH_PROBE = saved;
 		ok(`scratch knob ${JSON.stringify(raw)} -> ${seen}`, seen === expected, `atteso ${expected}`);
 	}
-	// The premise under the HOME default, because a reviewer argued for pointing it at the scratch and
+	// The premise under the HOME default, because an independent test argued for pointing it at the scratch and
 	// the argument stands or falls on this: EVERY COMMAND IS A FRESH BOX, so the scratch is fresh too.
 	// A cache under $HOME on the scratch would be rebuilt from the network on every single command.
 	// Asserted here rather than in prose because it is the reason the default is what it is.
@@ -121,7 +121,7 @@ async function main() {
 
 	// ---- activation must touch NOTHING ----------------------------------------------------------
 	console.log("\nactivation");
-	// A reviewer spent an afternoon on a pi startup hang and cleared this extension by running pi
+	// An independent test spent an afternoon on a pi startup hang and cleared this extension by running pi
 	// with and without `-e`. That clearing should be a PROPERTY we hold, not a result they had to go
 	// and measure: registering tools must not open a box, spawn kern, or pull an image.
 	//
@@ -312,7 +312,7 @@ async function main() {
 		// pi's tool is called `bash` and a model writes bash by reflex. This used to hand the command
 		// to `sh`, which on a Debian image is dash, WITH BASH PRESENT AND UNUSED: `[[ 1 == 1 ]]`
 		// answered `sh: 1: [[: not found`, arrays and process substitution answered `Syntax error:
-		// "(" unexpected`. Nothing was missing; the wrong binary was chosen. Found by a reviewer.
+		// "(" unexpected`. Nothing was missing; the wrong binary was chosen. Found by an independent test.
 		ok("the shell is measured, not assumed", (await detectShell(box)) === "bash");
 		out = "";
 		await b.exec("readlink -f /proc/$$/exe; [[ 1 == 1 ]] && echo BRACKETS-OK || echo BRACKETS-NO", "/workspace", { onData });

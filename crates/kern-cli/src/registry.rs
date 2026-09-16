@@ -3635,7 +3635,7 @@ mod tests {
         ));
     }
 
-    /// The PID-reuse collision the reviewer named: a box's `kern-box-<name>-<pid>` path is recreated -
+    /// The PID-reuse collision that test named: a box's `kern-box-<name>-<pid>` path is recreated -
     /// by a LATER box after a pid recycled the leaf - as a DIFFERENT cgroup (different inode). The stale
     /// record still points at that path, and the path IS populated (by the stranger's processes). Path
     /// alone would read the box as orphaned and `cgroup.kill` would SIGKILL the wrong box. The `(dev,

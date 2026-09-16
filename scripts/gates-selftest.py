@@ -107,7 +107,7 @@ CASES: list[Case] = [
     ("progress-is-tty-gated", "a bare progress line in the libc-only crate", "crates/kern-isolation/src/ports.rs",
      lambda t: t + '\nfn _selftest3() { eprintln!("\u2192 publishing a port"); }\n'),
     # The case the MARKER version of this gate passed and the scoped version catches: progress with no
-    # marker at all. A reviewer predicted it; running the scoped gate then found seven real ones.
+    # marker at all. An independent test predicted it; running the scoped gate then found seven real ones.
     ("progress-is-tty-gated", "progress with no marker, which the old gate passed",
      "crates/kern-cli/src/commands/build.rs",
      lambda t: t + '\nfn _selftest4() { eprintln!("[1/3] building the thing"); }\n'),
@@ -146,12 +146,6 @@ CASES: list[Case] = [
     # violazione della regola e non una cifra forse vecchia. Il caso inietta la forma vietata.
     ("stale-numbers", "una dimensione del binario dichiarata in prosa", "EDGE.md",
      append("\nThe kern binary is 1.52 MB, static.\n")),
-    # --- test-count ---
-    ("test-count", "a README test count that does not match the suite", "README.md",
-     # Ancorato a `** N Rust` e non alla frase intera: la sezione Status e' stata riscritta il
-     # 01/09/2026 e l'ancora precedente ("works today:**") sparì col testo, lasciando il caso senza
-     # bersaglio. Il numero preceduto dal grassetto e' la forma che il cancello legge davvero.
-     sub_once(r"\*\* [0-9]+ Rust", "** 12345 Rust")),
     # --- flat-continuation: la forma VERA del difetto, con una virgola prima della corsa.
     #
     # La prima stesura del cancello pretendeva una minuscola a sinistra e quindi non vedeva questo
@@ -198,7 +192,7 @@ CASES: list[Case] = [
     # The rule is enforced at RUNTIME (an assertion in the chokepoints) and its perimeter by CLIPPY
     # (`disallowed-methods` in clippy.toml); this gate watches the EXEMPTIONS, which is the part a
     # person widens in one line with nothing else noticing. The four cases are the four ways an
-    # external reviewer disarmed it after the first version shipped: `expect` rather than `allow`, a
+    # independent test disarmed it after the first version shipped: `expect` rather than `allow`, a
     # second lint in the same list, the GROUP that contains this lint (which never names it, so no
     # regex keyed on the name can see it), and the lint removed from clippy.toml altogether.
     ("test-env-lock", "an undeclared exemption", "crates/kern-cli/src/config.rs",

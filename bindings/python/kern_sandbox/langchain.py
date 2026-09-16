@@ -874,7 +874,7 @@ _SANDBOX_ALIASES = {
     # `bool(v)` with NO `None` passthrough, unlike `memory_mb` and `pids` above. On those, `None`
     # means "uncapped" on BOTH sides and is a value a caller writes on purpose. `Sandbox.network` is
     # `bool = False`: `None` is not one of its values, so passing it through would set a field declared
-    # `bool` to `None`. A reviewer flagged this as the same class as the `cap_drop` bug and ranked it
+    # `bool` to `None`. An independent test flagged this as the same class as the `cap_drop` bug and ranked it
     # first, on the assumption that langchain's `network_enabled` might default to True. Measured, it
     # does not: the field is ours, defaults False, and is read as `"host" if network_enabled else
     # "none"`, so `None` was falsy and produced `--net none`. The defect was a type lie, not an open

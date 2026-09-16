@@ -474,7 +474,7 @@ def test_wrong_argument_type(name, args, monkeypatch):
 def test_an_argument_the_tool_does_not_have_is_refused_not_dropped(name, args, ignored, monkeypatch):
     """An argument a model invents must not be silently ignored.
 
-    MEASURED by an external reviewer: `tools/call run_code` with `{"code": ..., "image": ""}` ran and
+    MEASURED by an independent test: `tools/call run_code` with `{"code": ..., "image": ""}` ran and
     answered `[exit 0]`. JSON Schema allows extra properties by default, so the server took the call, used
     its OWN image, and told the model the code had run. The model asked for a posture it did not get and
     had nothing to correct from. The SDK's contract one layer down is the opposite: an unknown keyword to
@@ -680,7 +680,7 @@ def test_exit_tail_is_never_clipped_away(monkeypatch):
 def test_every_reply_says_which_kern_ran_it(monkeypatch):
     """The substitution this closes is not an isolation failure, it is a client not calling us at all.
 
-    MEASURED by an external reviewer with this server correctly wired into Cursor: asked to "run
+    MEASURED by an independent test with this server correctly wired into Cursor: asked to "run
     print(sum(range(10))) in the sandbox", the agent answered "The sandbox run completed successfully.
     Output: 45" from its own python. The workspace had not been written to in eleven days, and four
     probes said host (the caller's `init.scope` cgroup, the host's full `/dev`, `Seccomp: 0` where a box
@@ -713,7 +713,7 @@ def test_the_tool_description_leads_with_what_a_client_shell_cannot_do():
     """A model picks a tool from this sentence, against the shell it already has.
 
     It used to open "in a fast, LOCAL, isolated kern sandbox on the user's own machine", which describes
-    the client's own terminal just as well, and the reviewer's agent chose the terminal. The facts that
+    the client's own terminal just as well, and the test's agent chose the terminal. The facts that
     are only true here lead now: the filter, the capabilities, the read-only root, the box's own /dev,
     the absent host filesystem. "Runs locally" stays, at the end, where it reads as privacy rather than
     as equivalence.

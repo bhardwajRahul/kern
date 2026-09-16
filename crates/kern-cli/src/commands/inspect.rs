@@ -148,18 +148,18 @@ pub fn ps(
             .collect();
         // FALLBACK, and only when the first channel had nothing to say. A host without cgroup
         // delegation has no `kern-box-*` directory, so the evidence above does not exist there -
-        // which is precisely the host where an independent reviewer, as uid 0 with no systemd,
+        // which is precisely the host where an independent test, as uid 0 with no systemd,
         // measured three live `kern box` processes after a registry wipe: absent from `ps`,
         // unreachable by `stop`, untouched by `gc`, and unreported, because the warning had nothing
         // to read. Asking `/proc` costs about as much as `ps` itself (6.11 ms over 534 pids), so a
         // host that HAS the cheap channel never pays for the expensive one.
         // THE FALLBACK RUNS WHENEVER THE CGROUP CHANNEL PRODUCED NO EVIDENCE, and getting this
-        // condition right took two wrong answers, both reported by the same reviewer.
+        // condition right took two wrong answers, both reported by the same independent test.
         //
         // First I asked "did the cgroup channel find an ORPHAN", which is false on a healthy host
         // with no boxes, so the most ordinary `kern ps` on earth fell through to the scan every time:
         // 3.9 ms against 1.1. So I gated on "does the cheap channel EXIST here", meaning `kern.slice`
-        // is a directory. That was worse, and the reviewer's host proved it in one command: there
+        // is a directory. That was worse, and the test's host proved it in one command: there
         // `kern.slice` EXISTS and has no `kern-box-*` children at all, so the gate said yes, the
         // fallback never ran, and three live boxes stayed invisible after a registry wipe - the exact
         // case the fallback was written for. ⛔ A directory existing is not a channel answering.
@@ -312,7 +312,7 @@ pub fn ps(
             //
             // WHY THE NAMES MATTER MORE THAN THE FRAMING. Matching NDJSON and then emitting
             // `{"name": …}` would still break the line every deploy script actually contains,
-            // `compose ps --format json | jq -r .Service`. An outside reviewer put this exactly:
+            // `compose ps --format json | jq -r .Service`. An outside independent test put this exactly:
             // the field names are the contract a script reads, and this is a NEW surface, so they
             // cost nothing to get right.
             //
@@ -633,7 +633,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// one this developer's host cannot produce. `enforced == None` needs a box whose PID 1 is outside
 /// every kern leaf, which happens on a host with no usable cgroup delegation and not here; buried in
 /// a 245-line I/O function that branch was unreachable by any test, and it is precisely the branch an
-/// outside reviewer had to discover by hand. Pure, total over the four `(asked, enforced)` shapes,
+/// outside independent test had to discover by hand. Pure, total over the four `(asked, enforced)` shapes,
 /// and pinned by `mem_cap_row_*` below.
 ///
 /// The wording is deliberate in each arm:
@@ -659,7 +659,7 @@ fn mem_cap_row(asked: Option<u64>, enforced: Option<u64>) -> String {
 ///
 /// WHY `inspect` ANSWERS BOTH. Docker's `inspect` takes a container OR an image, and kern's took only
 /// a box: `docker inspect alpine` through the drop-in answered `no running box named 'alpine'` for a
-/// reference the machine had on disk. Reported by an external reviewer as a declared gap on that
+/// reference the machine had on disk. Reported by an independent test as a declared gap on that
 /// surface; the fix belongs in kern's own verb rather than in the translation layer, because the
 /// question ("what is this thing kern knows about") is the same one either spelling is asking.
 ///
@@ -837,7 +837,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     //
     // `memory_max` is the value the box was STARTED with: kern writes it into the registry entry and
     // this echoes it. It is not a read-back, and on a host that cannot delegate a cgroup there is
-    // nothing behind it. An outside reviewer measured exactly that: `--memory 64m` reported
+    // nothing behind it. An outside independent test measured exactly that: `--memory 64m` reported
     // `"memory_max": 67108864` while the box's PID 1 sat in `0::/`, the cgroup-v2 ROOT, which has no
     // `memory.max` file at all. A cap reported as a fact where the kernel holds none.
     //
@@ -1151,7 +1151,7 @@ pub fn history(count: usize) -> Result<(), Error> {
 /// after the other: fixing the first alone turned "box writes no log" into "opening log: No such
 /// file", which is the same defect one step further along.
 ///
-/// MEASURED by the concurrency battery from review round 19, at roughly 1 read in 6000 against a box
+/// MEASURED by the concurrency battery from an audit pass, at roughly 1 read in 6000 against a box
 /// rotating every few KB - rare enough never to appear by hand, common enough to be someone's first
 /// impression of `kern logs` on a busy box. Three tries 20 ms apart cover a window that is two
 /// syscalls wide; a box that genuinely has no log finds nothing on every try, so the wait is spent
@@ -1685,7 +1685,7 @@ mod tests {
     ///
     /// `enforced == None` means `box_cgroup_dir` found no kern leaf for the box's PID 1 - a host with
     /// no usable cgroup delegation, where the box sits in the cgroup-v2 ROOT and nothing caps it. An
-    /// outside reviewer measured exactly that and read the requested value as a cap in force, because
+    /// outside independent test measured exactly that and read the requested value as a cap in force, because
     /// the row said `64M` and stopped. On a delegated developer machine this state cannot be created,
     /// so a runtime test would silently skip; the logic is pure, so it is pinned directly.
     #[test]

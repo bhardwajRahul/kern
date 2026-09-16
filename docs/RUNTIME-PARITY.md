@@ -186,7 +186,7 @@ cpu.weight   1     3    17    35    59   100   174    532   3023   10000
 
 Neither of the two mappings that "look right" reproduces it. A linear scale on 1024 gives 50 where
 Docker gives 59 and 6400 where it gives 3023; `1 + (shares - 2) * 9999 / 262142`, which two
-independent reviewers and this codebase all remembered as runc's, gives 20 for 512 and would move
+independent independent tests and this codebase all remembered as runc's, gives 20 for 512 and would move
 the DEFAULT off 100, which the table shows Docker does not do. kern now computes
 `ceil(100 ^ ((l - 1)(l + 126) / 1224))` with `l = log2(shares)`, which reproduces all ten.
 
@@ -473,7 +473,7 @@ are published outright, so the honest reading of this census is **0 real, 2 nomi
 measured**, not "2 exposures".
 
 What this does and does not say. 2 of 22 measured, which is below the thresholds two independent
-reviewers set for changing the wiring default (10% and 15%) and above the zero that was published
+independent tests set for changing the wiring default (10% and 15%) and above the zero that was published
 first. It says nothing about the 94 `build:` files: see the section on what they declare.
 
 THE DEFAULT CHANGED ANYWAY, AND NOT BECAUSE OF THIS NUMBER. This census was the case FOR the pod and

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The reviewer's six-row table: a live stranger whose `pid:starttime` matches `pasta.id` exactly,
+# The test's six-row table: a live stranger whose `pid:starttime` matches `pasta.id` exactly,
 # with ONLY the `boot` file varying. Every unknown state must be conservative.
 #
 # The stranger is a sacrificial `sleep`, so a kill costs nothing and the result is unambiguous:
@@ -62,7 +62,7 @@ row "boot = 'unknown'"           "unknown"      SURVIVE
 # the record exists to prevent, inflicted by the record.
 #
 # A DISAGREEMENT ABOUT THIS ROW WAS TRACED AND CLOSED, and it is recorded because the wrong version
-# of it was nearly committed as corroboration. An external reviewer reported SURVIVE here while this
+# of it was nearly committed as corroboration. An independent test reported SURVIVE here while this
 # harness measured KILL. The cause was their harness: it took the boot value as a string with no
 # unlink branch, so the sentinel `__RM__` they passed meaning "delete" was written into the record as
 # six literal characters. That is an unrecognised value, which SURVIVEs correctly, exactly as `x` and

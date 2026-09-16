@@ -86,7 +86,7 @@ cannot contain and says which: an absolute path, a `..` escape, a symlinked comp
 a device planted at the name, a file over `max_bytes`.
 
 **The MCP server names the kern that ran the code** (`[exit 0 in kern 0.9.32]`), and its tool
-description leads with what a client's own shell cannot do. A reviewer wired the server into Cursor
+description leads with what a client's own shell cannot do. An independent test wired the server into Cursor
 correctly and the agent answered from its own python, never calling the tool. An argument a tool
 does not have is refused with `-32602` rather than dropped, and box output reaching a model has
 terminal escapes stripped and both surfaces' framing neutralised, so a forged marker reads `[printed
@@ -299,7 +299,7 @@ process; the layer cache treated a sentinel without its directory as a hit, and 
 on a `mount(overlay)` ENOENT that named neither.
 
 **Known and unchanged:** the resource caps are verified on one machine. CI does not start boxes, and
-the second reviewer's host has no cgroup delegation, so `--memory`/`--pids-limit` enforcement has one
+the second test's host has no cgroup delegation, so `--memory`/`--pids-limit` enforcement has one
 witness. The squash that `FROM <stage>` and `push` share loses hard links and fills sparse files.
 Compose networks do not isolate services from each other: one stack is one namespace, and `up` says so.
 
@@ -431,7 +431,7 @@ scripted around the false notice, remove the workaround; if you concluded your c
 working, they were, and `--memory 256m` was killing at 256 MiB throughout.
 
 **Fixed: a box refused for running out of process slots was told to check user namespaces.** A
-reviewer hit it with a tightened `ulimit -u`:
+independent test hit it with a tightened `ulimit -u`:
 
 ```
 error: sandbox: fork(idmap helper) failed: Resource temporarily unavailable (os error 11)
@@ -442,7 +442,7 @@ The message is exact and the hint names two things that are both already fine, b
 could not have reached that fork otherwise. `EAGAIN` on a fork is a process-limit problem, and
 `RLIMIT_NPROC` is per-UID and counted across the whole system, so another program owned by the same
 user can exhaust it, and it counts TASKS rather than processes. That last clause is not a detail:
-the reviewer who reported the hint then compared `ulimit -u` against a process count, got 10 against
+that test who reported the hint then compared `ulimit -u` against a process count, got 10 against
 149, and concluded the kernel was accounting something unobservable. Measured here, an x86_64 desktop
 owned 208 processes and 1918 tasks and the limit at which a single fork began to succeed was 1932, so
 against the task count the threshold IS the count. The hint now names `ulimit -u`, the task count and
@@ -453,7 +453,7 @@ rather than on the variant for exactly this reason.
 release workflow, which is every binary anyone compiles from source, so two builds of the same tree
 were indistinguishable. That is not hypothetical: during the work above, a binary built ten minutes
 before the fix was compared against one built after and reported as if it were the same program. A
-reviewer made the same point from the other side, noting that a test script had to print a
+independent test made the same point from the other side, noting that a test script had to print a
 `sha256sum` to tell two builds apart, and that the workaround existed only because the binary could
 not answer.
 
@@ -483,7 +483,7 @@ reproduced on x86_64 Linux with pasta installed, changing only the service count
 one-service path had no coverage anywhere. `scripts/acceptance-matrix.sh` now has a case for it, with
 its two new assertions exercised in `--self-check` including a negative control on the pre-fix
 summary line. The case goes RED on the v0.9.1 binary and green here, confirmed by an external
-reviewer on their own host rather than only here.
+independent test on their own host rather than only here.
 
 ### Fixed
 
@@ -506,7 +506,7 @@ reviewer on their own host rather than only here.
 - **`has_outbound` answered from `resolv.conf` alone.** Kill `pasta` while the holder lives and the
   file stays on disk, so the predicate reported egress for a pod with no route. It now also requires a
   live pasta, verified by `comm` because passt re-execs into an ISA variant and a pid can be reused.
-  Found by an external reviewer reading the diff, not by a test here.
+  Found by an independent test reading the diff, not by a test here.
 - **`kern killall --help`, `kern down --help` and `kern logout --help` printed the whole 184-line
   reference.** The per-verb match read only the first token of each line, and those three are
   documented as the second half of a pair. The test that missed them named fifteen verbs by hand; it

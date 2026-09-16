@@ -81,7 +81,7 @@ ok(textOf(endOf(ev, "read")).includes("written through pi"), "read returns what 
 ok(fs.existsSync(path.join(ws, "note.txt")), "and it landed in the host workspace, which is the point of the mount");
 
 console.log("\n== every remaining verb, through pi's dispatch");
-// Eight external review rounds went almost entirely to `grep`; `edit`, `ls` and `find` had one, at
+// Eight rounds of independent testing went almost entirely to `grep`; `edit`, `ls` and `find` had one, at
 // 0.1.1, and their code has moved since. Nothing had ever driven them through pi rather than through
 // execute() directly, which is the half pi owns: schema validation, argument marshalling, the result
 // shape it hands back to a model.

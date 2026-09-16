@@ -130,7 +130,7 @@ fn catches_sigint(pid: u32) -> bool {
 ///
 /// IT ASKS PATH, and that is not a convenience. This probed two absolute paths and nothing else, so a
 /// machine with a perfectly good `~/.local/bin/busybox` and no passwordless sudo reported "no busybox
-/// available" and SKIPPED. MEASURED by an external reviewer on WSL2: **96 of 133 tests skipped for
+/// available" and SKIPPED. MEASURED by an independent test on WSL2: **96 of 133 tests skipped for
 /// this reason alone**, and the run still printed a green 133/133. A suite that skips 72% of itself
 /// and reports success is worse than a red one, because nobody looks.
 ///
@@ -230,7 +230,7 @@ fn host_cannot_build_a_box(text: &str) -> bool {
         // written from one machine. kern fail-closes `exec` where it cannot put the command in the
         // box's cgroup, because 0.9.31 ran exec'd commands UNCAPPED (300 MB survived a 64 MiB box).
         // By kern's own wording that host is "an ordinary ssh session on most distributions", so it is
-        // not exotic at all: an external reviewer hit it on WSL2 and a relay test reported `Got: ""`,
+        // not exotic at all: an independent test hit it on WSL2 and a relay test reported `Got: ""`,
         // a phantom defect in a relay that was carrying perfectly. Proved single-variable: the same
         // test binary and fixture PASS from a `systemd-run --user --scope` shell and FAIL from
         // `/init.scope`.
@@ -10065,7 +10065,7 @@ fn a_service_selector_narrows_stop_start_and_restart() {
 /// The message had two states where there are three. On a `--no-pod` stack `pod::holder_pid` is
 /// `None` because no pod was ever created, and the `else` branch read that as the pod having been
 /// collapsed: `stop a` answered "pod '<name>' gone with its last member" while `b` was still
-/// running. False twice over, and reported by an external reviewer against the released 0.8.6
+/// running. False twice over, and reported by an independent test against the released 0.8.6
 /// binary, whose behaviour was correct throughout.
 ///
 /// BOTH MODES IN ONE TEST, because the bug is a confusion between them: a no-pod assertion alone
@@ -10167,7 +10167,7 @@ fn compose_stop_names_a_pod_only_when_there_is_one() {
 /// leaves the stack directory behind forever, holding stale state.
 ///
 /// That is exactly what happened when `served` and `rescan` arrived with the start-wait fix, and a
-/// reviewer found it rather than the suite. Asserted on the DIRECTORY rather than on a list of file
+/// independent test found it rather than the suite. Asserted on the DIRECTORY rather than on a list of file
 /// names, so a file added in future fails this test instead of quietly accumulating.
 #[test]
 fn compose_down_removes_the_relay_directory_it_created() {
@@ -10750,7 +10750,7 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
     }
     let err = String::from_utf8_lossy(&out.stderr);
     // 137 IS NOT PROOF OF WHOSE KILL IT WAS, and on a small host it may not be kern's. An external
-    // reviewer saw this fail 1 run in 10 on a 7 GB WSL2 machine running the whole suite in parallel,
+    // independent test saw this fail 1 run in 10 on a 7 GB WSL2 machine running the whole suite in parallel,
     // and it does not reproduce on 31 GB (0 in 6 full runs, 0 in 15 of this test alone). The
     // hypothesis that fits both observations is the HOST's OOM killer taking the box while the suite
     // is at its peak, which produces the same 137 with nothing for kern to say. Unproven either way,
@@ -11089,7 +11089,7 @@ fn the_uncapped_notice_names_the_cause_it_can_name_and_not_the_other_one() {
 ///
 /// `kern exec` fails closed when the command cannot be placed in the box's cgroup, because the
 /// alternative is a command that runs outside the box's `--memory`/`--pids-limit` and says nothing.
-/// That is right. What was missing is the next step: an outside reviewer hit the refusal on every
+/// That is right. What was missing is the next step: an outside independent test hit the refusal on every
 /// `kern exec` on WSL2 with `systemd=true`, where the previous release ran the command uncapped and
 /// warned, and the message gave no way to tell a FULL box from a host layout on which no exec can
 /// ever join.
@@ -11158,7 +11158,7 @@ fn the_exec_refusal_names_both_causes_and_reads_as_one_sentence() {
 /// So a `/dev/tty` inside the box would open the operator's own terminal. The exclusion stays.
 ///
 /// What was wrong is what happened next: `/dev` is a tmpfs the box's root owns, so `> /dev/tty`
-/// CREATED a regular file. An outside reviewer measured `-rw-rw-r--` with 2 bytes where the host has
+/// CREATED a regular file. An outside independent test measured `-rw-rw-r--` with 2 bytes where the host has
 /// `crw-rw-rw- 5, 0`. A program writing a prompt there got no error and the operator saw nothing.
 ///
 /// Both halves are asserted, because either alone is satisfiable by the wrong build: a test that only
@@ -11207,11 +11207,11 @@ fn dev_tty_is_absent_as_a_device_and_refuses_to_become_a_file() {
 ///
 /// `report_exec_failure` runs in the FORKED CHILD and `_exit`s immediately after printing, so the
 /// error never reaches the CLI's hint function and no match arm there can help it. An outside
-/// reviewer measured the consequence: `kern: sandbox setup failed: mount(overlay) failed: Invalid
+/// independent test measured the consequence: `kern: sandbox setup failed: mount(overlay) failed: Invalid
 /// argument (os error 22)` arriving with no hint at all, while every neighbouring branch in the same
 /// function carries one.
 ///
-/// Driven through the reviewer's EXACT failure, reproduced deterministically: `--rootfs /proc` is a
+/// Driven through the test's EXACT failure, reproduced deterministically: `--rootfs /proc` is a
 /// directory that exists and cannot be an overlay lowerdir, so the mount fails with EINVAL every
 /// time. The first version of this test used `RLIMIT_AS` and SKIPPED on this host, which is the
 /// third time in this session a test asserted a guard it never reached.
@@ -11262,7 +11262,7 @@ fn a_setup_failure_printed_from_the_forked_child_still_carries_a_hint() {
 /// The placement fails for two causes. One is a box at its `pids.max`, where the cap is real and in
 /// force and the command would step around it. The other is cgroup v2 delegation containment: from a
 /// caller outside the tree kern's cgroups live in, the migration needs write access to the
-/// `cgroup.procs` of the COMMON ANCESTOR, which is the root cgroup. An outside reviewer measured that
+/// `cgroup.procs` of the COMMON ANCESTOR, which is the root cgroup. An outside independent test measured that
 /// second one on WSL2 with `systemd=true`, where `kern exec` then refused every single time and the
 /// verb was lost on the whole host class. No implementation fixes it: a process in `/init.scope`
 /// cannot reach the user's delegated tree and cannot move itself there either.
@@ -11431,7 +11431,7 @@ fn a_health_probe_is_not_refused_where_kern_exec_would_be() {
 
 /// **`kern doctor` names the way through, on the host class where `kern exec` refuses.**
 ///
-/// The refusal points at `kern doctor` to tell its two causes apart. An outside reviewer checked
+/// The refusal points at `kern doctor` to tell its two causes apart. An outside independent test checked
 /// whether that pointer resolves and found the row did not name `KERN_ALLOW_UNCAPPED`, so a reader
 /// who followed it learned which cause they had and not what to do about it. That is a pointer to
 /// half an answer, and it is the last thing they asked for.
@@ -12639,7 +12639,7 @@ fn a_taken_published_port_names_the_stack_holding_it() {
 
 /// `compose pull` HONOURS `pull_policy: never`, which `up` already did and this verb did not.
 ///
-/// MEASURED by an external reviewer on Sentry's official compose file: 48 of its 57 services declare
+/// MEASURED by an independent test on Sentry's official compose file: 48 of its 57 services declare
 /// `pull_policy: never` and 21 also declare `build:`, so kern went to Docker Hub for a name that only
 /// ever exists locally, failed, and ABORTED - leaving every image after it unfetched. The verb could
 /// not succeed on that file at all, while `up` on the same file honoured the key. A flag that one
@@ -12697,7 +12697,7 @@ fn compose_pull_honours_pull_policy_never() {
 
 /// `inspect` ANSWERS FOR AN IMAGE, because `docker inspect` takes a container OR an image.
 ///
-/// MEASURED by an external reviewer against the docker drop-in: `docker inspect alpine` answered
+/// MEASURED by an independent test against the docker drop-in: `docker inspect alpine` answered
 /// `no running box named 'alpine'` for a reference the machine had on disk, and he recorded it as a
 /// declared gap. The fix is in kern's own verb rather than in the translation layer: the question is
 /// the same one either spelling is asking, and a shim that answered it would be a second authority

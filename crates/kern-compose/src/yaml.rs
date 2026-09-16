@@ -5248,7 +5248,7 @@ fn platform_matches_host(v: &str) -> bool {
 #[must_use]
 pub(crate) fn docker_shares_to_cpu_weight(shares: u64) -> u64 {
     // DOCKER'S OWN CURVE, IDENTIFIED FROM TEN MEASURED POINTS, not a linear scale on 1024 and not
-    // the formula two reviewers (and this codebase) remembered.
+    // the formula two independent tests (and this codebase) remembered.
     //
     // Measured on Docker 29.6.2, cgroup v2, aarch64, one container per value:
     //
@@ -6492,7 +6492,7 @@ mod tests {
 
     /// THE REFUSAL MUST NOT NAME A FEATURE THIS PARSER SUPPORTS.
     ///
-    /// Reported by an outside reviewer against the released binary: a malformed file of theirs was
+    /// Reported by an outside independent test against the released binary: a malformed file of theirs was
     /// refused with "YAML anchors/aliases not supported (rewrite the value inline)", and anchors,
     /// aliases and merge keys all work - `DOCKER-COMPAT.md` lists them as supported and they verify
     /// four ways. The message sent the reader to rewrite the one construct that was never the
@@ -7284,7 +7284,7 @@ mod tests {
     /// * the LINEAR map on 1024 fixed the default and missed everything else: 50 where Docker gives
     ///   59, 200 where it gives 174, 6400 where it gives 3023.
     /// * `1 + (shares - 2) * 9999 / 262142`, offered as "runc's formula" by two independent
-    ///   reviewers and remembered as such here, gives 20 for 512 and 39 for 1024. It was about to be
+    ///   independent tests and remembered as such here, gives 20 for 512 and 39 for 1024. It was about to be
     ///   shipped on that recollection; the measurement below stopped it.
     ///
     /// Measured on Docker 29.6.2, cgroup v2, aarch64: one container per value, `cat cpu.weight`.
@@ -8847,7 +8847,7 @@ mod tests {
         // COLUMN ZERO is the boundary the rule has to survive, because there the pop-at-equal has
         // nothing left to pop: a top-level key whose items sit at its own indentation (`include:`
         // is written this way in the spec's own examples) is followed by `services:` at the same
-        // column 0. Asked for by a reviewer as the case a dedent rule is most likely to get wrong.
+        // column 0. Asked for by an independent test as the case a dedent rule is most likely to get wrong.
         let top = concat!(
             "include:\n",
             "- ./other.yml\n",
@@ -9421,7 +9421,7 @@ services:
     fn orphan_health_gate_degrades_to_start_order() {
         // db's healthcheck is NONE → omitted → no health_cmd. app's `service_healthy` gate toward db
         // must DEGRADE to depends_on (start-order), NOT leave an unsatisfiable depends_healthy that
-        // aborts the up (the reviewer's D1: no promise of a degrade that doesn't happen).
+        // aborts the up (the test's D1: no promise of a degrade that doesn't happen).
         let y = "services:\n  db:\n    image: alpine\n    healthcheck:\n      test: [\"NONE\"]\n  app:\n    image: alpine\n    depends_on:\n      db:\n        condition: service_healthy\n";
         let app = parse(y)
             .unwrap()

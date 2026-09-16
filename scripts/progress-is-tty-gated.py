@@ -14,7 +14,7 @@ gate exists for both:
 
 WHY THE RULE IS SCOPED TO A LIST OF FILES
 
-The first version of this gate matched a set of leading MARKERS ("->", "OK", "  layer "). A reviewer
+The first version of this gate matched a set of leading MARKERS ("->", "OK", "  layer "). An independent test
 pointed out that it freezes today's punctuation rather than the rule: a new progress line reading
 `eprintln!("pulling {image}...")` has no marker and sails through. They were right, and running the
 scoped form below immediately found seven more progress lines in `build.rs` and `push.rs` that the

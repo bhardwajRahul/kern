@@ -270,7 +270,7 @@ fn join_pod_and_bind_its_files(
     // MEASURED on a two-service file with `container_name: db` and `container_name: web`: inside
     // `web`, `/etc/hosts` carried `127.0.0.1 db` above `10.89.0.2 db`, and a connection to `db`
     // reached `web` itself - the same "a name answers as the wrong service" defect an outside
-    // reviewer found in the relay wiring, arriving by a different door.
+    // independent test found in the relay wiring, arriving by a different door.
     if on_bridge {
         return Ok(Some(holder));
     }
@@ -2225,7 +2225,7 @@ pub fn run(
     // for both, so it forked on exactly the hosts that never leaked (there the leaf lives inside the
     // transient scope and systemd reaps the whole unit) and left the leaking hosts untouched.
     //
-    // MEASURED by an outside reviewer, 2026-09-09, same binary, two hosts, 200 sequential `kern run`:
+    // MEASURED by an outside independent test, 2026-09-09, same binary, two hosts, 200 sequential `kern run`:
     //
     //     Ubuntu, systemd user manager present    0 leaves -> 200 runs -> 0 leaves
     //     WSL2 Alpine, no user manager            2 leaves -> 200 runs -> 201 leaves
@@ -2801,7 +2801,7 @@ fn await_box_started(
 /// AND 125 IS NEITHER, because it is not a workload exit at all: it is kern's own box-not-started code
 /// (Docker's too), used as the discriminator elsewhere in this file. Under `always` it was restarted
 /// forever, so a stack whose `up` died left its surviving boxes rebuilding a box that could not be
-/// built. MEASURED by an external reviewer bringing up Immich: 26 iterations for one service, 15 for
+/// built. MEASURED by an independent test bringing up Immich: 26 iterations for one service, 15 for
 /// another, each logging "never released: the launcher closed the pre-exec gate ... the workload did
 /// not run". Docker does not restart a container it failed to create.
 ///
@@ -2819,7 +2819,7 @@ fn await_box_started(
 /// - `POLLHUP` without `POLLIN`: the write end is gone and nothing is buffered. The launcher closed
 ///   the gate WITHOUT releasing this box, and no future attempt can ever be released, because the
 ///   process that would have written the byte has exited. Retrying is 10 refusals and a backoff that
-///   reaches 30 s, which is what an external reviewer watched go round 26 times on Immich.
+///   reaches 30 s, which is what an independent test watched go round 26 times on Immich.
 /// - Open, no data: the launcher is still working. Unchanged: the budget applies.
 ///
 /// `poll` does not consume, so asking costs the pipe nothing and the retry still finds its byte.
@@ -3163,7 +3163,7 @@ fn supervise_box(
         // workload. 125 is kern's own box-not-started convention (and Docker's), used as the
         // discriminator elsewhere in this file; under `always` it was restarted forever, so a stack
         // whose `up` died left its surviving boxes rebuilding a box that could not be built. MEASURED
-        // by an external reviewer bringing up Immich, 26 iterations for one service and 15 for
+        // by an independent test bringing up Immich, 26 iterations for one service and 15 for
         // another, each logging "never released: the launcher closed the pre-exec gate without
         // releasing this box - the workload did not run"; reproduced here by pointing one service at
         // an image that cannot be pulled. Docker does not restart a container it could not create.
@@ -3204,7 +3204,7 @@ fn supervise_box(
             if never_started {
                 // NOT "(always)": that word promises forever, and this case is budgeted. The reader who
                 // sees attempt 3 of 10 knows the loop ends, which is the whole difference from the log
-                // an external reviewer watched go round 26 times.
+                // an independent test watched go round 26 times.
                 eprintln!(
                     "kern: box '{}' never started (exit 125); retrying ({attempt}/{max_restarts})",
                     name.as_str()
@@ -3573,7 +3573,7 @@ pub(super) const fn run_should_fork(outer_enforcer: bool, cap_built: bool) -> bo
 /// none. Where an outer enforcer exists that process already exists too (the scope proxy, and
 /// `systemd-run --collect` on top of it), and this is a no-op. Where it does not - a host with no
 /// systemd user manager, which is the configuration of the WSL rootfs this project publishes - there
-/// was nothing, and a reviewer measured 200 sequential `kern run` leaving 201 directories behind.
+/// was nothing, and an independent test measured 200 sequential `kern run` leaving 201 directories behind.
 ///
 /// The fork buys three things on that host, not one: the leaf is removed, the workload's exit code
 /// and signals are still propagated by a process that survives it, and an OOM kill is EXPLAINED
@@ -4024,7 +4024,7 @@ mod image_defaults_tests {
 
     /// `restart: always` is a promise about a WORKLOAD, and a box that never started has none.
     ///
-    /// MEASURED by an external reviewer on a real stack (Immich, one image that would not pull): the
+    /// MEASURED by an independent test on a real stack (Immich, one image that would not pull): the
     /// surviving services logged "never released: the launcher closed the pre-exec gate ... the
     /// workload did not run" and were restarted 26 and 15 times, unbounded, while `ps` showed them
     /// running. Reproduced here by pointing one service at an image that cannot be pulled.
@@ -4116,7 +4116,7 @@ mod image_defaults_tests {
         assert_eq!(super::gate_can_still_release(), None);
         // A descriptor that CANNOT be open answers `POLLNVAL`, which is not "refused".
         //
-        // 🪤 NOT A NUMBER THAT LOOKS FREE. This was `987`, and an external reviewer caught it failing
+        // 🪤 NOT A NUMBER THAT LOOKS FREE. This was `987`, and an independent test caught it failing
         // 1 run in 12 at `--test-threads=16`: the tests are threads in ONE process, they open pipes
         // and files, and 987 is a descriptor a sibling is entitled to hold. The soft `RLIMIT_NOFILE`
         // is one past the highest fd this process may own, so no thread can make it valid, and the
@@ -4204,7 +4204,7 @@ mod image_defaults_tests {
     /// MEASURED on Immich's postgres (`Interval 300s, StartPeriod 300s, StartInterval 5s`): Docker
     /// probes every 5 s and calls it healthy in about ten; kern waited the full 300 s for its FIRST
     /// probe and reported `starting` for five minutes, with every `depends_on: service_healthy`
-    /// waiting behind it. An external reviewer sampled the process table at 0.1 s and saw the probe
+    /// waiting behind it. An independent test sampled the process table at 0.1 s and saw the probe
     /// run once, at 300 s, and pass.
     #[test]
     fn an_images_start_interval_reaches_the_checker() {

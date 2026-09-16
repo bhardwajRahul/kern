@@ -101,7 +101,7 @@ def memory_cap_bites(kern: str) -> "tuple[bool, str]":
     fire, and on a host with no cgroup delegation they cannot fire at all: kern accepts the write and
     the kernel never enforces it. The first version of this script decided that per case, by looking for
     the words "not enforced" in the fault MESSAGE, and that was the very mistake this file lectures
-    about: a skip must key on the HOST's capability, not on a string. It cost a reviewer a false red,
+    about: a skip must key on the HOST's capability, not on a string. It cost an independent test a false red,
     because that sentence only appears when kern's enforcement byte is exactly 2, so the one-shot path
     skipped while the resident-kernel and prewarm paths failed for the same host.
 
@@ -218,7 +218,7 @@ def main() -> int:
     finally:
         os.environ["KERN_BIN"] = prev
 
-    # THE SECOND LAYER OF THE GATE, and a reviewer found it by attacking the design rather than the code:
+    # THE SECOND LAYER OF THE GATE, and an independent test found it by attacking the design rather than the code:
     # answering `kern <version>` is not behaving like kern. A two-line script that prints a kern-looking
     # version and then exits 0 passed the identity check and produced `success=True` with an empty stdout.
     # The invariant that closes it is the started byte, written by every kern since v0.9.2.
@@ -274,7 +274,7 @@ def main() -> int:
     # A CELL CANNOT FABRICATE A BLOCKED ESCAPE, and the reason is the kernel rather than anything here:
     # the box's workload is pid 1 of its own pid namespace, and the kernel does not deliver an unhandled
     # fatal signal to a namespace's init from INSIDE it. So `os.kill(os.getpid(), SIGSYS)` is swallowed
-    # and the cell simply finishes. A reviewer supposed this route reopened the forgery that the fourth
+    # and the cell simply finishes. An independent test supposed this route reopened the forgery that the fourth
     # byte closed from the exit-code side; measured, it does not exist. The same property is why
     # `kill -9 $$` cannot end a box from inside.
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
@@ -407,7 +407,7 @@ def main() -> int:
         skip("real OOM", f"a memory cap does not bind here: {cap_evidence}")
 
     # THE RESIDUE, because a correct verdict that leaves a box behind is still a defect. A DELTA against
-    # the baseline taken before anything ran, never an absolute count: a reviewer got a false red here
+    # the baseline taken before anything ran, never an absolute count: an independent test got a false red here
     # because he had his own box up while the battery ran, and a suite that fails on someone else's
     # process is measuring the machine rather than itself. Counted by the binary's own PATH and not by
     # the string "kern", which also matches kern-mcp and this script's harness.

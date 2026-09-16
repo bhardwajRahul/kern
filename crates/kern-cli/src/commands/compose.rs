@@ -1076,7 +1076,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // ```
     //
     // The same command, twice, two outcomes: the first `up` on a clean machine breaks the stack and
-    // the second one fixes it. An outside reviewer predicted exactly this shape from the `config`
+    // the second one fixes it. An outside independent test predicted exactly this shape from the `config`
     // behaviour and asked which side of the pull the decision falls on. It falls on the wrong one.
     //
     // Pulling here is also what Docker does: MEASURED on 29.6.2, `docker compose up -d` on a cold
@@ -3181,7 +3181,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 
 /// `compose run [--rm] [--no-deps] <service> [command…]`: a one-off box from a service definition.
 ///
-/// THE VERB TWO INDEPENDENT REVIEWERS BOTH PUT FIRST. It is step 2 of nearly every project README
+/// THE VERB THAT COMES FIRST IN EVERY DOCKER WORKFLOW. It is step 2 of nearly every project README
 /// (`run --rm web python manage.py migrate`, `run --rm app npm test`, `run --rm db psql`), and
 /// nothing kern had could stand in for it: the service's environment, volumes, working directory,
 /// user and network, with a different command, once.

@@ -7,7 +7,7 @@
 //
 // 🪤 AND IT MASKED THE WHOLE LINT. cargo stops at the first crate that fails, and kern-common
 // is a dependency of everything: while this was an error, kern-cli was never linted at all, so
-// a clean run said nothing about the 40 call sites the lint exists for. An external reviewer
+// a clean run said nothing about the 40 call sites the lint exists for. An independent test
 // hit it on a cold build while my own warm one reported zero, which is the second time this
 // week a cache told me a check had passed when it had not run.
 #![allow(clippy::disallowed_methods)]

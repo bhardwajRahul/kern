@@ -4122,7 +4122,7 @@ const COMPOSE_CONDITION_TIMEOUT_SECS: u64 = 120;
 /// The exit-sidecar key for a box: `<pod>-<token>-<name>`. `<pod>` namespaces by STACK (two stacks
 /// with a `db` don't collide - review 1b); `<token>` namespaces by this `up`'s RUN (two concurrent
 /// `up`s of the SAME stack own separate files, so one's clear/write can't clobber the other's real
-/// completion - review round 2, the round-1 "token only inside the file" left the filename shared).
+/// completion - an audit pass, the round-1 "token only inside the file" left the filename shared).
 /// `compose_pod_name(file)` is stable per compose file even for a `--no-pod` stack (no live pod), so
 /// the prefix is well-defined in both modes. `compose down` doesn't know the `up`'s token, so it reaps
 /// each box's sidecar by `exit_key_prefix(pod)` ++ `-<name>` (pod-prefix AND name-suffix) - NOT a
@@ -4522,7 +4522,7 @@ pub enum ComposeAction {
     /// `run <service> [command…]`: one-off box from a service's definition, in the foreground.
     ///
     /// The step 2 of nearly every project README (`run --rm web python manage.py migrate`), and the
-    /// verb two independent reviewers both put first among what kern was missing. It brings the
+    /// verb two independent independent tests both put first among what kern was missing. It brings the
     /// service's dependencies up exactly as `up` does, because it IS `up`: the dependencies are
     /// started by re-invoking this binary rather than by a second copy of the ordering rules.
     Run,
@@ -4800,7 +4800,7 @@ fn reconcile_decision(running: &registry::Instance, want: &str) -> Reconcile {
 /// the first kind; the second is announced at bring-up.
 ///
 /// The generalisation matters more than any single case: the internal-port clash was found only
-/// because a reviewer's premise was tested, and it is one member of a class, not a special case.
+/// because a test's premise was tested, and it is one member of a class, not a special case.
 ///
 /// The gate lives HERE, not at the call sites. It used to be written at each of them, and they drifted
 /// exactly as that always ends: `up` gated it, `systemd` ran it ungated, and `config` (the verb whose
@@ -7249,7 +7249,7 @@ fn run_terminal_verb(
             // `pull_policy:` DECIDES HERE TOO. `up` honoured it and this verb did not, so on a file
             // whose services declare `pull_policy: never` kern went to the registry for a name that
             // only exists locally, failed, and aborted the run - leaving every image AFTER it
-            // unfetched. MEASURED by an external reviewer on Sentry's official compose file, where
+            // unfetched. MEASURED by an independent test on Sentry's official compose file, where
             // 48 of 57 services carry the key and 21 also carry `build:`: the verb could not succeed
             // at all. The image of a service that is BUILT is produced by `compose build`, so a
             // registry that does not have it is not an error either; it is reported and the pull
@@ -7386,7 +7386,7 @@ fn run_terminal_verb(
             // stopped box leaves no registry entry to carry it. A stack running under `--no-pod` has
             // no pod at all, and the two-state message below called that "gone with its last member"
             // - false twice over, since nothing was ever there and the other services were still
-            // running. Reported by an external reviewer against the released 0.8.6 binary.
+            // running. Reported by an independent test against the released 0.8.6 binary.
             let was_no_pod = boxes
                 .iter()
                 .any(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty()));

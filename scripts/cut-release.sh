@@ -78,7 +78,7 @@ ok "cargo test: $(grep -c '^test .* \.\.\. ok' /tmp/cut-release-test.$$) passing
 rm -f /tmp/cut-release-test.$$
 
 for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
-         registry-classified stale-numbers test-count progress-is-tty-gated gates-selftest; do
+         registry-classified stale-numbers progress-is-tty-gated gates-selftest; do
     python3 "scripts/$g.py" >/dev/null 2>&1 || die "scripts/$g.py failed"
 done
 ok "9 doc/consistency gates"

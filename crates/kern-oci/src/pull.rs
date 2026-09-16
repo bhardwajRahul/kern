@@ -128,7 +128,7 @@ pub struct ImageHealthcheck {
     /// ships `Interval 300s, StartPeriod 300s, StartInterval 5s`: Docker probes every 5 s and marks
     /// it healthy in about ten, kern waited the whole 300 s interval for its FIRST probe and reported
     /// `starting` for five minutes. Anything gated on `depends_on: condition: service_healthy` waits
-    /// with it. An external reviewer found it by sampling the process table at 0.1 s and seeing the
+    /// with it. An independent test found it by sampling the process table at 0.1 s and seeing the
     /// probe run once, late, and pass.
     pub start_interval_ns: Option<u64>,
     pub retries: Option<u32>,
@@ -616,7 +616,7 @@ pub(crate) fn parse_ref(image: &str) -> Result<(String, String, String), OciErro
     // for a manifest and got a document that is not one: unpinned it parsed as a manifest with NO
     // LAYERS, and pinned it failed as a digest mismatch against a digest that returns 404
     // MANIFEST_UNKNOWN in that repository. Two symptoms, one cause, and both messages sent the reader
-    // to look at the image instead of at the host. MEASURED by an external reviewer bringing up
+    // to look at the image instead of at the host. MEASURED by an independent test bringing up
     // Immich on WSL2, and reproduced here.
     //
     // `library/` is added AFTER the alias, and only for Docker Hub: `docker.io/alpine` means
@@ -3582,7 +3582,7 @@ mod tests {
     #[test]
     fn no_matching_arch_returns_none_no_fallback() {
         // A requested arch absent from the index yields None (NOT a wrong-arch fallback) - the pull
-        // then errors with the available list. Locks the reviewer-mandated dropped fallback.
+        // then errors with the available list. Locks that test-mandated dropped fallback.
         let ppc = Platform {
             os: "linux".into(),
             arch: "ppc64le".into(),

@@ -160,7 +160,7 @@ _TOOLS = [
     {
         "name": "run_code",
         # WHAT THIS SENTENCE IS FOR, and why it no longer opens with "on the user's own machine". An
-        # external reviewer wired this server into Cursor correctly and the agent answered
+        # independent test wired this server into Cursor correctly and the agent answered
         # "The sandbox run completed successfully. Output: 45" from its OWN python, never calling the
         # tool: the workspace was untouched for eleven days. The client already owns the word "sandbox"
         # (its terminal policy says "outside the sandbox (allowlisted)"), so a model choosing between
@@ -256,7 +256,7 @@ _RUN_CODE_LANGUAGES = next(
 # what the client was told is the only honest definition, and a retyped copy drifts.
 #
 # WHY THE SERVER CHECKS IT AT ALL, since JSON Schema allows extra properties by default and most servers
-# drop them. MEASURED by an external reviewer: a `tools/call` carrying `{"code": ..., "image": ""}` ran
+# drop them. MEASURED by an independent test: a `tools/call` carrying `{"code": ..., "image": ""}` ran
 # and returned `[exit 0]`, so a model that asked for a different image was told its code had run and was
 # never told the image it named had no effect. Under `additionalProperties` the SDK's own contract is the
 # opposite: an unknown keyword to `Sandbox()` raises. A model cannot correct what it is not told about.
@@ -700,7 +700,7 @@ class _Server:
         # the scratch charge for `oom`. Appended for EVERY type rather than for the one that prompted
         # this: a per-type branch here is a second place to keep in step with the taxonomy.
         # THE PROVENANCE STAMP, folded into the frame that is already on every reply so it costs no line.
-        # WHY IT IS HERE. An external reviewer wired this server into Cursor correctly, asked the agent to
+        # WHY IT IS HERE. An independent test wired this server into Cursor correctly, asked the agent to
         # "run print(sum(range(10))) in the sandbox", and got "The sandbox run completed successfully.
         # Output: 45" from the client's OWN python, with this server's workspace untouched for eleven days.
         # Four probes said host: the caller's `init.scope` cgroup, the host's full `/dev`, `Seccomp: 0`
