@@ -269,7 +269,15 @@ def follow():
                        text=True, timeout=25)
     out["so"] = p.stdout
 
-ths = [threading.Thread(target=watch), threading.Thread(target=follow)]
+# QUANDO IL FOLLOWER E' PARTITO, perche' se parte DOPO la prima rotazione il test misura una
+# finestra piu' corta e non vede la cucitura che dice di esaminare. Una corsa persa qui non e' un
+# verde: e' un test che non ha esercitato niente, e va detto.
+follow_start = []
+def follow_timed():
+    follow_start.append(time.time())
+    follow()
+
+ths = [threading.Thread(target=watch), threading.Thread(target=follow_timed)]
 [t.start() for t in ths]
 [t.join(30) for t in ths]
 subprocess.run([K, "stop", "fw"], env=ENV, capture_output=True)
@@ -291,11 +299,26 @@ print(f"   righe seguite: {len(lines)}")
 # IL FOLLOWER SEGUE IL NOME, NON L'INODE. Prima lo faceva: dopo la prima rotazione restava su un
 # descrittore che nessuno scrive piu', e ogni riga successiva era persa in silenzio. Rotazione e'
 # il DEFAULT (16 MiB), quindi valeva per ogni box longevo. Misurato: 0 righe su 120.
-seguite = {int(m.group(1)) for l in lines if (m := re.search(r"L_(\d+)", l))}
-print(f"   PASS  il follower ha seguito la rotazione ({len(seguite)} righe distinte)"
-      if len(seguite) > 150 else
-      f"   FAIL  il follower si e' fermato alla rotazione: solo {len(seguite)} righe distinte")
-if len(seguite) <= 150:
+# OGNI id CHE IL BOX HA STAMPATO, non "abbastanza". Il produttore e' un contatore stretto (L_0..L_199)
+# proprio perche' il test possa chiedere l'insieme COMPLETO: una soglia lasca ("piu' di 150") passa
+# su un follower che perde la coda di ogni generazione, che e' il difetto da cui nasce questa fase.
+seguite = sorted(int(m.group(1)) for l in lines if (m := re.search(r"L_(\d+)", l)))
+attesi = set(range(200))
+mancanti = sorted(attesi - set(seguite))
+doppi = [n for n in set(seguite) if seguite.count(n) > 1]
+ok_tutte = not mancanti and not doppi
+print(f"   PASS  il follower ha visto TUTTE le righe attraverso la rotazione ({len(seguite)})"
+      if ok_tutte else
+      f"   FAIL  mancanti {mancanti[:6]} ({len(mancanti)}), duplicate {doppi[:6]} ({len(doppi)})")
+if not ok_tutte:
+    FAIL += 1
+
+# IL FOLLOWER DEVE AVER VISTO LA CUCITURA, altrimenti questa fase non ha esercitato niente.
+partito_prima = follow_start and rotations and follow_start[0] < rotations[0]
+print(f"   PASS  il follower era attivo prima della prima rotazione"
+      if partito_prima else
+      "   FAIL  il follower e' partito DOPO la prima rotazione: la fase non ha esercitato la cucitura")
+if not partito_prima:
     FAIL += 1
 if not rotations or not lines:
     print("   INCONCLUSIVO: serve almeno una rotazione e delle righe")
@@ -330,12 +353,16 @@ oltre = [(m.group(2), m.group(1)) for l in lines
          and epoch(m.group(1)) > time.time() + 1]
 print(f"   PASS  nessuno stamp nel FUTURO assoluto" if not oltre else f"   FAIL  stamp nel futuro: {oltre[:3]}")
 
-# monotonia dentro il follow: gli stamp non devono MAI diminuire
+# MONOTONIA ATTRAVERSO I `-`, NON FINO AL PRIMO. Saltare le righe orfane spezza il confronto in
+# segmenti indipendenti: una cucitura rotta che emette un blocco di `-` e poi riprende con un tempo
+# sbagliato passa, perche' nessuna coppia confrontata la attraversa. `prev` sopravvive al blocco.
 prev, back = None, []
 for l in lines:
     m = re.match(r"^(\S+)\s+(L_\d+)", l)
-    if not m or m.group(1) == "-":
+    if not m:
         continue
+    if m.group(1) == "-":
+        continue  # non c'e' un tempo da confrontare, ma `prev` RESTA quello di prima
     t = epoch(m.group(1))
     if prev is not None and t < prev - 0.001:
         back.append((m.group(2), m.group(1)))
@@ -351,4 +378,72 @@ shutil.rmtree(XDG, ignore_errors=True)
 FAIL += 1 if (oltre or back) else 0
 
 print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
+
+
+# ---------------------------------------------------------------------------------------------
+# FASE 4: `gc` e `prune` a raffica MENTRE un follower e' attaccato a un box vivo.
+#
+# La sweep salta le chiavi vive e ricontrolla l'instance file prima di cancellare, quindi in teoria
+# non puo' togliere il log da sotto a un lettore. "In teoria" e' esattamente cio' che due misure di
+# questa giornata hanno gia' smentito, e un log cancellato per nome sotto un fd aperto e' il caso in
+# cui POSIX continua a servire i byte finche' il descrittore vive: il difetto sarebbe silenzioso.
+XDG = tempfile.mkdtemp(prefix="kern-gc-")
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+LOGS = os.path.join(XDG, "kern", "logs")
+subprocess.run(
+    [K, "box", "gcv", "--image", "alpine:3.19", "-d", "--log-max-size", "4k", "--",
+     "/bin/sh", "-c",
+     "i=0; while [ $i -lt 250 ]; do echo \"G_$i aaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); "
+     "/bin/busybox usleep 30000; done"],
+    env=ENV, capture_output=True, timeout=60)
+time.sleep(0.3)
+
+out = {}
+def follow():
+    p = subprocess.run([K, "logs", "gcv", "-t", "-f"], env=ENV, capture_output=True,
+                       text=True, timeout=30)
+    out["so"], out["se"], out["rc"] = p.stdout, p.stderr, p.returncode
+
+# gc e prune a raffica mentre il box e' vivo e qualcuno lo segue
+ran = {"gc": 0, "prune": 0, "reaped": 0}
+sparito_da_vivo = []
+def vivo():
+    return subprocess.run([K, "ps", "-q"], env=ENV, capture_output=True, text=True,
+                          timeout=20).stdout.count("gcv") > 0
+def sweeper():
+    t0 = time.time()
+    while time.time() - t0 < 9:
+        # LA DOMANDA VA POSTA MENTRE IL BOX E' VIVO. Dopo che e' morto, reclamare il suo log e'
+        # esattamente cio' che `prune` deve fare: controllare alla fine misura il comportamento
+        # corretto e lo chiama difetto, che e' come questo test si e' sbagliato la prima volta.
+        if vivo() and not any(f.startswith("gcv-") and f.endswith(".log") for f in os.listdir(LOGS)):
+            sparito_da_vivo.append(time.time() - t0)
+        for verb in ("prune", "gc"):
+            p = subprocess.run([K, verb], env=ENV, capture_output=True, text=True, timeout=30)
+            ran[verb] += 1
+            m = re.search(r"pruned (\d+) file", p.stdout)
+            if m:
+                ran["reaped"] += int(m.group(1))
+        time.sleep(0.2)
+
+ths = [threading.Thread(target=follow), threading.Thread(target=sweeper)]
+[t.start() for t in ths]
+[t.join(40) for t in ths]
+subprocess.run([K, "stop", "gcv"], env=ENV, capture_output=True)
+
+so = out.get("so", "")
+seen = sorted({int(m.group(1)) for l in so.splitlines() if (m := re.search(r"G_(\d+)", l))})
+print(f"\n== {ran['gc']} gc + {ran['prune']} prune mentre un follower era attaccato ==")
+print(f"   file reclamati dalle sweep: {ran['reaped']}")
+line(out.get("rc") == 0 and "panic" not in (out.get("se") or ""),
+     "il follower e' uscito pulito", f"rc={out.get('rc')} {(out.get('se') or '').strip()[:40]}")
+line(len(seen) > 100, "il follower ha continuato a vedere righe", f"{len(seen)} righe")
+buchi = [n for n in range(min(seen), max(seen) + 1) if n not in seen] if seen else ["nessuna riga"]
+line(not buchi, "nessun buco nella sequenza", f"{len(buchi)} buchi: {buchi[:5]}")
+
+line(not sparito_da_vivo, "il log non e' mai sparito MENTRE il box era vivo",
+     f"{len(sparito_da_vivo)} volte" if sparito_da_vivo else "mai")
+
+print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
+shutil.rmtree(XDG, ignore_errors=True)
 sys.exit(1 if FAIL else 0)

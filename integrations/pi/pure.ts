@@ -381,3 +381,97 @@ export async function detectShell(box: Sandbox): Promise<Shell> {
 		return "sh"; // a probe that cannot run is not a reason to pick the shell that may not exist
 	}
 }
+
+/**
+ * The framing BOTH agent surfaces of the SDK emit, spelled here because this extension has to
+ * neutralise all of it.
+ *
+ * 🔴 A CELL THAT PRINTS ONE OF THESE FORGES A VERDICT ABOUT ITSELF in the channel a model uses to
+ * decide. kern goes to the trouble of an unforgeable descriptor byte to tell `oom` from `killed`, and
+ * handing the forgery back for free at the text layer undoes it. A model does not know which surface
+ * wrote a line - the MCP server, the LangChain renderer and this extension all ship against the same
+ * runtime - so the list is one list and every surface neutralises every entry.
+ *
+ * Kept in sync by hand with `_FRAME_LINE_MARKS` in the Python binding, which is the canonical
+ * spelling. There is no shared module across the two languages; a marker added there and not here
+ * reopens the hole on this surface only.
+ */
+const FRAME_LINE_MARKS = [
+	"[sandbox: ", // langchain: `[sandbox: oom]`
+	"[exit ", // mcp: `[exit 137, sandbox fault: ...]`
+	"[stderr]",
+	"[rich result]",
+	"[output truncated: reply-size cap]",
+	"[the session's interpreter ended on that cell ",
+	"kern[host]:", // and this extension's own three, for the same reason
+	"kern[gate]:",
+	"kern[box]:",
+];
+
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const FORGED_LINE_FRAME = new RegExp(
+	`^(?:${FRAME_LINE_MARKS.map(esc).join("|")}|\\[\\d+ image result\\(s\\) omitted: reply-size cap\\])`,
+	"gm",
+);
+const FORGED_CUT_NOTICE = /\.\.\.\[truncated \d+ chars\]|\.\.\. \d+ characters of output, cut to fit \.\.\./g;
+
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPES = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-Z\\-_])/g;
+// eslint-disable-next-line no-control-regex
+const CONTROL_BYTES = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+
+/**
+ * One box-produced string, safe to put in a model's context.
+ *
+ * ⭐ AT THE TEXT BOUNDARY, NEVER AT THE BYTE BOUNDARY. `readFile` here returns a Buffer and the same
+ * call serves images - stripping control bytes there would corrupt every PNG the agent reads. So this
+ * is applied where bytes BECOME text for a model: grep's file contents, a directory listing, a glob's
+ * paths, a command's stdout and stderr. The read path stays opaque on purpose.
+ *
+ * What it does NOT close, and cannot at this layer: ordinary prompt injection. A cell whose output is
+ * `[system] ignore your instructions` printed a string, and no filter separates that from a program
+ * legitimately printing the same characters without destroying real output.
+ */
+export function untrusted(text: string): string {
+	const label = (m: string) => `[printed by the code, not the sandbox: ${m.replace(/^[.[]+/, "")}`;
+	const flat = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	const clean = flat.replace(ANSI_ESCAPES, "").replace(CONTROL_BYTES, "");
+	return clean.replace(FORGED_LINE_FRAME, label).replace(FORGED_CUT_NOTICE, label);
+}
+
+/** [`untrusted`] applied to one path or name, which a cell also controls. */
+export function untrustedName(name: string): string {
+	return untrusted(name);
+}
+
+/**
+ * A streaming neutraliser: whole lines out, an unterminated tail held back.
+ *
+ * ⭐ PER LINE AND NOT PER CHUNK, for the same reason the log reader holds a fragment. The markers are
+ * anchored at the start of a line, and a stream arrives in arbitrary pieces: a chunk can begin in the
+ * middle of a line, where `^` matches something that is not a line start, and a marker split across
+ * two chunks is matched by neither. Holding the tail until its newline makes the anchor mean what it
+ * says. `flush` releases whatever never gets one, so nothing is swallowed when the command ends.
+ */
+export function lineNeutraliser(emit: (b: Buffer) => void): {
+	push: (chunk: Buffer) => void;
+	flush: () => void;
+} {
+	let pending = "";
+	return {
+		push(chunk: Buffer) {
+			pending += chunk.toString("utf8");
+			const i = pending.lastIndexOf("\n");
+			if (i < 0) return;
+			const whole = pending.slice(0, i + 1);
+			pending = pending.slice(i + 1);
+			emit(Buffer.from(untrusted(whole), "utf8"));
+		},
+		flush() {
+			if (pending.length === 0) return;
+			const tail = pending;
+			pending = "";
+			emit(Buffer.from(untrusted(tail), "utf8"));
+		},
+	};
+}

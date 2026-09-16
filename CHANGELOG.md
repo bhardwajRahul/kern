@@ -124,6 +124,19 @@ with machinery nobody asked for. Time is never reordered. And a byte-capped rota
 line it lands in, so the first bytes of a fresh generation are the tail of a line that started in the
 previous one; `-t` stamps that fragment like any other line, correctly but confusingly.
 
+**The Pi extension neutralises box output that becomes model text.** A cell that prints
+`[sandbox: oom]` or `[exit 137, ...]` is forging a verdict about itself in the channel a model decides
+with, and the SDK's other two agent surfaces have refused that for a while: this one did not. It now
+does, on the paths where bytes become text - a command's stdout and stderr, grep's file contents, a
+directory listing, a glob's paths - and deliberately NOT on `readFile`, which returns a Buffer and
+serves images: stripping control bytes there would corrupt every PNG the agent reads. Neutralise at
+the text boundary, never at the byte boundary.
+
+The stream is neutralised per LINE rather than per chunk. The markers are anchored at a line start
+and output arrives in arbitrary pieces, so a chunk can begin mid-line and a marker can be split
+across two: measured, per-chunk both misses a marker broken in half and labels one that is merely
+quoted in the middle of a sentence.
+
 **`kern logs -f` stopped showing output after the first rotation, and said nothing.** It followed an
 open descriptor rather than the name, so when the pump renamed the active log and opened a fresh one
 the follower kept polling a file nobody writes to any more. Measured: a box that printed 120 lines

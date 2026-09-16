@@ -65,6 +65,9 @@ import {
 	guestHome,
 	requireScratchSupport,
 	boxOptions,
+	untrusted,
+	untrustedName,
+	lineNeutraliser,
 	refuseOutsideWorkspace,
 	detectImageMimeType,
 	globMatches,
@@ -415,7 +418,10 @@ export function kernGrepOps(box: Sandbox, ws: string): GrepOperations {
 			const p = await probeInBox(box, refuseOutsideWorkspace(abs));
 			return p !== null && p.exists && p.isDir;
 		},
-		readFile: async (abs) => readWorkspaceFile(ws, refuseOutsideWorkspace(abs), abs).toString("utf8"),
+		// TEXT, so it is neutralised - unlike `kernReadOps.readFile`, which hands back a Buffer that
+		// may be a PNG. This is the same file through a different door, and the door decides.
+		readFile: async (abs) =>
+			untrusted(readWorkspaceFile(ws, refuseOutsideWorkspace(abs), abs).toString("utf8")),
 	};
 }
 
@@ -434,7 +440,7 @@ export function kernFindOps(box: Sandbox): FindOperations {
 				const rel = base ? `${base}/${f.path}` : f.path;
 				if (!globMatches(pattern, f.path) && !globMatches(pattern, rel)) continue;
 				if (ignores.some((ig) => globMatches(ig, rel))) continue;
-				out.push(path.posix.join(GUEST_WORKSPACE, rel));
+				out.push(untrustedName(path.posix.join(GUEST_WORKSPACE, rel)));
 				if (out.length >= (options?.limit ?? 100)) break;
 			}
 			return out;
@@ -476,7 +482,11 @@ async function boxReaddir(box: Sandbox, guest: string): Promise<string[]> {
 		.split("\0")
 		.filter((s) => s.length > 0)
 		.map((s) => (s.startsWith(prefix) ? s.slice(prefix.length) : s))
-		.filter((n) => n.length > 0 && !isBindingScratch(n));
+		.filter((n) => n.length > 0 && !isBindingScratch(n))
+		// A NAME IS CONTENT THE CELL CHOSE. A file called `[sandbox: oom]` in a listing reads to a
+		// model exactly like a verdict this extension wrote, which is the hole the SDK closed on its
+		// own listing. Same answer here.
+		.map(untrustedName);
 }
 
 
@@ -540,16 +550,26 @@ export function kernBashOps(box: Sandbox, shell: Shell = "bash"): BashOperations
 			// than forwarded. One notice, then silence: repeating it per chunk would be the flood.
 			let forwarded = 0;
 			let noticed = false;
+			// THE COMMAND'S OUTPUT IS TEXT THE MODEL READS, so it goes through the same neutralisation
+			// the SDK's own surfaces apply: a cell that prints `[sandbox: oom]` or `[exit 137, ...]` is
+			// forging a verdict about itself in the channel the model decides with. Per LINE, because
+			// the markers are anchored at a line start and this arrives in arbitrary chunks.
+			//
+			// The CAP is counted on what arrives, not on what is emitted: neutralising changes the
+			// length (an escape sequence is removed, a marker is labelled), and a cap that measured
+			// the output would let a cell widen its own budget by printing escapes.
+			const neutral = lineNeutraliser((b) => onData(b));
 			const forward = (chunk: Buffer) => {
 				if (forwarded >= MAX_OUTPUT) {
 					if (!noticed) {
 						noticed = true;
+						neutral.flush();
 						onData(Buffer.from(`\n[kern: output past ${MAX_OUTPUT} bytes is not shown]\n`));
 					}
 					return;
 				}
 				forwarded += chunk.length;
-				onData(chunk);
+				neutral.push(chunk);
 			};
 
 			const run = box.runCode(script, {
@@ -568,6 +588,10 @@ export function kernBashOps(box: Sandbox, shell: Shell = "bash"): BashOperations
 			try {
 				r = signal ? await Promise.race([run, aborted]) : await run;
 			} finally {
+				// The last line of a command often has no trailing newline; without this it would be
+				// held by the neutraliser and never shown. `finally`, so an abort or a throw releases
+				// it too - a partial line is still the command's output.
+				neutral.flush();
 				if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 			}
 

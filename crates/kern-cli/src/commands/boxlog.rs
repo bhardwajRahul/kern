@@ -1676,6 +1676,35 @@ mod compaction_tests {
         // stale mark - and the tail is the part a reader is looking at. Measured as the last surviving
         // mark still covering the end of the log: with every-other thinning it is the penultimate
         // original mark or better; with oldest-half thinning it sits at the middle of the file.
+        // DENSITY IN THE INTERIOR, not only at the end. "The last mark still covers EOF" says nothing
+        // about the middle: a compaction that kept the first mark, the last, and nothing between
+        // would satisfy it while leaving the body of the log answered by one stale time. The bound is
+        // what thinning by half means - every surviving gap is at most twice the spacing it replaced -
+        // and it is checked against the MEDIAN rather than the max, so one naturally wide gap in the
+        // original (a quiet stretch where the pump wrote nothing) cannot raise the ceiling for all.
+        let gaps =
+            |m: &[(u64, u64)]| -> Vec<u64> { m.windows(2).map(|w| w[1].0 - w[0].0).collect() };
+        let median = |mut v: Vec<u64>| -> u64 {
+            v.sort_unstable();
+            if v.is_empty() {
+                0
+            } else {
+                v[v.len() / 2]
+            }
+        };
+        let before_median = median(gaps(&before));
+        let worst_after = gaps(&after).into_iter().max().unwrap_or(0);
+        assert!(
+            before_median > 0,
+            "the fixture produced no spacing to compare against"
+        );
+        assert!(
+            worst_after <= 2 * before_median,
+            "compaction left a hole in the interior: widest gap {worst_after} against a bound of \
+             {} (2x the pre-compaction median of {before_median})",
+            2 * before_median
+        );
+
         let last_kept = after.last().expect("a compacted index still has marks").0;
         let penultimate = before[before.len() - 2].0;
         assert!(

@@ -19,6 +19,7 @@
     "test-edge.ts",
     "test-hostile.ts",
     "test-pure.ts",
+    "test-neutral.ts",
     "test-register.ts",
     "e2e-provider.ts",
     "test-e2e.ts",
