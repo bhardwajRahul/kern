@@ -2793,6 +2793,49 @@ fn await_box_started(
 ///
 /// BOUNDED RATHER THAN FORBIDDEN, because not every 125 is permanent: a bind source that appears a
 /// second later, a peer still writing the pod's network. It gets the same budget `on-failure` uses.
+/// Can this box's pre-exec gate still release a retry? `None` when there is no gate to ask.
+///
+/// ASKED OF THE PIPE, NOT OF A MESSAGE, so it cannot be wrong about a box that is lying or about a
+/// line kern itself wrote: the gate is one pipe per box, the launcher holds the only write end, and
+/// the two states are distinguishable without reading a byte.
+///
+/// - `POLLIN`: a release byte is SITTING IN THE PIPE. The launcher released this box and the attempt
+///   died before consuming it (its own setup failed - a bind source that was not there yet). A retry
+///   will read that byte and run, so the budget is exactly right and this returns `true`.
+/// - `POLLHUP` without `POLLIN`: the write end is gone and nothing is buffered. The launcher closed
+///   the gate WITHOUT releasing this box, and no future attempt can ever be released, because the
+///   process that would have written the byte has exited. Retrying is 10 refusals and a backoff that
+///   reaches 30 s, which is what an external reviewer watched go round 26 times on Immich.
+/// - Open, no data: the launcher is still working. Unchanged: the budget applies.
+///
+/// `poll` does not consume, so asking costs the pipe nothing and the retry still finds its byte.
+/// Any error, an unusable descriptor, or no gate at all answers `None`, and the caller keeps the
+/// behaviour it had before this question existed: refusing to restart on a guess would be the same
+/// class of defect in the other direction.
+fn gate_can_still_release() -> Option<bool> {
+    let fd: libc::c_int = std::env::var("KERN_GATE_FD").ok()?.trim().parse().ok()?;
+    if fd < 0 {
+        return None;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live local `pollfd`, count 1, zero timeout: `poll` returns immediately and writes
+    // only into `revents`.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } < 0 {
+        return None;
+    }
+    if pfd.revents & libc::POLLNVAL != 0 {
+        return None;
+    }
+    if pfd.revents & libc::POLLIN != 0 {
+        return Some(true);
+    }
+    Some(pfd.revents & libc::POLLHUP == 0)
+}
+
 fn should_restart(
     code: i32,
     always: bool,
@@ -2855,17 +2898,36 @@ fn supervise_box(
     // variable is removed from THIS process's environment, which is what every forked attempt
     // inherits, so the change reaches the restart and nothing else.
     //
-    // Removed after the first attempt is FORKED rather than after it succeeds: a box that fails to
-    // start for its own reasons gets the same treatment on retry, which is the case that produced
-    // the 10 wasted attempts.
+    // 🔴 BUT ONLY AFTER AN ATTEMPT THAT ACTUALLY RAN THE WORKLOAD, or this becomes a way to RUN a box
+    // the launcher deliberately refused. MEASURED on published main with a
+    // `service_completed_successfully` dependency whose service exits 1: the gate does its job and the
+    // box logs "never released ... never started (exit 125)", and ONE SECOND LATER the restart, with
+    // the gate removed, execs the workload anyway. The condition was enforced and then undone by the
+    // recovery path.
+    //
+    // THE DISCRIMINATOR IS THE PREVIOUS EXIT, and 125 is exactly "no workload ran" (kern's
+    // box-not-started convention, used as the discriminator elsewhere in this file). So the gate is
+    // kept for a retry that follows a box which never started, and dropped only once a workload has
+    // exited - which is the only case the paragraph above is about.
+    //
+    // KEEPING IT IS NOT A HANG, AND THE PIPE ITSELF SEPARATES THE TWO CASES, which is why this needs
+    // no new channel and no stderr heuristic. Each box has its own gate pipe, and the supervisor's
+    // read end stays open across forks (the child closes its own copy, post-fork). If the launcher
+    // RELEASED this box and the box then failed its own setup - a missing bind source, the case the
+    // budget exists for - that release byte was never consumed and is still in the pipe, so the retry
+    // reads it and proceeds. If the launcher refused, there is no byte and the write end is gone, and
+    // the restart decision at the bottom of this loop ends the box on the first refusal rather than
+    // running a workload whose dependency failed.
     let mut gate_dropped = false;
+    // The previous attempt's exit, `None` before the first. Only its equality with 125 is read.
+    let mut last_code: Option<i32> = None;
     let final_code = loop {
         let ready = if attempt == 0 {
             have_pipe.then_some(wr)
         } else {
             None
         };
-        if attempt > 0 && !gate_dropped {
+        if attempt > 0 && !gate_dropped && last_code != Some(125) {
             // SAFETY: single-threaded supervisor between forks; no other thread can be reading the
             // environment here.
             unsafe { std::env::remove_var("KERN_GATE_FD") };
@@ -3092,14 +3154,27 @@ fn supervise_box(
         // second later, a peer that is still writing the pod's network. So the same budget `on-failure`
         // uses applies, and when it runs out the box says why instead of stopping silently.
         let never_started = code == 125;
-        let restart_now = should_restart(
-            code,
-            restart.always,
-            restart.on_failure,
-            attempt,
-            max_restarts,
-        );
-        if never_started && !restart_now {
+        // AND ONE 125 IS PERMANENT, so it does not get a budget: the launcher closed this box's gate
+        // without releasing it, and the process that would write that byte has exited. Asked only
+        // when the gate is still in force for retries (`!gate_dropped`), because once it is dropped a
+        // retry execs without it and the answer would be about a gate nobody consults.
+        let gate_shut = never_started && !gate_dropped && gate_can_still_release() == Some(false);
+        let restart_now = !gate_shut
+            && should_restart(
+                code,
+                restart.always,
+                restart.on_failure,
+                attempt,
+                max_restarts,
+            );
+        if gate_shut {
+            eprintln!(
+                "kern: box '{}' was never released and will not be retried: the launcher closed \
+                 this box's pre-exec gate without releasing it, so no attempt can ever start. The \
+                 reason is in the lines above this one",
+                name.as_str()
+            );
+        } else if never_started && !restart_now {
             eprintln!(
                 "kern: box '{}' never started {max_restarts} times in a row (exit 125); not \
                  restarting it again. `restart: always` restarts a workload that exits, and no \
@@ -3134,6 +3209,10 @@ fn supervise_box(
             // shape. `attempt` is >= 1 here (incremented above): 1, 2, 4, 8, 16, then 30 s thereafter.
             let backoff = (1u32 << attempt.saturating_sub(1).min(5)).min(30);
             unsafe { libc::sleep(backoff) };
+            // Read at the top of the next iteration to decide whether the pre-exec gate may be
+            // dropped. See the block above the loop: dropping it after a box that NEVER STARTED
+            // would exec a workload the launcher refused to release.
+            last_code = Some(code);
             continue;
         }
         break code;
@@ -3950,6 +4029,79 @@ mod image_defaults_tests {
         assert!(!super::should_restart(0, false, true, 1, 10));
         // and no policy means no restart at all.
         assert!(!super::should_restart(1, false, false, 1, 10));
+    }
+
+    /// The gate is asked whether a RETRY could still be released, and the pipe answers all four ways.
+    ///
+    /// WHY THIS TEST AND NOT A STACK: the state that separates "retry me" from "never" is whether a
+    /// release byte is in the pipe, and in a real stack the losing case needs the box to die inside
+    /// the window between the launcher's write and its own read - which is not a thing a test can
+    /// arrange on demand. The pipe is the whole mechanism, so the pipe is what is falsified here.
+    ///
+    /// THE CONTROLS ARE THE POINT. Without the `POLLIN`-with-a-closed-writer row, "closed writer
+    /// means never" would read as correct while silently discarding a box the launcher DID release.
+    #[test]
+    fn gate_can_still_release_separates_a_pending_byte_from_a_shut_pipe() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // Process-global env (`KERN_GATE_FD`) - serialize with every other env-mutating test.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        fn pipe() -> (OwnedFd, OwnedFd) {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+        fn ask(rd: &OwnedFd) -> Option<bool> {
+            std::env::set_var("KERN_GATE_FD", rd.as_raw_fd().to_string());
+            super::gate_can_still_release()
+        }
+        fn release(wr: &OwnedFd) {
+            let b = *b"r";
+            assert_eq!(
+                unsafe { libc::write(wr.as_raw_fd(), b.as_ptr().cast::<libc::c_void>(), 1) },
+                1
+            );
+        }
+
+        // Launcher alive, nothing sent yet: it may still release, so the budget applies.
+        let (rd, wr) = pipe();
+        assert_eq!(ask(&rd), Some(true));
+
+        // Launcher alive and the byte is waiting: a retry reads it and runs.
+        release(&wr);
+        assert_eq!(ask(&rd), Some(true));
+
+        // THE CONTROL THAT MATTERS: the launcher released this box and then EXITED. The byte is
+        // still in the pipe, so this is a retry that can succeed, not a box that was refused.
+        drop(wr);
+        assert_eq!(ask(&rd), Some(true));
+
+        // Released, consumed, writer gone: nothing left to read, so no retry can ever start.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(rd.as_raw_fd(), byte.as_mut_ptr().cast::<libc::c_void>(), 1) },
+            1
+        );
+        assert_eq!(ask(&rd), Some(false));
+
+        // Refused outright: writer closed, nothing ever written. This is the dependency that failed.
+        let (rd2, wr2) = pipe();
+        drop(wr2);
+        assert_eq!(ask(&rd2), Some(false));
+
+        // No gate, or one that cannot be parsed or used: no opinion, and the caller keeps its budget.
+        std::env::remove_var("KERN_GATE_FD");
+        assert_eq!(super::gate_can_still_release(), None);
+        std::env::set_var("KERN_GATE_FD", "not-a-number");
+        assert_eq!(super::gate_can_still_release(), None);
+        std::env::set_var("KERN_GATE_FD", "-1");
+        assert_eq!(super::gate_can_still_release(), None);
+        // A descriptor nobody opened answers `POLLNVAL`, which is not "refused".
+        std::env::set_var("KERN_GATE_FD", "987");
+        assert_eq!(super::gate_can_still_release(), None);
+        std::env::remove_var("KERN_GATE_FD");
     }
     use super::*;
 

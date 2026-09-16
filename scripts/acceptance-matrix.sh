@@ -244,10 +244,18 @@ answers() {
 # The payload, allowing the WORKLOAD the milliseconds it needs to bind - and no more than a second in
 # total, so a service that never binds is still a failure rather than a wait.
 reaches_soon() {
-    i=0
-    while [ $i -lt 20 ]; do
+    # BOUNDED IN SECONDS, NOT IN ATTEMPTS, and that distinction is a red this file produced. The bound
+    # was 20 attempts, which is a unit that means different things on different machines: an attempt
+    # costs about 3 ms here, so 20 of them is 60 ms, and it passed only because the answer came on the
+    # first one. MEASURED on a freshly booted machine: the payload after `compose start` arrives in
+    # 865 ms on the FIRST restart (290 attempts) and in 171 ms on every one after - the cold-start
+    # cost this repo already records for the first box. Three runs in four went red for it.
+    #
+    # Ten seconds is long enough for any cold machine and still fails a service that never binds,
+    # which is the thing this case is for.
+    deadline=$(( $(date +%s) + 10 ))
+    while [ "$(date +%s)" -le "$deadline" ]; do
         [ "$(reaches "$1" "$2" "$3")" = "1" ] && { printf '1'; return; }
-        i=$((i + 1))
     done
     printf '0'
 }
