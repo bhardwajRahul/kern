@@ -76,7 +76,7 @@ sandbox acted:
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here. A cap being set is not evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
 | `exec_failed` | the box started, the command did not exist in the image; the message names both |
-| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeout_s` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make) |
+| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeout_s` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make). The cold read is the FIRST call on a new machine and it is not small: 38 s for an arm64 image on a Raspberry Pi 5 here, against 0.1 s warm |
 
 `startup_failed` is **returned** by `run_code`/`run`, because each call is its own box and the result
 carries the verdict: measured on a typo'd image tag, `exit_code` 1, `success` False, `fault.type`
@@ -217,7 +217,7 @@ A bare `Sandbox()` has no network, no host mounts, seccomp on, dangerous capabil
 **mandatory** finite timeout. Every relaxation is a named argument:
 
 ```python
-Sandbox(
+kern.Sandbox(
     image="python:3.12-slim",   # OCI image
     setup="pip install pandas", # the ONLY network window: a separate net-on box; run_code is net-off
     workspace=None,             # None -> temp dir, deleted on exit; a path -> persists
@@ -250,7 +250,14 @@ one is the sandbox's control plane, so handing it to the code in a box defeats t
 `deps_readonly=False` reopens it, and a write then gets `EROFS` rather than failing silently.
 
 **`egress_allow` is the middle setting, and the one an agent usually wants.** `network=False` gives the
-run phase no network, `network=True` gives it the host's, and an allowlist gives it a named few:
+run phase no network, `network=True` gives it the host's, and an allowlist gives it a named few.
+
+**`network=True` includes the host's LOOPBACK, which is where unauthenticated services live.** It
+puts the box in the host's network namespace, so `127.0.0.1` inside the box is the host's
+`127.0.0.1`: a reviewer's cell connected to `127.0.0.1:22` and read back `SSH-2.0-OpenSSH_9.6p1`,
+and a developer's laptop is where a database, a Redis and a dashboard sit bound to localhost with no
+password. The same connect is refused under the default `network=False`, and `egress_allow` refuses
+it too, because that one goes through kern's proxy rather than through the host's stack.
 
 ```python
 kern.Sandbox(egress_allow=["pypi.org", "files.pythonhosted.org"])
@@ -367,6 +374,32 @@ for agent-generated code, **not** a hard boundary against deliberately hostile m
 that, use a microVM (Firecracker, Kata) or gVisor. `security_profile="untrusted"` bundles the
 allowlist with `--cap-drop ALL` and `--read-only`. The full statement is in
 [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+
+**Two jobs, and the handoff is the point.** A microVM product (Docker Sandboxes, Firecracker, Kata,
+gVisor) gives the code a kernel of its own, and that is the right answer when the code is actively
+hostile or belongs to someone else. It costs what a machine costs: measured here against `sbx`
+0.43.0 on the same laptop, half a second per command in a live sandbox and about three seconds to
+create one, against 2 ms and 4 ms for kern, with `uname -r` inside reading its own kernel there and
+the host's here. kern is for the OTHER job, the one an agent loop does a thousand times: a cell per
+call, network off, memory and pids the kernel enforces, a deadline applied from outside the box.
+Pick by which job you have, not by the ratio.
+
+**What the box does NOT hide from the code inside it.** The caps are real and the kernel enforces
+them where it can, but the box still reads the HOST's numbers for things nothing charges it for:
+`df` on the workspace reports the host's filesystem, because that is what it is, a bind mount with
+no quota, and `nproc` reports the host's core count even under a `cpus` cap, which caps TIME and not
+the count (measured here: 28 inside a box capped at 0.5 cores, 28 outside). Anything that sizes
+itself from a cgroup-unaware API is in the same family: Go's `GOMAXPROCS`, some JVMs, `ray`-style
+CPU detection. `memory_mb` and `pids` ARE enforced and visible as limits, but ONLY where the host
+gives kern a delegated cgroup: on one that does not (a root shell with no user manager, some CI
+runners) kern warns and the box runs UNCAPPED. `kern doctor` says which path a host takes, and
+`require_limits=True` refuses to start rather than run a box whose caps are decoration.
+
+**`pip install kern-sandbox` does not install the sandbox.** The binding drives a `kern` binary it
+finds on `PATH` or in `$KERN_BIN`, and that is a SECOND thing to install and to keep current: a
+binary that is not kern is refused by name, but an OLDER kern runs fine and answers fewer questions,
+because the fault taxonomy reads bytes only newer builds write. If a verdict looks wrong, print
+`kern --version` before anything else.
 
 ## Requirements
 

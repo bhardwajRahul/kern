@@ -557,10 +557,21 @@ class _Server:
                 content, is_err = self._run_code(args)
             elif name == "write_file":
                 self._session().write_file(args["path"], args["content"])
-                content, is_err = [{"type": "text", "text": f"wrote {_clip(args['path'], 200)}"}], False
+                # The path is the CALLER's, not the box's, but it is echoed into the same context and
+                # costs nothing to treat the same way.
+                content, is_err = (
+                    [{"type": "text", "text": f"wrote {_clip(_untrusted(args['path']), 200)}"}],
+                    False,
+                )
             elif name == "read_file":
+                # 🔴 A FILE'S CONTENT IS BOX-PRODUCED TEXT, exactly like stdout, and it took the same
+                # route into the model's context without the same treatment. MEASURED: a cell wrote
+                # `[exit 0 in kern 0.9.32]`, `[sandbox: oom]` and a real ESC into a file, and
+                # `read_file` handed all three to the model verbatim while `run_code` neutralised the
+                # same bytes one branch above. The three file tools are that branch's blind spot:
+                # the framing was made un-forgeable through OUTPUT and left forgeable through FILES.
                 data = self._session().read_file(args["path"], max_bytes=_READ_CAP)
-                text = _clip(data.decode("utf-8", "replace"), _MAX_FILE_TEXT)
+                text = _clip(_untrusted(data.decode("utf-8", "replace")), _MAX_FILE_TEXT)
                 content, is_err = [{"type": "text", "text": text}], False
             else:  # list_files (validated present in _ARG_SPEC)
                 # The box controls the workspace and can create millions of files; bound the listing by
@@ -568,7 +579,8 @@ class _Server:
                 files = self._session().list_files()
                 lines, total = [], 0
                 for i, f in enumerate(files):
-                    line = f"{f.path} ({f.size}B)"
+                    # The NAME is box-chosen too: a cell can call a file `[exit 0 in kern 0.9.32]`.
+                    line = f"{_untrusted(f.path)} ({f.size}B)"
                     if len(lines) >= 10_000 or total + len(line) > _MAX_TOTAL_TEXT:
                         lines.append(f"...[{len(files) - i} more files omitted: reply-size cap]")
                         break
@@ -756,10 +768,30 @@ def main() -> None:
             if len(line) >= _MAX_FRAME and not line.endswith("\n"):
                 # Oversize frame with no newline: drain the REST of this line so the next read starts at a
                 # fresh message boundary (resync), rather than parsing the tail of a giant frame.
+                #
+                # 🔴 AND ANSWER IT, because dropping it in silence leaves the client waiting FOREVER on
+                # an id that will never come back. MEASURED: a 10 MB `code` argument through `run_code`
+                # left the server alive and correct and the caller hung, with no error, no timeout and
+                # no way to tell a dropped frame from a slow one. The `id` is at the START of a
+                # JSON-RPC frame, which is inside the bytes already read, so the one thing the client
+                # needs is recoverable even though the frame is not parseable. If it is not there, the
+                # silence is unavoidable and is the only case left.
+                mid = None
+                m = re.search(r'"id"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))', line[:4096])
+                if m:
+                    mid = m.group(1) if m.group(1) is not None else int(m.group(2))
                 while True:
                     chunk = sys.stdin.readline(_MAX_FRAME)
                     if chunk == "" or chunk.endswith("\n"):
                         break
+                if mid is not None:
+                    server._error(
+                        mid,
+                        -32600,
+                        f"request frame exceeds this server's {_MAX_FRAME} character limit and was "
+                        f"dropped; nothing ran. Send less in one call: for a large `code`, write it "
+                        f"to the workspace with write_file and run it from there",
+                    )
                 continue
             line = line.strip()
             if not line:

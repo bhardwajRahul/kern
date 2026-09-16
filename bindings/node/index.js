@@ -1972,6 +1972,17 @@ class Sandbox {
   // -- workspace file I/O (host-direct; single-uid -> box files are host-owned) ---------------------
 
   _wsPath(rel) {
+    // A NUL BYTE IS REFUSED HERE, in the same words Python uses. Without it, node's own check fires
+    // deeper and the caller reads "The argument 'path' must be a string, Uint8Array...", which names
+    // the argument's TYPE for a path that is a perfectly good string. Found through the Python MCP
+    // server, where the same input surfaced as `internal error: ValueError`; both bindings answer the
+    // question that was asked now.
+    if (typeof rel === "string" && rel.includes("\u0000")) {
+      throw new SandboxError(
+        `path contains a NUL byte: ${JSON.stringify(rel)}. A NUL terminates a path for every API ` +
+          `below this one, so the name cannot mean what it appears to say`,
+      );
+    }
     // Lexical containment: normalize `..`/`.`, require it stays under the workspace base. Symlinks in
     // the final component are neutralized by O_NOFOLLOW on the actual open below.
     //

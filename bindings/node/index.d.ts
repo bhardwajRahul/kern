@@ -71,6 +71,12 @@ export class ExecutionResult {
   results: Result[];
   /** True iff the code exited 0 AND no sandbox fault fired. */
   readonly success: boolean;
+  /** `stderr` with kern's own `note:`/`warning:` lines removed: what the CODE wrote. Feed this to a
+   * model, not `stderr`, or kern's diagnostics read as the workload's. */
+  readonly codeStderr: string;
+  /** The complement of `codeStderr`: the lines kern wrote about itself, one per entry. `stderr`
+   * still holds both, in order. */
+  readonly runtimeNotes: string[];
 }
 
 /** A PROGRAMMER/config error, THROWN: bad argument, illegal mount, or `kern` not installed. */

@@ -2524,6 +2524,16 @@ class Sandbox:
         (in read/write) so a symlinked LAST component can't redirect the host I/O outside the workspace.
         """
         base = self._ws  # canonical since enter - no per-walk re-resolution
+        # A NUL BYTE IS REFUSED HERE, or it is refused by `os.open` as a bare `ValueError` that the
+        # caller sees as `internal error: ValueError` with no path in it. Found through the MCP server,
+        # where that string is what a MODEL reads: every other bad path on this route answers with a
+        # sentence naming the path and the reason, and this one read as a broken tool. NUL is also the
+        # terminator every path API below Python uses, so a name carrying one cannot mean what it says.
+        if "\x00" in rel:
+            raise SandboxError(
+                f"path contains a NUL byte: {rel!r}. A NUL terminates a path for every API below this "
+                "one, so the name cannot mean what it appears to say"
+            )
         # AN ABSOLUTE PATH IS NOT A WORKSPACE PATH, and that is checked HERE rather than left to
         # `os.path.join`, which happens to drop `base` when the second argument is absolute. Node's
         # `path.join` does the OPPOSITE (it keeps the base), so the same three lines refused here and

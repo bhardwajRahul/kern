@@ -78,14 +78,20 @@ spawns a **fresh** box on that shared workspace, so file state persists but in-m
 (write to disk for continuity). `withSandbox` opens the session and cleans it up, even on throw:
 
 ```js
-await kern.withSandbox({ setup: "pip install pandas" }, async (sbx) => {
-  await sbx.writeFile("data.csv", csvBytes);
-  const r = await sbx.runCode(
-    "import pandas as pd; print(pd.read_csv('data.csv').describe())",
-  );
-  console.log(r.stdout);          // network off, capped, isolated
-  const chart = await sbx.readFile("out.png");
-});
+await kern.withSandbox(
+  { setup: "pip install pandas matplotlib", memoryMb: 1536 },
+  async (sbx) => {
+    await sbx.writeFile("data.csv", "a,b\n1,2\n3,4\n");
+    const r = await sbx.runCode(
+      "import matplotlib; matplotlib.use('Agg')\n" +
+        "import pandas as pd, matplotlib.pyplot as plt\n" +
+        "df = pd.read_csv('data.csv'); print(df.describe())\n" +
+        "df.plot(); plt.savefig('out.png')",
+    );
+    console.log(r.stdout);        // network off, capped, isolated
+    const chart = await sbx.readFile("out.png");   // a Uint8Array of the PNG
+  },
+);
 ```
 
 `setup` is the **only** moment the network is on (a separate box that installs deps into the workspace
@@ -134,7 +140,7 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 | `oom` | the kernel's OOM killer took the box against its own memory cap. Read from a descriptor the code in the box cannot write, so it is an observation and not a guess from the exit code |
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here, which the message names |
 | `exec_failed` | the box started, the command did not exist inside it. `{language:"node"}` on an image with no `node` is the ordinary way there; the message names the binary AND the image |
-| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeoutS` fired while kern was still BUILDING the box (run it again: a fast second call was a cold image read), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make) |
+| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeoutS` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make). The cold read is the FIRST call on a new machine and it is not small: 38 s for an arm64 image on a Raspberry Pi 5 here, against 0.1 s warm |
 
 ```js
 const r = await kern.runCode("while True: pass", { timeoutS: 5 });
@@ -214,8 +220,15 @@ memory, scratch that does not survive a call, and the two writable places a tool
 `network: false` gives the run phase no network and `network: true` gives it the host's. `egressAllow`
 is the middle one, and usually the one an agent wants:
 
+**`network: true` includes the host's LOOPBACK, which is where unauthenticated services live.** It
+puts the box in the host's network namespace, so `127.0.0.1` inside the box is the host's
+`127.0.0.1`: a reviewer's cell connected to `127.0.0.1:22` and read back `SSH-2.0-OpenSSH_9.6p1`,
+and a developer's laptop is where a database, a Redis and a dashboard sit bound to localhost with no
+password. The same connect is refused under the default `network: false`, and `egressAllow` refuses
+it too, because that one goes through kern's proxy rather than through the host's stack.
+
 ```js
-await withSandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] }, async (sbx) => { /* ... */ });
+await kern.withSandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] }, async (sbx) => { /* ... */ });
 ```
 
 The box stays in its own network namespace and reaches the internet only through kern's filtering
@@ -280,7 +293,7 @@ bare expression**, every **`display(obj)`**, and **every open matplotlib figure 
 no `savefig`. Accessors: `.png`, `.jpeg`, `.html`, `.svg`, `.markdown`, `.json`, `.text`.
 
 ```js
-await withSandbox({ setup: "pip install pandas matplotlib" }, async (sbx) => {
+await kern.withSandbox({ setup: "pip install pandas matplotlib" }, async (sbx) => {
   await sbx.writeFile("data.csv", "a,b\n1,2\n3,4\n");
   const r = await sbx.runCode("import pandas as pd; pd.read_csv('data.csv').describe()");
   r.results[0].html;                       // the DataFrame as an HTML table
@@ -303,6 +316,32 @@ against deliberately hostile multi-tenant code. For that, reach for a microVM (F
 gVisor. The wider denylist is the opt-out (`KERN_SECCOMP=denylist`), and `securityProfile: "untrusted"`
 bundles the allowlist with `--cap-drop ALL` + `--read-only`. See the project's
 [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+
+**Two jobs, and the handoff is the point.** A microVM product (Docker Sandboxes, Firecracker, Kata,
+gVisor) gives the code a kernel of its own, and that is the right answer when the code is actively
+hostile or belongs to someone else. It costs what a machine costs: measured here against `sbx`
+0.43.0 on the same laptop, half a second per command in a live sandbox and about three seconds to
+create one, against 2 ms and 4 ms for kern, with `uname -r` inside reading its own kernel there and
+the host's here. kern is for the OTHER job, the one an agent loop does a thousand times: a cell per
+call, network off, memory and pids the kernel enforces, a deadline applied from outside the box.
+Pick by which job you have, not by the ratio.
+
+**What the box does NOT hide from the code inside it.** The caps are real and the kernel enforces
+them where it can, but the box still reads the HOST's numbers for things nothing charges it for:
+`df` on the workspace reports the host's filesystem, because that is what it is, a bind mount with
+no quota, and `nproc` reports the host's core count even under a `cpus` cap, which caps TIME and not
+the count (measured here: 28 inside a box capped at 0.5 cores, 28 outside). Anything that sizes
+itself from a cgroup-unaware API is in the same family: Go's `GOMAXPROCS`, some JVMs, `ray`-style
+CPU detection. `memoryMb` and `pids` ARE enforced and visible as limits, but ONLY where the host
+gives kern a delegated cgroup: on one that does not (a root shell with no user manager, some CI
+runners) kern warns and the box runs UNCAPPED. `kern doctor` says which path a host takes, and
+`requireLimits: true` refuses to start rather than run a box whose caps are decoration.
+
+**`npm install kern-sandbox` does not install the sandbox.** The binding drives a `kern` binary it
+finds on `PATH` or in `$KERN_BIN`, and that is a SECOND thing to install and to keep current: a
+binary that is not kern is refused by name, but an OLDER kern runs fine and answers fewer questions,
+because the fault taxonomy reads bytes only newer builds write. If a verdict looks wrong, print
+`kern --version` before anything else.
 
 ## License
 

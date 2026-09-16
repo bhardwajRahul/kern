@@ -1829,6 +1829,26 @@ def test_setup_refuses_the_shape_a_reader_guesses_first():
 
 
 @integration
+def test_a_nul_byte_in_a_path_is_refused_by_name():
+    """A NUL in a workspace path answers with a sentence, not with someone else's exception.
+
+    FOUND THROUGH THE MCP SERVER, which is where the cost is: `read_file` with `a\x00b` reached
+    `os.open`, which raised a bare `ValueError: embedded null byte`, and the model read
+    `internal error: ValueError` with no path in it. Every other bad path on that route names the path
+    and the reason. Node had the same gap one layer down, answering "The argument 'path' must be a
+    string, Uint8Array..." about a path that IS a string, so both bindings say the same thing now.
+
+    A NUL is not a normalisation question: it is the terminator every path API below this one uses, so
+    a name carrying one cannot mean what it appears to say.
+    """
+    with Sandbox(timeout_s=20) as s:
+        for call in (lambda: s.read_file("a\x00b"), lambda: s.write_file("a\x00b", "x")):
+            with pytest.raises(SandboxError) as e:
+                call()
+            assert "NUL byte" in str(e.value), str(e.value)
+            assert "a\x00b" in repr(str(e.value)) or "a\\x00b" in str(e.value), str(e.value)
+
+
 def test_an_absolute_path_is_refused_and_not_reinterpreted():
     """A host path handed to a workspace call is refused, and never resolved INSIDE the workspace.
 

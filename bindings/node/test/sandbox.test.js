@@ -2389,3 +2389,63 @@ test("any error kern prints before the box exists is a startup failure", () => {
     else process.env.KERN_BIN = prev;
   }
 });
+
+// A NUL IN A WORKSPACE PATH IS REFUSED BY NAME, in the same words the Python binding uses.
+//
+// Found through the Python MCP server, where `read_file` with a NUL surfaced to a MODEL as
+// `internal error: ValueError` with no path in it. Here the gap was one layer down and the message
+// named the argument's TYPE ("must be a string, Uint8Array...") for a path that IS a string. A NUL is
+// the terminator every path API below this one uses, so the name cannot mean what it appears to say.
+test("a NUL byte in a workspace path is refused by name, in both directions", async () => {
+  const bad = "a" + String.fromCharCode(0) + "b";
+  const s = new Sandbox({ timeoutS: 20 });
+  await s.open();
+  try {
+    for (const call of [() => s.readFile(bad), () => s.writeFile(bad, "x")]) {
+      await assert.rejects(call, (e) => {
+        assert.match(e.message, /NUL byte/);
+        assert.ok(e.message.includes("u0000"), e.message);
+        return true;
+      });
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+// THE .d.ts DECLARES EVERY FIELD AN ExecutionResult ACTUALLY HAS, and nothing it does not.
+//
+// FOUND BY RUNNING `tsc`, not by reading: `codeStderr` and `runtimeNotes` are documented in the
+// README's result table, exist at runtime as prototype getters, and were absent from `index.d.ts`.
+// A TypeScript consumer writing `r.runtimeNotes` got `error TS2339: Property does not exist`, for a
+// field the page told them to use. Nothing compared the two surfaces, so the declaration drifted
+// from the object it declares and only a user would have noticed.
+//
+// The comparison is on the OBJECT, not on a list typed here: own enumerable keys plus the getters on
+// the prototype, which is where `success`, `codeStderr` and `runtimeNotes` live.
+test("index.d.ts declares exactly the fields an ExecutionResult exposes", async () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "index.d.ts"), "utf8");
+  const body = src.split("export class ExecutionResult {")[1].split("\n}")[0];
+  const declared = new Set(
+    body
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => /^(readonly )?[a-zA-Z]+[?]?:/.test(l))
+      .map((l) => l.replace(/^readonly /, "").split(/[?:]/)[0]),
+  );
+
+  const r = await runCode("print(1)");
+  const real = new Set([
+    ...Object.keys(r),
+    // `_`-prefixed members are private by this file's own convention and are deliberately absent
+    // from the public declaration; comparing them would demand the .d.ts publish internals.
+    ...Object.getOwnPropertyNames(Object.getPrototypeOf(r)).filter(
+      (k) => k !== "constructor" && !k.startsWith("_"),
+    ),
+  ]);
+
+  const missing = [...real].filter((k) => !declared.has(k)).sort();
+  const extra = [...declared].filter((k) => !real.has(k)).sort();
+  assert.deepStrictEqual(missing, [], `fields on the object that the .d.ts does not declare: ${missing}`);
+  assert.deepStrictEqual(extra, [], `fields the .d.ts declares that the object does not have: ${extra}`);
+});
