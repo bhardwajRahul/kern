@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""`kern logs -t` under a reader that is OPEN while the pump rotates and compacts.
+
+WHY THIS EXISTS AS A SCRIPT AND NOT AS A UNIT TEST. The pump and the reader share a file format
+across two processes, and the interesting states last milliseconds: an index truncated between the
+reader's `read_marks` and its next line, a compaction halving the table under a follow that is
+mid-file. A unit test can drive `compact_index` directly - and one does - but it cannot put a real
+`kern logs -t -f` in front of a real pump. An external reviewer put this at the top of the residual
+risk after round 19, with the right reason: everything I had said about it was reasoning.
+
+It looks for the three ways this can LIE, not for a crash:
+
+  1. a timestamp that goes BACKWARDS inside one reader (a post-compaction table applied to a cursor
+     from before it)
+  2. a torn 16-byte record read as valid (its stamp lands outside the current year)
+  3. a line without a time column anywhere but at the very end, where an unterminated fragment is
+     the documented answer
+
+TWO HARNESS TRAPS, both of which produced a false red here before the script was right. Consecutive
+`--tail N` reads look at OVERLAPPING windows, so pasting their outputs together fabricates a jump
+backwards in time; each read is its own sample. And the last line of any read may be a fragment with
+no newline yet, which the reader deliberately emits unstamped; only a bare line in the MIDDLE is a
+defect.
+
+Runs in about a minute. Exits non-zero on the first lie.
+"""
+import os, re, shutil, subprocess, sys, tempfile, threading, time
+
+K = os.environ.get("KERN_BIN") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "release", "kern")
+XDG = tempfile.mkdtemp(prefix="kern-stress-")
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+LOGS = os.path.join(XDG, "kern", "logs")
+FAIL = 0
+
+
+def line(ok, name, det=""):
+    global FAIL
+    if not ok:
+        FAIL += 1
+    print(f"   {'PASS' if ok else 'FAIL'}  {name:<56} {str(det)[:64]}")
+
+
+# Un box che stampa in fretta con un cap minuscolo: rotazione ogni pochi KB, per ~12 s.
+NAME = "stress"
+subprocess.run(
+    [K, "box", NAME, "--image", "alpine:3.19", "-d", "--log-max-size", "8k", "--log-max-file", "3",
+     "--", "/bin/sh", "-c",
+     "i=0; while [ $i -lt 4000 ]; do echo \"RIGA_$i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; "
+     "i=$((i+1)); /bin/busybox usleep 3000; done"],
+    env=ENV, capture_output=True, timeout=60)
+time.sleep(0.4)
+
+# Sei lettori: tre che seguono per tutta la durata, tre che leggono a raffica.
+out = {}
+def follower(n):
+    p = subprocess.run([K, "logs", NAME, "-t", "-f"], env=ENV, capture_output=True,
+                       text=True, timeout=30)
+    out[f"follow{n}"] = (p.stdout, p.stderr, p.returncode)
+
+def hammer(n):
+    err = []
+    t0 = time.time()
+    k = 0
+    while time.time() - t0 < 11:
+        p = subprocess.run([K, "logs", NAME, "-t", "--tail", "40"], env=ENV,
+                           capture_output=True, text=True, timeout=20)
+        # UNA LETTURA = UN CAMPIONE. Due `--tail` successive guardano finestre che si
+        # SOVRAPPONGONO, quindi il tempo fra la fine di una e l'inizio della prossima torna
+        # indietro per costruzione: incollarle fabbrica il difetto che il test cerca.
+        out[f"hammer{n}.{k}"] = (p.stdout, p.stderr.strip()[:80], p.returncode)
+        k += 1
+        if p.returncode != 0 or p.stderr.strip():
+            err.append((p.returncode, p.stderr.strip()[:80]))
+
+ths = [threading.Thread(target=follower, args=(i,)) for i in range(3)]
+ths += [threading.Thread(target=hammer, args=(i,)) for i in range(3)]
+[t.start() for t in ths]
+[t.join(40) for t in ths]
+subprocess.run([K, "stop", NAME], env=ENV, capture_output=True)
+
+STAMP = re.compile(r"^(\S+)\s+(.*)$")
+ANNO = time.strftime("%Y")
+bad_rc, back, alieni, vuoti = [], [], [], []
+righe_viste = set()
+
+for who, (so, se, rc) in out.items():
+    if rc not in (0, None) or "panic" in (se or ""):
+        bad_rc.append((who, rc, (se or "")[:60]))
+    prev = None
+    ls = so.splitlines()
+    for i, l in enumerate(ls):
+        m = STAMP.match(l)
+        if not m:
+            continue
+        s, body = m.group(1), m.group(2)
+        if s == "-":
+            continue
+        if not (s.startswith("20") and s.endswith("Z")):
+            # Nessuna colonna: legale solo sull'ULTIMA riga, che e' il frammento senza newline
+            # che il lettore emette cosi' apposta. In mezzo sarebbe un difetto.
+            if i != len(ls) - 1:
+                alieni.append((who, "riga senza colonna a meta' output", l[:40]))
+            continue
+        if not s.startswith(ANNO):
+            alieni.append((who, s[:30], body[:30]))
+            continue
+        if prev and s < prev:
+            back.append((who, prev, s, body[:24]))
+        prev = s
+        mm = re.match(r"RIGA_(\d+)", body)
+        if mm:
+            righe_viste.add(int(mm.group(1)))
+        elif body.strip() == "":
+            vuoti.append((who, s))
+
+print(f"\n== FASE 1: rotazione. {len(out)} lettori concorrenti, cap 8k, 3 generazioni ==")
+line(not bad_rc, "nessun lettore e' uscito male o ha fatto panic", bad_rc[:2])
+line(not alieni, "nessuno stamp fuori dall'anno corrente (record torn letto come valido)", alieni[:2])
+line(not back, "nessun timestamp che TORNA INDIETRO dentro un lettore", back[:2])
+line(len(righe_viste) > 100, "i lettori hanno visto righe vere", f"{len(righe_viste)} distinte")
+
+# l'indice non deve mai superare il tetto, nemmeno sotto rotazione continua
+idx = [f for f in os.listdir(LOGS) if f.startswith(NAME) and f.endswith(".idx")]
+size = max((os.path.getsize(os.path.join(LOGS, f)) for f in idx), default=0)
+line(len(idx) <= 1, "una sola idx anche dopo molte rotazioni", idx)
+line(size % 16 == 0, "la idx e' un multiplo di 16 anche sotto stress", size)
+line(size <= 4096, "la idx non ha superato il tetto", f"{size} B su 4096")
+
+shutil.rmtree(XDG, ignore_errors=True)
+
+
+XDG = tempfile.mkdtemp(prefix="kern-compact-")
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+LOGS = os.path.join(XDG, "kern", "logs")
+NAME = "comp"
+# 40 s di righe corte ogni ~60 ms: ~650 marche potenziali contro un tetto di 256, quindi almeno
+# una compattazione durante la lettura. Il log resta ben sotto 64k, cosi' non ruota mai.
+subprocess.run(
+    [K, "box", NAME, "--image", "alpine:3.19", "-d", "--log-max-size", "64k", "--",
+     "/bin/sh", "-c",
+     "i=0; while [ $i -lt 700 ]; do echo \"C_$i\"; i=$((i+1)); /bin/busybox usleep 60000; done"],
+    env=ENV, capture_output=True, timeout=60)
+time.sleep(0.3)
+
+
+def logpath():
+    for f in os.listdir(LOGS):
+        if f.startswith(NAME + "-") and f.endswith(".log"):
+            return os.path.join(LOGS, f)
+    return None
+
+
+# campiona la dimensione dell'indice: se cala, la compattazione e' scattata
+sizes = []
+def watch():
+    t0 = time.time()
+    lp = None
+    while time.time() - t0 < 44:
+        lp = lp or logpath()
+        if lp and os.path.exists(lp + ".idx"):
+            try:
+                sizes.append(os.path.getsize(lp + ".idx"))
+            except OSError:
+                pass
+        time.sleep(0.15)
+
+out = {}
+def follower(n):
+    p = subprocess.run([K, "logs", NAME, "-t", "-f"], env=ENV, capture_output=True,
+                       text=True, timeout=60)
+    out[f"follow{n}"] = (p.stdout, p.stderr, p.returncode)
+
+ths = [threading.Thread(target=watch)] + [threading.Thread(target=follower, args=(i,)) for i in range(3)]
+[t.start() for t in ths]
+[t.join(70) for t in ths]
+subprocess.run([K, "stop", NAME], env=ENV, capture_output=True)
+
+cali = [(a, b) for a, b in zip(sizes, sizes[1:]) if b < a]
+print(f"\n== FASE 2: compattazione. indice: min {min(sizes or [0])} max {max(sizes or [0])} B, {len(sizes)} campioni ==")
+line(bool(cali), "la COMPATTAZIONE e' scattata davvero (l'indice cala)", f"{len(cali)} cali, es. {cali[:2]}")
+line(max(sizes or [0]) <= 4096, "l'indice non ha mai superato il tetto", f"max {max(sizes or [0])} B")
+
+STAMP = re.compile(r"^(\S+)\s+(.*)$")
+ANNO = time.strftime("%Y")
+back, alieni, bad = [], [], []
+for who, (so, se, rc) in out.items():
+    if rc not in (0, None) or "panic" in (se or ""):
+        bad.append((who, rc, (se or "")[:50]))
+    prev, prev_n = None, None
+    ls = so.splitlines()
+    for i, l in enumerate(ls):
+        m = STAMP.match(l)
+        if not m:
+            continue
+        s, body = m.group(1), m.group(2)
+        if s == "-":
+            continue
+        if not (s.startswith("20") and s.endswith("Z")):
+            if i != len(ls) - 1:
+                alieni.append((who, "riga senza colonna a meta'", l[:36]))
+            continue
+        if not s.startswith(ANNO):
+            alieni.append((who, s[:26], body[:26]))
+            continue
+        if prev and s < prev:
+            back.append((who, prev, s, body[:20]))
+        prev = s
+        # le righe devono arrivare IN ORDINE: un follower non puo' saltare indietro nel log
+        mm = re.match(r"C_(\d+)", body)
+        if mm:
+            n = int(mm.group(1))
+            if prev_n is not None and n < prev_n:
+                back.append((who, f"riga C_{prev_n}", f"poi C_{n}", "ordine"))
+            prev_n = n
+
+line(not bad, "nessun follower e' uscito male o ha fatto panic", bad[:2])
+line(not alieni, "nessuno stamp alieno (tabella nuova su cursore vecchio)", alieni[:2])
+line(not back, "nessun tempo NE' riga che torna indietro attraverso la compattazione", back[:2])
+
+print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
+shutil.rmtree(XDG, ignore_errors=True)
+sys.exit(1 if FAIL else 0)

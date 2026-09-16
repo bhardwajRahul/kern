@@ -488,6 +488,38 @@ fn the_completions_and_the_reference_agree() {
 /// make the shipped binary believe it is on a terminal, and a container without util-linux is not a
 /// defect in kern.
 #[test]
+fn a_continuation_line_follows_its_verb_and_only_its_verb() {
+    // The reference explains several verbs on the lines UNDER their signature, and the per-verb
+    // filter dropped every one of them: `kern up --help` lost six lines about when a namespace is
+    // shared and when relays are built, which is precisely what someone typing that command wants.
+    // The full reference had the text and the per-verb view silently did not, so the two stopped
+    // being one text without anything failing.
+    //
+    // The second half is the one that makes the first mean something: a continuation must not drift
+    // onto a NEIGHBOURING verb. `up`'s prose sits a few lines above `compose watch` in the source,
+    // so a filter that carried indentation without clearing it on the next signature would hand
+    // `up`'s explanation to whoever asked about something else.
+    let help_for = |verb: &str| -> String {
+        let out = kern().args([verb, "--help"]).output().expect("run kern");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let up = help_for("up");
+    assert!(
+        up.contains("DEFAULT: a namespace per service"),
+        "up's continuation lines belong to `kern up --help`:\n{up}"
+    );
+    let logs = help_for("logs");
+    assert!(
+        logs.contains("diagnostic stream"),
+        "logs' continuation lines belong to `kern logs --help`:\n{logs}"
+    );
+    assert!(
+        !logs.contains("DEFAULT: a namespace per service"),
+        "a continuation must not attach to a neighbouring verb:\n{logs}"
+    );
+}
+
+#[test]
 fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
     let bin = env!("CARGO_BIN_EXE_kern");
     let probe = Command::new("script").arg("--version").output();

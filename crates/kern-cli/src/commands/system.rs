@@ -46,7 +46,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output (-t: recorded time, bucketed from 100 ms; `-` if none was recorded)
+    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output
+                                                                     -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
+                                                                     -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
   {d}Images{z}
@@ -329,6 +331,8 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
     let mut out: Vec<String> = Vec::new();
     let mut in_commands = false;
     let mut in_verb_options = false;
+    // Set while the last COMMANDS line emitted was the asked-for verb, so its continuations follow.
+    let mut carry = false;
     for line in full.lines() {
         let flat = plain(line);
         let trimmed = flat.trim_start();
@@ -360,6 +364,27 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
         }
         if in_commands && line_declares_verb(trimmed, verb) {
             out.push(line.to_string());
+            carry = true;
+            continue;
+        }
+        // A CONTINUATION BELONGS TO THE VERB ABOVE IT, and this filter used to drop every one of
+        // them. The reference explains several verbs on the lines UNDER their signature - `up` has
+        // five, on when a namespace is shared and when relays are built - and none of it reached
+        // `kern up --help`, which is where a reader looks for exactly that. The full reference had
+        // it, the per-verb view silently did not, and the two are supposed to be one text.
+        //
+        // A continuation is recognised by INDENTATION and by nothing else. Every signature in this
+        // reference sits at four spaces; a continuation sits out at the description column. Trying to
+        // tell them apart by content does not work and was tried: the first thing a continuation
+        // says is a word, exactly like a verb, so "starts with a letter" excluded all five of `up`'s
+        // lines while letting nothing useful through. `carry` is cleared by any line that declares a
+        // verb, so a continuation can never attach to a verb other than the one it follows.
+        if in_commands && carry && !trimmed.is_empty() && flat.len() - trimmed.len() > 8 {
+            out.push(line.to_string());
+            continue;
+        }
+        if in_commands && !trimmed.is_empty() {
+            carry = false;
         }
     }
     if out.is_empty() {

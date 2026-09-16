@@ -118,6 +118,20 @@ runs for days loses resolution instead of growing a file without limit. A log wr
 kern has no index and prints `-` in the time column rather than a time nobody recorded, and so does a
 rotated generation, because rotation makes every offset in the index mean a different byte.
 
+**What `-t` is not.** `-f` is a diagnostic stream and not an audit log: under load a line written
+between the tail read and the follow can be dropped, which is stated in `--help` rather than fixed
+with machinery nobody asked for. Time is never reordered. And a byte-capped rotation splits whatever
+line it lands in, so the first bytes of a fresh generation are the tail of a line that started in the
+previous one; `-t` stamps that fragment like any other line, correctly but confusingly.
+
+**`kern logs` could report that a busy box writes no log at all.** A rotation renames the active file
+and opens a new one, and a reader that resolved the name in between found nothing, or opened a
+descriptor to a file that had just been renamed away. Resolving and opening are one retried operation
+now. Found at roughly 1 read in 6000 by a new concurrency battery,
+`scripts/logs-timestamp-battery.py`, which drives six readers against a box rotating every few KB and
+one whose index compacts underneath them, and looks for a time that goes backwards, a torn record read
+as valid, and a line with no time column anywhere but at the end.
+
 **The compatibility rate ships with its corpus and its definition.** The v0.9.32 claim of "14% to
 94%" was the CEILING under a permissive definition; the strict one measures 35% on the same 259
 files. Both numbers are in [DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) with the census scripts that

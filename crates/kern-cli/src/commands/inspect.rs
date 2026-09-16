@@ -1142,6 +1142,37 @@ pub fn history(count: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Resolve a box's newest log AND open it, retrying while a rotation is in flight.
+///
+/// ONE OPERATION, NOT TWO, because a rotation invalidates both halves and doing them separately just
+/// moves the window. `rotate` renames `<key>.log` to `<key>.log.1` and opens a fresh one: a reader
+/// that looks between those calls finds no name, and a reader that resolved the name a moment earlier
+/// opens a descriptor to a file that has just been renamed out from under it. Both were measured, one
+/// after the other: fixing the first alone turned "box writes no log" into "opening log: No such
+/// file", which is the same defect one step further along.
+///
+/// MEASURED by the concurrency battery from review round 19, at roughly 1 read in 6000 against a box
+/// rotating every few KB - rare enough never to appear by hand, common enough to be someone's first
+/// impression of `kern logs` on a busy box. Three tries 20 ms apart cover a window that is two
+/// syscalls wide; a box that genuinely has no log finds nothing on every try, so the wait is spent
+/// only on a path that is already an error.
+fn open_newest_log(name: &str) -> Result<Option<(std::path::PathBuf, std::fs::File)>, Error> {
+    for attempt in 0..3 {
+        if let Some(p) = newest_log(name)? {
+            match std::fs::File::open(&p) {
+                Ok(f) => return Ok(Some((p, f))),
+                // Renamed between the resolve and the open: look again rather than report it missing.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => {}
+                Err(e) => return Err(Error::Sandbox(format!("opening log: {e}"))),
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Ok(None)
+}
+
 /// `kern logs <name>` - print the captured stdout/stderr of the most recent box named `name`.
 pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> Result<(), Error> {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1149,7 +1180,7 @@ pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> 
     // whose log file persists) is used as-is.
     let by_pid = registry::find_ref(name).map(|i| i.name);
     let name = by_pid.as_deref().unwrap_or(name);
-    let Some(path) = newest_log(name)? else {
+    let Some((path, mut f)) = open_newest_log(name)? else {
         // 🔴 A LIVE BOX WITH NO LOG IS NOT A MISSING BOX, and the two used to share one sentence whose
         // hint sent the reader in a circle: `no logs for box 'x'` plus "run `kern ps` to see running
         // boxes", for a box that `kern ps` was ALREADY showing. MEASURED through the SDK, which is
@@ -1167,8 +1198,6 @@ pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> 
             format!("no logs for box '{name}'")
         }));
     };
-    let mut f =
-        std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
     // `--tail N` seeks a bounded window near EOF (cost O(bytes shown), not O(file size)); a plain
     // `logs` reads the whole file. Either way `f` ends positioned at EOF so `--follow` streams NEW
     // appends without re-printing. (Narrow race on `--tail N -f` of an actively-appending box: a line

@@ -16,7 +16,9 @@ COMMANDS:
     run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-    logs <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output (-t: recorded time, bucketed from 100 ms; `-` if none was recorded)
+    logs <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output
+                                                                     -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
+                                                                     -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
     stop <name>... | --all                                         Stop box(es), or all
 
   Images
