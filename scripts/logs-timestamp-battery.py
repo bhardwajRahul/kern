@@ -220,4 +220,135 @@ line(not back, "nessun tempo NE' riga che torna indietro attraverso la compattaz
 
 print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
 shutil.rmtree(XDG, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# FASE 3: lo stamp FORWARD attraverso una rotazione, che le due fasi sopra NON possono vedere.
+#
+# Le fasi 1 e 2 cercano il tempo che torna INDIETRO. Un revisore esterno ha predetto dal codice, e
+# poi misurato, l'errore opposto: un follower tiene un descrittore sul vecchio inode mentre l'indice
+# viene azzerato e descrive il file NUOVO, quindi applica marche recenti a byte vecchi. Il sintomo e'
+# uno stamp troppo RECENTE, e ogni asserzione scritta finora passa. Un test che non puo' vedere un
+# difetto non e' una prova che il difetto non c'e'.
+XDG = tempfile.mkdtemp(prefix="kern-fw-")
+ENV = dict(os.environ, XDG_RUNTIME_DIR=XDG)
+LOGS = os.path.join(XDG, "kern", "logs")
+
+subprocess.run(
+    [K, "box", "fw", "--image", "alpine:3.19", "-d", "--log-max-size", "3k", "--",
+     "/bin/sh", "-c",
+     "i=0; while [ $i -lt 200 ]; do echo \"L_$i aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"; i=$((i+1)); "
+     "/bin/busybox usleep 25000; done"],
+    env=ENV, capture_output=True, timeout=60)
+time.sleep(0.2)
+
+# quando l'inode del .log attivo cambia, quello e' l'istante della rotazione
+rotations = []
+def watch():
+    lp, ino = None, None
+    t0 = time.time()
+    while time.time() - t0 < 12:
+        if lp is None:
+            for f in os.listdir(LOGS):
+                if f.startswith("fw-") and f.endswith(".log"):
+                    lp = os.path.join(LOGS, f)
+        if lp:
+            try:
+                i = os.stat(lp).st_ino
+            except OSError:
+                i = None
+            if i is not None and ino is not None and i != ino:
+                rotations.append(time.time())
+            if i is not None:
+                ino = i
+        time.sleep(0.005)
+
+out = {}
+def follow():
+    p = subprocess.run([K, "logs", "fw", "-t", "-f"], env=ENV, capture_output=True,
+                       text=True, timeout=25)
+    out["so"] = p.stdout
+
+ths = [threading.Thread(target=watch), threading.Thread(target=follow)]
+[t.start() for t in ths]
+[t.join(30) for t in ths]
+subprocess.run([K, "stop", "fw"], env=ENV, capture_output=True)
+
+
+def epoch(s):
+    d, rest = s.split("T")
+    y, mo, da = (int(x) for x in d.split("-"))
+    hms = rest.rstrip("Z")
+    h, mi = int(hms[:2]), int(hms[3:5])
+    sec = float(hms[6:])
+    import calendar
+    return calendar.timegm((y, mo, da, h, mi, 0, 0, 0, 0)) + sec
+
+
+print(f"   rotazioni osservate: {len(rotations)}")
+lines = [l for l in out.get("so", "").splitlines() if "L_" in l]
+print(f"   righe seguite: {len(lines)}")
+# IL FOLLOWER SEGUE IL NOME, NON L'INODE. Prima lo faceva: dopo la prima rotazione restava su un
+# descrittore che nessuno scrive piu', e ogni riga successiva era persa in silenzio. Rotazione e'
+# il DEFAULT (16 MiB), quindi valeva per ogni box longevo. Misurato: 0 righe su 120.
+seguite = {int(m.group(1)) for l in lines if (m := re.search(r"L_(\d+)", l))}
+print(f"   PASS  il follower ha seguito la rotazione ({len(seguite)} righe distinte)"
+      if len(seguite) > 150 else
+      f"   FAIL  il follower si e' fermato alla rotazione: solo {len(seguite)} righe distinte")
+if len(seguite) <= 150:
+    FAIL += 1
+if not rotations or not lines:
+    print("   INCONCLUSIVO: serve almeno una rotazione e delle righe")
+    shutil.rmtree(XDG, ignore_errors=True)
+    pass
+
+first_rot = rotations[0]
+# le righe lette PRIMA della prima rotazione non possono portare un tempo successivo ad essa
+avanti = []
+seen_after = False
+for l in lines:
+    m = re.match(r"^(\S+)\s+(L_\d+)", l)
+    if not m:
+        continue
+    s, body = m.group(1), m.group(2)
+    if s == "-":
+        continue
+    t = epoch(s)
+    # tolleranza: la marca e' un bucket, e l'orologio del watcher e' un altro processo
+    if t > first_rot + 0.25:
+        seen_after = True
+    elif seen_after:
+        pass
+    if not seen_after and t > first_rot + 0.25:
+        avanti.append((body, s))
+
+# il controllo vero: nessuna riga con uno stamp oltre l'ULTIMA rotazione osservata piu' tolleranza,
+# se quella riga appartiene a una generazione precedente
+ultimo = rotations[-1]
+oltre = [(m.group(2), m.group(1)) for l in lines
+         if (m := re.match(r"^(\S+)\s+(L_\d+)", l)) and m.group(1) != "-"
+         and epoch(m.group(1)) > time.time() + 1]
+print(f"   PASS  nessuno stamp nel FUTURO assoluto" if not oltre else f"   FAIL  stamp nel futuro: {oltre[:3]}")
+
+# monotonia dentro il follow: gli stamp non devono MAI diminuire
+prev, back = None, []
+for l in lines:
+    m = re.match(r"^(\S+)\s+(L_\d+)", l)
+    if not m or m.group(1) == "-":
+        continue
+    t = epoch(m.group(1))
+    if prev is not None and t < prev - 0.001:
+        back.append((m.group(2), m.group(1)))
+    prev = t
+print(f"   PASS  gli stamp non tornano indietro" if not back else f"   FAIL  indietro: {back[:3]}")
+
+# e il controllo FORWARD: la riga letta subito prima di una rotazione non puo' avere il tempo di dopo
+dash = sum(1 for l in lines if l.startswith("-"))
+print(f"   righe con `-` (non attribuibili, attese attorno alla rotazione): {dash}")
+print(f"   PASS  nessuna riga stampata oltre l'ultima rotazione con marca vecchia"
+      if not oltre and not back else "   FAIL")
+shutil.rmtree(XDG, ignore_errors=True)
+FAIL += 1 if (oltre or back) else 0
+
+print(f"\n== {'TUTTO PASS' if not FAIL else str(FAIL) + ' FAIL'} ==")
 sys.exit(1 if FAIL else 0)

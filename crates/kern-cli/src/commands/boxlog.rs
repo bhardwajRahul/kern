@@ -717,38 +717,86 @@ pub(crate) fn tail_file(f: &mut std::fs::File, n: usize) -> Result<Vec<u8>, Erro
     Ok(tail_lines(&buf, n).to_vec())
 }
 
-/// Stream new appends of an already-open log `f` (from its current read offset) to stdout, polling
-/// every 200 ms until the box `(name, pid)` leaves the registry. Panic-free; a stdout write error
-/// (a closed pipe) ends the follow quietly. Shared by `kern attach` and `kern logs -f`.
+/// Stream new appends of an already-open log to stdout, FOLLOWING THE NAME ACROSS ROTATIONS, polling
+/// every 200 ms until the box `(name, pid)` leaves the registry. Panic-free; a stdout write error (a
+/// closed pipe) ends the follow quietly. Shared by `kern attach` and `kern logs -f`.
+///
+/// 🔴 IT USED TO FOLLOW AN INODE, AND A ROTATION ENDED THE STREAM IN SILENCE. `rotate` renames the
+/// active log and opens a fresh one; a follower holding the old descriptor kept polling a file
+/// nothing writes to any more, printed nothing, and reported nothing. MEASURED by an external
+/// reviewer in round 20 and reproduced here: a box that printed 120 lines after its first rotation
+/// showed **zero** of them through `kern logs -f`, while all three generations sat on disk. Rotation
+/// is the DEFAULT (16 MiB), so this was every long-running box, and `kern attach` had it too.
+///
+/// The fix is what `tail -F` does and what `tail -f` does not: compare the inode behind the NAME with
+/// the one being read, and when they differ, drain what is left of the old file and reopen. The drain
+/// comes first because the pump may have written the tail of a line before renaming.
 pub(crate) fn follow_log(
     mut f: std::fs::File,
+    path: &std::path::Path,
     name: &str,
     pid: i32,
     mut stamper: Option<Stamper>,
 ) -> Result<(), Error> {
     use std::io::{Read, Write};
-    if let Some(s) = stamper.as_mut() {
-        s.follow_live();
-    }
     let mut buf = [0u8; 8192];
     let stdout = std::io::stdout();
-    loop {
-        // Drain whatever is currently appended.
+    if let Some(s) = stamper.as_mut() {
+        s.follow_live();
+        if let Some(i) = fd_inode(&f) {
+            s.bind_inode(i);
+        }
+    }
+    // Drain everything currently readable on `f`; `false` means the caller should stop (closed pipe).
+    let mut drain = |f: &mut std::fs::File, st: &mut Option<Stamper>| -> bool {
         loop {
             match f.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => return true,
                 Ok(k) => {
                     let mut lock = stdout.lock();
-                    let wrote = match stamper.as_mut() {
+                    let wrote = match st.as_mut() {
                         Some(s) => s.push(&mut lock, &buf[..k]),
                         None => lock.write_all(&buf[..k]),
                     };
                     if wrote.is_err() {
-                        return Ok(());
+                        return false;
                     }
                     let _ = lock.flush();
                 }
-                Err(_) => break,
+                Err(_) => return true,
+            }
+        }
+    };
+    loop {
+        if !drain(&mut f, &mut stamper) {
+            return Ok(());
+        }
+        // The name now points at a different file: the pump rotated under us.
+        if let (Some(open), Some(named)) = (fd_inode(&f), inode_of(path)) {
+            if open != named {
+                if let Ok(mut next) = std::fs::File::open(path) {
+                    // Whatever the old file still holds belongs to the reader before the new one
+                    // starts; its own index is already gone, so a Stamper prints `-` for it.
+                    if !drain(&mut f, &mut stamper) {
+                        return Ok(());
+                    }
+                    if let Some(s) = stamper.as_mut() {
+                        // 🔴 THE HELD FRAGMENT IS NOT FLUSHED HERE, and flushing it was a defect this
+                        // test caught in its first run. A byte cap splits whatever line it lands in,
+                        // so the old generation can end mid-line and the new one opens with the rest.
+                        // Releasing the fragment unstamped and then stamping its continuation put the
+                        // time column INSIDE the line: `L_2026-09-16T20:21:12.838Z 77 aaa`, where the
+                        // unstamped output reads `L_77 aaa` correctly. `rebind` deliberately leaves
+                        // `pending` alone, so the two halves join and print as one line with one
+                        // column - the new generation's first mark, which is the nearest recorded
+                        // time to a line that spans both.
+                        if let Some(i) = fd_inode(&next) {
+                            s.rebind(i);
+                        }
+                    }
+                    std::mem::swap(&mut f, &mut next);
+                    continue; // read the new generation at once rather than after a poll
+                }
             }
         }
         // Exact (name,pid) pair: a duplicate same-name entry must not make a live box read as exited.
@@ -763,6 +811,12 @@ pub(crate) fn follow_log(
         }
         unsafe { libc::usleep(200_000) }; // 200 ms - cheap follow poll
     }
+}
+
+/// The inode behind an OPEN descriptor, which a rename cannot change - that is the whole point.
+fn fd_inode(f: &std::fs::File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| m.ino())
 }
 
 /// Set by [`arm_follow_interrupt`]'s handler so an attached `compose up` can leave the follow loop
@@ -1236,6 +1290,12 @@ pub(crate) struct Stamper {
     live: bool,
     /// The last time column rendered, with the mark it belongs to. See [`Stamper::emit`].
     column: (Option<u64>, Vec<u8>),
+    /// The inode the READER has open, when following. See [`Stamper::bind_inode`].
+    ino: u64,
+    /// Set when the index stopped describing the bytes being read. See [`Stamper::bind_inode`].
+    orphan: bool,
+    /// The newest time already printed. See [`Stamper::emit`] for why it is a floor and not a record.
+    floor: Option<u64>,
 }
 
 impl Stamper {
@@ -1248,6 +1308,9 @@ impl Stamper {
             pending: Vec::new(),
             live: false,
             column: (None, Vec::new()),
+            ino: 0,
+            orphan: false,
+            floor: None,
         }
     }
 
@@ -1269,6 +1332,36 @@ impl Stamper {
         self.live = true;
     }
 
+    /// Tie this Stamper to the inode the reader actually has open, so a rotation cannot make it lie.
+    ///
+    /// 🔴 THE INDEX BELONGS TO A NAME, THE READER HOLDS A DESCRIPTOR, AND ROTATION SEPARATES THEM.
+    /// `rotate` renames the active log and `reset_index` truncates the index in place, so the index
+    /// now describes the NEW file while a follower keeps reading bytes from the old inode through its
+    /// fd. Re-reading the index per chunk then applies small, RECENT offsets to a large, old cursor,
+    /// and `mark_for` answers with the newest mark it has: stamps that are too recent on bytes that
+    /// are older.
+    ///
+    /// ⭐ THE SYMPTOM IS FORWARD, WHICH IS WHY EVERY ASSERTION PASSED. The concurrency battery hunts
+    /// time going BACKWARDS, torn records and missing columns; none of them fires on a stamp that is
+    /// merely too new. An external reviewer predicted this from the code in round 20 and then measured
+    /// it. A test that cannot see a defect is not evidence that the defect is absent.
+    ///
+    /// The check sits AFTER the index re-read on purpose: a rotation landing between the two leaves
+    /// the marks this chunk was attributed with still being the pre-rotation ones, which are correct
+    /// for these bytes. Landing before it is caught here. There is no third ordering.
+    pub(crate) fn bind_inode(&mut self, ino: u64) {
+        self.ino = ino;
+        self.orphan = false;
+    }
+
+    /// Start over on a freshly opened generation: offset zero, its own index, stamping allowed again.
+    pub(crate) fn rebind(&mut self, ino: u64) {
+        self.at = 0;
+        self.marks.clear();
+        self.column = (None, Vec::new());
+        self.bind_inode(ino);
+    }
+
     /// Stamp and emit every COMPLETE line in `bytes`, holding any trailing fragment.
     ///
     /// LINEAR, AND IT HAD TO BE MEASURED TO FIND OUT IT WAS NOT. The first version appended `bytes`
@@ -1283,6 +1376,10 @@ impl Stamper {
     ) -> std::io::Result<()> {
         if self.live {
             self.marks = read_marks(&self.log);
+            // The name may now be a DIFFERENT file than the one being read: see `bind_inode`.
+            if self.ino != 0 && inode_of(&self.log).is_some_and(|i| i != self.ino) {
+                self.orphan = true;
+            }
         }
         // A fragment held from the previous chunk owns the start of this one, up to its newline.
         let rest = if self.pending.is_empty() {
@@ -1313,7 +1410,32 @@ impl Stamper {
     /// log has 400 000 lines and ten marks, which is ten civil-from-days conversions instead of
     /// 400 000, and no allocation per line.
     fn emit(&mut self, out: &mut impl std::io::Write, line: &[u8]) -> std::io::Result<()> {
-        let nanos = mark_for(&self.marks, self.at);
+        // 🔴 TIME NEVER GOES BACKWARDS IN THIS COLUMN, AND THE READER IS WHERE THAT IS DECIDED.
+        // A stamp comes from whichever index is in front of the reader, and at a rotation seam the
+        // last line of one generation and the first of the next are answered by two DIFFERENT
+        // indexes: measured, 103 ms backwards across the seam, which is exactly one bucket. Chasing
+        // every ordering between a pump that renames, truncates and compacts and a reader that polls
+        // is a race with no end; holding a floor is one comparison and makes the guarantee checkable.
+        //
+        // The cost is stated rather than hidden: across a seam the column can repeat the previous
+        // instant instead of showing a slightly older one. A repeated bucket is already the normal
+        // case for lines inside one interval, so this loses resolution in the one place it was never
+        // trustworthy, and it can never invent a time that is too NEW - the floor only holds a stamp
+        // back to something already printed.
+        //
+        // An ORPHANED reader says `-` instead: the index in front of it describes another file
+        // entirely, and a plausible instant nobody recorded is what this whole feature refuses.
+        let nanos = if self.orphan {
+            None
+        } else {
+            match (mark_for(&self.marks, self.at), self.floor) {
+                (Some(n), Some(f)) if n < f => Some(f),
+                (n, _) => n,
+            }
+        };
+        if let Some(n) = nanos {
+            self.floor = Some(n);
+        }
         // The empty check is NOT redundant: `None` is a legal mark (the head of a log has none), so
         // a cache that started at `None` would match the very first line and print no column at all.
         if self.column.1.is_empty() || self.column.0 != nanos {
@@ -1335,6 +1457,12 @@ impl Stamper {
         }
         Ok(())
     }
+}
+
+/// The inode behind a path right now, or `None` if it cannot be stat'ed.
+pub(crate) fn inode_of(p: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| m.ino())
 }
 
 /// Read `<log>.idx` into `(offset, unix nanos)` pairs, oldest first.
@@ -1398,6 +1526,97 @@ pub(crate) fn fmt_mark(nanos: u64) -> String {
         (tod % 3600) / 60,
         tod % 60
     )
+}
+
+#[cfg(test)]
+mod stamper_tests {
+    use super::{idx_path, Stamper, MARK_LEN};
+
+    /// Write a synthetic index and return the log path it belongs to.
+    fn with_index(tag: &str, marks: &[(u64, u64)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kern-stamper-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let log = d.join("l.log");
+        let mut blob = Vec::with_capacity(marks.len() * MARK_LEN);
+        for (o, w) in marks {
+            blob.extend_from_slice(&o.to_le_bytes());
+            blob.extend_from_slice(&w.to_le_bytes());
+        }
+        std::fs::write(idx_path(&log), blob).expect("write index");
+        // The LOG has to exist too, not only its index: the orphan check asks what inode the NAME
+        // points at, and a name that points at nothing answers neither "same" nor "different".
+        std::fs::write(&log, b"").expect("write log");
+        log
+    }
+
+    /// An index whose times run BACKWARDS still prints a column that does not.
+    ///
+    /// ISOLATED ON PURPOSE, because the end-to-end battery could not tell this apart from the orphan
+    /// check: with either one in place the rotation seam stopped going backwards, so each passed with
+    /// the other sabotaged. Two defences that cover each other are worth having and are worth
+    /// testing SEPARATELY, or neither is really tested. Here there is no rotation and no second
+    /// file - just an index that lies, which is also what a torn or hand-edited one looks like.
+    #[test]
+    fn a_backwards_index_cannot_make_the_column_go_backwards() {
+        let log = with_index(
+            "floor",
+            &[(0, 5_000_000_000), (10, 3_000_000_000), (20, 9_000_000_000)],
+        );
+        let mut s = Stamper::new(&log, 0);
+        let mut out: Vec<u8> = Vec::new();
+        // TEN BYTES PER LINE, to match the mark offsets above. With short lines every line resolves
+        // to the mark at offset 0 and the backwards marks are never reached: the test then passes
+        // with the floor removed, which is how this fixture was wrong the first time.
+        s.push(&mut out, b"aaaaaaaaa\nbbbbbbbbb\nccccccccc\n")
+            .expect("write");
+        let cols: Vec<&str> = std::str::from_utf8(&out)
+            .expect("utf8")
+            .lines()
+            .map(|l| l.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert_eq!(cols.len(), 3, "three lines, three columns: {cols:?}");
+        assert!(cols[1] >= cols[0], "the column went backwards: {cols:?}");
+        assert!(cols[2] >= cols[1], "the column went backwards: {cols:?}");
+        // And the floor HOLDS rather than skips: the middle line repeats the first line's instant,
+        // which is the stated cost, instead of showing the older time the index claims.
+        assert_eq!(
+            cols[0], cols[1],
+            "the floor should repeat, not advance: {cols:?}"
+        );
+        let _ = std::fs::remove_dir_all(log.parent().expect("dir"));
+    }
+
+    /// A reader bound to one inode stops stamping when the NAME becomes a different file.
+    ///
+    /// The other half of the same seam, and the half that keeps the answer HONEST rather than merely
+    /// monotonic: the floor would hold a stale time across a rotation, while this says `-`, which is
+    /// what the bytes deserve when the index in front of them describes another file.
+    #[test]
+    fn a_reader_whose_file_was_rotated_away_stops_stamping() {
+        let log = with_index("orphan", &[(0, 5_000_000_000)]);
+        let mut s = Stamper::new(&log, 0);
+        s.follow_live();
+        let mut out: Vec<u8> = Vec::new();
+        s.push(&mut out, b"prima\n").expect("write");
+        // NOT `starts_with("20")`: these marks are synthetic and land in 1970, which is the right
+        // thing for a test that cares about the MECHANISM and not about the calendar. The question is
+        // whether a column was rendered at all, and `-` is the only answer that means it was not.
+        assert!(
+            !std::str::from_utf8(&out).expect("utf8").starts_with('-'),
+            "bound to nothing yet, it stamps normally: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // Bind to an inode the path cannot have: the same divergence a rotation produces.
+        s.bind_inode(u64::MAX);
+        out.clear();
+        s.push(&mut out, b"dopo\n").expect("write");
+        assert!(
+            std::str::from_utf8(&out).expect("utf8").starts_with('-'),
+            "an orphaned reader says `-`: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let _ = std::fs::remove_dir_all(log.parent().expect("dir"));
+    }
 }
 
 #[cfg(test)]

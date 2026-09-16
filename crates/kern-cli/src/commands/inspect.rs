@@ -1252,7 +1252,7 @@ pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> 
     if follow {
         // Only a live box appends more output; a stopped box's log is already complete.
         if let Some(bx) = registry::find_ref(name) {
-            return follow_log(f, name, bx.pid, stamper);
+            return follow_log(f, &path, name, bx.pid, stamper);
         }
         // A stopped box under `-f`: nothing more is coming, so release the held fragment now.
         if let Some(s) = stamper.as_mut() {
@@ -1286,7 +1286,7 @@ pub fn attach(name: &str) -> Result<(), Error> {
     );
     let f = std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
     // Print the log so far (from offset 0), then poll appends until the box exits (shared with `logs -f`).
-    follow_log(f, name, bx.pid, None)?;
+    follow_log(f, &path, name, bx.pid, None)?;
     eprintln!("kern: box '{name}' exited");
     Ok(())
 }

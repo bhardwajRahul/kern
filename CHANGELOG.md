@@ -124,6 +124,21 @@ with machinery nobody asked for. Time is never reordered. And a byte-capped rota
 line it lands in, so the first bytes of a fresh generation are the tail of a line that started in the
 previous one; `-t` stamps that fragment like any other line, correctly but confusingly.
 
+**`kern logs -f` stopped showing output after the first rotation, and said nothing.** It followed an
+open descriptor rather than the name, so when the pump renamed the active log and opened a fresh one
+the follower kept polling a file nobody writes to any more. Measured: a box that printed 120 lines
+after its rotation showed **zero** of them, while all three generations sat on disk. Rotation is the
+default at 16 MiB, so this was every long-running box, and `kern attach` had it too. It follows the
+name across rotations now, the way `tail -F` does and `tail -f` does not.
+
+**A timestamp can no longer go backwards, whatever the index says.** At a rotation seam the last line
+of one generation and the first of the next are answered by two different indexes, which measured 103
+ms backwards across the seam. Rather than chase every ordering between a pump that renames, truncates
+and compacts and a reader that polls, the reader holds a floor: a stamp is never older than one
+already printed. The cost is stated in the code - across a seam the column repeats an instant instead
+of showing a slightly older one - and it can never invent a time that is too new. A reader whose file
+was rotated away says `-` instead, because the index in front of it describes a different file.
+
 **`kern logs` could report that a busy box writes no log at all.** A rotation renames the active file
 and opens a new one, and a reader that resolved the name in between found nothing, or opened a
 descriptor to a file that had just been renamed away. Resolving and opening are one retried operation
