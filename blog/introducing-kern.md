@@ -1,4 +1,4 @@
-# Introducing kern: a container runtime that does less than Docker, on purpose
+# Introducing kern: a container runtime that does less, on purpose
 
 *A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and
 AI-generated code. One static binary, one Rust dependency (`libc`), no daemon. It starts a
