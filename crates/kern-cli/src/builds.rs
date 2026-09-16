@@ -124,10 +124,10 @@ pub struct Record {
 /// data under `$XDG_DATA_HOME/kern/builds` (fallback `~/.local/share/kern/builds`, then a `/tmp`
 /// last resort), NOT the tmpfs runtime dir.
 pub fn builds_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
         return PathBuf::from(x).join("kern").join("builds");
     }
-    if let Some(h) = std::env::var_os("HOME") {
+    if let Some(h) = crate::global_env("HOME") {
         return PathBuf::from(h).join(".local/share/kern/builds");
     }
     PathBuf::from(format!("/tmp/kern-builds-{}", unsafe { libc::getuid() }))
@@ -612,15 +612,14 @@ mod tests {
     use super::*;
     // XDG_DATA_HOME is process-global; the CRATE-WIDE lock serializes this against every other module's
     // env-mutating tests (e.g. `volume`), which also repoint XDG_DATA_HOME.
-    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     fn with_tmp_home<T>(f: impl FnOnce() -> T) -> T {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-builds-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
         let out = f();
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
         out
     }

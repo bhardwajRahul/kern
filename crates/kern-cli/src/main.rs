@@ -13,6 +13,220 @@
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The threads currently holding [`TEST_ENV_LOCK`], so a read can ask whether ITS OWN thread does.
+///
+/// A `Mutex` cannot answer "do I hold you": `try_lock` answers "does anyone", which is a different
+/// question and the wrong one. So the guard registers the thread that took it and removes it on drop,
+/// and [`global_env`] asks that set. A `Vec` and not a single slot because it holds MORE than one
+/// thread whenever a guarded test spawns workers: see [`env_guard_inherited`].
+#[cfg(test)]
+pub(crate) static ENV_LOCK_HOLDERS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Take [`TEST_ENV_LOCK`] and witness it, for the whole of the caller's body.
+///
+/// 🔴 EVERY TEST THAT TOUCHES THE ENVIRONMENT CALLS THIS, and [`global_env`] panics at the point of
+/// use if it did not. That is the whole design: a static check of this rule was walked through EIGHT
+/// TIMES OUT OF EIGHT by an external reviewer (a comment mentioning the lock satisfied it, an alias
+/// renamed a resolver out of sight, a variable held the variable's name, a resolver was passed as a
+/// function pointer, attributes pushed `#[test]` out of the lookback, and a helper one hop away hid
+/// the rest), and two more holes were mine: parsing Rust with regular expressions is a losing game
+/// against someone who is trying. The check that cannot be walked through is the one AT THE READ.
+///
+/// 🔴 REENTRANT ON PURPOSE: a thread that already holds it gets a guard that does nothing.
+///
+/// A `std::sync::Mutex` is not reentrant, and taking it twice on one thread is a deadlock with no
+/// message: the test binary simply stops. That is not hypothetical here. It happened TWICE in one
+/// session, the first time because a static check reported eight tests that were already holding the
+/// lock through an alias it could not see, the second because helpers like `reg_guard` take it for
+/// their caller. Both times a test binary sat for over ten minutes and looked slow rather than stuck.
+///
+/// So the rule this function enforces is "the lock is held for this body", not "this body takes the
+/// lock", and asking for it when you already have it is free and correct. The nesting is bounded by
+/// the call graph; the outermost guard is the one that releases.
+#[cfg(test)]
+pub(crate) fn env_guard() -> EnvGuard {
+    let me = std::thread::current().id();
+    if ENV_LOCK_HOLDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&me)
+    {
+        return EnvGuard {
+            lock: None,
+            deregister: false,
+        };
+    }
+    let g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ENV_LOCK_HOLDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(me);
+    EnvGuard {
+        lock: Some(g),
+        deregister: true,
+    }
+}
+
+/// For a thread SPAWNED inside a guarded body: the parent holds the lock, this thread inherits it.
+///
+/// A guard registers the thread that took it, and a thread the test spawns is not that thread, so a
+/// contention test whose workers resolve a state path trips the assertion while being perfectly
+/// safe: no sibling test can flip the variable, because the parent is holding the lock for all of
+/// them. This is the explicit way to say that, and it refuses when NOBODY holds the lock.
+///
+/// ⚠️ It cannot check that the holder is this thread's own parent, because a thread does not know who
+/// spawned it: a worker whose parent holds nothing, running while an UNRELATED test holds the lock,
+/// would be let through. That is a narrower hole than the one this file closes and it needs a test
+/// written to exploit it, but it is a hole and it is not worth pretending otherwise. The honest
+/// summary is "the environment is serialised while this runs", not "my parent holds it".
+#[cfg(test)]
+pub(crate) fn env_guard_inherited() -> EnvGuard {
+    let mut holders = ENV_LOCK_HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !holders.is_empty(),
+        "env_guard_inherited() in a thread whose parent does not hold TEST_ENV_LOCK: there is \
+         nothing to inherit, and the value this thread reads is whatever a sibling test last wrote"
+    );
+    holders.push(std::thread::current().id());
+    drop(holders);
+    // It did not take the mutex, so it must not release it, but it DID register and must therefore
+    // de-register: a `ThreadId` is recycled once its thread is gone, and a stale registration would
+    // let some later, unrelated thread read the environment with the assertion satisfied by a
+    // worker that finished minutes ago.
+    EnvGuard {
+        lock: None,
+        deregister: true,
+    }
+}
+
+/// The witness half of [`env_guard`]: holds the lock, and un-registers the thread when it goes.
+///
+/// Three shapes, and the middle one is why `deregister` exists: the owner (took the mutex and
+/// registered), the reentrant guard (registered by an OUTER guard on this same thread, so it must
+/// not un-register or every read after the inner scope would fail on a lock that IS held), and the
+/// inherited guard (registered itself in a spawned thread, took no mutex, and must un-register).
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    /// `Some` only for the thread that actually took the mutex, which is the one that releases it.
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Whether this guard is the one that registered the current thread. False for the reentrant
+    /// case, where an outer guard on the SAME thread is still the registration's owner.
+    deregister: bool,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if !self.deregister {
+            return;
+        }
+        let me = std::thread::current().id();
+        ENV_LOCK_HOLDERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|t| *t != me);
+        // The lock is released AFTER the de-registration, so no thread can see itself as a holder
+        // while another one is already past `lock()`.
+        self.lock = None;
+    }
+}
+
+/// THE ONE PLACE THIS CRATE READS A PROCESS-GLOBAL ENVIRONMENT VARIABLE.
+///
+/// Identical to `std::env::var_os` in a release build. In a test build it refuses to answer a thread
+/// that does not hold [`TEST_ENV_LOCK`], because the answer would be whatever a sibling test last
+/// wrote: `cargo test` runs the crate's tests as threads in ONE process, and the environment is one
+/// table for all of them. The failure it prevents is not a flake, it is a red against production that
+/// is correct, which costs an afternoon to attribute and has cost several.
+///
+/// The same chokepoint shape as `registry::assert_registry_child`, and for the same reason: a rule
+/// enforced where the thing happens cannot be routed around by naming it differently.
+/// THE ONE PLACE THIS CRATE WRITES A PROCESS-GLOBAL ENVIRONMENT VARIABLE.
+///
+/// The read chokepoint below is only half the rule: a write with no lock moves the value under a
+/// reader that DOES hold it, which is the same race seen from the other side. So writes are witnessed
+/// too, and by the same registration, which is why a test that writes must take the guard even when
+/// it never reads anything back.
+///
+/// Uniform over production and tests on purpose. A production function that writes the environment is
+/// single-threaded before an `execve` and has nothing to race with, but a TEST that calls it is a
+/// thread among others, and that is exactly the case worth catching. In a release build this is
+/// `std::env::set_var` and nothing else.
+///
+/// # Safety
+/// Same contract as `std::env::set_var`: no other thread may be reading the environment concurrently.
+/// Under test that is what the assertion enforces; in production the callers are pre-`execve` paths.
+#[allow(clippy::disallowed_methods)] // this IS the chokepoint
+pub(crate) fn set_global_env<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    name: K,
+    value: V,
+) {
+    #[cfg(test)]
+    assert_env_lock_held(&name.as_ref().to_string_lossy());
+    // SAFETY: see the contract above; the test build proves the serialisation, the release build
+    // reaches here only from single-threaded pre-exec paths.
+    unsafe { std::env::set_var(name, value) };
+}
+
+/// The removal half of [`set_global_env`], with the same contract.
+#[allow(clippy::disallowed_methods)] // this IS the chokepoint
+pub(crate) fn unset_global_env<K: AsRef<std::ffi::OsStr>>(name: K) {
+    #[cfg(test)]
+    assert_env_lock_held(&name.as_ref().to_string_lossy());
+    // SAFETY: as [`set_global_env`].
+    unsafe { std::env::remove_var(name) };
+}
+
+/// The witness question, asked by all three chokepoints.
+#[cfg(test)]
+fn assert_env_lock_held(name: &str) {
+    let me = std::thread::current().id();
+    let held = ENV_LOCK_HOLDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&me);
+    assert!(
+        held,
+        "this test touched the process-global `{name}` without holding TEST_ENV_LOCK, so it is \
+         racing every other test in this binary. Take the lock for the whole body:\n    \
+         let _g = crate::env_guard();"
+    );
+}
+
+/// The WHOLE table, for the one caller that needs every name rather than one: witnessed the same.
+///
+/// Collected rather than returned as an iterator on purpose. `std::env::vars_os` borrows the
+/// environment for as long as the iterator lives, and a caller that holds it across a write gets
+/// undefined behaviour; taking the snapshot here bounds that to this function, where the assertion
+/// above has just established that nothing else may be writing.
+#[allow(clippy::disallowed_methods)] // this IS the chokepoint
+pub(crate) fn global_env_all() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    #[cfg(test)]
+    assert_env_lock_held("<the whole environment>");
+    std::env::vars_os().collect()
+}
+
+/// [`global_env`] for the callers that want `String` and `VarError`, with the same witness.
+///
+/// A second entry point rather than an adapter at 40 call sites: `std::env::var` and
+/// `std::env::var_os` differ in their return type and in nothing else that matters here, and making
+/// every caller convert would have turned a rename into forty small edits, which is where mistakes
+/// come from.
+#[allow(clippy::disallowed_methods)] // this IS the chokepoint
+pub(crate) fn global_env_str(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    assert_env_lock_held(name);
+    std::env::var(name)
+}
+
+#[allow(clippy::disallowed_methods)] // this IS the chokepoint
+pub(crate) fn global_env(name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    assert_env_lock_held(name);
+    std::env::var_os(name)
+}
+
 mod auth;
 mod boxcp;
 mod builds;
@@ -74,7 +288,7 @@ fn main() -> ExitCode {
     // instead of leaving the box dead. Done at the earliest point, before any subcommand can exit first,
     // and the marker is removed so the box workload never inherits it or the closed fd number. Safe
     // single-threaded env mutation at process entry (no other thread yet).
-    if let Some(v) = std::env::var_os("KERN_SCOPE_READY_FD") {
+    if let Some(v) = global_env("KERN_SCOPE_READY_FD") {
         // Honour it ONLY as the genuine scope re-exec (KERN_SCOPE set) and only for a non-std fd, so a
         // `KERN_SCOPE_READY_FD` planted in the environment cannot make kern write a stray byte to or
         // close its own stdout/stderr or an arbitrary descriptor. See `commands::ready_fd_to_signal`.
@@ -87,7 +301,7 @@ fn main() -> ExitCode {
                 libc::close(fd);
             }
         }
-        std::env::remove_var("KERN_SCOPE_READY_FD");
+        unset_global_env("KERN_SCOPE_READY_FD");
     }
     // Inside our own transient scope: move kern's processes into a leaf of their own, so the box can be
     // capped in a sibling cgroup whose whole-box OOM kill takes the workload and NOT the supervisor that

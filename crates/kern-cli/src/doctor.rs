@@ -1425,7 +1425,7 @@ fn read_int(path: &str) -> Option<i64> {
 
 /// Is `bin` on `PATH`? (No spawn - just a path probe.)
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
+    crate::global_env("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).exists()))
         .unwrap_or(false)
 }

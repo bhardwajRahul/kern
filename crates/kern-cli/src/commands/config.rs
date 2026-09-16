@@ -518,8 +518,8 @@ fn config_edit() -> Result<(), Error> {
     if !path.exists() {
         config_setup(false)?;
     }
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
+    let editor = crate::global_env_str("EDITOR")
+        .or_else(|_| crate::global_env_str("VISUAL"))
         .unwrap_or_else(|_| "vi".into());
     let status = std::process::Command::new(&editor)
         .arg(&path)
@@ -958,9 +958,7 @@ mod tests {
     /// parse would agree on two files that differ in exactly the way this is about.
     #[test]
     fn a_refused_config_add_leaves_the_file_byte_identical() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-cfg-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("kern")).expect("temp config dir");
@@ -969,7 +967,7 @@ mod tests {
         // what `require_backend` refuses - and it refuses it AFTER the materialisation.
         let before = b"[[cpu]]\nid = \"host\"\ncores = 8\n".to_vec();
         std::fs::write(&file, &before).expect("seed config");
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        crate::set_global_env("XDG_CONFIG_HOME", &tmp);
 
         let err = super::config_add(&["vcpu:big".into(), "--cpus".into(), "4".into()])
             .expect_err("a reserved backend id must refuse the add");
@@ -988,7 +986,7 @@ mod tests {
             "a failed `config add` rewrote the file: it must be byte-identical"
         );
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        crate::unset_global_env("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1022,6 +1020,7 @@ mod tests {
     /// switched off in silence.
     #[test]
     fn a_physical_block_with_a_bad_size_is_refused_naming_the_field() {
+        let _g = crate::env_guard();
         for (text, want) in [
             (
                 "[[cpu]]\nid = \"cpu:0\"\nmemory = \"nonsense\"\n",
@@ -1060,6 +1059,7 @@ mod tests {
     /// re-reading.
     #[test]
     fn a_physical_block_with_a_nonsense_count_is_refused_like_a_profile_is() {
+        let _g = crate::env_guard();
         for (text, want) in [
             (
                 "[[cpu]]\nid = \"cpu:0\"\ncores = -8\n",
@@ -1096,6 +1096,7 @@ mod tests {
     /// invokes them, which is the defect itself.
     #[test]
     fn validate_refuses_what_the_launch_refuses() {
+        let _g = crate::env_guard();
         let dir = std::env::temp_dir().join(format!("kern-validate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("the case directory");
         for (name, text, want) in [

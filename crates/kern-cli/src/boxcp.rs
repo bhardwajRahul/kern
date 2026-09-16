@@ -263,6 +263,7 @@ mod tests {
     /// exactly the case under test.
     #[test]
     fn a_missing_box_is_not_reported_as_a_syntax_error() {
+        let _g = crate::env_guard();
         // Box-shaped, no such box: the caller must be able to say WHICH name was missing.
         match classify("definitely-not-a-box:/etc/x") {
             Side::NoSuchBox(n) => assert_eq!(n, "definitely-not-a-box"),
@@ -304,6 +305,7 @@ mod tests {
 
     #[test]
     fn cp_write_guard_allows_an_ordinary_host_path() {
+        let _g = crate::env_guard();
         // A destination whose parent is NOT under the registry passes. The refuse case (a registry
         // parent) is covered by `path_overlaps_trusted_state`'s own env-mutating anti-forgery tests, so
         // this only pins that the shared write-guard does not false-positive on an ordinary path.

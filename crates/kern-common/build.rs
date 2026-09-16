@@ -1,3 +1,17 @@
+// A BUILD SCRIPT, AND CLIPPY DOES LINT IT: `crates/kern-common/build.rs:35` reads
+// `CARGO_PKG_VERSION`, and the workspace `clippy.toml` forbids `std::env::var` so that
+// kern-cli's environment chokepoints cannot be spelled around. The exemption is honest here
+// rather than a hole: a build script runs inside cargo's own process, before any test exists,
+// so there is no sibling thread to move a value under it. It is declared in
+// `scripts/test-env-lock.py` with the other seven.
+//
+// 🪤 AND IT MASKED THE WHOLE LINT. cargo stops at the first crate that fails, and kern-common
+// is a dependency of everything: while this was an error, kern-cli was never linted at all, so
+// a clean run said nothing about the 40 call sites the lint exists for. An external reviewer
+// hit it on a cold build while my own warm one reported zero, which is the second time this
+// week a cache told me a check had passed when it had not run.
+#![allow(clippy::disallowed_methods)]
+
 //! What build is this? `kern --version` used to answer `0.0.0` for every binary that was not cut by
 //! the release workflow, which is every binary anyone compiles from source.
 //!

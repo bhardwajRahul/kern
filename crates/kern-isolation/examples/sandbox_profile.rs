@@ -1,3 +1,7 @@
+// An example binary, outside the crate-level exemption in `src/lib.rs`: see there for why the
+// workspace forbids direct environment access and why this crate is not audited yet.
+#![allow(clippy::disallowed_methods)]
+
 //! Extreme end-to-end exercise of the SDK's `kern.toml` compose feature:
 //! `.config()` / `.profile()` and the `.warnings()` advisory channel.
 //!

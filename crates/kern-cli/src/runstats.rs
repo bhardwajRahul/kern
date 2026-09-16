@@ -44,7 +44,7 @@ pub fn mark_start() {
 /// agree on the file without a shared constant. `pub(crate)` so the volume guard can add this FILE's
 /// dev/ino to the non-mountable identity set (it is a runtime registry child, not a directory).
 pub(crate) fn path() -> std::path::PathBuf {
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+    if let Some(x) = crate::global_env("XDG_RUNTIME_DIR") {
         return std::path::PathBuf::from(x).join("kern/runstats");
     }
     let uid = unsafe { libc::getuid() };
@@ -166,12 +166,10 @@ mod tests {
     #[test]
     fn record_increments_the_shared_total() {
         // Isolate the counter file to a temp runtime dir (process-global env - serialize with others).
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-runstats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         assert_eq!(snapshot().0, 0, "fresh counter starts at 0");
         record();
@@ -179,7 +177,7 @@ mod tests {
         record();
         assert_eq!(snapshot().0, 3, "three records → total 3");
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        crate::unset_global_env("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -187,12 +185,10 @@ mod tests {
     fn box_starts_count_independently_of_runs() {
         // The box-start counter (offset 16) must be independent of the `kern run` counter (offset 0):
         // recording box starts must not move the run total, and vice-versa.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-boxstats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         assert_eq!(box_total(), 0, "fresh box counter starts at 0");
         record_box();
@@ -205,7 +201,7 @@ mod tests {
             "one run → run total 1, unaffected by box starts"
         );
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        crate::unset_global_env("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -215,13 +211,11 @@ mod tests {
         // with no backing - touching it would SIGBUS and crash `kern top`. `with_map`'s fstat guard must
         // make the reader report 0 instead, and the writer must self-heal the file (ftruncate to a page)
         // then count. This test would ABORT the whole runner if the guard regressed.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-runstats-short-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("kern")).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         std::fs::write(tmp.join("kern/runstats"), b"").unwrap(); // 0 bytes
         assert_eq!(
@@ -236,7 +230,7 @@ mod tests {
             "the writer grows the short file and counts"
         );
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        crate::unset_global_env("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

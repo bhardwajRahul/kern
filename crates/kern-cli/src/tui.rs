@@ -3442,6 +3442,7 @@ mod tests {
     /// to carry its own outcome to the screen.
     #[test]
     fn a_failed_lifecycle_key_is_reported_in_the_overlay() {
+        let _g = crate::env_guard();
         let name = format!("tui-absent-{}-{}", std::process::id(), 0xC0FFEEu32);
         let rows = vec![row(&name, false)];
         let mut mode = Mode::Nav;
@@ -3471,6 +3472,7 @@ mod tests {
     /// cannot exist, which `volume rm` refuses without touching this machine's volume store.
     #[test]
     fn a_refused_destructive_action_returns_its_reason() {
+        let _g = crate::env_guard();
         let name = format!("tui-novol-{}-{}", std::process::id(), 0xBADF00Du32);
         let outcome = perform_pending(Pending::RemoveVolume(name.clone()));
         let text = match outcome {
@@ -3516,6 +3518,7 @@ mod tests {
     /// would pass an assertion that only looked for the word.
     #[test]
     fn the_boxes_table_reports_an_orphaned_box_as_orphaned_and_not_as_running() {
+        let _g = crate::env_guard();
         let p = Palette::plain();
         let host = HostStats::default();
         let mut orphan = row("gone", false);
@@ -3860,6 +3863,7 @@ mod tests {
     /// some new constant.
     #[test]
     fn the_boxes_table_never_truncates_a_name_into_a_shared_prefix() {
+        let _g = crate::env_guard();
         let row = |name: &str, pod: &str, pid: i32| Row {
             name: name.to_string(),
             pid,
@@ -4227,6 +4231,7 @@ mod tests {
 
     #[test]
     fn persistent_is_a_toggle_not_free_text() {
+        let _g = crate::env_guard();
         // Space flips it; typing letters never lands in it; on → `persistent = true`, off → omitted.
         let mut form = new_profile_form("vdisk");
         set_field(&mut form.fields, "name", "scratch".into()); // form_to_body needs a name
@@ -4309,6 +4314,7 @@ mod tests {
 
     #[test]
     fn edit_form_round_trips_every_field_losslessly() {
+        let _g = crate::env_guard();
         // A profile hand-written with the full field set, loaded into the edit form and re-serialised,
         // must reproduce every field - no CLI-only / hand-edit-only field is dropped by an edit cycle.
         let raw = "\
@@ -4352,6 +4358,7 @@ leds = [\"led0\"]
 
     #[test]
     fn active_field_cursor_sits_at_the_insertion_point() {
+        let _g = crate::env_guard();
         let p = plain();
         let mut form = new_profile_form("vcpu");
         // Empty active field: cursor is immediately before the placeholder ("▏e.g. heavy").
@@ -4453,6 +4460,7 @@ leds = [\"led0\"]
 
     #[test]
     fn vgpio_form_does_not_offer_net_a_field_the_resolver_ignores() {
+        let _g = crate::env_guard();
         // `net` in a vgpio profile is inert (the resolver never attaches an interface), so the form
         // must not advertise it - offering a knob that does nothing is exactly the "misleading" trap.
         let form = new_profile_form("vgpio");
@@ -4468,6 +4476,7 @@ leds = [\"led0\"]
 
     #[test]
     fn vgpio_form_hides_rare_fields_until_advanced_is_opened() {
+        let _g = crate::env_guard();
         // A new vgpio form is short: the rare knob `backend` (pre-filled to gpio:0) lives under the
         // collapsed Advanced fold, so a beginner doesn't see it at all until they ask.
         let mut form = new_profile_form("vgpio");
@@ -4521,6 +4530,7 @@ leds = [\"led0\"]
 
     #[test]
     fn every_profile_field_is_guarded_for_all_kinds() {
+        let _g = crate::env_guard();
         // EXTREME, for all vprofiles: no field in ANY profile form is unguarded free text. Each field
         // is validated by the field_state authority (numbers / name / sizes), a picker/radio selection,
         // a boolean toggle, or a "none here / explanatory" note - with ONE documented exception, the
@@ -4546,6 +4556,7 @@ leds = [\"led0\"]
 
     #[test]
     fn backend_is_a_selection_never_a_free_text_box() {
+        let _g = crate::env_guard();
         // `backend` names a configured id (gpio/cpu/disk) - so for EVERY kind it must be a picker of
         // those ids (or a "none configured" note), never a free-text box where `disk:0sfsf…` could be
         // typed. Regression: vcpu/vdisk backend used to be free text.
@@ -4561,6 +4572,7 @@ leds = [\"led0\"]
 
     #[test]
     fn focused_field_gets_a_plain_language_help_line() {
+        let _g = crate::env_guard();
         // Whatever field is focused, the form shows a concrete "what is this / when to use it" line at
         // the bottom - the user is guided, never left guessing what to enter.
         let mut form = new_profile_form("vgpio");
@@ -4782,6 +4794,7 @@ leds = [\"led0\"]
     /// to an implicit default) is about what the FILE says, and it still says it.
     #[test]
     fn a_new_profile_form_arrives_with_the_backend_sentinel_already_picked() {
+        let _g = crate::env_guard();
         for (kind, sentinel) in [("vcpu", "host"), ("vgpio", "host"), ("vdisk", "ram")] {
             let form = new_profile_form(kind);
             let f = form
@@ -4804,6 +4817,7 @@ leds = [\"led0\"]
 
     #[test]
     fn backend_field_is_required_and_offers_the_sentinel_first() {
+        let _g = crate::env_guard();
         // `backend` is MANDATORY on every profile kind. Its `kern top` form field is a single-select
         // radio (never free text), lists the reserved sentinel FIRST (host for vcpu/vgpio, ram for
         // vdisk) so a profile can bind to the whole host with no physical block declared, is never an

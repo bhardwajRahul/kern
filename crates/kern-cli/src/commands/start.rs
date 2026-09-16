@@ -838,7 +838,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // dead same-name entry, so a freed name is immediately reusable. ADVISORY fast-fail only - the
     // authoritative check runs inside `claim_name` below; skipped on the scoped inner re-run
     // (`KERN_SCOPE`), which already passed it in the outer process.
-    if std::env::var_os("KERN_SCOPE").is_none() && registry::name_taken(name.as_str()) {
+    if crate::global_env("KERN_SCOPE").is_none() && registry::name_taken(name.as_str()) {
         return Err(Error::AlreadyRunning(format!(
             "a box named '{}' is already running",
             name.as_str()
@@ -847,7 +847,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     pt.mark("parent:name-check");
     // FLEET LIMITS (env-configured, deployment-level). Checked only in the OUTER process (KERN_SCOPE
     // unset), like the name check: the scoped inner re-run is the SAME box, already counted.
-    if std::env::var_os("KERN_SCOPE").is_none() {
+    if crate::global_env("KERN_SCOPE").is_none() {
         fleet_gate_and_budget()?;
     }
     warn_if_ssh_lacks_a_uid_range(args.ssh_port);
@@ -1426,7 +1426,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // the same process. cap-drop and read-only mutate LOCALS only. The profile still rides the replayed
     // argv into the scope re-exec, so the re-exec'd process re-derives the same posture from the flag.
     let seccomp_mode = resolve_seccomp_mode(
-        std::env::var_os("KERN_SECCOMP").as_deref(),
+        crate::global_env("KERN_SECCOMP").as_deref(),
         args.security_profile,
     )?;
     let mut cap_drops = args.cap_drop.to_vec();
@@ -2096,7 +2096,7 @@ pub fn run(
     // version of this line was unconditional and put a getenv plus an allocation on every run for a
     // message that could not be printed.
     let first_pass =
-        (!vgpio.is_empty() || !vdisk.is_empty()) && std::env::var_os("KERN_SCOPE").is_none();
+        (!vgpio.is_empty() || !vdisk.is_empty()) && crate::global_env("KERN_SCOPE").is_none();
     // `run` has no sandbox, so a `vgpio:` profile can't confine devices - instead export it as env
     // (`KERN_VGPIO_NAME`/`_PINS`), so a cooperative workload can find its pins. To
     // actually *isolate* the peripherals, use `kern box vgpio:NAME …`.
@@ -2107,8 +2107,8 @@ pub fn run(
             .flat_map(|v| v.pins.iter())
             .map(u32::to_string)
             .collect();
-        std::env::set_var("KERN_VGPIO_NAME", names.join(","));
-        std::env::set_var("KERN_VGPIO_PINS", pins.join(","));
+        crate::set_global_env("KERN_VGPIO_NAME", names.join(","));
+        crate::set_global_env("KERN_VGPIO_PINS", pins.join(","));
         // Say it, for the same reason the vdisk line below exists. `run` treats the two the same way
         // (neither can confine without a mount namespace) and used to report only one of them, so a
         // vgpio profile attached here looked like a device grant and was cooperative metadata. A
@@ -2160,9 +2160,9 @@ pub fn run(
     // Authored here in BOTH directions, so the value the second pass reads is always one this pass
     // wrote and never one a user happened to have exported into the environment.
     if landlock_rw.is_empty() {
-        std::env::remove_var(LANDLOCK_REQUIRED_ENV);
+        crate::unset_global_env(LANDLOCK_REQUIRED_ENV);
     } else {
-        std::env::set_var(LANDLOCK_REQUIRED_ENV, "1");
+        crate::set_global_env(LANDLOCK_REQUIRED_ENV, "1");
     }
     // Robust caps via a transient systemd user scope whose MemoryMax/CPUQuota track the caps; this
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
@@ -2267,7 +2267,7 @@ pub fn run(
     // confinement, not a limit, and it refuses instead of warning. See the block just before the exec.
     if cg.is_none()
         && (memory.is_some() || cpus.is_some())
-        && std::env::var_os("KERN_SCOPE").is_none()
+        && crate::global_env("KERN_SCOPE").is_none()
     {
         eprintln!(
             "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
@@ -2813,7 +2813,11 @@ fn await_box_started(
 /// behaviour it had before this question existed: refusing to restart on a guess would be the same
 /// class of defect in the other direction.
 fn gate_can_still_release() -> Option<bool> {
-    let fd: libc::c_int = std::env::var("KERN_GATE_FD").ok()?.trim().parse().ok()?;
+    let fd: libc::c_int = crate::global_env_str("KERN_GATE_FD")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     if fd < 0 {
         return None;
     }
@@ -2876,7 +2880,7 @@ fn supervise_box(
     // SAME stack under a concurrent `up` (that run has a different token → a different filename). Absent
     // for a plain `kern box` - no sidecar is written. Read ONCE at start; the box's own workload can't
     // change our env.
-    let exit_key = std::env::var("KERN_EXIT_KEY")
+    let exit_key = crate::global_env_str("KERN_EXIT_KEY")
         .ok()
         .filter(|k| !k.is_empty());
     // The box's log file, resolved here in the SUPERVISOR (whose pid names it) so the runner child
@@ -2930,7 +2934,7 @@ fn supervise_box(
         if attempt > 0 && !gate_dropped && last_code != Some(125) {
             // SAFETY: single-threaded supervisor between forks; no other thread can be reading the
             // environment here.
-            unsafe { std::env::remove_var("KERN_GATE_FD") };
+            crate::unset_global_env("KERN_GATE_FD");
             gate_dropped = true;
         }
         // Wall-clock this attempt so a box that stayed up counts as recovered (see the reset below).
@@ -3685,7 +3689,7 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     // stated once per host. An explicit request keeps its per-invocation warning, because asking for
     // `--memory 256m` and silently not getting it is a different failure from starting a default box.
     if !allow_uncapped
-        && std::env::var_os("KERN_BUILD_STEP").is_none()
+        && crate::global_env("KERN_BUILD_STEP").is_none()
         && !kern_isolation::memory_cap_enforceable()
     {
         let asked = memory.is_some() || memory_swap_max.is_some();
@@ -4044,9 +4048,7 @@ mod image_defaults_tests {
     fn gate_can_still_release_separates_a_pending_byte_from_a_shut_pipe() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         // Process-global env (`KERN_GATE_FD`) - serialize with every other env-mutating test.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
 
         fn pipe() -> (OwnedFd, OwnedFd) {
             let mut fds = [0 as libc::c_int; 2];
@@ -4054,7 +4056,7 @@ mod image_defaults_tests {
             unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
         }
         fn ask(rd: &OwnedFd) -> Option<bool> {
-            std::env::set_var("KERN_GATE_FD", rd.as_raw_fd().to_string());
+            crate::set_global_env("KERN_GATE_FD", rd.as_raw_fd().to_string());
             super::gate_can_still_release()
         }
         fn release(wr: &OwnedFd) {
@@ -4092,16 +4094,29 @@ mod image_defaults_tests {
         assert_eq!(ask(&rd2), Some(false));
 
         // No gate, or one that cannot be parsed or used: no opinion, and the caller keeps its budget.
-        std::env::remove_var("KERN_GATE_FD");
+        crate::unset_global_env("KERN_GATE_FD");
         assert_eq!(super::gate_can_still_release(), None);
-        std::env::set_var("KERN_GATE_FD", "not-a-number");
+        crate::set_global_env("KERN_GATE_FD", "not-a-number");
         assert_eq!(super::gate_can_still_release(), None);
-        std::env::set_var("KERN_GATE_FD", "-1");
+        crate::set_global_env("KERN_GATE_FD", "-1");
         assert_eq!(super::gate_can_still_release(), None);
-        // A descriptor nobody opened answers `POLLNVAL`, which is not "refused".
-        std::env::set_var("KERN_GATE_FD", "987");
+        // A descriptor that CANNOT be open answers `POLLNVAL`, which is not "refused".
+        //
+        // 🪤 NOT A NUMBER THAT LOOKS FREE. This was `987`, and an external reviewer caught it failing
+        // 1 run in 12 at `--test-threads=16`: the tests are threads in ONE process, they open pipes
+        // and files, and 987 is a descriptor a sibling is entitled to hold. The soft `RLIMIT_NOFILE`
+        // is one past the highest fd this process may own, so no thread can make it valid, and the
+        // case stops depending on what the rest of the suite happens to be doing.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: one live local `rlimit`, filled by the kernel.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        let impossible = libc::c_int::try_from(lim.rlim_cur).unwrap_or(libc::c_int::MAX);
+        crate::set_global_env("KERN_GATE_FD", impossible.to_string());
         assert_eq!(super::gate_can_still_release(), None);
-        std::env::remove_var("KERN_GATE_FD");
+        crate::unset_global_env("KERN_GATE_FD");
     }
     use super::*;
 
@@ -4260,6 +4275,7 @@ mod image_defaults_tests {
     /// would pass while production looked somewhere else.
     #[test]
     fn only_an_empty_named_volume_at_a_real_path_is_seeded() {
+        let _g = crate::env_guard();
         let base = std::env::temp_dir().join(format!("kern-seedable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("volumes");

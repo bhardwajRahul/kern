@@ -1301,9 +1301,7 @@ mod net_resource_tests {
         // `parse_volumes` resolves the registry root from the process-global `XDG_RUNTIME_DIR`; hold
         // `TEST_ENV_LOCK` so a sibling test flipping that var under /tmp can't make `/tmp` look like an
         // ancestor of the (relocated) registry root and spuriously refuse a valid `-v`.
-        let _env = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::env_guard();
         // Bad targets are rejected before any mount.
         for bad in [
             "data:mnt",        // relative
@@ -1340,16 +1338,14 @@ mod net_resource_tests {
         // alone would leave the equivalent forms unproven (adversarial review, final round). Each must
         // fail with the OVERLAP message, not a source-not-found error, so the dirs are materialized
         // first.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-forgegate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // Canonicalize the base so a symlinked `/tmp` (rare, but real on some systems) can't make the
         // PARENT-form comparison inconsistent with what `parse_volumes` canonicalizes.
         let tmp = std::fs::canonicalize(&tmp).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         // Materialize instances/claims/exit so `canonicalize` of the forms below succeeds. Production
         // resolves the identity set non-creatingly, so the test must create the dirs explicitly.
@@ -1402,7 +1398,7 @@ mod net_resource_tests {
             "a sibling of the registry must stay mountable"
         );
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        crate::unset_global_env("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1413,14 +1409,12 @@ mod net_resource_tests {
         // registry) redirect the write onto a peer's posture record - a real forgery bypass. The guard
         // must follow the link to where the write LANDS. Covers a direct link, a link to a not-yet-existing
         // registry path, and a two-hop chain; a link to a safe target stays writable.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-wguard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let tmp = std::fs::canonicalize(&tmp).unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
         crate::registry::materialize_authoritative_dirs_for_test();
 
         let safe = tmp.join("safe");
@@ -1464,7 +1458,7 @@ mod net_resource_tests {
             "an ordinary path must stay writable"
         );
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        crate::unset_global_env("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2025,6 +2019,7 @@ mod net_resource_tests {
     /// runs, instead of a number that is true here.
     #[test]
     fn clamp_cpus_leaves_a_request_at_the_host_count_alone() {
+        let _g = crate::env_guard();
         let host = host_cpu_count() as f64;
         assert!(host >= 1.0, "a host with no CPUs cannot run this suite");
 
@@ -2055,6 +2050,7 @@ mod net_resource_tests {
 
     #[test]
     fn clamp_cpuset_narrows_overwide_pins() {
+        let _g = crate::env_guard();
         // Host CPU count (same source as the fn) - the test is host-agnostic.
         let host = std::fs::read_to_string("/proc/cpuinfo")
             .map(|t| t.lines().filter(|l| l.starts_with("processor")).count())
@@ -3039,14 +3035,12 @@ mod image_rm_tests {
     #[test]
     fn rmi_removes_only_the_named_image_and_reports_freed() {
         // Process-global env (XDG_CACHE_HOME) - serialize with every other env-mutating test.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-rmitest-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&cache).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &tmp);
+        crate::set_global_env("XDG_CACHE_HOME", &tmp);
 
         fake_image(&cache, "alpine_3_19-aaaa", "alpine:3.19", 4096);
         fake_image(&cache, "alpine_3_20-bbbb", "alpine:3.20", 4096);
@@ -3073,7 +3067,7 @@ mod image_rm_tests {
         );
         assert!(remove_image(&cache, "ghost:1").is_none(), "a miss is None");
 
-        std::env::remove_var("XDG_CACHE_HOME");
+        crate::unset_global_env("XDG_CACHE_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3082,9 +3076,7 @@ mod image_rm_tests {
         // A file literally named `...ok` has file_stem() == ".."; unchecked, cache.join("..") would let
         // a `remove_dir_all` wipe the cache's PARENT. `is_safe_stem` must reject it - a delete never
         // escapes the images dir, whatever a planted sentinel is named.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-rmiesc-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3116,14 +3108,12 @@ mod image_rm_tests {
     fn rmi_removes_the_base_and_image_sidecars_too() {
         // rmi must delete ALL sidecar forms (via the shared drop_image_artifacts) - a leaked `.base`
         // would otherwise misclassify a later same-name pull.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-rmiside-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&cache).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &tmp);
+        crate::set_global_env("XDG_CACHE_HOME", &tmp);
 
         let stem = "myapp-cccc";
         std::fs::write(cache.join(format!("{stem}.ok")), "myapp:latest").unwrap();
@@ -3139,7 +3129,7 @@ mod image_rm_tests {
             );
         }
 
-        std::env::remove_var("XDG_CACHE_HOME");
+        crate::unset_global_env("XDG_CACHE_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3148,9 +3138,7 @@ mod image_rm_tests {
         // If the payload `<stem>/` is a SYMLINK to a dir outside the cache, deleting the image must NOT
         // reach through it - remove_dir_all unlinks the symlink, never the target's contents.
         use std::os::unix::fs::symlink;
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-rmisym-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3185,15 +3173,13 @@ mod image_rm_tests {
     fn rmi_keeps_a_layer_still_referenced_by_another_image() {
         // A shared L/ layer named by TWO images' manifests must survive rmi of the first, and only be
         // reclaimed once its last referrer is removed - the fail-closed sweep, end to end.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-rmilayer-{}", std::process::id()));
         let cache = tmp.join("kern/images");
         let lc = cache.join("L");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&lc).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", &tmp);
+        crate::set_global_env("XDG_CACHE_HOME", &tmp);
 
         let key = "0123456789abcdef0123456789abcdef"; // 32 hex
         std::fs::create_dir_all(lc.join(key)).unwrap();
@@ -3218,7 +3204,7 @@ mod image_rm_tests {
             "an orphaned layer is reclaimed once its last referrer is gone"
         );
 
-        std::env::remove_var("XDG_CACHE_HOME");
+        crate::unset_global_env("XDG_CACHE_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3723,6 +3709,7 @@ mod bring_up_check_tests {
 
     #[test]
     fn only_an_awaited_completion_may_have_exited() {
+        let _g = crate::env_guard();
         // The exit sidecar is written ONLY for a service some peer awaits with
         // `service_completed_successfully`, so the presence of a clean exit IS the declared intention:
         // a migration task that finished passes, and a long-running service that exited 0 by mistake
@@ -4255,13 +4242,11 @@ mod port_collision_tests {
     /// counter to `pid_max`. The condition and the text do not need one.
     #[test]
     fn a_checker_that_gives_up_updates_a_record_and_never_creates_one() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        let _g = crate::env_guard();
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
         let tmp = std::env::temp_dir().join(format!("kern-gaveup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         let (name, pid) = ("gaveup", 4242);
         // NO RECORD: nothing to update, so nothing may appear. Asserted FIRST, because a function
@@ -4285,8 +4270,8 @@ mod port_collision_tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         match prev {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+            None => crate::unset_global_env("XDG_RUNTIME_DIR"),
         }
     }
 
@@ -5397,6 +5382,7 @@ mod the_plan_previews_every_profile_kind {
     /// assertion.
     #[test]
     fn a_plan_that_cannot_attach_a_profile_exits_saying_so() {
+        let _g = crate::env_guard();
         let dir = std::env::temp_dir().join(format!("kern-plan-rc-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let toml = dir.join("kern.toml");
@@ -6324,6 +6310,7 @@ fn the_unprivileged_port_floor_is_read_from_the_host_and_falls_back_to_the_kerne
 /// exactly the state the first version of the guard produced, and it took a control to see it.
 #[test]
 fn a_bind_source_inside_the_registry_is_never_created_and_one_beside_it_is() {
+    let _g = crate::env_guard();
     use crate::commands::parse_volumes;
 
     // The registry ROOT is the parent of `instances/`; `registry_root` itself is private, and the
@@ -6490,6 +6477,7 @@ fn a_file_cannot_grant_itself_privileged_and_the_grant_clears_the_field() {
 /// `--secret-env pw` it found it in 0 of 3, and `/run/secrets/pw` still held the value.
 #[test]
 fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_absent() {
+    let _g = crate::env_guard();
     use crate::secret::{parse_secret_envs, secret_env_var};
 
     // The variable name is DERIVED, so the driver and the box cannot look in two different places.
@@ -6519,7 +6507,7 @@ fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_a
 
     // Present: the bytes are the variable's value, and the mode travels with it.
     // SAFETY: single-threaded test process setting a variable it alone reads.
-    unsafe { std::env::set_var("KERN_SECRET_kern_test_present", "hunter2") };
+    crate::set_global_env("KERN_SECRET_kern_test_present", "hunter2");
     let got = parse_secret_envs(&["kern_test_present".to_string()], 0o444).expect("present");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].name, "kern_test_present");
@@ -6542,7 +6530,7 @@ fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_a
     // A name that cannot be a path component is refused before anything is read.
     assert!(parse_secret_envs(&["../escape".to_string()], 0o444).is_err());
     // SAFETY: as above.
-    unsafe { std::env::remove_var("KERN_SECRET_kern_test_present") };
+    crate::unset_global_env("KERN_SECRET_kern_test_present");
 }
 
 /// `--env-file` READS THE `.env` FORMAT DOCKER READS, because it is the same format and now the same
@@ -6559,6 +6547,7 @@ fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_a
 /// reaches a workload.
 #[test]
 fn an_env_file_is_read_with_dockers_rules_not_a_second_parser() {
+    let _g = crate::env_guard();
     let dir = std::env::temp_dir().join(format!("kern-envfile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");

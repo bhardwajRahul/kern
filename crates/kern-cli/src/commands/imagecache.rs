@@ -1353,10 +1353,10 @@ pub(crate) fn pull_to_cache(
 /// Image cache root: `$XDG_CACHE_HOME/kern/images` → `$HOME/.cache/kern/images` (both user-owned
 /// and persistent) → `/tmp/kern-cache-<uid>/images` (created mode 0700, last resort).
 pub(crate) fn cache_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+    if let Some(x) = crate::global_env("XDG_CACHE_HOME") {
         return PathBuf::from(x).join("kern/images");
     }
-    if let Some(h) = std::env::var_os("HOME") {
+    if let Some(h) = crate::global_env("HOME") {
         return PathBuf::from(h).join(".cache/kern/images");
     }
     let uid = unsafe { libc::getuid() };

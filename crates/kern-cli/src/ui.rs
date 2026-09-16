@@ -41,7 +41,7 @@ impl Palette {
     }
 
     fn for_stream(is_tty: bool) -> Self {
-        if std::env::var_os("NO_COLOR").is_none() && is_tty {
+        if crate::global_env("NO_COLOR").is_none() && is_tty {
             Self {
                 b: "\x1b[1m",
                 c: "\x1b[36m",
@@ -93,7 +93,7 @@ impl Glyphs {
     pub fn detect() -> Self {
         let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
-            .filter_map(std::env::var_os)
+            .filter_map(|k| crate::global_env(k))
             .filter_map(|v| v.into_string().ok())
             .any(|v| v.to_ascii_uppercase().contains("UTF"));
         if utf8 {
@@ -126,7 +126,7 @@ pub fn term_width(fd: i32) -> usize {
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
         return ws.ws_col as usize;
     }
-    std::env::var("COLUMNS")
+    crate::global_env_str("COLUMNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&c| c > 0)

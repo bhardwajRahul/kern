@@ -870,10 +870,10 @@ fn value_u32_array(v: &str) -> Result<Vec<u32>, String> {
 pub fn default_path() -> Option<std::path::PathBuf> {
     // An empty `XDG_CONFIG_HOME` (exported but blank) must be treated as unset - otherwise it forms a
     // *relative* `kern/kern.toml` and the config lands in the current directory.
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+    if let Some(x) = crate::global_env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
         return Some(std::path::PathBuf::from(x).join("kern").join("kern.toml"));
     }
-    std::env::var_os("HOME")
+    crate::global_env("HOME")
         .filter(|h| !h.is_empty())
         .map(|h| std::path::PathBuf::from(h).join(".config/kern/kern.toml"))
 }
@@ -889,7 +889,7 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 /// or `run` command still wins for THAT command's read (it is passed to `load`); it is not a global
 /// flag and never reaches the config-editing verbs, which is why it is absent here.
 pub fn active_path() -> Option<std::path::PathBuf> {
-    active_path_impl(std::env::var_os("KERN_CONFIG"), default_path())
+    active_path_impl(crate::global_env("KERN_CONFIG"), default_path())
 }
 
 /// Testable core of [`active_path`] (same split as [`load_impl`], for the same reason: the rule is
@@ -910,7 +910,7 @@ fn active_path_impl(
 /// yields an empty config, so profiles are simply "not found". A present-but-malformed file IS an
 /// error (with its line).
 pub fn load(path: Option<&str>) -> Result<KernConfig, String> {
-    load_impl(path, std::env::var_os("KERN_CONFIG"), &default_path())
+    load_impl(path, crate::global_env("KERN_CONFIG"), &default_path())
 }
 
 /// [`load`], memoised for the life of this process.
@@ -942,7 +942,7 @@ pub fn load_cached(path: Option<&str>) -> Result<std::rc::Rc<KernConfig>, String
     let key = format!(
         "{}\u{1}{}",
         path.unwrap_or_default(),
-        std::env::var_os("KERN_CONFIG")
+        crate::global_env("KERN_CONFIG")
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_default()
     );

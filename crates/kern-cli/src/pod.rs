@@ -773,7 +773,7 @@ pub fn narrate_to_stderr_from_now_on() {
 #[must_use]
 pub fn narrate_to_stderr() -> bool {
     NARRATE_STDERR.load(std::sync::atomic::Ordering::Acquire)
-        || std::env::var_os("KERN_NARRATE_STDERR").is_some()
+        || crate::global_env("KERN_NARRATE_STDERR").is_some()
 }
 
 /// passes `ImageDefault` when the stack has image boxes and `Requested` when a service asked in as
@@ -890,7 +890,8 @@ pub fn create_with_range(
                            // files, and the file inside the box mode 0400. `/proc/<pid>/environ` is readable only by the
                            // same uid, which is the box owner. But the holder is the one process that has no reason to
                            // carry it at all, and the window is the widest, so it is scrubbed rather than justified.
-    for (k, _) in std::env::vars_os()
+    for (k, _) in crate::global_env_all()
+        .into_iter()
         .filter(|(k, _)| k.to_string_lossy().starts_with(crate::secret::ENV_PREFIX))
     {
         cmd.env_remove(k);
@@ -1742,7 +1743,7 @@ pub fn attach_box_outbound(dir: &std::path::Path, pid1: i32) -> Result<(), Strin
 
 /// Locate the `pasta` binary (part of passt), or `None` if it isn't installed.
 fn which_pasta() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
+    crate::global_env("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|d| d.join("pasta"))
             .find(|p| p.is_file())
@@ -2225,6 +2226,7 @@ mod tests {
 
     #[test]
     fn a_pod_dir_from_a_previous_boot_reaps_nothing() {
+        let _g = crate::env_guard();
         // The test the reviewer said needs no reboot: write a boot id that cannot be this boot's
         // and assert that BOTH markers refuse, including the fallback, which is the branch a stale
         // dir would otherwise reach with a live stranger's pid in it.
@@ -2295,6 +2297,7 @@ mod tests {
 
     #[test]
     fn a_boot_record_that_cannot_be_evaluated_refuses_rather_than_defaults() {
+        let _g = crate::env_guard();
         // The third state, and the one that used to be folded into "absent". A dir that HAS a boot
         // record was written by a kern that could read `boot_id`; if the read fails now, the only
         // signal that a reboot happened is gone, and the primary path would go on comparing
@@ -2373,6 +2376,7 @@ mod tests {
 
     #[test]
     fn a_torn_pasta_record_falls_back_and_never_matches() {
+        let _g = crate::env_guard();
         let root = pods_root();
         if std::fs::create_dir_all(&root).is_err() {
             eprintln!("skip: no writable pods root");
@@ -2426,6 +2430,7 @@ mod tests {
 
     #[test]
     fn a_pasta_pid_claimed_by_another_pod_is_not_signalled() {
+        let _g = crate::env_guard();
         // The defect this closes: two pods, both with a pasta, both `comm == "pasta"`. If A's
         // recorded pid has been recycled onto B's pasta, the family check alone says yes and A's
         // teardown kills B's NAT.
@@ -2483,6 +2488,7 @@ mod tests {
 
     #[test]
     fn a_recorded_pasta_start_time_rejects_a_recycled_pid() {
+        let _g = crate::env_guard();
         let root = pods_root();
         if std::fs::create_dir_all(&root).is_err() {
             eprintln!("skip: no writable pods root");

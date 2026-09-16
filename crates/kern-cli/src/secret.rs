@@ -77,7 +77,7 @@ pub(crate) fn parse_secret_envs(
             return Err(name_err(name));
         }
         let var = secret_env_var(name);
-        let Ok(value) = std::env::var(&var) else {
+        let Ok(value) = crate::global_env_str(&var) else {
             return Err(Error::Sandbox(format!(
                 "--secret-env {name}: {var} is not set in this process's environment, so there is \
                  no content to deliver at /run/secrets/{name}"
@@ -326,6 +326,7 @@ mod tests {
 
     #[test]
     fn file_form_auto_and_explicit_name() {
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-sec-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("api.key");
@@ -344,6 +345,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_name_world_writable_and_dupes() {
+        let _g = crate::env_guard();
         assert!(parse_secrets(&["../evil=x".into()], DEFAULT_SECRET_MODE).is_err());
         assert!(parse_secrets(&["a/b=x".into()], DEFAULT_SECRET_MODE).is_err());
         assert!(parse_secrets(&["A=1".into(), "A=2".into()], DEFAULT_SECRET_MODE).is_err());

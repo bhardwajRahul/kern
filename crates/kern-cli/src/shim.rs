@@ -44,7 +44,7 @@ pub const DIALECT_ENV: &str = "KERN_ARGV_IS_KERN_DIALECT";
 
 /// Is this process the far side of a re-exec that already carries kern's own dialect?
 pub fn argv_already_translated() -> bool {
-    std::env::var_os(DIALECT_ENV).is_some()
+    crate::global_env(DIALECT_ENV).is_some()
 }
 
 /// Record the post-translation argv (without `argv[0]`). Called once, from `main`.

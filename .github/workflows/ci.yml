@@ -33,7 +33,15 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --all-targets --all-features
+        # `-D warnings` TWICE ON PURPOSE. The job sets `RUSTFLAGS: -D warnings` twenty lines above,
+        # and that IS what makes a clippy lint fatal here: measured, a planted `env::set_var` exits
+        # 101 with it and 0 without. But an external reviewer read this line on its own, ran it
+        # without the job's environment, saw a warning and exit 0, and reported the perimeter as
+        # unenforced. He was wrong about this repository and right about the shape: a rule whose
+        # teeth are in a variable declared elsewhere is one `env:` edit away from being decoration,
+        # and it reads as decoration to anyone auditing the step. Saying it on the command makes the
+        # step true on its own.
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
         run: cargo test --all
         # HW/privilege-gated tests skip gracefully, so x86 CI stays green.
@@ -85,6 +93,13 @@ jobs:
           # the second one, in kern-cli, went unseen: a per-crate check has to be extended by hand, and
           # the second occurrence is the proof that it is not. This one reads the whole tree.
           python3 scripts/flat-continuation.py
+          # The environment is one table per PROCESS and a crate's tests are threads in one, so a test
+          # that writes XDG_DATA_HOME moves every sibling's volumes_dir() while its body runs. The
+          # RULE is enforced at runtime, by an assertion inside crate::global_env/set_global_env: it
+          # found 27 such tests where a static version of the same rule found 3, and an external
+          # reviewer walked through that static version eight times out of eight. This gate only
+          # checks that nothing goes around the chokepoints, which is a per-line question.
+          python3 scripts/test-env-lock.py
           python3 scripts/progress-is-tty-gated.py
           # Every entry under a code section declares what it did about its own injection. A warning,
           # never a refusal: it cannot verify an executed injection (several suites here need hardware

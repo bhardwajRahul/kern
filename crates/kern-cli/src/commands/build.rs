@@ -708,7 +708,7 @@ fn build_run(
     //
     // Evaluated in the same order as the `&&` chain it replaces, so the expensive probe still runs
     // only when the cheap check has not already decided.
-    let flat_because = if std::env::var_os("KERN_BUILD_FLAT").is_some() {
+    let flat_because = if crate::global_env("KERN_BUILD_FLAT").is_some() {
         Some(FlatReason::Forced)
     } else if !probe_overlay(&self_exe, &base_lower, work) {
         Some(FlatReason::NoUnprivilegedOverlay)

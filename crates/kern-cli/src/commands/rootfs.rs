@@ -1905,7 +1905,7 @@ pub(crate) fn scratch_dir() -> PathBuf {
     // ours, not merely writable, and refusing a foreign-owned `kern-<uid>` dir also closes the
     // pre-created-directory trap on world-writable `/tmp` and `/dev/shm`.
     let mut cands: Vec<(PathBuf, PathBuf, &str)> = Vec::new();
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+    if let Some(x) = crate::global_env("XDG_RUNTIME_DIR") {
         let base = PathBuf::from(&x);
         cands.push((base.join("kern/scratch"), base, "xdg"));
     }

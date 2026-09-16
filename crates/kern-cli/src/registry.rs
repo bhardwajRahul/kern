@@ -936,7 +936,7 @@ fn runtime_subdir_candidates(leaf: &str) -> Vec<PathBuf> {
     assert_registry_child(leaf);
     let uid = unsafe { libc::getuid() };
     let mut candidates = Vec::new();
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+    if let Some(x) = crate::global_env("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(x).join("kern").join(leaf));
     }
     candidates.push(PathBuf::from(format!("/run/user/{uid}/kern/{leaf}")));
@@ -969,7 +969,7 @@ fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     // memo that ignored it handed back a directory under the previous root.
     let key = (
         leaf.to_string(),
-        std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+        crate::global_env("XDG_RUNTIME_DIR").unwrap_or_default(),
     );
     static MEMO: OnceLock<
         std::sync::Mutex<std::collections::HashMap<(String, std::ffi::OsString), PathBuf>>,
@@ -2692,28 +2692,26 @@ mod tests {
         // `a_volume_source_that_resolves_onto_the_registry_is_refused_in_every_form` - both resolving a
         // registry path while this one had pointed the variable at a temp dir. The lock is what the
         // memo test beside it uses, for exactly this reason.
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let base = std::env::temp_dir().join(format!("kern-idisp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("kern/instances")).expect("make a runtime dir");
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
         // RESTORED BY DROP, not at the end of the body: an assertion that fails must not leave the
         // variable pointing at a temp dir for whatever runs next.
         struct Restore(Option<std::ffi::OsString>, PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
                 match &self.0 {
-                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                    Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+                    None => crate::unset_global_env("XDG_RUNTIME_DIR"),
                 }
                 let _ = fs::remove_dir_all(&self.1);
             }
         }
         let _restore = Restore(prev, base.clone());
 
-        std::env::set_var("XDG_RUNTIME_DIR", &base);
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
         assert_eq!(
             instances_dir_for_display(),
             base.join("kern/instances").display().to_string(),
@@ -2721,7 +2719,7 @@ mod tests {
         );
         // AND WITH NO CANDIDATE ON DISK it still names one rather than saying nothing: a reader who is
         // told a record is missing has to be able to go and look.
-        std::env::set_var("XDG_RUNTIME_DIR", base.join("gone"));
+        crate::set_global_env("XDG_RUNTIME_DIR", base.join("gone"));
         let shown = instances_dir_for_display();
         assert!(
             shown.starts_with('/') && shown.ends_with("instances"),
@@ -2756,19 +2754,17 @@ mod tests {
     /// same way `runstats`'s tests already do.
     #[test]
     fn a_memoised_runtime_dir_is_re_created_after_something_removes_it() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-memo-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
         // Whatever this test does from here, the real runtime dir is out of reach: every path below
         // resolves under `tmp` because the memo is keyed on the variable just set.
         let restore = Restore(tmp.clone());
         struct Restore(PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
-                std::env::remove_var("XDG_RUNTIME_DIR");
+                crate::unset_global_env("XDG_RUNTIME_DIR");
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
@@ -2854,9 +2850,7 @@ mod tests {
     /// drop leaves that `canonicalize` can then no longer find, failing the 1:1 count spuriously.
     #[test]
     fn every_registry_child_is_classified() {
-        let _env = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::env_guard();
         // The two classes must be disjoint - a dir cannot be both authoritative and opaque data.
         for a in AUTHORITATIVE_DIRS {
             assert!(!BOX_DATA_DIRS.contains(&a), "{a:?} is in BOTH classes");
@@ -3458,13 +3452,8 @@ mod tests {
     /// env flip mid-test split the 16-thread contention test across two runtime dirs, so each half took
     /// its own `.lock` and BOTH "won" (flaky `claim_name_one_winner_under_contention`). Hold BOTH locks,
     /// always env-then-reg (one consistent order → no deadlock, since no path takes them reversed).
-    fn reg_guard() -> (
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let env = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn reg_guard() -> (crate::EnvGuard, std::sync::MutexGuard<'static, ()>) {
+        let env = crate::env_guard();
         let reg = REG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         (env, reg)
     }
@@ -3921,13 +3910,19 @@ mod tests {
 
     #[test]
     fn claim_name_one_winner_under_contention() {
+        let _g = crate::env_guard();
         let _g = reg_guard();
         // The E5 race: N concurrent starts of the SAME name - exactly one may win. Threads each
         // open their own lock fd (flock is per-open-file-description, so they do exclude each other).
         let name = format!("clm-race-{}", std::process::id());
         let wins: Vec<Option<NameClaim>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..16)
-                .map(|_| s.spawn(|| claim_name(&name).ok().flatten()))
+                .map(|_| {
+                    s.spawn(|| {
+                        let _g = crate::env_guard_inherited();
+                        claim_name(&name).ok().flatten()
+                    })
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -3944,10 +3939,10 @@ mod tests {
         // The ceiling is a GLOBAL count, so unique names do not isolate it the way the other claim
         // tests are isolated - point the runtime dir at a fresh temp so the count sees ONLY this test's
         // claims. `reg_guard` holds `TEST_ENV_LOCK`, so no other test flips `XDG_RUNTIME_DIR` meanwhile.
-        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
         let tmp = std::env::temp_dir().join(format!("kern-fleet-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        crate::set_global_env("XDG_RUNTIME_DIR", &tmp);
 
         // A binder that asserts the outcome is a live claim and hands back the guard (kept alive so its
         // claim keeps counting). Panicking here is a TEST assertion, not production code.
@@ -3982,8 +3977,8 @@ mod tests {
         drop(c4);
         let _ = fs::remove_dir_all(&tmp);
         match prev {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+            None => crate::unset_global_env("XDG_RUNTIME_DIR"),
         }
     }
 
@@ -4118,6 +4113,7 @@ mod box_env_tests {
     /// image's own `HEALTHCHECK` reported a working service UNHEALTHY.
     #[test]
     fn a_recorded_environment_survives_every_shape_a_value_can_take() {
+        let _g = crate::env_guard();
         let name = format!("kern-envtest-{}", std::process::id());
         // A LIVE PID, and the fake one it replaces cost a false red. This writes into the developer's
         // real runtime dir, and any concurrent kern invocation is entitled to prune a record whose pid

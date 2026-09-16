@@ -13,10 +13,10 @@ use std::path::PathBuf;
 
 /// Root directory holding all named volumes.
 pub fn volumes_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
         return PathBuf::from(x).join("kern").join("volumes");
     }
-    if let Some(h) = std::env::var_os("HOME") {
+    if let Some(h) = crate::global_env("HOME") {
         return PathBuf::from(h).join(".local/share/kern/volumes");
     }
     PathBuf::from(format!("/tmp/kern-volumes-{}", unsafe { libc::getuid() }))
@@ -270,7 +270,7 @@ fn validate_net(host: &str, path: &str) -> Result<(), Error> {
 fn net_staging(idx: usize) -> String {
     crate::registry::assert_registry_child("mounts"); // classification chokepoint (see registry.rs)
     let uid = unsafe { libc::getuid() };
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    let base = crate::global_env("XDG_RUNTIME_DIR")
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("/run/user/{uid}"));
     format!("{base}/kern/mounts/net-{}-{idx}", std::process::id())
@@ -311,7 +311,7 @@ fn run_mount(cmd: &mut std::process::Command) -> bool {
 
 /// Is `tool` on `PATH` and executable? `access(X_OK)`, no subprocess.
 fn tool_exists(tool: &str) -> bool {
-    std::env::var_os("PATH")
+    crate::global_env("PATH")
         .map(|p| {
             std::env::split_paths(&p).any(|d| {
                 let f = d.join(tool);
@@ -431,7 +431,7 @@ pub fn setup_network(spec: &str, idx: usize) -> Result<(String, String, bool, Ne
 /// Locate a just-created GVFS mount for (scheme, host) under `$XDG_RUNTIME_DIR/gvfs`.
 fn find_gvfs_mount(scheme: NetScheme, host: &str) -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    let base = crate::global_env("XDG_RUNTIME_DIR")
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("/run/user/{uid}"));
     let (prefix, key) = match scheme {
@@ -1149,6 +1149,7 @@ mod tests {
     /// which is their own directory and never kern's to fill.
     #[test]
     fn only_a_volumes_own_data_dir_is_recognised_as_one() {
+        let _g = crate::env_guard();
         let base = super::volumes_dir();
         assert_eq!(
             super::name_of_data_dir_under(&base, &base.join("pgdata/data")),
@@ -1257,7 +1258,6 @@ mod tests {
     // `XDG_DATA_HOME` is process-global; the CRATE-WIDE lock serializes this against every other
     // module's env-mutating tests (e.g. `builds`), which also repoint XDG_DATA_HOME - a per-module lock
     // wouldn't (they'd race across modules).
-    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     /// Every flag a `volume` subcommand ACCEPTS must appear in the text `usage()` prints.
     ///
@@ -1343,9 +1343,9 @@ mod tests {
 
     #[test]
     fn resolve_named_auto_creates_under_the_data_home() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-voltest-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
         let path = resolve_named("unit_vol").unwrap();
         assert!(path.ends_with("kern/volumes/unit_vol/data"));
         assert!(
@@ -1356,7 +1356,7 @@ mod tests {
         // a traversal name never resolves.
         assert!(resolve_named("../evil").is_err());
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
     }
 
     /// `volume create --size N` must not report success when the quota it was asked for was not
@@ -1374,10 +1374,10 @@ mod tests {
     /// `meta.json` as a DIRECTORY, which makes `fs::write` fail `EISDIR` on every filesystem.
     #[test]
     fn volume_create_refuses_when_the_quota_cannot_be_written() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-volmeta-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
 
         // Pre-plant `meta.json` as a directory: `create_dir_all(vol/data)` still succeeds, and the
         // metadata write that carries `size_limit` cannot.
@@ -1388,7 +1388,7 @@ mod tests {
         let quota = size_limit("capped");
 
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
 
         assert!(
             r.is_err(),
@@ -1487,9 +1487,9 @@ mod tests {
     fn size_limit_rejects_bad_name_and_out_of_range() {
         // A traversing name never reaches the filesystem read.
         assert_eq!(size_limit("../etc"), None);
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-qclamp-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
         // A hand-edited meta.json past the ceiling is re-clamped away (treated as unset).
         let vol = volumes_dir().join("huge");
         std::fs::create_dir_all(vol.join("data")).unwrap();
@@ -1500,15 +1500,15 @@ mod tests {
         .unwrap();
         assert_eq!(size_limit("huge"), None);
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
     }
 
     #[test]
     fn edit_renames_requotas_and_guards() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-edittest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
         let g2 = 2 * 1024 * 1024 * 1024;
         resolve_named("v1").unwrap();
         // Set a quota (no rename).
@@ -1535,7 +1535,7 @@ mod tests {
         run(&["edit".into(), "q".into(), "--name".into(), "qq".into()]).unwrap();
         assert_eq!(size_limit("qq"), Some(g2), "rename-only kept the quota");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
     }
 
     #[test]
@@ -1553,9 +1553,9 @@ mod tests {
         assert!(parse_named_spec("../evil:/w").is_err());
 
         // create --size records a quota that size_limit reads back.
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::env_guard();
         let tmp = std::env::temp_dir().join(format!("kern-qtest-{}", std::process::id()));
-        std::env::set_var("XDG_DATA_HOME", &tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
         create(&[
             "quotavol".to_string(),
             "--size".to_string(),
@@ -1566,7 +1566,7 @@ mod tests {
         create(&["plainvol".to_string()]).unwrap();
         assert_eq!(size_limit("plainvol"), None);
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("XDG_DATA_HOME");
+        crate::unset_global_env("XDG_DATA_HOME");
     }
 
     /// The line that sent us here: `-v .:/app` (mount the project you are standing in) answered

@@ -458,7 +458,7 @@ fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
     let c = cpus?;
     let host = host_cpu_count() as f64;
     if cpus_exceed_host(c, host) {
-        if std::env::var_os("KERN_SCOPE").is_none() {
+        if crate::global_env("KERN_SCOPE").is_none() {
             eprintln!(
                 "kern: --cpus {c} exceeds the {host:.0} available CPUs - clamping to {host:.0}"
             );
@@ -544,7 +544,7 @@ fn clamp_cpuset(set: Option<String>) -> Result<Option<String>, Error> {
         return Ok(Some(s));
     }
     let clamped = out.join(",");
-    if clamped != s && std::env::var_os("KERN_SCOPE").is_none() {
+    if clamped != s && crate::global_env("KERN_SCOPE").is_none() {
         eprintln!(
             "kern: --cpuset-cpus {s} exceeds the {host} available CPUs - clamping to {clamped}"
         );
@@ -577,7 +577,7 @@ fn clamp_cpuset(set: Option<String>) -> Result<Option<String>, Error> {
 /// by the advisory fast-fail here and the authoritative under-lock check in `box_run`, so the env key
 /// and its parse rule live once.
 fn fleet_max() -> Option<usize> {
-    std::env::var("KERN_MAX_CONCURRENT")
+    crate::global_env_str("KERN_MAX_CONCURRENT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
 }
@@ -597,10 +597,10 @@ fn fleet_gate_and_budget() -> Result<(), Error> {
             return Err(fleet_limit_error(live, max));
         }
     }
-    let mem = std::env::var("KERN_FLEET_MEMORY_MAX")
+    let mem = crate::global_env_str("KERN_FLEET_MEMORY_MAX")
         .ok()
         .and_then(|v| kern_common::parse_binary_size(v.trim()));
-    let pids = std::env::var("KERN_FLEET_PIDS_MAX")
+    let pids = crate::global_env_str("KERN_FLEET_PIDS_MAX")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
     if mem.is_some() || pids.is_some() {
@@ -654,7 +654,7 @@ fn persistent_supervision(
 /// (before the box is forked). Fail-closed: a fd we cannot even stat is dropped (`None`), since no
 /// signal beats a forgeable one. Mirrors [`ready_fd_to_signal`]'s `> 2` discipline.
 fn started_signal_fd() -> Option<i32> {
-    let fd = std::env::var("KERN_STARTED_FD")
+    let fd = crate::global_env_str("KERN_STARTED_FD")
         .ok()?
         .trim()
         .parse::<i32>()
@@ -726,7 +726,7 @@ pub(crate) const ALIVE_ACK: u8 = b'A';
 /// A FAILED ACK DROPS THE CHANNEL (`None`), fail-closed in the direction of the old behaviour: a reader
 /// that gets no `A` keeps its previous verdict, where a half-open channel would have it guess.
 fn alive_signal_fd() -> Option<i32> {
-    let fd = std::env::var("KERN_ALIVE_FD")
+    let fd = crate::global_env_str("KERN_ALIVE_FD")
         .ok()?
         .trim()
         .parse::<i32>()
@@ -907,7 +907,7 @@ fn nesting_active(privileged: bool) -> bool {
 /// better to skip the logo than to reprint it every time. A lost race (two boxes at once) just
 /// prints the logo twice, which is harmless.
 fn first_box_of_session() -> bool {
-    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+    let Some(dir) = crate::global_env("XDG_RUNTIME_DIR") else {
         return false;
     };
     let marker = std::path::Path::new(&dir).join("kern").join(".greeted");
@@ -2119,12 +2119,12 @@ fn ports_summary(ports: &[kern_isolation::PortMap]) -> String {
 
 /// The user's systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, else `~/.config/systemd/user`).
 fn user_systemd_dir() -> Result<PathBuf, Error> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(x) = crate::global_env("XDG_CONFIG_HOME") {
         if !x.is_empty() {
             return Ok(PathBuf::from(x).join("systemd/user"));
         }
     }
-    let home = std::env::var_os("HOME")
+    let home = crate::global_env("HOME")
         .filter(|h| !h.is_empty())
         .ok_or_else(|| {
             Error::Sandbox("HOME not set - cannot locate the systemd user dir".into())
@@ -2179,10 +2179,10 @@ const SCOPE_TASKS_MAX: &str = "TasksMax=512";
 /// comes from the kernel command line. Mirrors [`crate::volume::volumes_dir`] and
 /// [`crate::builds::builds_dir`] rather than inventing a fourth location rule.
 fn uncapped_notice_path() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
         return PathBuf::from(x).join("kern").join("uncapped-notice");
     }
-    if let Some(h) = std::env::var_os("HOME") {
+    if let Some(h) = crate::global_env("HOME") {
         return PathBuf::from(h).join(".local/share/kern/uncapped-notice");
     }
     PathBuf::from(format!("/tmp/kern-uncapped-notice-{}", unsafe {
@@ -3068,7 +3068,7 @@ fn disk_usage(p: &std::path::Path, seen: &mut std::collections::HashSet<(u64, u6
 /// OUTSIDE this filesystem, so removing the Linux binary from in here leaves a shim pointing at a distro
 /// with no kern. Recoverable - the shim says how - but not something to discover afterwards.
 fn in_wsl() -> bool {
-    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+    if crate::global_env("WSL_DISTRO_NAME").is_some() {
         return true;
     }
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -5926,10 +5926,10 @@ pub(crate) fn image_expose_collisions(
 /// `kern box --image` would fail on a rootfs nobody extracted. Nothing here is ever mistaken for an
 /// image: the files hold port numbers and nothing else.
 fn expose_memo_dir() -> std::path::PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+    if let Some(x) = crate::global_env("XDG_CACHE_HOME") {
         return std::path::PathBuf::from(x).join("kern").join("expose");
     }
-    if let Some(h) = std::env::var_os("HOME") {
+    if let Some(h) = crate::global_env("HOME") {
         return std::path::PathBuf::from(h).join(".cache/kern/expose");
     }
     std::path::PathBuf::from(format!("/tmp/kern-expose-{}", unsafe { libc::getuid() }))
@@ -6002,7 +6002,7 @@ fn image_exposed_ports(image: &str) -> Option<Vec<(u16, bool)>> {
     // `up` DOES NOT NEED THIS. It resolves its images through the ordinary pull path before the
     // wiring is decided (see `ensure_images_for_wiring`), so the runtime answer is exact whatever
     // this variable says.
-    std::env::var_os("KERN_COMPOSE_FETCH_IMAGE_CONFIG")?;
+    crate::global_env("KERN_COMPOSE_FETCH_IMAGE_CONFIG")?;
     // A scratch directory that is removed either way: the blob is a means, not a thing to keep, and
     // the image store must not learn about an image whose layers are absent.
     let scratch = expose_memo_dir().join(format!(".fetch-{}", std::process::id()));

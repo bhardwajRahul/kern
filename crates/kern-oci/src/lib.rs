@@ -1,5 +1,9 @@
 //! OCI image handling for kern: pull, layer extraction, whiteout application, and Hub search.
 
+// NOT AUDITED for the process-global environment race that `clippy.toml` guards against, and
+// exempted EXPLICITLY rather than by the lint quietly not applying. The reasoning, and the list of
+// every exemption, is in `scripts/test-env-lock.py`. Remove this when this crate's tests are audited.
+#![allow(clippy::disallowed_methods)]
 mod archive;
 mod json;
 mod net;

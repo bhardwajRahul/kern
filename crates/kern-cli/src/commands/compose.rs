@@ -444,7 +444,7 @@ fn default_override_for(files: &[String]) -> Option<String> {
     let [only] = files else {
         return None;
     };
-    if std::env::var_os("COMPOSE_FILE").is_some() {
+    if crate::global_env("COMPOSE_FILE").is_some() {
         return None;
     }
     let path = std::path::Path::new(only);
@@ -700,14 +700,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // exporting that variable once here, at the CLI boundary, before any parsing. One assignment in a
     // one-shot process, never from library code - the parser keeps reading a single source of truth.
     if !profiles.is_empty() {
-        let mut all: Vec<String> = std::env::var("COMPOSE_PROFILES")
+        let mut all: Vec<String> = crate::global_env_str("COMPOSE_PROFILES")
             .ok()
             .into_iter()
             .flat_map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
             .filter(|p| !p.is_empty())
             .collect();
         all.extend(profiles.iter().cloned());
-        std::env::set_var("COMPOSE_PROFILES", all.join(","));
+        crate::set_global_env("COMPOSE_PROFILES", all.join(","));
     }
     // The override `docker compose` would have loaded, appended so it merges LAST (see
     // `default_override_for` for the three conditions and what each one was measured against).
@@ -760,7 +760,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // THE SHELL STILL WINS, and `--profile` (merged into the same variable above) with it: this only
     // fills in a value nobody supplied. One assignment, at the CLI boundary, exactly like the flag.
-    if std::env::var("COMPOSE_PROFILES")
+    if crate::global_env_str("COMPOSE_PROFILES")
         .map(|v| v.trim().is_empty())
         .unwrap_or(true)
     {
@@ -768,14 +768,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .get("COMPOSE_PROFILES")
             .filter(|v| !v.trim().is_empty())
         {
-            std::env::set_var("COMPOSE_PROFILES", v);
+            crate::set_global_env("COMPOSE_PROFILES", v);
         }
     }
     // The project name follows the same rule, in Docker's order: `-p` wins, then the environment,
     // then the `.env`, then the name kern derives from the file. Without it a stack that names
     // itself in its `.env` came up under a different name than `docker compose` gives it, so its
     // boxes and its pod answered to something else.
-    let project_from_env = std::env::var("COMPOSE_PROJECT_NAME")
+    let project_from_env = crate::global_env_str("COMPOSE_PROJECT_NAME")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
@@ -3734,6 +3734,7 @@ mod tests {
     /// environment. Asserting it would mean mutating global state under a thread pool.
     #[test]
     fn the_default_override_is_discovered_beside_a_default_named_file() {
+        let _g = crate::env_guard();
         let root = std::env::temp_dir().join(format!("kern-ovr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("scratch dir");
@@ -3780,6 +3781,7 @@ mod tests {
     /// ports say nothing, and the relay plan says everything.
     #[test]
     fn a_service_that_died_on_a_port_is_told_which_port_and_which_wiring_took_it() {
+        let _g = crate::env_guard();
         let plan = crate::nopod::assign_aliases(&[
             ("proxy".into(), "p-proxy".into(), vec![80], vec![], vec![]),
             ("backend".into(), "p-backend".into(), vec![], vec![], vec![]),

@@ -3,6 +3,10 @@
 //! Newtypes live here so units (bytes vs MiB, names vs paths) can't be mixed up by accident.
 //! This is a 0.1 scaffold - see the roadmap in README.md / ARCHITECTURE.md.
 
+// NOT AUDITED for the process-global environment race that `clippy.toml` guards against, and
+// exempted EXPLICITLY rather than by the lint quietly not applying. The reasoning, and the list of
+// every exemption, is in `scripts/test-env-lock.py`. Remove this when this crate's tests are audited.
+#![allow(clippy::disallowed_methods)]
 /// The kern version. On a release binary this is the tag, exactly as before: the release workflow
 /// rewrites `Cargo.toml` from the tag and `build.rs` passes that through untouched. On a build from
 /// source, where `Cargo.toml` still reads the de-versioned `0.0.0`, this is `git describe` instead

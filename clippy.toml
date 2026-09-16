@@ -1,0 +1,23 @@
+# THE ENVIRONMENT IS ONE TABLE PER PROCESS, AND A CRATE'S TESTS ARE THREADS IN ONE.
+#
+# `crate::global_env`, `crate::set_global_env` and `crate::unset_global_env` are the only places
+# kern-cli may touch it: in a test build each asserts that the calling thread holds `TEST_ENV_LOCK`,
+# so a test cannot read a value a sibling is in the middle of changing.
+#
+# THIS FILE IS WHY THAT RULE CANNOT BE SPELLED AROUND. A previous version was a python gate matching
+# `std::env::` in the source, and an external reviewer walked past it with `use std::env;` then
+# `env::set_var(..)`, with `use std::env::set_var as sv;`, with the variable name in a binding, and
+# with spaces around the `::`. All four compile to the same call, which is what the gate could not
+# see and clippy resolves by construction. The compiler answering beats a parser guessing.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "use crate::set_global_env, which witnesses TEST_ENV_LOCK in a test build" },
+    { path = "std::env::remove_var", reason = "use crate::unset_global_env, which witnesses TEST_ENV_LOCK in a test build" },
+    { path = "std::env::var", reason = "use crate::global_env, which witnesses TEST_ENV_LOCK in a test build" },
+    { path = "std::env::var_os", reason = "use crate::global_env, which witnesses TEST_ENV_LOCK in a test build" },
+    { path = "std::env::vars", reason = "the whole table is the same table: use crate::global_env for the name you want" },
+    { path = "std::env::vars_os", reason = "the whole table is the same table: use crate::global_env for the name you want" },
+    { path = "libc::setenv", reason = "a write under another name: use crate::set_global_env" },
+    { path = "libc::unsetenv", reason = "a write under another name: use crate::unset_global_env" },
+    { path = "libc::putenv", reason = "a write under another name: use crate::set_global_env" },
+    { path = "libc::getenv", reason = "a read under another name: use crate::global_env" },
+]
