@@ -828,6 +828,21 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // CLOEXEC is deferred past the scope re-exec by `cloexec_started_fd` below (see both docstrings for
     // why the systemd-run re-exec forces the split); written once, at the terminal exit arm below.
     let started_fd = started_signal_fd();
+    // 🔴 THE ALIVE ACK GOES HERE, NOT AT THE SPAWN, and the byte is the whole point of the position.
+    // Its docstring says "as soon as it has accepted the descriptor, before any box setup begins", and
+    // that was false by about 780 lines: the ack was written just before the fork, while the IMAGE is
+    // resolved and PULLED far above it. So the longest phase of a cold start was the one the channel
+    // could not describe.
+    //
+    // MEASURED, and found on a board rather than on a laptop: the first SDK call on a Raspberry Pi 5
+    // took 38 s pulling `python:3.12-slim` for arm64 against 0.1 s warm, the caller's 30 s deadline
+    // fired inside the pull, and the verdict came back `timeout` - "your code was slow" - for a box
+    // whose code never ran. Reproduced deterministically on x86 with an empty `XDG_CACHE_HOME` and
+    // `timeout_s=3`, on the released binary AND on this tree, so it was never the tag skew.
+    //
+    // Written ONCE: `alive_signal_fd` writes the byte as a side effect, so the value is carried down
+    // to the spawn rather than asked for twice.
+    let alive_fd = alive_signal_fd();
     // An INHERITED direct-cap-path marker (e.g. a nested `kern box` inside a box whose host-side
     // start chose the direct path) is meaningless here and would arm the fail-closed refusal on a
     // host that never chose it - scrub before any cap decision is read.
@@ -1823,12 +1838,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // on every start (measured with 61 entries in the slice, 7.4% of a 2.6 ms box). Here it overlaps
     // the workload rather than delaying it, and the slice is still swept once per box start.
     kern_isolation::sweep_orphans_off_hot_path();
-    // THE READINESS PIPE ON THE FOREGROUND PATH, when a caller asked for it with `KERN_ALIVE_FD`.
-    // `-d` builds its own (the launcher blocks on it to print a truthful "started"), and this path had
-    // no reader, so it passed `None`. An SDK is a reader: it needs to tell "the workload was slow" from
-    // "kern never reached `execvp`", and those are the same overrun without this fd. See
-    // `alive_signal_fd`. `None` when unset or unusable, which is byte-for-byte the old behaviour.
-    let alive_fd = alive_signal_fd();
+    // THE READINESS PIPE ON THE FOREGROUND PATH, acked at the TOP of this function (see there) and
+    // only handed on here. `-d` builds its own (the launcher blocks on it to print a truthful
+    // "started"), and this path had no reader, so it passed `None`. An SDK is a reader: it needs to
+    // tell "the workload was slow" from "kern never reached `execvp`", and those are the same overrun
+    // without this fd.
     let result = run_in_sandbox_with(
         &spec,
         alive_fd,
