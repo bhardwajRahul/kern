@@ -10,9 +10,10 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 Eight days of work since v0.9.32. Each line is the change; how a defect was found and why the fix is
 shaped that way is in the commit it came from (`git log v0.9.32..v0.9.35`).
 
-**Read these first if you are upgrading:** a published port now binds `0.0.0.0` rather than
-`127.0.0.1`, each compose service gets its own network namespace on a bridge, and `fault.type` reports
-a different value for four events. Every one of them is described below.
+**Read these first if you are upgrading:** each compose service gets its own network namespace on a
+bridge, so a port a service binds on its `127.0.0.1` stays private to it; `fault.type` reports a
+different value for four events; and the SDKs refuse mounts they used to accept, with no opt-out.
+Every one of them is described below.
 
 **Sentry's official `install.sh` completes on kern, and the 57-service stack runs.** Measured end to
 end against `getsentry/self-hosted` at 26.8.0: every image built, the migrations, `compose up
