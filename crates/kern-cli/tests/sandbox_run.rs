@@ -3926,6 +3926,83 @@ fn logs_timestamps_stamp_every_line_and_the_tail_agrees() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// `kern build` with no `-f` reads a `Containerfile`, and still reads a `Dockerfile`.
+///
+/// BOTH, AND IN THAT ORDER. `Containerfile` is the name podman and buildah look for first, and
+/// accepting it is what lets a project drop the other project's name from its tree without losing
+/// kern. Refusing to open a file someone already has, because of what it is called, would be a
+/// position rather than a behaviour, so the old name keeps working and is not deprecated.
+///
+/// The third case is the one that makes the order mean something: a context holding BOTH takes the
+/// neutral one. Without that assertion this test passes on an implementation that only ever looks at
+/// `Dockerfile` and happens to find the other by accident.
+#[test]
+fn build_reads_a_containerfile_and_still_reads_a_dockerfile() {
+    let root = std::env::temp_dir().join(format!("kern-cf-{}", std::process::id()));
+    let xdg = root.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    let build = |name: &str, files: &[(&str, &str)]| -> (bool, String) {
+        let dir = root.join(name);
+        let _ = fs::create_dir_all(&dir);
+        for (f, body) in files {
+            fs::write(dir.join(f), body).expect("write build file");
+        }
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["build", "-t", name, dir.to_str().unwrap()])
+            .output()
+            .expect("run kern");
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+
+    // `FROM scratch` needs no registry, so this test says nothing about the network.
+    let (ok, err) = build(
+        "kern-t-containerfile",
+        &[("Containerfile", "FROM scratch\n")],
+    );
+    assert!(ok, "a Containerfile alone should build: {err}");
+
+    let (ok, err) = build("kern-t-dockerfile", &[("Dockerfile", "FROM scratch\n")]);
+    assert!(ok, "a Dockerfile alone should still build: {err}");
+
+    // Both present: the neutral name wins, and the LABEL is how the answer is read back.
+    let (ok, err) = build(
+        "kern-t-bothfiles",
+        &[
+            // ENV and not LABEL: `inspect --json` reports the environment and does not report
+            // labels, so a label would have made this assertion unanswerable rather than false.
+            ("Containerfile", "FROM scratch\nENV CHOSEN=containerfile\n"),
+            ("Dockerfile", "FROM scratch\nENV CHOSEN=dockerfile\n"),
+        ],
+    );
+    assert!(ok, "a context with both should build: {err}");
+    let o = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["inspect", "kern-t-bothfiles", "--json"])
+        .output()
+        .expect("run kern");
+    let seen = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        seen.contains("CHOSEN=containerfile"),
+        "with both present the Containerfile is the one read: {seen}"
+    );
+
+    for n in [
+        "kern-t-containerfile",
+        "kern-t-dockerfile",
+        "kern-t-bothfiles",
+    ] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["rmi", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A named volume (`-v name:/dest`) is auto-created and **persists across boxes**: what one box
 /// writes, a later box reads back. Fully rootless (a dir bind-mount).
 #[test]

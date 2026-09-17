@@ -196,9 +196,23 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
             args.context
         )));
     }
+    // `Containerfile` FIRST, `Dockerfile` second, which is the order podman and buildah use and the
+    // order that lets a project drop the other project's name from its tree without losing kern. Both
+    // are read: a build file is an INPUT, and refusing to open a file someone already has because of
+    // what it is called would be a position, not a behaviour.
+    //
+    // The order matters only where BOTH exist, which is rare and is a repository saying something
+    // about itself. Taking the neutral one there is the whole point of accepting it at all.
     let dfpath = match args.file {
         Some(f) => PathBuf::from(f),
-        None => ctx.join("Dockerfile"),
+        None => {
+            let neutral = ctx.join("Containerfile");
+            if neutral.exists() {
+                neutral
+            } else {
+                ctx.join("Dockerfile")
+            }
+        }
     };
     // `-f <path>` reads a host file whose CONTENT becomes build INSTRUCTIONS (a `RUN`/`COPY`/`ADD` run
     // against the box) - the same host-content-reaches-the-box class as `--env-file`, in a MORE powerful

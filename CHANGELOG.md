@@ -5,6 +5,14 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**`kern build` reads a `Containerfile`.** Without `-f`, it looks for that name first and for
+`Dockerfile` second, which is the order podman and buildah use. Both are read and neither is
+deprecated: a build file is an input, and refusing to open one someone already has, because of what
+it is called, would be a position rather than a behaviour. The order matters only in a context
+holding both, which is a repository saying something about itself, and there the neutral name wins.
+
 ## v0.9.35 - 2026-09-17
 
 Eight days of work since v0.9.32. Each line is the change; how a defect was found and why the fix is

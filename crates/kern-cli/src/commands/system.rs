@@ -58,7 +58,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    {c}build{z} -t <name> [-f Dockerfile] [--build-arg K=V] [--target S] [ctx]  Build a local image from a Dockerfile (--target: stop at that `FROM … AS S` stage)
+    {c}build{z} -t <name> [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
     {c}images{z} [--json]                                                List pulled (cached) images
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)

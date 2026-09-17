@@ -28,7 +28,7 @@ COMMANDS:
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     tag <src> <dst>                                                Give a cached image a second name
     commit <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    build -t <name> [-f Dockerfile] [--build-arg K=V] [--target S] [ctx]  Build a local image from a Dockerfile (--target: stop at that `FROM … AS S` stage)
+    build -t <name> [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
     images [--json]                                                List pulled (cached) images
     rmi <image>...                                                 Remove cached images (frees unshared layers)
     save <image> [-o file]                                         Export an image to a tar (docker load-compatible)

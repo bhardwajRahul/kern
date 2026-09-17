@@ -51,8 +51,8 @@ kern run --memory 256m --cpus 0.5 -- ./job # limits only, host still visible
 kern compose up -d
 ```
 
-- **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
-  `save`/`load`. A box from an image starts in ~3.4 ms.
+- **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
+  `commit`, `push`, `save`/`load`. A box from an image starts in ~3.4 ms.
 - **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
   agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
   fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
