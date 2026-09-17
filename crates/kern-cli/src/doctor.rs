@@ -820,7 +820,7 @@ fn apparmor_userns_verdict(sysctl: Option<i64>, probe: Userns) -> R {
         // The knob is on AND nothing can map: `check_userns` has already failed, and repeating the
         // failure here would count one broken host twice.
         (Some(1), Userns::NoMap) => R::Warn(
-            "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+), and it is what refused the map above".into(),
+            "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+): it refused the map above".into(),
             "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 (or add an AppArmor profile for the kern binary)".into(),
         ),
         // On, and boxes work anyway: a profile covers the kern binary. Worth naming, not warning.
@@ -1742,11 +1742,34 @@ mod tests {
         let _g = crate::env_guard();
         let mut all = rows();
         assert!(all.len() > 5, "the list did not assemble: {}", all.len());
-        // The states this host is in exactly one of, so the other four are never otherwise measured.
-        all.push(userns_verdict(Userns::NoMap));
-        all.push(userns_verdict(Userns::NoNamespace));
-        all.push(selinux_verdict(true, Some("1".into())));
-        all.push(selinux_verdict(true, Some("0".into())));
+        // EVERY state each pure verdict can be in, not the one this host happens to be in. Driven
+        // exhaustively rather than sampled: the first two versions of this test each found exactly
+        // one more row per CI run, because each added only the state that had just failed.
+        for probe in [Userns::Works, Userns::NoNamespace, Userns::NoMap] {
+            all.push(userns_verdict(probe));
+            for sysctl in [None, Some(0), Some(1), Some(2)] {
+                all.push(apparmor_userns_verdict(sysctl, probe));
+            }
+        }
+        for present in [false, true] {
+            for mode in [None, Some("0"), Some("1"), Some("7"), Some("")] {
+                all.push(selinux_verdict(present, mode.map(str::to_string)));
+            }
+        }
+        // Both branches of a tool row, for every tool as it is actually spelled in `check_tools`.
+        // `which` decides which branch a real call takes, so a host with the tool never renders the
+        // other one. The names are deliberately absent ones so the not-found branch is the one built.
+        all.push(tool_req(
+            "definitely-not-here",
+            "kern pull / --image",
+            "install GNU tar >= 1.27",
+        ));
+        all.push(tool_opt(
+            "definitely-not-here",
+            "pod outbound networking (NAT + DNS)",
+            "a plain box is loopback-only whatever pasta does; `--net` gives it the host's stack",
+            "install passt",
+        ));
         for r in &all {
             let (msg, note, bound_note) = match r {
                 R::Ok(m, n) => (m, n, true),
