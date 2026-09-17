@@ -7,6 +7,10 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The Boxes tab of `kern top` says what it lists.** Every other list pane has a caption and the row
+budget reserves one for all of them, so this tab was spending the line on nothing; it now names the
+pane, the word containers, and the command that makes one.
+
 **`kern top` could not reach past the first screenful of any list.** Every pane drew its rows from
 index zero, so on a host with 309 cached images the Images tab showed 25 and `… 284 more`, and no key
 reached the 284: the selection walked off the bottom of the screen and the window never followed it.

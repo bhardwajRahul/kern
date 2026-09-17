@@ -3352,7 +3352,17 @@ fn builds_table(
 
 fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &HostStats) -> String {
     let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
-    let mut s = String::new();
+    // The caption every other list pane has and this one did not, though the row budget above
+    // already reserves its three lines (blank, caption, blank) for EVERY pane: Boxes was spending
+    // the slot on nothing. It carries the word `containers` because that is what someone arriving
+    // from another runtime looks for, and a capability named only in this project's own vocabulary
+    // is invisible to them - measured once already, when `host.docker.internal` existed and went
+    // unfound for three weeks. The pane still costs exactly the 5 chrome lines the budget counts:
+    // the start-rate line below takes the second blank's place when it is there.
+    // It says `boxes` and not `running boxes` because a row here can be ORPHANED, and the guard
+    // that catches a dashboard contradicting its own STATUS column reads the whole pane.
+    let mut s =
+        format!("\n  {d}boxes (containers) - {z}{c}kern box <name>{z}{d} · pods grouped{z}\n");
     // Box-START rate. The live list below shows only boxes alive right NOW, but a `kern box` lives ~ms:
     // an agent firing hundreds/sec (via the SDK / kern-mcp) flickers past a 1 s refresh and never appears
     // in the list. This header counts STARTS as a rate + sparkline (same daemonless counter as the Runs
@@ -3366,6 +3376,8 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
             host.box_starts_total,
             spark(&host.box_starts_spark)
         ));
+    } else {
+        s.push('\n');
     }
     // THE NAME COLUMN IS MEASURED, for the reason the comment further down already gives about pod
     // members and which applied one case over. A box with no pod has an empty `pod` field, so
@@ -3910,6 +3922,35 @@ mod tests {
         assert!(
             !none.contains("box starts"),
             "no rate header before any box has started"
+        );
+    }
+
+    #[test]
+    fn the_boxes_caption_costs_the_same_rows_with_or_without_the_start_rate() {
+        // The frame budget (`body_rows = term_rows - 12`) reserves FIVE lines per list pane. Boxes
+        // used two of them and now uses the caption as well, so the arithmetic is asserted rather
+        // than trusted: the start-rate line, when present, takes the second blank's place instead of
+        // adding a sixth line. Getting this wrong is the flicker the budget comment describes.
+        let chrome = |host: &HostStats| -> usize {
+            boxes_table(&plain(), &[], 10, usize::MAX, host)
+                .lines()
+                .count()
+        };
+        let busy = HostStats {
+            box_starts_total: 12,
+            box_starts_per_sec: 3.0,
+            ..HostStats::default()
+        };
+        let idle = HostStats::default();
+        assert_eq!(chrome(&busy), chrome(&idle), "same rows in both branches");
+        let out = boxes_table(&plain(), &[], 10, usize::MAX, &idle);
+        assert!(
+            out.contains("boxes (containers)"),
+            "the pane names what it lists, in the word a reader from another runtime searches for"
+        );
+        assert!(
+            out.contains("kern box <name>"),
+            "and the command that makes one, as every other pane's caption does"
         );
     }
 
