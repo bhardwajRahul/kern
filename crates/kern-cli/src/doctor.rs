@@ -903,10 +903,10 @@ fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
                 `sudo setenforce 1`: that is the discriminator, because the denial is `dontaudit`ed \
                 and the audit log stays empty while it happens";
     match mode.as_deref().map(str::trim) {
-        Some("1") => R::ok(
-            "SELinux: ENFORCING (kern's isolation is unaffected; a policy can still refuse what the \
-             kernel would allow, e.g. pod egress)"
-                .into(),
+        Some("1") => R::ok_note(
+            "SELinux: ENFORCING",
+            "kern's isolation is unaffected; a policy can still refuse what the kernel would \
+             allow, e.g. pod egress",
         ),
         Some("0") => R::ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
         Some(other) => R::Warn(
@@ -1721,21 +1721,36 @@ mod tests {
 
     /// THE GATE OVER THE WHOLE LIST, which is the only place this defect is visible.
     ///
-    /// Each row was written and reviewed alone, and alone each one looked reasonable; read together
-    /// on a terminal, two of them ran to 169 and 181 characters and wrapped over their neighbours.
-    /// This holds every row `doctor` produces on THIS host at once, so a new one cannot be added
-    /// past it, and it is also the check that the `Ok` note actually gets used rather than a
-    /// qualification being pushed back into a parenthesis on the verdict line.
+    /// Each row was written and read alone, and alone each one looked reasonable; read together on a
+    /// terminal, two of them ran to 169 and 181 characters and wrapped over their neighbours. This
+    /// holds every row at once, so a new one cannot be added past it, and it is also the check that
+    /// the `Ok` note gets used rather than a qualification going back into a parenthesis.
+    ///
+    /// ONLY THE VERDICT LINE IS BOUNDED FOR A WARNING OR A FAILURE, and the first version of this
+    /// bounded their hints too. That is wrong, and CI said so: the `Userns::NoMap` hint is 1078
+    /// characters because it is a REMEDY, a sequence of commands with this binary's absolute path
+    /// substituted into it three times, meant to be pasted rather than read. Length is a defect in
+    /// a sentence a reader must read and a property of a command they must copy. An `Ok` note is a
+    /// qualification and stays bounded.
+    ///
+    /// The rows of THIS host are not enough, which is the second thing CI said. The AppArmor remedy
+    /// is unreachable on a machine where AppArmor does not restrict the rootless map, so the verdicts
+    /// this host cannot produce are constructed and held to the same rule.
     #[test]
-    fn every_doctor_row_on_this_host_fits_a_terminal() {
+    fn every_doctor_row_fits_a_terminal() {
         // `check_tools` reads the process-global `PATH`, so this takes the lock for the whole body.
         let _g = crate::env_guard();
-        let all = rows();
+        let mut all = rows();
         assert!(all.len() > 5, "the list did not assemble: {}", all.len());
+        // The states this host is in exactly one of, so the other four are never otherwise measured.
+        all.push(userns_verdict(Userns::NoMap));
+        all.push(userns_verdict(Userns::NoNamespace));
+        all.push(selinux_verdict(true, Some("1".into())));
+        all.push(selinux_verdict(true, Some("0".into())));
         for r in &all {
-            let (msg, note) = match r {
-                R::Ok(m, n) => (m, n),
-                R::Warn(m, h) | R::Fail(m, h) => (m, h),
+            let (msg, note, bound_note) = match r {
+                R::Ok(m, n) => (m, n, true),
+                R::Warn(m, h) | R::Fail(m, h) => (m, h, false),
             };
             assert_eq!(msg.lines().count(), 1, "a verdict spans lines: {msg}");
             assert!(
@@ -1743,11 +1758,13 @@ mod tests {
                 "{} chars of verdict, move the tail to the note line: {msg}",
                 msg.len()
             );
-            assert!(
-                note.len() <= NOTE_MAX,
-                "{} chars of note: {note}",
-                note.len()
-            );
+            if bound_note {
+                assert!(
+                    note.len() <= NOTE_MAX,
+                    "{} chars qualifying a PASSING row: {note}",
+                    note.len()
+                );
+            }
         }
     }
 
