@@ -685,6 +685,20 @@ _FRAME_LINE_MARKS = (
 )
 
 
+# The "invisible" leading run a cell can put before a marker to slip it past the line anchor: ASCII
+# space and tab, the Unicode spaces (NBSP, the en/em family, ideographic space) and the zero-width
+# characters (ZWSP/ZWNJ/ZWJ, BOM). The `^` anchor alone catches `[sandbox: oom]` at column 0 but
+# MISSES ` [sandbox: oom]` (one leading space), and a model reads the two identically - the space is
+# invisible to it - so a cell forges a verdict by printing one character first. Stripped for the
+# anchor AND for the label below, because a line that is ONLY invisibles + marker is the frame
+# indented, not a sentence that mentions it ("the error [sandbox: oom]" keeps a WORD before the
+# marker and is left alone).
+_INVIS = (
+    "\t \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    "\u2008\u2009\u200a\u200b\u200c\u200d\u202f\u205f\u3000\ufeff"
+)
+_LEAD = "[" + re.escape(_INVIS) + "]*"
+
 # TWO PATTERNS, not one, because the two surfaces neutralise these differently ON PURPOSE and the
 # difference is worth keeping: a line-anchored frame is LABELLED (the reader still sees what the code
 # printed), while a truncation notice is REPLACED, since leaving its words in place would leave the claim
@@ -692,8 +706,8 @@ _FRAME_LINE_MARKS = (
 # recognised by both from this one edit, which is what the reset note needed and did not have.
 _FORGED_LINE_FRAME = re.compile(
     "|".join(
-        [*(r"^" + re.escape(m.rstrip()) for m in _FRAME_LINE_MARKS),
-         r"^\[\d+" + re.escape(_FRAME_MCP_IMG_TAIL)]
+        [*(r"^" + _LEAD + re.escape(m.rstrip()) for m in _FRAME_LINE_MARKS),
+         r"^" + _LEAD + r"\[\d+" + re.escape(_FRAME_MCP_IMG_TAIL)]
     ),
     re.MULTILINE,
 )

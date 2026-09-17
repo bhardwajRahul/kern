@@ -7,6 +7,15 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A cell could forge a sandbox verdict with one leading space.** The neutralisation that stops a box
+printing `[sandbox: oom]` or `[exit 137]` and having a model read it as the sandbox's own verdict was
+anchored at column 0, so ` [sandbox: oom]` (one space, a tab, a NBSP, a zero-width space or a BOM in
+front) sailed through unlabelled - and a model reads the leading space as nothing. The anchor now
+allows a run of invisible characters before the marker, on every surface that neutralises framing
+(the MCP server, the LangChain renderer, the Pi extension). A marker with a WORD in front of it is
+still left alone, because that is a sentence mentioning the frame rather than forging it.
+
+
 **`kern build` reads a `Containerfile`.** Without `-f`, it looks for that name first and for
 `Dockerfile` second, which is the order podman and buildah use. Both are read and neither is
 deprecated: a build file is an input, and refusing to open one someone already has, because of what

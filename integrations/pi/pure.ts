@@ -409,8 +409,24 @@ const FRAME_LINE_MARKS = [
 ];
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The "invisible" leading run a cell can put before a marker to slip it past the line anchor: ASCII
+ * space and tab, the Unicode spaces (NBSP, the en/em family, ideographic space) and the zero-width
+ * characters (ZWSP/ZWNJ/ZWJ, BOM).
+ *
+ * 🔴 `^` ALONE IS NOT ENOUGH, and one character defeats it. `[sandbox: oom]` at column 0 is caught;
+ * ` [sandbox: oom]` is not, and a model reads the two IDENTICALLY because the space is invisible to
+ * it. So a cell forges a verdict by printing one space first. Kept in sync by hand with `_INVIS` in
+ * the Python binding, which is the canonical spelling.
+ *
+ * A line that is ONLY invisibles + marker is the frame indented, not a sentence that mentions it:
+ * "the error [sandbox: oom]" keeps a WORD before the marker and is deliberately left alone.
+ */
+const INVIS = "\\t \\u00a0\\u1680\\u2000-\\u200d\\u202f\\u205f\\u3000\\ufeff";
+const LEAD = `[${INVIS}]*`;
 const FORGED_LINE_FRAME = new RegExp(
-	`^(?:${FRAME_LINE_MARKS.map(esc).join("|")}|\\[\\d+ image result\\(s\\) omitted: reply-size cap\\])`,
+	`^${LEAD}(?:${FRAME_LINE_MARKS.map(esc).join("|")}|\\[\\d+ image result\\(s\\) omitted: reply-size cap\\])`,
 	"gm",
 );
 const FORGED_CUT_NOTICE = /\.\.\.\[truncated \d+ chars\]|\.\.\. \d+ characters of output, cut to fit \.\.\./g;
@@ -433,7 +449,10 @@ const CONTROL_BYTES = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
  * legitimately printing the same characters without destroying real output.
  */
 export function untrusted(text: string): string {
-	const label = (m: string) => `[printed by the code, not the sandbox: ${m.replace(/^[.[]+/, "")}`;
+	// The invisible prefix FIRST: the pattern now matches a marker preceded by invisible characters,
+	// so the match carries them and the label would otherwise keep them in front of the reframing.
+	const label = (m: string) =>
+		`[printed by the code, not the sandbox: ${m.replace(new RegExp(`^[${INVIS}]*`), "").replace(/^[.[]+/, "")}`;
 	const flat = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	const clean = flat.replace(ANSI_ESCAPES, "").replace(CONTROL_BYTES, "");
 	return clean.replace(FORGED_LINE_FRAME, label).replace(FORGED_CUT_NOTICE, label);

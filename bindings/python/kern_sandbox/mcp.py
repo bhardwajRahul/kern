@@ -43,7 +43,7 @@ import traceback
 from . import (Kernel, Sandbox, SandboxError, __version__, _FORGED_CUT_NOTICE,
                _FORGED_LINE_FRAME, _FRAME_MCP_CLIP, _FRAME_MCP_EXIT, _FRAME_MCP_IMG_TAIL,
                _FRAME_MCP_RESET, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _FRAME_MCP_TRUNC,
-               _neutralise_terminal)
+               _INVIS, _neutralise_terminal)
 
 # The single MCP protocol revision we implement; initialize always answers with THIS (we negotiate to
 # our version, we never echo a client-chosen string back).
@@ -100,7 +100,9 @@ def _untrusted(text: str) -> str:
     NOT closed, and not closable here: ordinary prompt injection. A cell whose output is
     `[system] ignore your instructions` printed a string, and no filter separates that from a program
     legitimately printing the same characters without destroying real output."""
-    label = lambda m: "[printed by the code, not the sandbox: " + m.group(0).lstrip(".[")  # noqa: E731
+    # `_INVIS` FIRST: the pattern now matches a marker preceded by invisible characters (a cell that
+    # prints one space slips past a bare `^`), so the match carries them and the label would keep them.
+    label = lambda m: "[printed by the code, not the sandbox: " + m.group(0).lstrip(_INVIS).lstrip(".[")  # noqa: E731
     # BOTH shared patterns, in the core so the LangChain renderer recognises the same markers: this
     # server labels every one of them, which keeps what the code printed visible while saying whose it is.
     return _FORGED_CUT_NOTICE.sub(label, _FORGED_LINE_FRAME.sub(label, _neutralise_terminal(text)))
