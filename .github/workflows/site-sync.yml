@@ -1,7 +1,7 @@
 name: site-sync
 
-# `getkern.dev/install.sh` must stay byte-identical to the one in this repo, because a user can audit
-# the file on GitHub before piping the OTHER one into their shell. That is the whole argument for
+# `getkern.dev/install.sh` and `install.ps1` must stay byte-identical to the ones in this repo,
+# because a user can audit the file on GitHub before piping the OTHER one into their shell. That is the whole argument for
 # `curl | sh` being acceptable here, and it is only true while the two agree.
 #
 # Nothing enforced it. The file drifted TWICE in a single day: once carrying a stale Darwin message
@@ -32,19 +32,31 @@ jobs:
           # tag, and the default shallow checkout fetches none, so `git describe` would fail on a
           # repository that has plenty.
           fetch-depth: 0
-      - name: compare the served file with this tree
+      - name: compare the served installers with this tree
         run: |
+          # BOTH INSTALLERS, and the second one is here because checking only the first hid a drift
+          # for longer than the one it caught. `install.sh` was audited daily and `install.ps1` was
+          # not, so while the Linux file was being re-synced the Windows one sat at 271 lines against
+          # the tree's 575: no antivirus detection, no `kern.cmd` fallback, seven fewer checksum
+          # checks. A gate that watches one of two identical surfaces does not report the other as
+          # unwatched, it reports nothing at all, which reads exactly like "fine".
+          #
           # A cache-busting query so Cloudflare answers from origin: a HIT could show yesterday's file
           # and report drift that was already fixed, or hide drift that exists.
-          curl -fsSL "https://getkern.dev/install.sh?ci=${GITHUB_RUN_ID}" -o /tmp/served.sh
-          if diff -u install.sh /tmp/served.sh; then
-            echo "getkern.dev serves the installer in this tree"
-            exit 0
-          fi
-          echo "::error::getkern.dev/install.sh has drifted from install.sh in main" >&2
-          echo "re-sync it, then re-run this check:" >&2
-          echo "  scp install.sh root@getkern.dev:/var/www/getkern.dev/install.sh" >&2
-          exit 1
+          bad=0
+          for f in install.sh install.ps1; do
+            curl -fsSL "https://getkern.dev/$f?ci=${GITHUB_RUN_ID}" -o "/tmp/served-$f"
+            if diff -u "$f" "/tmp/served-$f"; then
+              echo "getkern.dev serves the $f in this tree"
+            else
+              echo "::error::getkern.dev/$f has drifted from $f in main" >&2
+              echo "  scp $f root@getkern.dev:/var/www/getkern.dev/$f" >&2
+              bad=1
+            fi
+          done
+          # Every file is reported before exiting: stopping at the first turns a two-file drift into a
+          # one-file fix and a red run tomorrow.
+          exit $bad
       - name: the hero names every platform the page's own metadata claims
         run: |
           curl -fsSL "https://getkern.dev/?ci=${GITHUB_RUN_ID}" -o /tmp/live.html
