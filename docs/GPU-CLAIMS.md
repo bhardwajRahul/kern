@@ -4,10 +4,12 @@ This is the detail behind one paragraph of [SECURITY.md](../SECURITY.md), moved 
 limit ships: it is a long argument about a mechanism kern does not have, and it was crowding the
 policy for the mechanisms kern does have. Nothing here was shortened in the move.
 
-kern slices no GPU. `kern doctor` prints one line per DRM card saying what a cap on it *would* be
-worth, and this section is the evidence behind that line. The judgement ships ahead of the
-capability on purpose: if the cap shipped first, it would be sold as a boundary for however long the
-description took to catch up.
+kern slices no GPU. `kern doctor` prints one row per DRM card, the card and its tier on the first
+line and what that tier is worth on the line under it, and this section is the evidence behind both.
+The full statement appears where a GPU is actually being handed over: `kern box … --plan` prints it
+under a profile that grants a render node. The judgement ships ahead of the capability on purpose:
+if the cap shipped first, it would be sold as a boundary for however long the description took to
+catch up.
 
 **TIER-HW** means a hardware partition is present on that card: an SR-IOV virtual function, or MIG
 instances configured for it. The split such a partition makes is enforced by the device rather than

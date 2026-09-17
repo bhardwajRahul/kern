@@ -108,6 +108,14 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
                         r.pins
                     );
                 }
+                // A GRANTED GPU NODE IS WHERE THE FULL CLAIM IS WORTH READING, and `kern doctor` is
+                // not. That row answers "will boxes run here" and fires on every host with a DRM
+                // node - a Pi's `v3d`, a Jetson's `nv_platform`, WSL's passthrough node - so four
+                // lines of MIG/SR-IOV vocabulary there were spent on readers who were not handing a
+                // GPU to anybody. This line prints only when a profile actually does.
+                if r.devs.iter().any(|d| crate::gpu::is_compute_node(d)) {
+                    println!("    {}", crate::gpu::weakest_tier().claim());
+                }
             }
             Err(e) => {
                 refused += 1;

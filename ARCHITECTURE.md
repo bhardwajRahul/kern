@@ -113,8 +113,10 @@ crates/
 
 A GPU layer is **deferred to a later phase** and is additive: nothing in the core changes to accommodate
 it. The only GPU code here is `kern-cli/src/gpu.rs`, a read-only classifier: it reads `/sys/class/drm`
-and `/proc`, decides what a VRAM cap on each card would be worth, and hands `kern doctor` a line to
-print. It slices nothing and loads nothing, which is why it fits in a single static binary while the
+and `/proc`, decides what a VRAM cap on each card would be worth, and hands its two readers a string
+to print: `kern doctor`, a row per card, and `kern box … --plan`, which prints the full statement
+when a profile grants a render node. It slices nothing and loads nothing, which is why it fits in a
+single static binary while the
 layer that would actually cap a GPU does not. This document will describe that layer when there is
 something to describe.
 

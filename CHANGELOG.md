@@ -7,6 +7,16 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The GPU row in `kern doctor` is no longer a warning, and fits on the screen.** It fired on every
+host with any DRM node, which on a Raspberry Pi or a Jetson is a display core, and carried four lines
+of MIG and SR-IOV vocabulary about the strength of a cap this binary has no flag to request. The card
+and its tier are one line now with the qualification under it, and the full statement is printed
+where a GPU is actually handed over: `kern box ... --plan`, under a profile that grants a render node.
+
+**Three other `doctor` rows were a paragraph wide.** A passing row had nowhere to put a qualification
+but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
+warning stayed under 70. A passing row takes a second line now, as a warning always could.
+
 **The Boxes tab of `kern top` says what it lists.** Every other list pane has a caption and the row
 budget reserves one for all of them, so this tab was spending the line on nothing; it now names the
 pane, the word containers, and the command that makes one.

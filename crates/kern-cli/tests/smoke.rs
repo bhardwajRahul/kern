@@ -217,6 +217,52 @@ fn box_plan_prints_ordered_isolation_sequence() {
     assert!(mount < pivot && pivot < ro, "steps out of order:\n{s}");
 }
 
+/// THE VRAM CAVEAT BELONGS TO THE GRANT AND NOT TO THE HOST.
+///
+/// It used to be a `!` row in `kern doctor`, which fires on every host that has a DRM node at all:
+/// a Raspberry Pi's `v3d`, a Jetson's `nv_platform`, WSL's passthrough node. Four lines of
+/// MIG/SR-IOV vocabulary were spent there on readers who were not handing a GPU to anybody, and a
+/// warning true of every host teaches people to skim the list that also carries "unprivileged userns
+/// restricted". Both halves are asserted here: present on the GPU grant, absent on the other one.
+#[test]
+fn the_vram_caveat_prints_on_a_gpu_grant_and_not_on_another_device() {
+    let dir = std::env::temp_dir().join(format!("kern-gpuplan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let cfg = dir.join("kern.toml");
+    std::fs::write(
+        &cfg,
+        "[[vgpio]]\nname = \"gpu\"\nbackend = \"host\"\ndisplay = [\"/dev/dri/renderD128\"]\n\n\
+         [[vgpio]]\nname = \"other\"\nbackend = \"host\"\nextra = [\"/dev/null\"]\n",
+    )
+    .expect("write config");
+    let plan = |profile: &str| -> String {
+        let out = kern()
+            .args(["box", "p", "--config"])
+            .arg(&cfg)
+            .args([profile, "--plan"])
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    const CAVEAT: &str = "NOT a boundary against malicious code";
+    let gpu = plan("vgpio:gpu");
+    let other = plan("vgpio:other");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Skipped rather than failed when the host has no render node: the grant cannot resolve there,
+    // and a test that passes because the subject never ran is the one shape worth refusing.
+    if gpu.contains("bind /dev/dri/renderD128") {
+        assert!(gpu.contains(CAVEAT), "no caveat on a granted GPU:\n{gpu}");
+    }
+    assert!(
+        gpu.contains(CAVEAT) || !std::path::Path::new("/dev/dri/renderD128").exists(),
+        "a host with a render node printed no caveat:\n{gpu}"
+    );
+    assert!(
+        !other.contains(CAVEAT),
+        "the caveat leaked onto a non-GPU grant:\n{other}"
+    );
+}
+
 #[test]
 fn box_plan_rejects_a_traversing_name() {
     let out = kern()

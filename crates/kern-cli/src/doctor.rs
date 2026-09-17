@@ -20,9 +20,29 @@ use crate::ui::Palette;
 
 /// One check outcome.
 enum R {
-    Ok(String),
+    /// message, note (may be empty). The note prints on its own dim line, exactly as the hint
+    /// of a `Warn` does. It exists because it did not: a qualification that could not be a second
+    /// line was written into a parenthesis on the first, and two rows reached 169 and 181 characters
+    /// while every `!` row stayed under 70. The shape of the type was deciding the prose.
+    Ok(String, String),
     Warn(String, String), // message, hint
     Fail(String, String),
+}
+
+impl R {
+    /// A passing row whose verdict says the whole thing.
+    fn ok(msg: String) -> R {
+        R::Ok(msg, String::new())
+    }
+
+    /// A passing row with a qualification that belongs on its own line.
+    ///
+    /// The line above the note answers `doctor`'s question and is read first; the note is what a
+    /// reader needs only if they are deciding something. Both were previously one line joined by a
+    /// parenthesis, and that line does not fit a terminal.
+    fn ok_note(msg: &str, note: &str) -> R {
+        R::Ok(msg.to_string(), note.to_string())
+    }
 }
 
 /// What the per-box `systemd-run --user --scope` actually costs on THIS host, and how to stop paying
@@ -54,7 +74,7 @@ fn check_scope_toll() -> R {
     let mine = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     // Inside `user@<uid>.service` = inside the user manager's tree = kern caps directly, no toll.
     if mine.contains(&format!("/user@{uid}.service/")) {
-        return R::Ok("caps go direct into kern.slice: no per-box systemd round trip".into());
+        return R::ok("caps go direct into kern.slice: no per-box systemd round trip".into());
     }
     if !kern_isolation::user_systemd_present() {
         // No user manager means no transient scope to pay for, which on WSL2 is why a box costs 4.2 ms
@@ -66,7 +86,7 @@ fn check_scope_toll() -> R {
         // say both and point at the row that decides. Deliberately still a tick and NOT a second
         // warning: the cgroup row above already carries the warning, and duplicating it would make a
         // single problem look like two. This row costs no probe, which is what its doc promises.
-        return R::Ok(
+        return R::ok(
             "no systemd user manager here: no per-box scope is paid, and none is available to \
              delegate a cap through either - whether caps bind is the cgroup row above"
                 .into(),
@@ -91,11 +111,11 @@ fn check_scope_toll() -> R {
     // which is the duplicated-derived-condition rule broken in the function that measures it.
     const NO_SCOPE: &str = "caps take the best-effort path (no usable systemd --user scope)";
     if once().is_none() {
-        return R::Ok(NO_SCOPE.into());
+        return R::ok(NO_SCOPE.into());
     }
     let mut s: Vec<f64> = (0..3).filter_map(|_| once()).collect();
     if s.is_empty() {
-        return R::Ok(NO_SCOPE.into());
+        return R::ok(NO_SCOPE.into());
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ms = s[s.len() / 2];
@@ -157,7 +177,7 @@ fn check_linger() -> R {
     // invented, which is the one thing this codebase does not do. Measured on WSL2 (kernel
     // 6.18-microsoft-standard) on 2026-08-01.
     if !kern_isolation::user_systemd_present() {
-        return R::Ok(
+        return R::ok(
             "no systemd manager here, so nothing stops a detached box when your session ends"
                 .into(),
         );
@@ -169,12 +189,12 @@ fn check_linger() -> R {
     // which fixes nothing: measured on a Contabo VPS on 2026-08-01, a detached box as root was still
     // running with its port bound 30 s after every session had closed, lingering off throughout.
     if kern_isolation::systemd_scope_mode() == "--system" {
-        return R::Ok(
+        return R::ok(
             "running as root: boxes go to the system manager, so a detached box is not tied to a login session".into(),
         );
     }
     let Some(user) = current_username() else {
-        return R::Ok("could not resolve the current user name to check systemd lingering".into());
+        return R::ok("could not resolve the current user name to check systemd lingering".into());
     };
     if std::path::Path::new(&format!("/var/lib/systemd/linger/{user}")).exists() {
         // LINGERING IS NECESSARY AND NOT SUFFICIENT for a stack to come back after a REBOOT, and
@@ -183,11 +203,10 @@ fn check_linger() -> R {
         // owns one. The unit `kern compose <file> systemd` emits is what does, and it is the piece
         // a migration from Docker does not know it needs: there the daemon starts at boot and
         // restarts the containers itself.
-        return R::Ok(
-            "systemd lingering is on: a detached box outlives the session that started it (a \
-             compose STACK still needs its own unit to return after a reboot: \
-             `kern compose <file> systemd`)"
-                .into(),
+        return R::ok_note(
+            "systemd lingering is on: a detached box outlives the session that started it",
+            "a compose STACK still needs its own unit to return after a reboot: \
+             `kern compose <file> systemd`",
         );
     }
     R::Warn(
@@ -218,8 +237,13 @@ fn current_username() -> Option<String> {
     }
 }
 
-pub fn doctor() -> Result<(), Error> {
-    let p = Palette::detect();
+/// Every row `doctor` will print, in order, as a value.
+///
+/// Split out of [`doctor`] so a test can hold the WHOLE list rather than the handful of rows that
+/// happen to have their own unit test. The one property that only the whole list has is shape: a row
+/// that overflows the terminal is found by reading all of them at once, and reading them one at a
+/// time is how two of them reached 169 and 181 characters.
+fn rows() -> Vec<R> {
     let mut results: Vec<R> = vec![
         // Core: can we create an unprivileged user namespace at all?
         check_userns(),
@@ -242,14 +266,23 @@ pub fn doctor() -> Result<(), Error> {
     results.extend(check_gpu());
     results.extend(check_tools());
     results.push(check_kernel());
+    results
+}
+
+pub fn doctor() -> Result<(), Error> {
+    let p = Palette::detect();
+    let results = rows();
 
     println!("{b}kern doctor{z}", b = p.b, z = p.z);
     let (mut ok, mut warn, mut fail) = (0u32, 0u32, 0u32);
     for r in &results {
         match r {
-            R::Ok(m) => {
+            R::Ok(m, n) => {
                 ok += 1;
                 println!("  {g}✔{z} {m}", g = p.g, z = p.z);
+                if !n.is_empty() {
+                    println!("      {d}{n}{z}", d = p.d, z = p.z);
+                }
             }
             R::Warn(m, h) => {
                 warn += 1;
@@ -684,7 +717,7 @@ fn check_userns() -> R {
 /// Pure, so the three states can be tested without a kernel that exhibits each one.
 fn userns_verdict(probe: Userns) -> R {
     match probe {
-        Userns::Works => R::Ok("unprivileged user namespaces: enabled".into()),
+        Userns::Works => R::ok("unprivileged user namespaces: enabled".into()),
         Userns::NoNamespace => R::Fail(
             "unprivileged user namespaces: DISABLED - kern boxes need them".into(),
             "enable: sysctl -w kernel.unprivileged_userns_clone=1 (Debian) - see the AppArmor check below on Ubuntu".into(),
@@ -791,11 +824,11 @@ fn apparmor_userns_verdict(sysctl: Option<i64>, probe: Userns) -> R {
             "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 (or add an AppArmor profile for the kern binary)".into(),
         ),
         // On, and boxes work anyway: a profile covers the kern binary. Worth naming, not warning.
-        (Some(1), _) => R::Ok(
+        (Some(1), _) => R::ok(
             "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+), but this kern maps them anyway"
                 .into(),
         ),
-        _ => R::Ok("AppArmor: not restricting unprivileged user namespaces".into()),
+        _ => R::ok("AppArmor: not restricting unprivileged user namespaces".into()),
     }
 }
 
@@ -848,11 +881,10 @@ fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
         // while the host underneath is Enforcing and refusing things. kern is frequently run inside
         // one. The old wording asserted a fact about the host that this probe cannot establish, and
         // a reader chasing a denial would have crossed SELinux off the list on the strength of it.
-        return R::Ok(
-            "SELinux: no selinuxfs visible from here (not in force for this process; a \
-                      host policy can still apply if kern is running inside a container that does \
-                      not mount it)"
-                .into(),
+        return R::ok_note(
+            "SELinux: no selinuxfs visible from here",
+            "not in force for this process; a host policy can still apply if kern is running \
+             inside a container that does not mount it",
         );
     }
     // THE AUDIT LOG IS THE WRONG PLACE TO LOOK, and this hint said to look there until a Fedora 43
@@ -871,12 +903,12 @@ fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
                 `sudo setenforce 1`: that is the discriminator, because the denial is `dontaudit`ed \
                 and the audit log stays empty while it happens";
     match mode.as_deref().map(str::trim) {
-        Some("1") => R::Ok(
+        Some("1") => R::ok(
             "SELinux: ENFORCING (kern's isolation is unaffected; a policy can still refuse what the \
              kernel would allow, e.g. pod egress)"
                 .into(),
         ),
-        Some("0") => R::Ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
+        Some("0") => R::ok("SELinux: permissive (denials are logged, nothing is refused)".into()),
         Some(other) => R::Warn(
             format!(
                 "SELinux is present and {SELINUX_ENFORCE} holds {:?}, which is neither 0 nor 1",
@@ -893,12 +925,12 @@ fn selinux_verdict(selinuxfs_present: bool, mode: Option<String>) -> R {
 
 fn check_max_userns() -> R {
     match read_int("/proc/sys/user/max_user_namespaces") {
-        Some(n) if n > 0 => R::Ok(format!("max_user_namespaces: {n}")),
+        Some(n) if n > 0 => R::ok(format!("max_user_namespaces: {n}")),
         Some(_) => R::Fail(
             "max_user_namespaces is 0 - user namespaces are capped off".into(),
             "sysctl -w user.max_user_namespaces=10000".into(),
         ),
-        None => R::Ok("max_user_namespaces: (default)".into()),
+        None => R::ok("max_user_namespaces: (default)".into()),
     }
 }
 
@@ -964,14 +996,14 @@ fn check_cgroup() -> R {
     // removes it - the exact operation a box performs - so the three states are told apart.
     if !kern_isolation::user_systemd_present() {
         return match kern_isolation::memory_cap_state() {
-            MemoryCapState::Enforced => R::Ok(
+            MemoryCapState::Enforced => R::ok(
                 "cgroup v2, no systemd --user manager needed: caps enforced in the current cgroup"
                     .into(),
             ),
             // Reachable only if a transient scope carried a `MemoryMax` that bound while this host
             // reports no user manager. Not observed anywhere; report what was measured, not a state
             // derived from the two facts disagreeing.
-            MemoryCapState::EnforcedOnScope => R::Ok(
+            MemoryCapState::EnforcedOnScope => R::ok(
                 "cgroup v2: caps enforced on a transient scope (probed in force) though no systemd --user manager was detected"
                     .into(),
             ),
@@ -1013,7 +1045,7 @@ fn check_cgroup() -> R {
                 "`--memory` applied by the user manager on the box's own scope, probed in force"
             };
             if cpu_bandwidth_interface_present() {
-                R::Ok(format!(
+                R::ok(format!(
                     "cgroup v2 + systemd --user scope: resource caps enforced ({how})"
                 ))
             } else {
@@ -1025,7 +1057,7 @@ fn check_cgroup() -> R {
         }
         // Couldn't read `/proc/self/cgroup` to resolve the target - don't over- or under-claim.
         MemoryCapState::Unknown => {
-            R::Ok("cgroup v2 + systemd --user scope: memory/pids/cpu caps where delegated".into())
+            R::ok("cgroup v2 + systemd --user scope: memory/pids/cpu caps where delegated".into())
         }
         // The write did not bind in the box's cap target. Name the user manager's delegated set so the
         // fix (enable `memory` delegation) is actionable.
@@ -1109,7 +1141,7 @@ fn check_overlay() -> R {
                 ),
                 "measured constant here: same cost with an EMPTY lowerdir and with everything on tmpfs, so it is not your disk or your image. `--bind-rootfs` skips it (91.9 -> 11.3 ms per box on an Arduino UNO Q) but binds the source directly: mutable and shared between boxes, where the overlay root is per-box and leaves the source untouched".into(),
             ),
-            OverlayProbe::Works(_) => R::Ok(
+            OverlayProbe::Works(_) => R::ok(
                 "overlayfs: available unprivileged (box rootfs AND layered builds)".into(),
             ),
             // THE STATE THIS ROW USED TO CALL `available`. The driver is listed and the mount is
@@ -1230,7 +1262,7 @@ fn check_uid_range() -> R {
         .map(|s| has_subid_allocation(&s, &ids))
         .unwrap_or(false);
     if has_helper && has_subid {
-        return R::Ok("--uid-range / --user / --ssh: newuidmap + /etc/subuid present".into());
+        return R::ok("--uid-range / --user / --ssh: newuidmap + /etc/subuid present".into());
     }
     // Emit the two EXACT commands, not "install uidmap and add an allocation". kern deliberately does
     // NOT write `/etc/subuid`/`/etc/subgid` itself: it is global state shared with shadow-utils and
@@ -1279,16 +1311,19 @@ fn check_tools() -> Vec<R> {
         tool_opt(
             "mkfs.ext4",
             "vdisk: disk-backed quota (root)",
+            "",
             "tmpfs fallback used without it",
         ),
         tool_opt(
             "sshd",
             "kern box --ssh",
+            "",
             "install openssh-server in your images",
         ),
         tool_opt(
             "sshfs",
             "-v sshfs:// network volumes",
+            "",
             "install sshfs, or use nfs/smb",
         ),
         tool_opt(
@@ -1297,8 +1332,10 @@ fn check_tools() -> Vec<R> {
             // comes from `--net` (the host's own stack), not from this tool. Measured: a default box
             // reaches neither an IP nor DNS with pasta installed; the same command in a pod reaches
             // the internet. `doctor` is what a reader runs to learn what will work, so it may not
-            // name a capability the next command will not have.
-            "pod outbound networking (NAT + DNS); a plain box is loopback-only, `--net` gives it the host's",
+            // name a capability the next command will not have. That distinction is the NOTE, which
+            // is why it is not welded into the capability name.
+            "pod outbound networking (NAT + DNS)",
+            "a plain box is loopback-only whatever pasta does; `--net` gives it the host's stack",
             "install passt (apt install passt / dnf install passt); without it a pod is loopback-only \
              - peers reach each other but nothing reaches the network (no apk add / pip install). kern \
              uses pasta if present, it does not ship it",
@@ -1317,7 +1354,7 @@ fn check_tools() -> Vec<R> {
 /// `# CONFIG_SECURITY_LANDLOCK is not set`.
 fn landlock() -> R {
     match kern_isolation::landlock_abi() {
-        Some(v) => R::Ok(format!(
+        Some(v) => R::ok(format!(
             "Landlock: ABI v{v} (--landlock-rw enforces a write allowlist)"
         )),
         // The wording tracks the runtime, which is FAIL-CLOSED: a box that passes `--landlock-rw`
@@ -1337,15 +1374,21 @@ fn landlock() -> R {
 
 fn tool_req(bin: &str, what: &str, hint: &str) -> R {
     if which(bin) {
-        R::Ok(format!("{bin}: found ({what})"))
+        R::ok(format!("{bin}: found ({what})"))
     } else {
         R::Fail(format!("{bin}: MISSING - needed for {what}"), hint.into())
     }
 }
 
-fn tool_opt(bin: &str, what: &str, hint: &str) -> R {
+/// `what` NAMES THE CAPABILITY AND NOTHING ELSE, because it is substituted into two different
+/// sentences: "found (`what`)" and "not found - `what` unavailable". A `what` carrying a clause
+/// reads correctly in the first and is broken English in the second, which is what pasta's did:
+/// "not found - pod outbound networking (NAT + DNS); a plain box is loopback-only, `--net` gives it
+/// the host's unavailable". Any qualification goes in `note`, which is a line of its own, and the
+/// not-found branch does not need it because `hint` is already that line there.
+fn tool_opt(bin: &str, what: &str, note: &str, hint: &str) -> R {
     if which(bin) {
-        R::Ok(format!("{bin}: found ({what})"))
+        R::Ok(format!("{bin}: found ({what})"), note.to_string())
     } else {
         R::Warn(
             format!("{bin}: not found - {what} unavailable"),
@@ -1358,7 +1401,7 @@ fn check_kernel() -> R {
     let ver = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
-    R::Ok(format!("kernel: {ver}"))
+    R::ok(format!("kernel: {ver}"))
 }
 
 /// What a VRAM cap would be worth on each GPU present, per [`crate::gpu`].
@@ -1368,15 +1411,20 @@ fn check_kernel() -> R {
 /// boundary ships before the mechanism, so there is never a window in which kern can cap a GPU
 /// while its own documentation is still catching up with what the cap is worth.
 ///
-/// A cooperative tier is reported as a WARNING rather than as an OK, and the choice is deliberate.
-/// `doctor`'s contract is that a reader learns here what will and will not work; a green tick next
-/// to a GPU whose quota any tenant can step over would be read as "capping this GPU is safe", which
-/// is the exact misreading the tier model exists to prevent. A host with no GPU at all is an OK,
-/// because nothing is degraded: the feature simply does not apply.
+/// EVERY GPU ROW IS AN OK, AND IT USED TO BE A WARNING ON THE COOPERATIVE TIER. The warning was
+/// arguing against a misreading - "a green tick means capping this GPU is safe" - that needs a cap
+/// to exist in order to be made, and no flag in this binary caps a GPU: `kern box --help` has no
+/// `--gpus` and no `--vram`. So the `!` fired on every host with any DRM node, which on an ARM board
+/// is a display core (`v3d`, `vc4-drm`, `nv_platform`) and on WSL is a passthrough node. A warning
+/// that is true of 100% of hosts teaches the reader to skim past `!`, and the rows that need to be
+/// read - unprivileged userns restricted, no cgroup delegation - are in the same list.
+///
+/// What the row must still never do is imply a boundary; that contract moved from the severity to
+/// the words, where the vocabulary gate can hold it. A host with no GPU at all is an OK too.
 fn check_gpu() -> Vec<R> {
     let gpus = crate::gpu::detect();
     if gpus.is_empty() {
-        return vec![R::Ok(
+        return vec![R::ok(
             "no GPU found: GPU capability tiers do not apply on this host".into(),
         )];
     }
@@ -1390,31 +1438,21 @@ fn check_gpu() -> Vec<R> {
 /// checked on THIS string, not on the tier's claim alone, because the appendices below are the part
 /// most likely to drift.
 fn gpu_row(g: &crate::gpu::Gpu) -> R {
-    let line = crate::gpu::describe(g);
-    match g.tier {
-        crate::gpu::Tier::Hw => R::Ok(format!("{line}. {}", g.tier.claim())),
-        crate::gpu::Tier::Soft => {
-            let mut hint = g.tier.claim().to_string();
-            // `dmem` presence is appended as a FACT and never as a promotion. The controller
-            // accounts faithfully and, on the driver this was measured against, does not charge the
-            // ROCm compute path to the allocating cgroup, so its presence alone changes nothing
-            // about what a cap is worth. Showing it keeps the reader from concluding that kern
-            // failed to notice.
-            if g.dmem_controller {
-                hint.push_str(
-                    ". dmem cgroup controller present on this kernel, which accounts device \
-                     memory but is not known to charge this driver's compute path",
-                );
-            }
-            if g.kfd_present {
-                hint.push_str(
-                    ". /dev/kfd present: the ROCm compute path is the one measured NOT to \
-                     be charged to the allocating cgroup",
-                );
-            }
-            R::Warn(line, hint)
-        }
+    // The VERDICT is the card, its tier and the evidence. Everything a reader needs only when they
+    // are about to hand the device to a tenant goes on the note line.
+    //
+    // `dmem` and `/dev/kfd` sit there as FACTS and never as promotions. The controller accounts
+    // faithfully and, on the driver this was measured against, does not charge the ROCm compute path
+    // to the allocating cgroup, so its presence alone changes nothing about what a cap is worth.
+    // Naming them keeps the reader from concluding that kern failed to notice.
+    let mut note = g.tier.short().to_string();
+    if g.dmem_controller {
+        note.push_str(" · dmem cgroup controller present");
     }
+    if g.kfd_present {
+        note.push_str(" · /dev/kfd present");
+    }
+    R::ok_note(&crate::gpu::describe(g), &note)
 }
 
 // ── helpers ──
@@ -1590,8 +1628,7 @@ mod tests {
         /// it: a claim moved from the message into the hint is still a claim on screen.
         fn text(&self) -> String {
             match self {
-                R::Ok(m) => m.clone(),
-                R::Warn(m, h) | R::Fail(m, h) => format!("{m} {h}"),
+                R::Ok(m, h) | R::Warn(m, h) | R::Fail(m, h) => format!("{m} {h}"),
             }
         }
     }
@@ -1624,6 +1661,11 @@ mod tests {
                     None,
                     "a TIER-SOFT row claims a boundary (dmem={dmem}, kfd={kfd}): {row}"
                 );
+                // THE EXACT STRING, because `pentest-gpu-claims.sh` A4 pins it too and the two
+                // must not drift apart. This assertion was weakened to "the whole device" once and
+                // the shell suite caught what this one then let through: a cooperative row that
+                // avoided the forbidden words and no longer said anything about the boundary reads
+                // as a capability to anyone skimming.
                 assert!(
                     row.contains("NOT a boundary against malicious code"),
                     "the disclaimer went missing: {row}"
@@ -1637,16 +1679,90 @@ mod tests {
         );
     }
 
-    /// A cooperative tier is a WARNING and a hardware tier is an OK. Asserted because the choice is
-    /// the row's whole editorial content: a green tick next to a quota any tenant can step over
-    /// reads as "capping this GPU is safe".
+    /// NO GPU ROW IS A WARNING, and the row stays ONE LINE whatever the two extra facts say.
+    ///
+    /// Both halves are the defect this replaced. The `!` was true of every host with a screen, so it
+    /// spent the reader's attention on a feature this binary does not have; and the text it carried
+    /// was four lines in a list whose every other entry is one. The tier still has to be legible
+    /// from the row, which is what separates this from simply deleting the row.
     #[test]
-    fn tier_decides_the_severity() {
-        assert!(matches!(
-            gpu_row(&fake(Tier::Soft, false, false)),
-            R::Warn(..)
-        ));
-        assert!(matches!(gpu_row(&fake(Tier::Hw, false, false)), R::Ok(_)));
+    fn no_gpu_row_warns_and_none_of_them_wraps() {
+        for tier in [Tier::Soft, Tier::Hw] {
+            for dmem in [false, true] {
+                for kfd in [false, true] {
+                    let r = gpu_row(&fake(tier, dmem, kfd));
+                    let (msg, note) = match &r {
+                        R::Ok(m, n) => (m.clone(), n.clone()),
+                        other => panic!("a GPU row warns again: {}", other.text()),
+                    };
+                    assert!(msg.contains(tier.label()), "the tier is unreadable: {msg}");
+                    // The verdict line carries the card and its tier; the qualification is on the
+                    // note. Bounds are asserted on each PART, because the shape on screen is two
+                    // lines and a single joined length would hide one of them growing.
+                    assert!(
+                        msg.len() <= ROW_MAX,
+                        "{} chars of verdict: {msg}",
+                        msg.len()
+                    );
+                    assert!(
+                        note.len() <= NOTE_MAX,
+                        "{} chars of note: {note}",
+                        note.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Longest a row's two parts may be. Not a style preference: at 80 columns the verdict line is
+    /// indented 4 and the note 6, so these are the widths that survive one wrap instead of three.
+    const ROW_MAX: usize = 100;
+    const NOTE_MAX: usize = 140;
+
+    /// THE GATE OVER THE WHOLE LIST, which is the only place this defect is visible.
+    ///
+    /// Each row was written and reviewed alone, and alone each one looked reasonable; read together
+    /// on a terminal, two of them ran to 169 and 181 characters and wrapped over their neighbours.
+    /// This holds every row `doctor` produces on THIS host at once, so a new one cannot be added
+    /// past it, and it is also the check that the `Ok` note actually gets used rather than a
+    /// qualification being pushed back into a parenthesis on the verdict line.
+    #[test]
+    fn every_doctor_row_on_this_host_fits_a_terminal() {
+        // `check_tools` reads the process-global `PATH`, so this takes the lock for the whole body.
+        let _g = crate::env_guard();
+        let all = rows();
+        assert!(all.len() > 5, "the list did not assemble: {}", all.len());
+        for r in &all {
+            let (msg, note) = match r {
+                R::Ok(m, n) => (m, n),
+                R::Warn(m, h) | R::Fail(m, h) => (m, h),
+            };
+            assert_eq!(msg.lines().count(), 1, "a verdict spans lines: {msg}");
+            assert!(
+                msg.len() <= ROW_MAX,
+                "{} chars of verdict, move the tail to the note line: {msg}",
+                msg.len()
+            );
+            assert!(
+                note.len() <= NOTE_MAX,
+                "{} chars of note: {note}",
+                note.len()
+            );
+        }
+    }
+
+    /// Neither one-line form may claim a boundary either. The gate that guards [`Tier::claim`] runs
+    /// over the string `doctor` actually prints, which is now a different one.
+    #[test]
+    fn the_short_forms_never_overclaim() {
+        for tier in [Tier::Soft, Tier::Hw] {
+            assert_eq!(
+                overclaims(tier.short()),
+                None,
+                "short form claims a boundary: {}",
+                tier.short()
+            );
+        }
     }
 
     /// The `dmem` and `/dev/kfd` facts appear only when true, and neither changes the tier. This is
@@ -1700,7 +1816,7 @@ mod tests {
         for r in check_gpu() {
             let t = r.text();
             if t.starts_with("no GPU found") {
-                assert!(matches!(r, R::Ok(_)), "no GPU is not a degraded state");
+                assert!(matches!(r, R::Ok(..)), "no GPU is not a degraded state");
             }
         }
     }
@@ -1798,8 +1914,7 @@ mod tests {
     #[test]
     fn doctor_does_not_say_ready_on_a_host_where_no_box_can_start() {
         let msg = |r: &R| match r {
-            R::Ok(m) => m.clone(),
-            R::Warn(m, _) | R::Fail(m, _) => m.clone(),
+            R::Ok(m, _) | R::Warn(m, _) | R::Fail(m, _) => m.clone(),
         };
 
         // THE UBUNTU 24.04 DEFAULT, and the reason this exists. `unshare(CLONE_NEWUSER)` succeeds
@@ -1822,7 +1937,7 @@ mod tests {
         // to everyone who reads only the first command.
         let hint = match &no_map {
             R::Warn(_, h) | R::Fail(_, h) => h.clone(),
-            R::Ok(_) => String::new(),
+            R::Ok(..) => String::new(),
         };
         // `usize::MAX` for an absent remedy, so a hint that names only one of them fails the
         // ordering assertion rather than needing a second one to catch it.
@@ -1876,7 +1991,7 @@ mod tests {
         );
 
         // The other two are unchanged and still distinct.
-        assert!(matches!(userns_verdict(Userns::Works), R::Ok(_)));
+        assert!(matches!(userns_verdict(Userns::Works), R::Ok(..)));
         let none = userns_verdict(Userns::NoNamespace);
         assert!(matches!(none, R::Fail(..)));
         assert!(msg(&none).contains("DISABLED"));
@@ -1886,7 +2001,7 @@ mod tests {
         // that is a fact to state, not a warning to raise.
         let on_but_fine = apparmor_userns_verdict(Some(1), Userns::Works);
         assert!(
-            matches!(on_but_fine, R::Ok(_)),
+            matches!(on_but_fine, R::Ok(..)),
             "a restriction that is not biting must not warn: {}",
             msg(&on_but_fine)
         );
@@ -1898,11 +2013,11 @@ mod tests {
         // Off: nothing to say.
         assert!(matches!(
             apparmor_userns_verdict(Some(0), Userns::Works),
-            R::Ok(_)
+            R::Ok(..)
         ));
         assert!(matches!(
             apparmor_userns_verdict(None, Userns::Works),
-            R::Ok(_)
+            R::Ok(..)
         ));
     }
 
@@ -1924,13 +2039,12 @@ mod tests {
     #[test]
     fn selinux_verdict_separates_all_five_states() {
         let msg = |r: &R| match r {
-            R::Ok(m) => m.clone(),
-            R::Warn(m, _) | R::Fail(m, _) => m.clone(),
+            R::Ok(m, _) | R::Warn(m, _) | R::Fail(m, _) => m.clone(),
         };
 
         // No selinuxfs: the mode is not merely unknown, SELinux is not in force at all.
         let none = selinux_verdict(false, None);
-        assert!(matches!(none, R::Ok(_)), "absent SELinux must not warn");
+        assert!(matches!(none, R::Ok(..)), "absent SELinux must not warn");
         // It must report what it OBSERVED (no selinuxfs here), not a claim about the host it
         // cannot see: a container that does not mount selinuxfs looks identical to a host with no
         // SELinux at all, and "not active on this host" told the reader the second one either way.
@@ -1944,14 +2058,14 @@ mod tests {
         // Present and enforcing. Trailing newline, as the kernel writes it.
         let enf = selinux_verdict(true, Some("1\n".into()));
         assert!(
-            matches!(enf, R::Ok(_)),
+            matches!(enf, R::Ok(..)),
             "enforcing is the correct posture and must not warn"
         );
         assert!(msg(&enf).contains("ENFORCING"));
 
         // Present and permissive.
         let perm = selinux_verdict(true, Some("0\n".into()));
-        assert!(matches!(perm, R::Ok(_)));
+        assert!(matches!(perm, R::Ok(..)));
         assert!(msg(&perm).contains("permissive"));
 
         // Readable and NOT a number: the state that was reported as unreadable before this split.

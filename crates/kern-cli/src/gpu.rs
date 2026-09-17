@@ -151,6 +151,27 @@ impl Tier {
         }
     }
 
+    /// The ONE-LINE form, for a surface whose question is not "how strong is a VRAM cap".
+    ///
+    /// [`claim`] above is the full statement and belongs wherever a cap is actually being applied.
+    /// `doctor` is not that place: its contract is "will boxes run here?", and this binary has no
+    /// flag that caps a GPU at all, so the long form there was four lines of MIG/SR-IOV vocabulary
+    /// answering a question the reader had not asked. It fired on EVERY host with a DRM node - a
+    /// Raspberry Pi's `v3d`, a Jetson's `nv_platform`, WSL's passthrough node - none of which is a
+    /// GPU anybody was about to slice.
+    ///
+    /// Same vocabulary contract as `claim`: the test gate runs over both.
+    pub fn short(self) -> &'static str {
+        match self {
+            // Neither repeats what `describe` already put on the same line - the tier label and the
+            // evidence are there - so each one carries only the CONSEQUENCE for the reader.
+            Tier::Hw => "kern read its presence, not the split",
+            Tier::Soft => {
+                "NOT a boundary against malicious code: a granted render node is the whole device"
+            }
+        }
+    }
+
     /// Short label for tables and machine-readable output.
     pub fn label(self) -> &'static str {
         match self {
@@ -441,6 +462,36 @@ fn classify(device_dir: &Path, vendor: Vendor) -> (Tier, Evidence) {
 /// boards are the platforms kern is aimed at, and "no GPU found" on a machine with a GPU is a plain
 /// false statement, which costs more than a line that says non-PCI and names the driver. Absent
 /// identity now weakens the DESCRIPTION and never removes the device.
+/// Is `path` a device node through which a tenant can reach GPU COMPUTE?
+///
+/// Used by `kern box --plan` to decide whether the full [`Tier::claim`] is worth printing. The
+/// render node is the one a `vgpio:` profile is expected to grant and the one the config layer
+/// allows; the primary `cardN` node is refused there today, and is matched anyway so that a future
+/// grant cannot slip past this without also changing this function.
+///
+/// Prefix matching on the whole path, not a substring: a bind of `/home/user/renderD128` is a file
+/// with a confusing name and not a GPU.
+pub fn is_compute_node(path: &str) -> bool {
+    path.starts_with("/dev/dri/renderD")
+        || path.starts_with("/dev/dri/card")
+        || path.starts_with("/dev/nvidia")
+        || path == "/dev/kfd"
+}
+
+/// The tier to quote when a GPU node is granted but nothing establishes WHICH card served it.
+///
+/// Fail-closed, the same rule the detector follows per card: with cards of different tiers kern says
+/// the smaller thing. A host with no detected GPU also answers [`Tier::Soft`] - a grant of a node
+/// kern could not classify is the least, not the most, that can be claimed.
+pub fn weakest_tier() -> Tier {
+    let gpus = detect();
+    if !gpus.is_empty() && gpus.iter().all(|g| g.tier == Tier::Hw) {
+        Tier::Hw
+    } else {
+        Tier::Soft
+    }
+}
+
 pub fn detect() -> Vec<Gpu> {
     let dmem = dmem_controller_available();
     let kfd = Path::new("/dev/kfd").exists();
@@ -589,6 +640,31 @@ mod tests {
         assert_eq!(overclaims("provides VRAM isolation"), Some("isolation"));
         assert_eq!(overclaims("a SECURE per-tenant cap"), Some("secure"));
         assert_eq!(overclaims("a hardware partition"), Some("hard"));
+    }
+
+    /// The node test decides whether `--plan` prints the full claim, so a miss on either side is a
+    /// defect: a granted GPU with no caveat, or a caveat on a bind that is not a GPU at all.
+    #[test]
+    fn a_gpu_compute_node_is_told_apart_from_a_file_that_looks_like_one() {
+        for yes in [
+            "/dev/dri/renderD128",
+            "/dev/dri/card0",
+            "/dev/nvidia0",
+            "/dev/nvidiactl",
+            "/dev/kfd",
+        ] {
+            assert!(is_compute_node(yes), "missed a GPU node: {yes}");
+        }
+        for no in [
+            "/dev/i2c-5",
+            "/dev/gpiochip0",
+            "/dev/null",
+            "/home/user/renderD128", // a file with a confusing name
+            "/tmp/dev/nvidia0",      // not an absolute device path
+            "",
+        ] {
+            assert!(!is_compute_node(no), "claimed a non-GPU as one: {no}");
+        }
     }
 
     /// The reason kern prints for a tier must not be an assertion of the tier itself: evidence
