@@ -7,6 +7,13 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`kern compose --help` ended with two lines about networks.** They are the tail of `network create`
+in the full reference, and they were printed under `compose ps` as though they described it, because
+the per-verb filter read a line's first word before its indentation and that continuation begins
+"compose file names with `external: true`". A per-verb help now carries only lines that belong to the
+verb, and three signatures that lacked the double space separating a command from its description
+got it, so `kern box --help` no longer shows `compose cp` for ending its sentence with "the box".
+
 **The GPU row in `kern doctor` is no longer a warning, and fits on the screen.** It fired on every
 host with any DRM node, which on a Raspberry Pi or a Jetson is a display core, and carried four lines
 of MIG and SR-IOV vocabulary about the strength of a cap this binary has no flag to request. The card

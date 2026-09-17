@@ -217,6 +217,52 @@ fn box_plan_prints_ordered_isolation_sequence() {
     assert!(mount < pivot && pivot < ro, "steps out of order:\n{s}");
 }
 
+/// A PER-VERB `--help` MAY ONLY CONTAIN LINES THAT BELONG TO THAT VERB.
+///
+/// `kern <verb> --help` is a filtered view of the one reference `kern --help` prints, and the filter
+/// decided what a line was by reading its first word before looking at its indentation. A
+/// continuation line in the reference begins with a word like any other, so the tail of
+/// `network create` - which starts "compose file names with `external: true`" - was taken for a
+/// `compose` signature and printed under `compose ps`, dragging the line after it in as its own
+/// continuation. Two lines of text about networks, in the help for a different verb, reading as
+/// though they described the one above them.
+///
+/// Both directions are asserted, because the obvious fix for the first breaks the second: the
+/// continuation rule exists so that `up`'s five explanatory lines reach `kern up --help` at all.
+#[test]
+fn a_per_verb_help_carries_no_line_from_another_verb() {
+    let verb_help = |verb: &str| -> String {
+        let out = kern()
+            .args([verb, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("run kern {verb} --help: {e}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let compose = verb_help("compose");
+    assert!(
+        compose.contains("compose <file> ps"),
+        "the compose help lost its own signatures:\n{compose}"
+    );
+    assert!(
+        !compose.contains("external: true"),
+        "a `network create` continuation leaked into the compose help:\n{compose}"
+    );
+
+    // The other direction. `up` explains itself on the lines UNDER its signature, and those are the
+    // reason the filter follows continuations at all; a filter that dropped them would pass the
+    // assertion above while making the help useless.
+    let up = verb_help("up");
+    assert!(
+        up.contains("DEFAULT: a namespace per service"),
+        "the up help lost the continuation lines that explain it:\n{up}"
+    );
+    assert!(
+        up.matches("                    ").count() >= 5,
+        "fewer continuation lines than the reference gives `up`:\n{up}"
+    );
+}
+
 /// THE VRAM CAVEAT BELONGS TO THE GRANT AND NOT TO THE HOST.
 ///
 /// It used to be a `!` row in `kern doctor`, which fires on every host that has a DRM node at all:

@@ -45,7 +45,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
-    {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
+    {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
                                                                      -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
@@ -86,7 +86,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    {c}compose{z} <file> [{cv}]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
     {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
                                                                      DEFAULT: a namespace per service, as soon as the stack has two of them.
                                                                      They meet on the pod's bridge, which is Docker's own arrangement.
@@ -97,12 +97,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     {c}compose{z} <file> {c}run{z} [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
-    {c}compose{z} <file> {c}cp{z} <service>:<path> <dst> | <src> <service>:<path> Copy a file in or out, naming the SERVICE rather than the box
+    {c}compose{z} <file> {c}cp{z} <service>:<path> <dst> | <src> <service>:<path>  Copy a file in or out, naming the SERVICE rather than the box
     {c}compose{z} <file> {c}exec{z} [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
     {c}compose{z} <file> {c}ps{z} [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
     {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
     {c}up{z} [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
-    {c}pod{z} create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
+    {c}pod{z} create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]  Shared-network pod: peers reach each other by name.
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
@@ -362,7 +362,18 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
             out.push(line.to_string());
             continue;
         }
-        if in_commands && line_declares_verb(trimmed, verb) {
+        // INDENTATION DECIDES WHAT A LINE IS, and it has to decide FIRST. The continuation rule
+        // below already said so, but it was consulted second, so a continuation whose first word
+        // happens to be the verb was read as a signature: `kern compose --help` ended with
+        //
+        //     compose file names with `external: true`. Services of
+        //     DIFFERENT files on one resolve and reach each other by name (alias: net)
+        //
+        // which is the tail of `network create` in the reference, printed under `compose ps` as if
+        // it described it. Being pushed also set `carry`, which then dragged the line after it in.
+        // A signature sits at four spaces; anything out at the description column is prose.
+        let is_signature = flat.len() - trimmed.len() <= 8;
+        if in_commands && is_signature && line_declares_verb(trimmed, verb) {
             out.push(line.to_string());
             carry = true;
             continue;
@@ -1091,4 +1102,87 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
 pub fn examples() -> Result<(), Error> {
     print!("{EXAMPLE_KERN_TOML}");
     Ok(())
+}
+
+#[cfg(test)]
+mod help_filter_tests {
+    use super::*;
+
+    /// NO LINE OF THE REFERENCE MAY DECLARE A VERB FROM ITS DESCRIPTION.
+    ///
+    /// [`line_declares_verb`] reads the HEAD of a line - everything before the first double space -
+    /// precisely so a verb named in the prose does not pull the line into that verb's `--help`. When
+    /// a line has no double space at all, the whole of it is the head and the rule is off: measured,
+    /// `compose <file> cp <service>:<path> <dst> | <src> <service>:<path> Copy a file in or out,
+    /// naming the SERVICE rather than the box` had one space before `Copy`, so it was printed under
+    /// `kern box --help`, where nothing about it belongs.
+    ///
+    /// Asserted as the property rather than as a formatting rule, so the prose notes at the end of
+    /// the reference - which are not signatures and have no description column - are not dragged in
+    /// by a check they were never meant to satisfy. What must hold is only this: whatever verbs a
+    /// line declares, it declares them with its command spelling and not with its English.
+    #[test]
+    fn no_reference_line_declares_a_verb_from_its_prose() {
+        // `Palette::plain` reads the process-global `NO_COLOR`.
+        let _g = crate::env_guard();
+        let full = help_text(&crate::ui::Palette::plain());
+        let verbs: Vec<&str> = vec![
+            "box", "run", "exec", "ps", "logs", "compose", "build", "pull", "push", "images",
+            "volume", "pod", "network", "top", "doctor", "config", "stop", "start", "attach",
+            "inspect", "prune", "gc", "recover", "commit", "save", "load", "rmi", "wait", "events",
+            "update", "builds", "cp", "login",
+        ];
+        let mut checked = 0usize;
+        // The same two states the filter keeps. An `OPTIONS for <verb>:` block is claimed WHOLE by
+        // its verb and never matched line by line, so its lines are not this rule's business - and
+        // they do not all keep a description column (`-w, --workdir <dir> Working directory ...`).
+        let mut in_commands = false;
+        for line in full.lines() {
+            let flat = strip_ansi(line);
+            let trimmed = flat.trim_start();
+            if flat.contains("COMMANDS:") {
+                in_commands = true;
+                continue;
+            }
+            if trimmed.starts_with("OPTIONS") {
+                in_commands = false;
+                continue;
+            }
+            if !in_commands {
+                continue;
+            }
+            // Signature lines only: four spaces in. A continuation sits out at the description
+            // column and is claimed by the verb above it, never by its own words.
+            if trimmed.is_empty() || flat.len() - trimmed.len() != 4 {
+                continue;
+            }
+            let Some(head_end) = trimmed.find("  ") else {
+                // No description column. Then the line must not name a verb at all, or that verb
+                // gets it for free. The prose notes at the end of the reference are the case this
+                // allows through only when they name nothing.
+                for v in &verbs {
+                    assert!(
+                        !line_declares_verb(trimmed, v),
+                        "this line has no double space, so `{v}` is taken from its description and \
+                         the line lands in `kern {v} --help`:\n    {trimmed}"
+                    );
+                }
+                continue;
+            };
+            checked += 1;
+            let head = &trimmed[..head_end];
+            for v in &verbs {
+                assert_eq!(
+                    line_declares_verb(trimmed, v),
+                    line_declares_verb(head, v),
+                    "`{v}` is read out of the DESCRIPTION of this line, not its command:\n    \
+                     {trimmed}"
+                );
+            }
+        }
+        assert!(
+            checked > 20,
+            "only {checked} signatures found: the slicing broke"
+        );
+    }
 }

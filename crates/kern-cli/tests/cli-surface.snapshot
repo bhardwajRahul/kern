@@ -1,10 +1,3 @@
-  _  _______ ____  _   _
- | |/ / ____|  _ \| \ | |
- | ' /|  _| | |_) |  \| |
- | . \| |___|  _ <| |\  |
- |_|\_\_____|_| \_\_| \_|
-kern v0.9.32-98-g924daec-dirty: a fast, rootless sandbox & virtual resource runtime
-
 USAGE:
     kern <COMMAND> [ARGS]
 
@@ -15,7 +8,7 @@ COMMANDS:
     run [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
-    ps [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T] List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
+    ps [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
                                                                      -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
@@ -56,7 +49,7 @@ COMMANDS:
     history [-n N]                                                 Recently-run boxes
 
   Multi-box
-    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run|cp|exec] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run|cp|exec]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
     up [--no-pod|--pod|--bridge] [-d] / down                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
                                                                      DEFAULT: a namespace per service, as soon as the stack has two of them.
                                                                      They meet on the pod's bridge, which is Docker's own arrangement.
@@ -67,12 +60,12 @@ COMMANDS:
     compose <file> watch [service...]                              Rebuild + restart ONE service when its `build:` context changes
     compose <file> port <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     compose <file> run [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
-    compose <file> cp <service>:<path> <dst> | <src> <service>:<path> Copy a file in or out, naming the SERVICE rather than the box
+    compose <file> cp <service>:<path> <dst> | <src> <service>:<path>  Copy a file in or out, naming the SERVICE rather than the box
     compose <file> exec [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
     compose <file> ps [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
     up [-d] [--wait [--wait-timeout N]] / down [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
     up [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
-    pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
+    pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]  Shared-network pod: peers reach each other by name.
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     pod ls [--json] | pod rm <name>                                List pods, or remove one
