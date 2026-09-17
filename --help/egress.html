@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Egress control: what a box can reach | kern</title>
+<meta name="description" content="Written before the code, on purpose. Egress filtering is the one feature where a half-honest implementation is worse than none: it invites a false sense of s">
+<link rel="canonical" href="https://getkern.dev/guide/egress.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/egress.html">
+<meta property="og:title" content="Egress control: what a box can reach">
+<meta property="og:description" content="Written before the code, on purpose. Egress filtering is the one feature where a half-honest implementation is worse than none: it invites a false sense of s">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="egress-allowlist-egress-allow-threat-model-design">Egress allowlist (<code>--egress-allow</code>): threat model &amp; design</h1>
+<blockquote>
+<p>Written <strong>before</strong> the code, on purpose. Egress filtering is the one feature where a half-honest
+implementation is worse than none: it invites a false sense of safety. This document states exactly
+what the allowlist enforces, what it does <strong>not</strong>, and why.</p>
+<p><strong>Status.</strong> The three gaps this doc originally flagged are now closed: the foreground box exits cleanly
+(the helper is spawned in the host PID namespace, before box_run's <code>unshare(CLONE_NEWPID)</code>, so it never
+becomes the box-pidns zombie that used to deadlock teardown); an allowlisted NAME that resolves to a
+loopback / link-local / <code>169.254.169.254</code> / RFC-1918 IP is refused (resolved-IP SSRF guard); and only
+ports 80/443 are tunnelled. The one hole that remains is inherent to any name-based HTTP-proxy
+allowlist and is stated plainly below: domain fronting on a <strong>shared CDN</strong> (SNI != CONNECT host).</p>
+</blockquote>
+<h2 id="what-it-is">What it is</h2>
+<p><code>kern box … --egress-allow pypi.org,files.pythonhosted.org</code> gives a box outbound network access <strong>only
+to the listed domains</strong> (and their subdomains). An agent can <code>pip install</code> from PyPI but cannot exfiltrate
+to an arbitrary host. Without the flag the box's default is unchanged: <strong>no outbound at all</strong> (an isolated
+loopback-only netns). <code>--egress-allow</code> is strictly <em>more</em> open than the default, never less.</p>
+<h2 id="the-client-inside-the-box-has-to-speak-proxy">The client inside the box has to speak proxy</h2>
+<p>kern hands the box the allowlist as a <strong>forward proxy</strong> and exports <code>http_proxy</code>, <code>https_proxy</code> and
+their uppercase spellings into its environment, so anything that honours those variables works with
+no change: <code>curl</code>, <code>pip</code>, <code>npm</code>, Go, Python's <code>urllib</code> and <code>requests</code>.</p>
+<p>One common client does not, and it is the one in the smallest image people reach for first. Alpine's
+default <code>wget</code> is busybox's, and busybox does not implement the <code>CONNECT</code> tunnel that HTTPS through a
+proxy needs. Measured with <code>--egress-allow example.com</code>:</p>
+<table>
+<thead>
+<tr>
+<th>client</th>
+<th><code>http://</code></th>
+<th><code>https://</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>busybox <code>wget</code> (alpine's default)</td>
+<td>works</td>
+<td><strong>fails</strong>, <code>wget: error getting response</code></td>
+</tr>
+<tr>
+<td><code>curl</code></td>
+<td>works</td>
+<td>works</td>
+</tr>
+</tbody>
+</table>
+<p>So a first attempt with <code>kern box … --image alpine --egress-allow example.com -- wget https://example.com</code>
+reports a failure that is not the allowlist refusing anything: it is the client. <code>apk add curl</code> in the
+image, or any of the runtimes above, and the same box reaches the allowlisted host and nothing else.</p>
+<h2 id="how-it-is-enforced-the-enforceable-part">How it is enforced (the enforceable part)</h2>
+<ol>
+<li><strong>The box runs in an isolated network namespace.</strong> It has loopback and nothing else: no route to the
+   internet, no DNS, no default gateway. This is a <strong>real kernel boundary</strong>: the box, even as root in
+   its user namespace, cannot add a route or an interface to reach the outside. This is the load-bearing
+   property: everything below only matters because the box has no <em>other</em> way out.</li>
+<li><strong>The only egress is a kern-controlled HTTP proxy.</strong> kern runs two helper processes it owns, outside
+   the box's control:</li>
+<li>a <strong>pump</strong> joined to the box's network namespace, listening on <code>127.0.0.1:&lt;port&gt;</code> inside the box,
+     that relays bytes to a host-side UNIX socket (UNIX sockets are not namespaced, so they bridge the
+     box netns to the host without giving the box a network route);</li>
+<li>a <strong>filtering proxy</strong> in the host network namespace, listening on that UNIX socket, that parses each
+     request and dials out <strong>only</strong> to an allowlisted host.
+   <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code> / <code>http_proxy</code> / <code>https_proxy</code> are set in the box to point at the pump.
+   This is <strong>fail-closed</strong>: if either helper fails to start (or dies), the box's isolated netns still has
+   no route, so the box gets <em>no</em> outbound rather than an unfiltered one. A helper failure can only make
+   egress more restrictive, never open it.</li>
+<li><strong>The proxy allowlists by the host the client names</strong>: the <code>CONNECT host:port</code> target for HTTPS, or
+   the request's <code>Host</code> / absolute-URI for plain HTTP. A host that is not the allowlist (or a subdomain of
+   an entry) is refused with <code>403</code>, and no connection is dialed. An <strong>IP-literal</strong> target (<code>CONNECT
+   1.2.3.4:443</code>) never matches a domain entry, so it is refused too.</li>
+<li><strong>The proxy pins the dialed host to what it allowed.</strong> It resolves and connects to the <em>allowlisted</em>
+   name itself; the client cannot ask it to connect to one host and stream to another. It connects only
+   to a <strong>public unicast</strong> resolved address (loopback / link-local / <code>169.254.169.254</code> / RFC-1918 / ULA /
+   multicast are refused), which closes the SSRF where an allowlisted name resolves to a host-local
+   service, and it tunnels <strong>only ports 80 and 443</strong>, so an allowlisted host's <code>:22</code> or <code>:6379</code> is not
+   reachable.</li>
+</ol>
+<p>Because the box has no route except the proxy (point 1), a workload that simply ignores <code>HTTP_PROXY</code> and
+tries to open a raw socket to <code>evil.com:443</code> gets <code>ENETUNREACH</code>: there is nowhere for the packet to go.
+The proxy is not a suggestion; it is the only door.</p>
+<h2 id="what-it-does-not-stop-state-it-plainly">What it does NOT stop (state it plainly)</h2>
+<ul>
+<li><strong>Domain fronting / shared-CDN egress.</strong> The client asks to <code>CONNECT allowed.com:443</code>, the proxy dials
+  <code>allowed.com</code>, and then the client speaks TLS with <code>SNI=evil.com</code> inside that tunnel. If <code>evil.com</code> and
+  <code>allowed.com</code> are served by the <em>same</em> front (a shared CDN / IP), data can reach <code>evil.com</code>. The proxy
+  today does NOT parse the TLS ClientHello, so it does not check that the SNI equals the <code>CONNECT</code> host:
+  domain fronting on a shared endpoint is NOT defended against (a ClientHello-SNI-equals-CONNECT check is
+  a planned hardening). <strong>If your allowlist includes a big CDN domain, treat egress as open to everything
+  on that CDN.</strong></li>
+<li><strong>DNS exfiltration</strong> is not a channel here (the box has no DNS; the proxy resolves), but a covert
+  channel <em>inside</em> an allowed TLS session (timing, payload to an allowed host that then forwards) is not
+  something a network allowlist can see. This is an allowlist, not a DLP.</li>
+<li><strong>A kernel-level network escape.</strong> The isolation is the netns (a real boundary), but the <em>filtering</em> is
+  cooperative in the sense that it inspects an application protocol. For a workload you assume is actively
+  hostile and sophisticated, a microVM with a real firewall is the stronger tool. <code>--egress-allow</code> is for
+  <strong>semi-trusted</strong> code (an agent running <code>pip</code>/<code>npm</code>/<code>curl</code> you don't fully trust) that must not phone
+  home, not for defeating a determined, protocol-aware adversary.</li>
+</ul>
+<h2 id="summary">Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Strength</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Box has no egress except the proxy</td>
+<td><strong>Hard</strong> (isolated netns; kernel-enforced)</td>
+</tr>
+<tr>
+<td>Non-allowlisted domain refused</td>
+<td><strong>Hard</strong> for a normal client (proxy refuses <code>CONNECT</code>, no dial)</td>
+</tr>
+<tr>
+<td>IP-literal target refused</td>
+<td><strong>Hard</strong> (never matches a domain entry)</td>
+</tr>
+<tr>
+<td>Connecting an allowlisted NAME that resolves to a private/loopback/metadata IP</td>
+<td><strong>Hard</strong> (resolved-IP guard: the proxy refuses the WHOLE name if ANY resolved record is non-public: loopback / link-local / <code>169.254.169.254</code> / RFC-1918 / ULA / multicast, incl. IPv4-mapped IPv6 like <code>::ffff:127.0.0.1</code>. It does not "pick the public one" from a mixed record set, so a clever-DNS operator can't order/flip records to reach a host-local service.)</td>
+</tr>
+<tr>
+<td>Restricting the PORT on an allowlisted host</td>
+<td><strong>Hard</strong> (only 80 and 443 are tunnelled; <code>:22</code>, <code>:6379</code>, … are refused)</td>
+</tr>
+<tr>
+<td>SNI ≠ CONNECT host on a shared CDN (domain fronting)</td>
+<td><strong>Not addressed</strong> (no ClientHello parsing today)</td>
+</tr>
+<tr>
+<td>Covert channel inside an allowed session</td>
+<td><strong>Not addressed</strong> (this is an allowlist, not DLP)</td>
+</tr>
+</tbody>
+</table>
+<p>The rule of thumb kern states everywhere applies here too: this is a strong control for first-party and
+semi-trusted workloads, and it is honest about the microVM-shaped hole it does not fill.</p>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/EGRESS.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

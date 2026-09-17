@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kern.toml: configuration reference | kern</title>
+<meta name="description" content="kern reads TOML from ~/.config/kern/kern.toml and from compose files. Two kinds of definition live there, sharing one schema philosophy (every key mirrors a ">
+<link rel="canonical" href="https://getkern.dev/guide/config.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/config.html">
+<meta property="og:title" content="kern.toml: configuration reference">
+<meta property="og:description" content="kern reads TOML from ~/.config/kern/kern.toml and from compose files. Two kinds of definition live there, sharing one schema philosophy (every key mirrors a ">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="kern-config-profile-schema">kern config &amp; profile schema</h1>
+<p>kern reads TOML from <code>~/.config/kern/kern.toml</code> and from compose files. Two kinds of definition live
+there, sharing <strong>one schema philosophy</strong> (every key mirrors a CLI flag):</p>
+<ul>
+<li><strong>Resource profiles</strong>: reusable <code>[[vcpu]]</code> / <code>[[vgpio]]</code> / <code>[[vdisk]]</code> tables, attached to any
+  <code>kern box</code> or <code>kern run</code> by <strong>prefix</strong>: <code>kern run vcpu:heavy vgpio:sensors vdisk:data -- ./job</code>.
+  Managed with <code>kern config</code>, and edited live (guided, validated) in <code>kern top</code>.</li>
+<li><strong>Compose stacks</strong>: <code>[box.NAME]</code> tables in a compose file, brought up by <code>kern compose</code> in
+  <code>depends_on</code> order.</li>
+</ul>
+<p>The parser is hand-rolled (no <code>serde</code>/<code>toml</code>) and <strong>tolerant</strong>: an unrecognized section or key is
+<strong>ignored, not rejected</strong>, so a <code>kern.toml</code> shared with another kern edition still loads. A malformed
+value of a key it DOES implement is always an error, with its line.</p>
+<h2 id="which-file-is-in-effect">Which file is in effect</h2>
+<table>
+<thead>
+<tr>
+<th>source</th>
+<th>applies to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--config &lt;path&gt;</code></td>
+<td>that one <code>kern box</code> / <code>kern run</code> invocation, for its <code>vcpu:</code>/<code>vgpio:</code>/<code>vdisk:</code> tokens</td>
+</tr>
+<tr>
+<td><strong><code>KERN_CONFIG=&lt;path&gt;</code></strong></td>
+<td><strong>everything</strong>: reads <em>and</em> writes. <code>config list</code>/<code>add</code>/<code>rm</code>/<code>setup</code>/<code>edit</code>, <code>validate</code>, <code>info</code>, and every profile token</td>
+</tr>
+<tr>
+<td><code>$XDG_CONFIG_HOME/kern/kern.toml</code>, else <code>~/.config/kern/kern.toml</code></td>
+<td>the default when neither is set</td>
+</tr>
+</tbody>
+</table>
+<p><code>KERN_CONFIG</code> is how you keep a per-project config: export it and every kern command, including the
+ones that <em>edit</em> the file, uses it. <code>kern info</code> prints the path in effect. An exported-but-empty
+<code>KERN_CONFIG</code> counts as unset, since it would otherwise resolve to a relative path and drop a
+<code>kern.toml</code> in the current directory.</p>
+<hr />
+<h2 id="resource-profiles">Resource profiles</h2>
+<p>Profiles are <strong>resource-centric</strong>: you declare a named slice once, then attach it to as many boxes as
+you like by its prefix (declare-then-carve, attach-by-prefix). The CPU field names are spelled to match
+the CLI flags, see the divergence note at the end. A GPU family is on the
+<a href="https://github.com/getkern/kern/blob/main/ROADMAP.md">Roadmap</a>, not in this schema.</p>
+<blockquote>
+<p><strong>Editing by hand? Three rules cover everything:</strong></p>
+<ol>
+<li><strong>Attach by prefix.</strong> <code>[[vcpu]] name = "heavy"</code> is used as <code>vcpu:heavy</code> on the command line
+   (<code>kern run vcpu:heavy -- ./job</code>); same for <code>vgpio:</code> and <code>vdisk:</code>.</li>
+<li><strong>Every profile MUST name a <code>backend</code></strong> (the host resource it slices): a declared
+   <code>[[cpu]]</code>/<code>[[gpio]]</code>/<code>[[disk]]</code> id, or a reserved keyword: <strong><code>host</code></strong> (the whole host CPU, or the
+   host's own device nodes) or <strong><code>ram</code></strong> (a RAM-backed vdisk).</li>
+<li><strong>Key == flag.</strong> Every key is spelled exactly like its CLI flag (<code>cpus</code> = <code>--cpus</code>, <code>memory</code> =
+   <code>--memory</code>, <code>cpuset</code> = <code>--cpuset-cpus</code>), so if you know the flag you know the field.</li>
+</ol>
+<p>Copy-paste this starter, then edit. It shows the <strong>declare-then-carve</strong> shape: a physical
+<code>[[cpu]]</code>/<code>[[disk]]</code>/<code>[[gpio]]</code> block, then a profile that references it by <code>backend</code>. <strong>One key per
+line</strong> (the parser wants the multi-line form, not <code>[[vcpu]] name = "x" cpus = 2</code> on one line):</p>
+<p>```toml
+[[cpu]]                 # physical: the host CPU budget
+id    = "cpu:0"
+cores = 8.0
+[[vcpu]]                # a slice of it  -&gt;  attach with  vcpu:cpu
+name    = "cpu"
+backend = "cpu:0"       # or "host" for the whole host CPU, with no [[cpu]] block
+cpus    = 2</p>
+<p>[[disk]]                # physical: a disk pool for volumes
+id = "pool"
+path = "/var/lib/kern/disks"
+[[vdisk]]               # a size-capped scratch on it  -&gt;  vdisk:scratch
+name    = "scratch"
+backend = "disk:pool"   # or "ram" for a RAM tmpfs, with no [[disk]] block
+size    = "8g"</p>
+<p>[[gpio]]                # physical: a controller anchor (kern config setup writes one per host)
+id = "gpio:0"
+[[vgpio]]               # the device grant  -&gt;  vgpio:sensor
+name    = "sensor"
+backend = "gpio:0"      # or "host"; pins/pwm/adc/onewire NEED a [[gpio]] id here
+i2c     = ["/dev/i2c-1"]
+```</p>
+<p>Prefer not to hand-edit? <code>kern config setup</code> writes a starter tuned to this host, <code>kern top</code> edits
+profiles live (validated, with device pickers), <code>kern validate &lt;file&gt;</code> checks one, and
+<code>kern examples</code> prints a full annotated reference.</p>
+</blockquote>
+<h3 id="vcpu-a-cpu-memory-slice-attach-with-vcpuname"><code>[[vcpu]]</code>, a CPU + memory slice · attach with <code>vcpu:&lt;name&gt;</code></h3>
+<pre><code class="language-toml">[[vcpu]]
+name     = &quot;heavy&quot;
+cpus     = 4.0         # core QUOTA (cgroup cpu.max), like --cpus: 4.0 = four cores, 0.5 = half a core
+memory   = &quot;2 GB&quot;      # RAM limit (cgroup memory.max), like --memory
+cpuset   = &quot;0-7&quot;       # optional CPU PINNING (cpulist), like --cpuset-cpus; exclusive with `numa`
+numa     = 0           # optional: pin to this NUMA node's CPUs
+nice     = -5          # optional: scheduling priority, like --nice (-20 high … 19 low)
+backend  = &quot;cpu:0&quot;     # REQUIRED: a [[cpu]] id to carve from, or &quot;host&quot; for the whole host CPU
+extends  = &quot;base&quot;      # optional: inherit another [[vcpu]] by name
+</code></pre>
+<blockquote>
+<p>Profile fields match the CLI flags <strong>1:1</strong>: <code>cpus</code> = <code>--cpus</code> (quota), <code>cpuset</code> = <code>--cpuset-cpus</code>
+(pinning), <code>memory</code> = <code>--memory</code>, <code>nice</code> = <code>--nice</code>. Know the flag, know the field.</p>
+</blockquote>
+<h3 id="vgpio-device-passthrough-attach-with-vgpioname"><code>[[vgpio]]</code>, device passthrough · attach with <code>vgpio:&lt;name&gt;</code></h3>
+<p>Deny-by-default: <strong>only</strong> the peripherals you list cross into the box; every other <code>/dev</code> node is
+refused. Each device is fd-pinned at bind time to close a check→mount race.</p>
+<pre><code class="language-toml">[[vgpio]]
+name    = &quot;sensors&quot;
+backend = &quot;gpio:0&quot;     # references a [[gpio]] controller (required)
+pins    = [17, 27]     # GPIO lines
+pwm     = [18]         # PWM channels
+i2c     = [&quot;1&quot;]        # /dev/i2c-1
+spi     = [&quot;0.0&quot;]      # /dev/spidev0.0
+adc     = [0]
+onewire = [4]
+# also available: uart, can, camera, audio, leds, bluetooth, usb, input, midi, display, net, extra
+# `extra` takes explicit /dev paths (validated); everything is refused unless a capability-based
+# deny-list (raw memory, disks, VFIO/DMA, kvm, HID injection, the console, …) rejects it first.
+</code></pre>
+<p><strong>Every supported device field</strong> (list what you want, nothing else crosses in). Hand-edit the TOML, or
+let <code>kern top</code> / <code>kern config setup</code> pre-fill it from what it detects on the host:</p>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>grants</th>
+<th>host path</th>
+<th>needs a <code>[[gpio]]</code>?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pins</code></td>
+<td>GPIO lines (chip-granular)</td>
+<td><code>/dev/gpiochip*</code></td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>pwm</code></td>
+<td>PWM channels</td>
+<td>sysfs pwm</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>adc</code></td>
+<td>ADC channels</td>
+<td>sysfs</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>onewire</code></td>
+<td>1-Wire</td>
+<td>sysfs</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>i2c</code></td>
+<td>I2C buses</td>
+<td><code>/dev/i2c-*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>spi</code></td>
+<td>SPI buses</td>
+<td><code>/dev/spidev*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>uart</code></td>
+<td>serial</td>
+<td><code>/dev/ttyS*</code> <code>ttyUSB*</code> <code>ttyACM*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>can</code></td>
+<td>CAN bus</td>
+<td><code>/dev/can*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>camera</code></td>
+<td>cameras</td>
+<td><code>/dev/video*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>audio</code></td>
+<td>ALSA audio</td>
+<td><code>/dev/snd/pcm*</code> <code>controlC*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>midi</code></td>
+<td>ALSA MIDI</td>
+<td><code>/dev/snd/midi*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td>keyboards / mice / sensors</td>
+<td><code>/dev/input/event*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>leds</code></td>
+<td>on-board LEDs</td>
+<td><code>/sys/class/leds/*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>bluetooth</code></td>
+<td>BT controllers</td>
+<td><code>/sys/class/bluetooth/hci*</code></td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>net</code></td>
+<td>network interfaces</td>
+<td><code>/sys/class/net/*</code> (eth0, wlan0)</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>display</code></td>
+<td>GPU render node</td>
+<td><code>/dev/dri/renderD*</code> (never <code>card*</code>)</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>usb</code></td>
+<td>USB devices</td>
+<td>by bus / port</td>
+<td>no</td>
+</tr>
+<tr>
+<td><code>extra</code></td>
+<td>explicit <code>/dev/*</code> paths</td>
+<td>any (validated)</td>
+<td>no</td>
+</tr>
+</tbody>
+</table>
+<p><strong>How to write an entry.</strong> <code>i2c</code> takes a bus number (<code>"1"</code>, <code>"i2c-1"</code>) or a full path; <code>spi</code> takes
+<code>BUS.CS</code> (<code>"0.0"</code>, <code>"spidev0.0"</code>) or a full path. <strong>Every other field takes the full <code>/dev/…</code> path</strong>
+(<code>uart = ["/dev/ttyUSB0"]</code>, not <code>["ttyUSB0"]</code>). An entry kern cannot resolve is skipped with a line on
+stderr naming the field and the entry, because a device grant that vanishes quietly is
+indistinguishable from one that was honoured until the workload fails.</p>
+<p><code>pins</code>/<code>pwm</code>/<code>adc</code>/<code>onewire</code> are lines of a controller, so they need a <code>backend</code> naming a <code>[[gpio]]</code>
+id. The rest are standalone host device nodes: use <code>backend = "host"</code>, or any declared <code>[[gpio]]</code> id as
+the anchor. Whatever you list, kern binds only the paths that <strong>exist</strong> on this host (absent ones are
+skipped) and <strong>refuses</strong> any node that grants host control (disk, raw memory, kvm, tun, fuse, the
+console, ...) by device <strong>identity</strong>, even via <code>extra</code>. A <code>[[gpio]]</code> block is a bare named anchor
+(<code>id = "..."</code>); it holds no device list of its own, the grant lives on the <code>[[vgpio]]</code>.</p>
+<h3 id="vdisk-a-size-capped-disk-attach-with-vdiskname"><code>[[vdisk]]</code>, a size-capped disk · attach with <code>vdisk:&lt;name&gt;</code></h3>
+<pre><code class="language-toml">[[vdisk]]
+name       = &quot;data&quot;
+size       = &quot;2g&quot;          # quota
+backend    = &quot;disk:pool&quot;   # REQUIRED: a declared [[disk]] pool, or &quot;ram&quot; for a RAM-backed tmpfs
+iops       = 1000          # optional I/O-ops limit
+bandwidth  = &quot;50m&quot;         # optional throughput limit
+persistent = true          # survive box removal AND be shared by name across boxes
+                           # (default: false → a private scratch disk per box, discarded)
+</code></pre>
+<p>A <code>vdisk:</code> appears in the box at <code>/vdisk/&lt;name&gt;</code>: a RAM tmpfs when rootless, or an ext4-on-loop image
+with a real quota when privileged <strong>and the box runs in the foreground</strong>. The ext4 backend's teardown
+is bounded to the box's run, so <code>-d</code> and <code>-it</code> take the tmpfs path even as root; kern says so when a
+<code>backend = "disk:…"</code> profile ends up RAM-backed, and the size cap is enforced either way. <code>iops</code>,
+<code>bandwidth</code> and <code>persistent</code> need the ext4 backend and are reported as unapplied without it.</p>
+<h3 id="physical-declarations-what-a-profiles-backend-points-at">Physical declarations, what a profile's <code>backend</code> points at</h3>
+<p>Declaring these is optional (a profile can use the reserved <code>host</code>/<code>ram</code> backend), but every profile
+<strong>must name a <code>backend</code></strong>: a block below, or <code>host</code> (vcpu/vgpio) / <code>ram</code> (vdisk). Field shapes:</p>
+<pre><code class="language-toml">[[cpu]]   # a physical CPU budget a [[vcpu]] splits
+id = &quot;0&quot;; cores = 16.0; memory = &quot;32 GB&quot;; cpuset = &quot;0-15&quot;; numa = 0
+
+[[gpio]]  # a physical GPIO / peripheral controller a [[vgpio]] draws from
+id = &quot;0&quot;; total_pins = 40; pins = [2, 3, 4, 17, 27]; i2c = [&quot;1&quot;]; leds = [&quot;led0&quot;]
+# a specific USB port can be reserved on a controller:
+[[gpio.usb_ports]]
+bus = 1; port = 2; name = &quot;sensor-hub&quot;
+
+[[disk]]  # a physical disk pool a [[vdisk]] places volumes on
+id = &quot;pool&quot;; path = &quot;/var/lib/kern/disks&quot;; default = true; size = &quot;100g&quot;; iops = 5000
+</code></pre>
+<hr />
+<h2 id="compose-boxname-tables">Compose, <code>[box.NAME]</code> tables</h2>
+<p><code>kern compose &lt;file&gt;</code> brings up a stack of <code>[box.NAME]</code> tables in <code>depends_on</code> order (it also reads a
+<code>docker-compose.yml</code>). <code>compose</code> shells out to <code>kern box</code>, so a value can never mean something
+different from its flag. <strong>Every service is started detached</strong>, so there is no <code>detach</code> key: <code>up</code>
+adds <code>-d</code> itself and returns once the stack is up. Use <code>kern logs</code> and <code>kern ps</code> to follow it. Every key maps to one, except <code>port</code> and <code>expose</code>, which are pod-scoped and
+described below.</p>
+<pre><code class="language-toml">[box.api]
+# source (one required)
+image      = &quot;alpine:3.19&quot;        # --image
+rootfs     = &quot;/var/lib/rootfs&quot;    # --rootfs   (mutually: image OR rootfs)
+
+# named resource profiles, the ones declared above as [[vcpu]] / [[vdisk]] / [[vgpio]]
+config     = &quot;kern.toml&quot;          # --config: the file those profiles are DECLARED in
+vcpu       = &quot;slim&quot;               # -&gt; the positional token `vcpu:slim`
+vdisk      = [&quot;scratch&quot;, &quot;logs&quot;]  # -&gt; `vdisk:scratch vdisk:logs`, one mount each
+vgpio      = &quot;leds&quot;               # -&gt; `vgpio:leds`
+
+# command &amp; ordering
+command    = [&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;exec app&quot;]   # -- &lt;command...&gt;
+depends_on = [&quot;db&quot;]               # start after these boxes
+# conditional dependencies, `up` WAITS for the condition before starting this box:
+depends_healthy   = [&quot;db&quot;]        # wait until each named box's health_cmd reports healthy
+depends_completed = [&quot;migrate&quot;]   # wait until each named box exits 0 (init-container / migration job)
+# Docker long-syntax is accepted verbatim too, so a docker-compose.yml block pastes in as-is:
+#   depends_on = { db = { condition = &quot;service_healthy&quot; }, migrate = { condition = &quot;service_completed_successfully&quot; } }
+# Constraints (rejected at bring-up, not left to time out): a `depends_healthy` target must declare
+# `health_cmd`; a `depends_completed` target must NOT set `restart = true` (it would never complete).
+# `up` waits up to 120s per condition, and aborts early if a dependency dies or fails.
+
+# filesystem / runtime
+workdir    = &quot;/srv&quot;               # --workdir / -w
+read_only  = true                 # --read-only
+bind_rootfs = false               # --bind-rootfs   (rootfs only; mutually excl. read_only)
+uid_range  = false                # --uid-range
+hostname   = &quot;api&quot;                # --hostname
+user       = &quot;1000:1000&quot;          # --user  (UID[:GID], or a name from the image's /etc/passwd)
+tmpfs      = [&quot;/tmp:64m&quot;]         # --tmpfs  (repeatable; PATH[:size])
+
+# resources
+memory     = &quot;512m&quot;               # --memory / -m
+cpus       = &quot;1.5&quot;                # --cpus                (quota)
+cpuset     = &quot;0-3&quot;                # --cpuset-cpus         (pinning, via sched_setaffinity, rootless)
+swap_max   = &quot;1g&quot;                 # --memory-swap-max
+pids_limit = &quot;512&quot;                # --pids-limit
+io_weight  = &quot;200&quot;                # --io-weight (cgroup v2 io.weight, 1-10000)
+nice       = &quot;5&quot;                  # --nice (-20..19)
+# (Resource profiles attach on the CLI, `kern run vcpu:heavy vgpio:sensors -- cmd`, not via a box
+#  key yet. Docker's `profiles: [...]` service-gating key IS honored: a service with a non-empty
+#  profile list stays inactive unless enabled via COMPOSE_PROFILES, exactly like Docker.)
+
+# networking
+net        = false                # --net   (share host net; no isolation)
+tun        = false                # --tun   (expose /dev/net/tun)
+ports      = [&quot;127.0.0.1:8080:80&quot;]  # --publish / -p  (repeatable)
+ssh        = &quot;2222&quot;               # --ssh PORT  (in-box sshd on host PORT)
+ssh_key    = &quot;/keys/id.pub&quot;       # --ssh-key   (authorize this pubkey instead of a throwaway)
+add_host   = [&quot;db:10.0.0.5&quot;]      # --add-host N:IP (IP may be `host-gateway`; repeatable)
+dns        = [&quot;1.1.1.1&quot;]          # --dns  (nameserver lines; without it the image's file is kept)
+dns_search = [&quot;example.com&quot;]      # --dns-search  (the resolver's `search` line)
+dns_opt    = [&quot;ndots:2&quot;]          # --dns-option  (resolv.conf options; `dns_options` also accepted)
+networks   = [&quot;front&quot;, &quot;back&quot;]    # the networks this service joins. INERT in a pod (one shared
+                                  #   namespace); under --no-pod it is ENFORCED: only services with
+                                  #   a network in common get a peer relay and resolve each other.
+                                  #   No key = the implicit `default` network (Compose Spec rule)
+links      = [&quot;db:database&quot;]      # Docker's `links`: an /etc/hosts ALIAS for a peer, plus the
+                                  #   start-ordering edge. No CLI flag: the alias becomes an
+                                  #   --add-host whose address kern resolves per stack mode
+# Pod-scoped, and the only two keys with no CLI flag: a pod shares one network namespace, so kern
+# needs to know what each service LISTENS on to refuse a collision before it starts anything.
+port       = 3000                 # the port this service listens on inside the pod
+expose     = [&quot;8080&quot;, &quot;9000/udp&quot;] # the same, for several; documented, not published
+
+# process &amp; metadata
+init       = true                 # --init     (reaping PID 1: no zombies, forwards SIGTERM)
+labels     = [&quot;team=api&quot;]         # --label / -l  (repeatable; selectable with `ps --filter label=`)
+sysctls    = [&quot;net.core.somaxconn=1024&quot;]  # --sysctl (namespaced knobs only; repeatable)
+ulimits    = [&quot;nofile=1024:2048&quot;] # --ulimit  (rootless can only LOWER; repeatable)
+
+# environment / secrets
+env        = [&quot;LOG=debug&quot;, &quot;PORT=8080&quot;]   # --env / -e  (repeatable)
+env_file   = [&quot;/etc/app.env&quot;]     # --env-file  (repeatable; K=V lines)
+secrets    = [&quot;/host/db-pw:db&quot;]   # --secret  (repeatable; src:name → /run/secrets/name)
+
+# least privilege
+cap_add    = [&quot;NET_ADMIN&quot;]        # --cap-add  (repeatable)
+cap_drop   = [&quot;ALL&quot;]              # --cap-drop (repeatable)
+
+# supervision (detached boxes)
+restart              = true       # --restart
+restart_max          = 10         # --restart-max (retries before giving up; default 10)
+stop_signal          = &quot;SIGTERM&quot;  # --stop-signal  (name or number)
+stop_grace_period    = &quot;30s&quot;      # --stop-timeout (seconds before the SIGKILL; default 10)
+timeout              = &quot;300&quot;      # --timeout  (SIGTERM at N, SIGKILL 2s later: N+2 worst case)
+health_cmd           = &quot;wget -qO- localhost/health&quot;   # --health-cmd
+health_interval      = 30         # --health-interval (integer seconds)
+health_retries       = &quot;3&quot;        # --health-retries
+health_start_period  = &quot;10&quot;       # --health-start-period
+health_start_interval = &quot;5&quot;       # --health-start-interval (probe cadence INSIDE the start period,
+                                  #   Docker 25+'s start_interval; default: the steady interval)
+health_timeout       = &quot;2&quot;        # --health-timeout
+health_action        = &quot;restart&quot;  # --health-action &lt;restart|stop|none&gt;
+
+# devices
+devices    = [&quot;/dev/net/tun&quot;, &quot;/dev/kvm:/dev/kvm:r&quot;]  # HOST[:BOX[:PERMS]] - bound in, not created.
+                                  #   /dev/net/tun maps to --tun (the node alone is useless without
+                                  #   CAP_NET_ADMIN); a spec with no `w` becomes a read-only bind
+
+# logs (kern's own capture, read with `kern logs`)
+mem_reservation = &quot;64m&quot;           # --memory-reservation (cgroup memory.low: a SOFT floor,
+                                  #   protected under pressure, never a cap and never an OOM kill)
+cpu_weight = &quot;100&quot;                # --cpu-weight (cgroup cpu.weight, 1-10000, 100 = normal). A
+                                  #   compose `cpu_shares:` is CONVERTED onto this scale
+pull       = &quot;missing&quot;            # --pull (compose spells it `pull_policy:`)
+shm_size   = &quot;1g&quot;                 # --shm-size (/dev/shm cap; the memory cgroup still bounds the
+                                  #   total, so a size above the memory cap is not more memory)
+volumes_from = [&quot;data&quot;]           # copy another service's mounts (`data:ro` narrows the copy).
+                                  #   Resolved after the whole file; ONE level, never a chain
+log_max_size = &quot;10m&quot;              # --log-max-size (rotate at this size; default 16m)
+log_max_file = &quot;3&quot;                # --log-max-file (files kept, active one included; default 2)
+
+# host paths
+volumes    = [&quot;/data:/data:ro&quot;, &quot;/etc/app:/app&quot;]  # --volume / -v  (repeatable)
+</code></pre>
+<h3 id="key-flag-map-the-non-obvious-ones">Key → flag map (the non-obvious ones)</h3>
+<table>
+<thead>
+<tr>
+<th>TOML key</th>
+<th>CLI flag</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cpuset</code></td>
+<td><code>--cpuset-cpus</code></td>
+</tr>
+<tr>
+<td><code>swap_max</code></td>
+<td><code>--memory-swap-max</code></td>
+</tr>
+<tr>
+<td><code>volumes</code></td>
+<td><code>--volume</code> / <code>-v</code></td>
+</tr>
+<tr>
+<td><code>env</code></td>
+<td><code>--env</code> / <code>-e</code></td>
+</tr>
+<tr>
+<td><code>secrets</code></td>
+<td><code>--secret</code></td>
+</tr>
+<tr>
+<td><code>ports</code></td>
+<td><code>--publish</code> / <code>-p</code></td>
+</tr>
+<tr>
+<td><code>labels</code></td>
+<td><code>--label</code> / <code>-l</code></td>
+</tr>
+<tr>
+<td><code>sysctls</code></td>
+<td><code>--sysctl</code></td>
+</tr>
+<tr>
+<td><code>ulimits</code></td>
+<td><code>--ulimit</code></td>
+</tr>
+<tr>
+<td><code>stop_grace_period</code></td>
+<td><code>--stop-timeout</code></td>
+</tr>
+<tr>
+<td><code>dns_opt</code></td>
+<td><code>--dns-option</code></td>
+</tr>
+<tr>
+<td><code>devices</code></td>
+<td><code>--volume</code> / <code>-v</code> (a device is bound, not created; <code>/dev/net/tun</code> → <code>--tun</code>)</td>
+</tr>
+<tr>
+<td><code>links</code></td>
+<td><code>--add-host</code> (the alias; the ordering edge folds into <code>depends_on</code>)</td>
+</tr>
+<tr>
+<td><code>networks</code></td>
+<td>no flag: it shapes the <code>--no-pod</code> relay graph and each box's <code>--add-host</code> set</td>
+</tr>
+<tr>
+<td><code>log_max_size</code></td>
+<td><code>--log-max-size</code></td>
+</tr>
+<tr>
+<td><code>log_max_file</code></td>
+<td><code>--log-max-file</code></td>
+</tr>
+<tr>
+<td><code>shm_size</code></td>
+<td><code>--shm-size</code></td>
+</tr>
+<tr>
+<td><code>network_mode: host</code></td>
+<td><code>--net</code> (the service leaves the stack's network, as under Docker)</td>
+</tr>
+<tr>
+<td><code>network_mode: none</code></td>
+<td>no pod and no NAT: loopback only</td>
+</tr>
+<tr>
+<td><code>mem_reservation</code></td>
+<td><code>--memory-reservation</code></td>
+</tr>
+<tr>
+<td><code>cpu_weight</code></td>
+<td><code>--cpu-weight</code> (compose's <code>cpu_shares:</code> is converted onto this scale)</td>
+</tr>
+<tr>
+<td><code>pull</code></td>
+<td><code>--pull</code> (compose spells it <code>pull_policy:</code>)</td>
+</tr>
+<tr>
+<td><code>volumes_from</code></td>
+<td>no flag: it appends the named service's entries to <code>--volume</code></td>
+</tr>
+<tr>
+<td><code>vcpu</code>/<code>vdisk</code>/<code>vgpio</code></td>
+<td>positional <code>vcpu:&lt;name&gt;</code> …</td>
+</tr>
+<tr>
+<td><code>security_profile</code></td>
+<td><code>--security-profile</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="kern-publish_bind"><code>[kern] publish_bind</code></h3>
+<pre><code class="language-toml">[kern]
+publish_bind = &quot;127.0.0.1&quot;   # or &quot;0.0.0.0&quot; (the default: Docker's, every interface)
+</code></pre>
+<p>A <code>-p</code>/<code>ports:</code> spec that names no address binds <strong><code>0.0.0.0</code></strong>, which is what Docker does and what a
+compose file written for Docker means. This key changes that for the whole host.</p>
+<p>It is a <strong>CEILING, not a default</strong>: with <code>publish_bind = "127.0.0.1"</code> even a spec that explicitly
+writes <code>0.0.0.0:8080:80</code> is bound to loopback, because a policy any downloaded compose file could
+defeat by writing an address would not be a policy. It is never silent: the box reports how many
+specs it narrowed.</p>
+<p>Read from the DEFAULT config only, never from a <code>--config</code> path a compose file chose, for the same
+reason as <code>allow_device_grants</code> below: a stack obtained from anywhere must not decide where the host
+listens. Only the two values above are accepted; a different bind address belongs in the spec, next
+to the port it applies to (<code>10.0.0.5:8080:80</code>).</p>
+<p>If <code>kern.toml</code> cannot be parsed, publishing falls back to <strong>loopback</strong> and says so. The two wrong
+answers are not symmetric: guessing "every interface" would publish ports an operator may have
+written a config file to prevent.</p>
+<h3 id="kern-compose_memory_max"><code>[kern] compose_memory_max</code></h3>
+<pre><code class="language-toml">[kern]
+compose_memory_max = &quot;512m&quot;   # absent: the host's own RAM, which is Docker's bound
+</code></pre>
+<p>A <code>kern compose</code> <strong>service</strong> whose file names no <code>mem_limit:</code> gets the <strong>host's RAM</strong> as its
+<code>memory.max</code>. That is the bound a <code>docker compose</code> service has, because Docker imposes no memory
+limit on a container at all and the machine is the only limit. kern used to hand such a service
+<code>kern box</code>'s 512 MiB default, so a service that runs fine under Docker was OOM-killed at a number
+written <strong>nowhere in the file</strong>, with exit 137 and nothing to grep for. Measured on a neutral corpus
+of 259 compose files, one per repository: <strong>243</strong> have at least one service in that position, which
+made it the largest remaining difference from Docker after the publish default.</p>
+<p>It is <strong>not uncapped</strong>, and the difference matters: the box still carries a <code>memory.max</code> and still
+has <code>memory.oom.group = 1</code>, so a service that really does exhaust the machine is killed against
+<strong>its own cgroup</strong> with kern's message naming the cap, rather than leaving the host OOM killer to
+choose a victim elsewhere. <code>kern build</code>'s <code>RUN</code> steps already took exactly this decision, for exactly
+this measured reason; this makes the two agree.</p>
+<p>This key restores a strict ceiling, and like <code>publish_bind</code> it is a <strong>CEILING, not a default</strong>: a
+service asking for more through <code>mem_limit:</code> is held at this value, because a limit a downloaded
+compose file can raise by writing a bigger number limits nothing. A service asking for <strong>less</strong> is
+left alone. It is never silent when it binds: kern names the services it moved, and says nothing on a
+stack where the ceiling changed nothing.</p>
+<p><code>kern box</code> and <code>kern run</code> are <strong>not affected</strong>. Their 512 MiB default is a sensible bound for a
+one-off sandbox typed at a prompt; a compose service is a declared long-running workload whose file
+has a way to say what it needs.</p>
+<p>If <code>kern.toml</code> cannot be parsed, compose services fall back to the historic <strong>512 MiB</strong> and kern says
+so. The two wrong answers are not symmetric: reading a broken config as "no ceiling" would hand every
+stack on the machine the whole of its RAM because of a typo.</p>
+<h3 id="kern-allow_device_grants"><code>[kern] allow_device_grants</code></h3>
+<p>A compose stack that names a <code>vgpio</code> profile is REFUSED unless the person running it says so, because
+that profile resolves to host device nodes and, unlike a cpu or disk profile, there is no sense in
+which the local grant is the smaller one: <code>/dev/gpiochip0</code> is not a smaller <code>/dev/gpiochip1</code>. The
+acknowledgement is <code>--allow-device-grants</code> on the command line, or this key:</p>
+<pre><code class="language-toml">[kern]
+allow_device_grants = true
+</code></pre>
+<p>It exists for the case the command line cannot reach. A service with <code>restart:</code> becomes a systemd unit
+whose <code>ExecStart</code> nobody types, so without a persistent grant such a service either never restarts
+after a reboot (and nobody finds out until the machine reboots) or the generated unit has to carry the
+permission itself, which is a self-perpetuating hardware grant on a machine nobody is watching.</p>
+<p><strong>This key is read from YOUR config only.</strong> A stack file can name its own config (<code>config =
+"other.toml"</code>), so honouring the key from there would let a downloaded bundle ship its own permission.
+Only the default config (or <code>KERN_CONFIG</code>, which is equally yours) is consulted, and a config that
+cannot be read is not a grant. Run <code>kern compose &lt;file&gt; config</code> first: it prints the exact device paths
+each profile name reaches on this host.</p>
+<p>Everything else shares the flag's long name. <strong>Two keys have no flag</strong>, <code>port</code> and <code>expose</code>: they
+declare what a service listens on so <code>compose</code> can refuse a port collision inside the shared pod
+namespace before starting anything, which is a property of the stack rather than of one box.</p>
+<p><strong>The three v-profile keys are named after the tables that declare them</strong>, not after a flag, because
+<code>kern box</code> takes them POSITIONALLY (<code>kern box api --image alpine vcpu:slim vdisk:scratch -- app</code>).
+Each takes one name or a list, and the prefix is optional inside the value: <code>vcpu = "slim"</code> and
+<code>vcpu = "vcpu:slim"</code> are the same profile. They could not be called <code>profiles</code>: that key already
+exists here with Docker's meaning (which services a plain <code>up</code> starts), and one word with two
+meanings in one file is how a stack quietly does something else.</p>
+<p><code>config</code> names the file those profiles resolve against. Without it kern falls back to its usual
+discovery order, which depends on the caller's <code>$HOME</code> and environment: fine on a laptop, wrong for a
+stack that ships its own <code>kern.toml</code> beside it. <code>kern compose &lt;file&gt; config</code> prints the tokens each
+service will receive and the file they resolve against, so a name that is not in it is visible before
+anything starts.</p>
+<hr />
+<h2 id="the-one-rule-toml-mirrors-the-cli">The one rule: TOML mirrors the CLI</h2>
+<p>Every key maps to a flag, nothing to learn twice. If you know the flag, you know the key. The two
+exceptions are named above and exist because a pod is not a box.</p>
+<ul>
+<li><strong>Scalar</strong> → a <strong>quoted string</strong> carrying the exact CLI argument: <code>memory = "512m"</code>, <code>cpus = "1.5"</code>,
+  <code>cpuset = "0-3"</code>. (Numeric profile fields like <code>cpus = 4.0</code> / <code>iops = 1000</code> / <code>nice = -5</code> are
+  bare numbers, as shown above.)</li>
+<li><strong>Switch</strong> → a <strong>TOML bool</strong>: <code>read_only = true</code>. A <code>false</code> (or absent) key emits no flag.</li>
+<li><strong>Repeatable flag</strong> → an <strong>array</strong>: <code>volumes = ["src:dst:ro"]</code>, <code>pins = [17, 27]</code>.</li>
+</ul>
+<h2 id="types-tolerance">Types &amp; tolerance</h2>
+<ul>
+<li>Strings are double-quoted. An unquoted scalar (<code>memory = 512m</code>) for a key kern <strong>implements</strong> is a
+  parse error, quote it. A <em>malformed value</em> of a recognized key is always caught, with its line.</li>
+<li>Bools are bare <code>true</code> / <code>false</code>. Integers/floats are bare (<code>health_interval = 30</code>, <code>cpus = 4.0</code>).</li>
+<li>Arrays are <code>["a", "b"]</code> / <code>[17, 27]</code>; a comma inside a quoted element does not split it.</li>
+<li><code>#</code> starts a comment outside a string.</li>
+<li><strong>Unknown keys and sections are ignored, not rejected</strong>, so a <code>kern.toml</code> written for another kern
+  edition still loads. The trade is deliberate and has a cost: a typo in a key name is silently
+  skipped, so lean on <code>kern config</code> / <code>kern top</code>, which validate live.</li>
+</ul>
+<h2 id="deliberate-choices-in-this-schema">Deliberate choices in this schema</h2>
+<ul>
+<li><strong>Two surfaces, one philosophy.</strong> Profiles are resource-centric (<code>[[vcpu]]</code>/<code>[[vgpio]]</code>/<code>[[vdisk]]</code>,
+  attached by prefix) and compose is box-centric (<code>[box.NAME]</code>). They read differently because they
+  answer different questions: "what slice" and "what stack".</li>
+<li><strong>CPU field names match the CLI everywhere</strong>: <code>cpus</code> = quota, <code>cpuset</code> = pinning, in the flat compose
+  keys AND the <code>[[vcpu]]</code> profile. One spelling per concept, and it is the flag's. Know the flag, know
+  the field, in both files.</li>
+<li><strong>No <code>seccomp = "off"</code> / <code>no_seccomp</code> / <code>no_cgroup</code> key</strong>: the seccomp filter and the cgroup caps
+  are always on and cannot be disabled from config (hardening over blind parity, by design).</li>
+<li><strong>Keys this edition does not model</strong> (a <code>[[vgpu]]</code> / <code>[[gpu]]</code> family among them) are <strong>ignored,
+  not rejected</strong>, so a <code>kern.toml</code> shared with another kern edition still loads here. What is on the
+  roadmap is listed in the <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md">roadmap</a>; what is in the schema is this document.</li>
+</ul>
+<h2 id="fleet-limits-environment">Fleet limits (environment)</h2>
+<p>Per-box caps (<code>--memory</code>, <code>--cpus</code>, <code>--pids-limit</code>) bound each box on its own. For a HOST that runs many
+boxes (a serverless <code>box fn</code> pattern, an agent platform), three environment variables bound the fleet as
+a whole. They are deployment-level, so they live in the environment kern runs under, not in a <code>kern.toml</code>
+profile:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Effect</th>
+<th>Kind</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KERN_MAX_CONCURRENT=N</code></td>
+<td>Refuse to start a new box when <code>N</code> boxes are already running.</td>
+<td><strong>Cooperative.</strong> First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). The count-and-claim runs under a <code>flock</code> (the ceiling is read while the lock is held), so a <strong>concurrent burst</strong> (<code>kern compose up</code>, <code>xargs -P kern box</code>) serializes on the claim and cannot overshoot <code>N</code>.</td>
+</tr>
+<tr>
+<td><code>KERN_FLEET_MEMORY_MAX</code></td>
+<td>A <code>memory.max</code> on kern's shared <code>kern.slice</code>, bounding the SUM of all boxes' memory. Accepts <code>512m</code>, <code>4g</code>, or bare bytes.</td>
+<td><strong>Kernel-enforced ONLY when boxes share <code>kern.slice</code></strong> (see below).</td>
+</tr>
+<tr>
+<td><code>KERN_FLEET_PIDS_MAX</code></td>
+<td>A <code>pids.max</code> on <code>kern.slice</code>, bounding total tasks across all boxes.</td>
+<td>Same condition as above.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Important scope of the fleet caps.</strong> The fleet SUM caps write <code>memory.max</code> / <code>pids.max</code> on kern's
+<code>kern.slice</code> and only bound boxes that actually run INSIDE that slice, which happens on the <strong>direct-cap
+path</strong> (kern as root, or a host where a delegated <code>kern.slice</code> is ensured). In the common ROOTLESS setup
+kern puts each box in its OWN per-box systemd scope (under <code>app.slice</code>, NOT <code>kern.slice</code>), so the fleet
+SUM is currently <strong>not</strong> enforced there. kern does not stay silent about it: when a fleet cap is set but
+the direct-cap path is not taken, it prints a one-line warning at box start. The <strong>per-box <code>--memory</code> /
+<code>--pids-limit</code> caps are the reliable knob and enforce everywhere the controller is delegated</strong> (verified on
+x86, the ARM boards, and the VPS: a box over its <code>--memory</code> is OOM-killed). For a guaranteed fleet bound
+today, run kern as root, or cap each box with <code>--memory</code> / <code>--pids-limit</code>; add <code>--require-limits</code> to make a box
+refuse to start rather than run uncapped where the per-box cap cannot be enforced. A rootless
+shared-slice fleet cap is tracked as a post-launch improvement. Example:</p>
+<pre><code class="language-sh">export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once
+export KERN_FLEET_MEMORY_MAX=16g      # SUM cap, enforced only when boxes share kern.slice (see above)
+export KERN_FLEET_PIDS_MAX=20000
+</code></pre>
+<p><strong>Cross-box OOM semantics.</strong> <code>KERN_FLEET_MEMORY_MAX</code> caps the SUM of all boxes on the shared
+<code>kern.slice</code>. When that shared ceiling is hit, the kernel's cgroup OOM killer acts at the slice level: it
+picks a victim task by the usual heuristic (roughly the largest RSS) across ALL boxes, so one box's
+memory spike can cause a task in a DIFFERENT box to be killed. This is the intended pooled-budget
+behavior (the fleet shares one hard limit), but it means a fleet cap is not a per-box guarantee. For a
+workload that must not be collateral, ALSO give it a per-box <code>--memory</code>: a box with its own <code>memory.max</code>
+is OOM-scoped to itself first (its own cgroup limit is hit before it can push the slice over), so the
+fleet cap becomes a backstop for the aggregate rather than the thing that kills your critical box.</p>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/CONFIG.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

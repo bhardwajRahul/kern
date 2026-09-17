@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual resources: CPU, memory, disk and device profiles | kern</title>
+<meta name="description" content="kern is built around one idea, virtual resources, exposed as two verbs: box wraps a process in a full isolated slice; run caps a resource on a process you la">
+<link rel="canonical" href="https://getkern.dev/guide/resources.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/resources.html">
+<meta property="og:title" content="Virtual resources: CPU, memory, disk and device profiles">
+<meta property="og:description" content="kern is built around one idea, virtual resources, exposed as two verbs: box wraps a process in a full isolated slice; run caps a resource on a process you la">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="virtual-resources">Virtual resources</h1>
+<p>kern is built around one idea, <em>virtual resources</em>, exposed as <strong>two verbs</strong>: <code>box</code> wraps a process in
+a full isolated slice; <code>run</code> caps a resource on a process you launch yourself. Isolation is the first
+resource, not the only one. A box gets <em>only</em> what you slice for it; a bare <code>run</code> adds the same caps
+to a process that otherwise still sees the host. Every shipping cap is a real cgroup v2 or kernel
+control, and devices are deny-by-default. The exact <code>kern.toml</code> schema is in <a href="config.html">CONFIG.md</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>Flag / profile</th>
+<th>What the box gets</th>
+<th>Enforcement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CPU</strong></td>
+<td><code>--cpus</code> · <code>--cpuset-cpus</code> · <code>--nice</code> · <code>vcpu:</code></td>
+<td>Fractional CPU-time quota, core pinning, priority</td>
+<td>cgroup <code>cpu.max</code> / <code>cpuset</code>, hard</td>
+</tr>
+<tr>
+<td><strong>Memory</strong></td>
+<td><code>--memory</code> · <code>--memory-swap-max</code> · <code>--shm-size</code></td>
+<td>Hard RAM ceiling, swap allowance, <code>/dev/shm</code> size</td>
+<td>cgroup <code>memory.max</code>, hard¹</td>
+</tr>
+<tr>
+<td><strong>Disk</strong></td>
+<td><code>vdisk:</code> · <code>--size</code> (named volumes)</td>
+<td>Size-capped scratch at <code>/vdisk/&lt;name&gt;</code></td>
+<td>rootless: a <strong>RAM-backed tmpfs</strong>, charged to the box's memory cap; privileged: ext4-on-loop quota</td>
+</tr>
+<tr>
+<td><strong>Devices</strong></td>
+<td><code>vgpio:</code></td>
+<td><em>Only</em> the named GPIO/I²C/SPI/LED nodes</td>
+<td>fresh <code>/dev</code> + fd-pinned bind + capability deny-list</td>
+</tr>
+<tr>
+<td><strong>PIDs</strong></td>
+<td><code>--pids-limit</code></td>
+<td>Fork-bomb ceiling</td>
+<td>cgroup <code>pids.max</code>, hard</td>
+</tr>
+<tr>
+<td><strong>Block I/O</strong></td>
+<td><code>--io-weight</code></td>
+<td>I/O bandwidth weight</td>
+<td>cgroup <code>io</code></td>
+</tr>
+<tr>
+<td><strong>GPU</strong></td>
+<td><em>(roadmap)</em></td>
+<td>Not shipped</td>
+<td>see <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md">Roadmap</a></td>
+</tr>
+</tbody>
+</table>
+<p>¹ Where the <code>memory</code> controller is not delegated to a non-root user's scope, kern warns and shows the
+one-line <code>.wslconfig</code> fix; enforced natively on Linux.</p>
+<h2 id="checking-a-cap-and-how-not-to">Checking a cap, and how not to</h2>
+<p><code>free</code>, <code>top</code> and <code>htop</code> inside a box report the <strong>host's</strong> memory, because the kernel does not
+namespace <code>/proc/meminfo</code>. That is true of every runtime without a <code>/proc</code> shim, and it makes an
+enforced cap look absent. A runtime that sizes itself from the <strong>cgroup</strong> (a modern JVM, Go's memory
+limit, most container-aware tooling) gets the right number. Read the cgroup, or hit the ceiling:</p>
+<pre><code class="language-sh">kern box check --image alpine --memory 256m -- cat /sys/fs/cgroup/memory.max   # 268435456
+kern box oom   --image alpine --memory 256m -- \
+  sh -c 'dd if=/dev/zero of=/dev/shm/x bs=1M count=512' ; echo &quot;exit=$?&quot;       # exit=137, OOM-killed
+</code></pre>
+<p>An over-allocation is OOM-killed as a WHOLE box (exit <strong>137</strong>, recorded for <code>kern wait</code> and
+<code>kern ps -a</code>): kern writes <code>memory.oom.group=1</code> on the box's own cgroup, so the kernel SIGKILLs every
+task at once instead of leaving the box half-dead. Measured: a sleeper child and the parent both
+vanish, and <code>kern ps</code> shows no stale box.</p>
+<p>That holds on both cap paths. Where a rootless box takes the <code>systemd-run --scope</code> path rather than
+the direct <code>kern.slice</code> one, kern builds its own cgroup inside the scope: the workload capped at
+exactly what you asked for, kern's supervisor outside the blast radius so the group-kill takes the
+workload and not the process that has to report it. Re-checked in both layouts on four hosts and four
+systemd versions (<strong>249, 252, 255, 257</strong>). On the UNO Q, Android's <code>lmkd</code> is not running, so it is the
+cgroup doing the killing and not a host-level low-memory killer.</p>
+<p><strong>Enforce, or refuse to start.</strong> Where the controllers are not delegated, the default is to warn once
+and run uncapped. <code>--require-limits</code> (or <code>KERN_REQUIRE_LIMITS</code>) makes that fatal: the box refuses to
+start unless the memory and pids caps are <strong>read back</strong> from the cgroup as in force.
+<code>--allow-uncapped</code> (<code>KERN_ALLOW_UNCAPPED</code>) is the explicit inverse for a host with no delegation. The
+two are mutually exclusive. cpu and cpuset stay best-effort under both, carrying no OOM or fork-bomb
+role.</p>
+<p><code>cpu.max</code> reads directly: <code>50000 100000</code> is half a core, <code>200000 100000</code> is two.</p>
+<p><code>--pids-limit</code> counts <strong>every task in the box</strong>, not just the ones you fork, so your available forks
+are the limit minus what is already there. That baseline is not fixed: it depends on whether the
+command is a shell or an exec'd binary, and on whether the box is detached. On the box measured here
+it was 2, so <code>--pids-limit 30</code> allowed 28 forks before <code>EAGAIN</code>. It is a fork-bomb ceiling, not an
+exact budget.</p>
+<h2 id="profiles">Profiles</h2>
+<p>Name a slice once, attach it by name, and stop repeating flags. Profiles live in
+<code>~/.config/kern/kern.toml</code>.</p>
+<pre><code class="language-sh">kern config add vcpu:slim --cpus 0.5 --memory 256m       # or edit the file by hand
+kern box app --image alpine vcpu:slim -- ./app           # no flag: the profile is just there
+kern run vcpu:slim -- ./train.sh                         # the same slice, no sandbox
+</code></pre>
+<p>That writes both the profile and the physical resource it slices:</p>
+<pre><code class="language-toml">[[cpu]]
+id = &quot;cpu:0&quot;
+
+[[vcpu]]
+name    = &quot;slim&quot;
+cpus    = 0.5
+memory  = &quot;256m&quot;
+backend = &quot;cpu:0&quot;    # the [[cpu]] above; `backend = &quot;host&quot;` slices the whole CPU with no [[cpu]] block
+</code></pre>
+<p>Profile tokens go BEFORE the <code>--</code>: <code>vcpu:</code> · <code>vdisk:</code> · <code>vgpio:</code>. Author them with <code>kern probe</code> (list
+what the host has to slice), <code>kern examples</code> (print a sample) and <code>kern validate</code> (check one). Use
+<code>--config ./kern.toml</code> for a per-project file, or <code>KERN_CONFIG</code> to make that the file every command
+reads and writes. The full schema, every field, the 7-layer precedence and <code>extends</code> are in
+<strong><a href="config.html">CONFIG.md</a></strong>; a runnable walk-through is
+<a href="https://github.com/getkern/kern/blob/main/examples/resources/resource-profiles.sh">resource-profiles.sh</a>.</p>
+<h2 id="the-model-in-two-verbs">The model, in two verbs</h2>
+<table>
+<thead>
+<tr>
+<th>Verb</th>
+<th>Question it answers</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>kern box</code></strong></td>
+<td><em>"Isolate this workload, and slice its resources."</em></td>
+<td>Its own namespaces, overlay or read-only fs, private process tree, seccomp, <strong>plus</strong> the same resource slices</td>
+</tr>
+<tr>
+<td><strong><code>kern run</code></strong></td>
+<td><em>"Just slice resources, no sandbox."</em></td>
+<td>The same caps with no namespaces, <strong>plus</strong> <code>--landlock-rw</code> to confine writes</td>
+</tr>
+</tbody>
+</table>
+<p>They compose: <code>run</code> inside <code>box</code>. Both ship today.</p>
+<p><strong>Both carry a default memory cap of 512 MiB where the host can hold one</strong>, plus no swap and a
+ceiling of 512 tasks.</p>
+<p><strong><code>kern compose</code> answers the same question differently, and both answers are deliberate.</strong> They are
+in one table here because a reader who meets them one at a time concludes that one of them is a bug:</p>
+<table>
+<thead>
+<tr>
+<th>what you ran</th>
+<th>memory ceiling with no flag or key</th>
+<th>why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kern box</code> / <code>kern run</code></td>
+<td><strong>512 MiB</strong></td>
+<td>kern's own default: a sandbox for something you are about to run is capped until you say otherwise</td>
+</tr>
+<tr>
+<td>a <code>kern compose</code> service with no <code>mem_limit:</code></td>
+<td><strong>the host's RAM</strong></td>
+<td>compose parity. Docker does not cap a service by default, and a file that behaves differently here than under Docker is the thing <code>kern compose</code> exists to avoid</td>
+</tr>
+</tbody>
+</table>
+<p>Measured, on a host with 33465040896 bytes of RAM: <code>kern box --image alpine -- cat
+/sys/fs/cgroup/memory.max</code> prints <code>536870912</code>, and the same read inside a compose service with no
+keys prints <code>33465040896</code>. The compose case is a ceiling, not an absence of one: the box still has a
+<code>memory.max</code> and <code>oom.group = 1</code>, so a failure stays attributable to its own cgroup rather than the
+host OOM killer picking a victim. <code>[kern] compose_memory_max</code> puts a strict ceiling back and caps a
+larger <code>mem_limit:</code> too (<a href="config.html">CONFIG.md</a>, and <a href="docker-compat.html">DOCKER-COMPAT.md</a> for the
+parity argument). Where kern's delegated <code>kern.slice</code> is usable, both write those three caps
+straight into a cgroup of their own; where it is not, they re-exec into a transient systemd scope that
+carries the same three. A workload past the ceiling is OOM-killed and kern names <code>--memory</code> as the
+fix. Two ways to change it, and they are not the same:
+<code>--memory &lt;size&gt;</code> raises or lowers the ceiling, which is the one you want; <code>KERN_NO_SCOPE=1</code> removes
+the scope and with it all three ceilings, leaving the command in the cgroup of whatever started it,
+usually your shell's. kern warns when that happens, and <code>KERN_ALLOW_UNCAPPED=1</code> silences the warning.</p>
+<p><strong>And there is a third case, which this page used to promise its way past.</strong> A host with no systemd
+user manager whose own cgroup cannot take a capped child has neither of the two mechanisms above, so
+NO cap is in force, default or asked-for. kern warns at start rather than pretending, <code>kern doctor</code>
+names the directories it probed and what it found there, and for a running box the answer is a fact
+you can read rather than a promise you have to trust:</p>
+<pre><code class="language-console">$ kern inspect web --json | grep memory
+&quot;memory_max&quot;:67108864,&quot;memory_max_enforced&quot;:null
+</code></pre>
+<p><code>memory_max</code> is what you asked for; <code>memory_max_enforced</code> is what the kernel will hold the box to,
+read back from the box's own cgroup. <code>null</code> means nothing is enforcing it, and the human output says
+<code>64M (requested, NOT enforced here)</code>. Note that exit <strong>137</strong> alone does not tell you a cap bit: it is
+SIGKILL, which the system OOM killer delivers identically. A kill by the box's own cap always carries
+kern's own OOM message on stderr.</p>
+<p><strong>One boundary crosses the split.</strong> <code>--landlock-rw &lt;path&gt;</code> works on <code>run</code> as well as on <code>box</code>, because
+Landlock restricts the calling process rather than needing a mount namespace. So
+<code>kern run --landlock-rw ~/project -- ./agent</code> runs a host binary with its writes confined by the
+kernel to that directory. Two differences from the same flag on <code>box</code>, both consequences of there
+being no namespace:</p>
+<ul>
+<li>It grants <strong>only what you name</strong>, plus <code>/dev/null</code> and the other character devices a program opens
+  for writing. Inside a box, <code>/tmp</code>, <code>/run</code> and <code>/proc</code> are the box's own ephemeral ones and are
+  granted automatically; on the host they are real and persistent, so they are not.</li>
+<li>It <strong>refuses to run</strong> where the kernel has no Landlock, rather than warning and continuing as a
+  resource cap does. A cap that cannot be applied leaves the command running without a limit, which
+  <code>run</code> says out loud; a confinement that cannot be applied would leave your files reachable while you
+  believed otherwise.</li>
+</ul>
+<p>It also implies <code>no_new_privs</code>, which Landlock requires, so <code>sudo</code> inside it stops working.</p>
+<h2 id="storage-volumes-and-vdisks">Storage: volumes and vdisks</h2>
+<table>
+<thead>
+<tr>
+<th>I want</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data that survives runs, or is shared between boxes</td>
+<td>a <strong>volume</strong>, <code>-v name:/path</code></td>
+</tr>
+<tr>
+<td>A cap on how big that shared data can get</td>
+<td>a <strong>volume with <code>--size</code></strong></td>
+</tr>
+<tr>
+<td>One box with its own capped scratch disk</td>
+<td>a <strong>vdisk</strong> profile, <code>vdisk:x</code> → <code>/vdisk/x</code></td>
+</tr>
+<tr>
+<td>Data on a remote server</td>
+<td>a <strong>network volume</strong>, <code>-v nfs://…</code></td>
+</tr>
+<tr>
+<td>A persistent vdisk on a <em>specific</em> disk (advanced)</td>
+<td>a <code>[[disk]]</code> plus the vdisk's <code>backend</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>volume</strong> is shared, persistent data, the same relationship a <code>docker volume</code> has to a Kubernetes
+<code>emptyDir</code>. A <strong>vdisk</strong> is one box's private capped disk. Both use the same ext4-on-loop engine.</p>
+<h3 id="volumes">Volumes</h3>
+<p>Attach with <code>-v NAME:/path-in-the-box</code>; kern creates it on first use.</p>
+<pre><code class="language-sh">kern box w --image alpine -v data:/out -- sh -c 'echo hello &gt; /out/note.txt'
+kern box r --image alpine -v data:/out -- cat /out/note.txt      # → hello
+</code></pre>
+<p>They live under <code>~/.local/share/kern/volumes/</code> (or <code>$XDG_DATA_HOME/kern/volumes</code>), and
+<code>kern top</code> → Storage tab manages them: <code>[n]ew</code>, <code>[⏎]inspect</code>, <code>[d]elete</code>, <code>[p]rune</code>.</p>
+<p><code>kern volume create cache --size 2g</code> gives one a quota. Honest note: the quota is <strong>enforced</strong> only
+when a <strong>privileged, foreground</strong> box mounts it, where kern backs the volume with a real ext4-on-loop
+image. Rootless or detached, kern falls back to a bind-mount and <strong>says the quota is not enforced</strong>
+rather than pretending. Your data is in the same place either way; only the hard cap differs.</p>
+<p>A <code>-v</code> source can also be a URL, mounted for the box's lifetime:</p>
+<pre><code class="language-sh">kern box app --image alpine -v nfs://server/export:/data   -- ./run.sh
+kern box app --image alpine -v smb://server/share:/data    -- ./run.sh
+kern box app --image alpine -v sshfs://user@host/srv:/data -- ./run.sh
+</code></pre>
+<h3 id="vdisks">Vdisks</h3>
+<p>A vdisk is a reusable spec you name once and attach with the <code>vdisk:</code> prefix.</p>
+<pre><code class="language-toml">[[vdisk]]
+name = &quot;scratch&quot;
+size = &quot;2g&quot;            # hard cap
+persistent = false     # true = survives box removal
+backend = &quot;ram&quot;        # REQUIRED: &quot;ram&quot; is a RAM-backed tmpfs, or a [[disk]] id
+# iops = 500           # optional I/O limit, ext4-loop backend only
+</code></pre>
+<pre><code class="language-sh">kern box build --image alpine vdisk:scratch -- ./compile.sh    # → /vdisk/scratch, capped at 2g
+</code></pre>
+<p><code>kern top</code> → Profiles tab edits them without touching the file, writing <strong>surgically</strong> so comments and
+other sections survive. Like a quota'd volume, a vdisk uses the ext4-loop backend when the box is
+privileged and a tmpfs otherwise; kern says which one you got and never silently drops the profile.</p>
+<p><strong><code>persistent</code> also decides who the disk belongs to.</strong> It reads as a statement about time, and it is
+also one about identity:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>where the image lives</th>
+<th>two boxes on the same profile</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>persistent = false</code> (default)</td>
+<td>the box's own scratch dir</td>
+<td><strong>one disk each</strong>, empty at start, gone at exit</td>
+</tr>
+<tr>
+<td><code>persistent = true</code></td>
+<td>the <code>[[disk]]</code> pool, or a per-user default</td>
+<td><strong>one disk, shared by name</strong></td>
+</tr>
+</tbody>
+</table>
+<p>So a persistent vdisk is closer to a named volume than to an <code>emptyDir</code>: the name is the disk. Two
+boxes cannot mount it at once, because an ext4 image mounted read-write twice corrupts, so kern takes
+an exclusive lock. <strong>The second box does not fail: it gets a tmpfs for that run and says so.</strong></p>
+<pre><code>kern: vdisk 'cache' is in use by another box - using a tmpfs backend this run
+</code></pre>
+<p>Its writes to <code>/vdisk/cache</code> are discarded at exit, which is the one case where a profile named
+<code>persistent</code> does not persist. Serialise the boxes, or give each its own profile.</p>
+<h3 id="advanced-pin-a-vdisk-to-a-specific-disk">Advanced: pin a vdisk to a specific disk</h3>
+<p>By default kern picks where a vdisk's image lives, the way Docker does not ask which disk a volume
+goes on. With multiple disks, name a <code>[[disk]]</code> pool and point the vdisk's <code>backend</code> at it:</p>
+<pre><code class="language-toml">[[disk]]
+name = &quot;fast&quot;
+path = &quot;/mnt/nvme&quot;     # a writable dir on the disk you want
+
+[[vdisk]]
+name = &quot;cache&quot;
+size = &quot;10g&quot;
+backend = &quot;fast&quot;       # this vdisk's image lives under /mnt/nvme
+</code></pre>
+<p><code>kern probe</code> lists your physical disks; <code>kern top</code>'s Overview and Storage tabs show them read-only.</p>
+<pre><code class="language-sh">$ kern probe
+disks   nvme0n1  931.5G  SSD (Samsung 990 PRO)  ·  sda  1.8T  HDD (WDC WD20)
+</code></pre>
+<p>This is the one knob that stays in <code>kern.toml</code> rather than the TUI, kept out of the beginner's way.</p>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/RESOURCES.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

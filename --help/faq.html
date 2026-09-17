@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kern FAQ: the questions people ask | kern</title>
+<meta name="description" content="Short, honest answers to the questions that come up first. The threat model in full is SECURITY.md; the honest open items are ROADMAP.md.">
+<link rel="canonical" href="https://getkern.dev/guide/faq.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/faq.html">
+<meta property="og:title" content="kern FAQ: the questions people ask">
+<meta property="og:description" content="Short, honest answers to the questions that come up first. The threat model in full is SECURITY.md; the honest open items are ROADMAP.md.">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="faq">FAQ</h1>
+<p>Short, honest answers to the questions that come up first. The threat model in full is
+<a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a>; the honest open items are <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md#known-gaps-and-what-would-settle-them">ROADMAP.md</a>.</p>
+<h2 id="is-kern-a-docker-replacement">Is kern a Docker replacement?</h2>
+<p>Partly. kern speaks Docker's <strong>formats</strong> (OCI images, <code>docker-compose.yml</code>, Dockerfiles), not its API.
+It starts a real, kernel-enforced container from an OCI image in ~3.5 ms against <code>docker run</code>'s ~297 ms,
+with no daemon, rootless by default, and 0 RAM at rest. It has no overlay networks, no plugin
+ecosystem and no Swarm; it does not implement CRI (for Kubernetes, use containerd or CRI-O). Reach for
+kern where the daemon, the root, and the hundreds of milliseconds hurt: agent tool-calls, CI jobs,
+per-request functions, dev sandboxes, edge and ARM. The full compatibility matrix is
+<a href="docker-compat.html">docs/DOCKER-COMPAT.md</a>.</p>
+<h2 id="kern-vs-bubblewrap">kern vs bubblewrap?</h2>
+<p>bubblewrap is a sandbox <strong>launcher</strong>; kern is a <strong>runtime</strong>. bwrap has no OCI image pull, no lifecycle
+(<code>ps</code>/<code>stop</code>/<code>exec</code>/<code>stats</code>), no resource profiles, no Python/Node SDK, no faults-as-data, no compose,
+and a simpler seccomp posture. At namespace parity kern is about 15% faster, but that is not the point:
+the value is the runtime around the namespaces, not the raw primitive. If all you need is to unshare a
+few namespaces and exec, bwrap is a fine, smaller tool.</p>
+<h2 id="kern-vs-youki-runc">kern vs youki / runc?</h2>
+<p>youki and runc are <strong>low-level OCI runtimes</strong>: they run a pre-made bundle and are normally driven by an
+engine (Docker, Podman, containerd) above them. kern is the whole runtime (pull, box, lifecycle, SDK).
+In one same-host measurement (same busybox rootfs, full lifecycle) a youki create+start+delete was
+~42 ms against kern's ~4 ms full box, roughly 10x; numbers vary by host and kernel. kern also installs
+a deny-by-default seccomp allowlist that a stock low-level runtime does not.</p>
+<h2 id="kern-vs-e2b-modal-daytona">kern vs E2B / Modal / Daytona?</h2>
+<p>Those are hosted clouds: they need an account, a network round-trip and per-execution cost, and they do
+not run offline, air-gapped, in your CI, or on an ARM board. kern runs on your own machine with nothing
+to call. For <strong>actively hostile, multi-tenant</strong> code from strangers on shared hardware they use a
+hardware boundary (a microVM); kern's ground is your own or semi-trusted code run locally. Same job,
+different substrate.</p>
+<h2 id="does-it-run-on-windows">Does it run on Windows?</h2>
+<p>Not natively. kern's isolation is Linux kernel machinery (user namespaces, cgroup v2, seccomp), so it
+runs on <strong>Linux, WSL2 and ARM boards</strong> (Raspberry Pi, Jetson, Arduino UNO Q). On Windows, use WSL2: the
+release ships a pre-baked WSL rootfs and a small <code>kern.exe</code> shim.</p>
+<h2 id="does-it-run-on-macos">Does it run on macOS?</h2>
+<p>Not natively, and that is a non-goal rather than work left undone: macOS has no namespaces and no
+cgroups, so there is nothing there for kern to build a box out of. It does run <strong>on a Mac inside a
+Linux VM</strong> (Lima, colima, OrbStack, UTM, or the one Docker Desktop is already running), where it is
+the ordinary Linux kern, same binary and same CLI as your CI box.</p>
+<p><strong>Which guest you pick changes how much of kern you get</strong>, and the gap is bigger than it looks. Both
+options below have been observed rather than assumed, and they are not equivalent.</p>
+<p><strong>A Fedora guest gives the whole runtime.</strong> A user on Apple Silicon running Lima with Fedora 43
+(<code>6.17.1-300.fc43.aarch64</code>) posted their <code>kern doctor</code> in
+<a href="https://github.com/getkern/kern/issues/5">issue #5</a>: 16 ok and one warning. Unprivileged user
+namespaces enabled, AppArmor not restricting them, <strong><code>cgroup v2</code> + a <code>systemd --user</code> scope with
+resource caps enforced</strong>, caps going straight into <code>kern.slice</code> with no per-box systemd round trip,
+lingering on, unprivileged overlayfs, <code>newuidmap</code>, <code>pasta</code>, and Landlock ABI v7. The single warning
+was a missing <code>sshfs</code>. Nothing switched off. Their host, their output, reported rather than measured
+here, which is why it is attributed: Lima's own template list is the place to get a Fedora guest.</p>
+<p><strong>colima with its default Ubuntu guest works, with two things switched off.</strong> Verified directly, on a
+MacBook with Apple Silicon, colima 0.10.3 and Ubuntu 24.04: kern installs, a box from an OCI image
+starts, and the Python SDK drives it.</p>
+<pre><code class="language-sh">brew install colima &amp;&amp; colima start &amp;&amp; colima ssh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+</code></pre>
+<p>The second line is the normal installer, run from inside the VM. What you give up on that guest:</p>
+<ul>
+<li><strong>The first box fails on AppArmor</strong>, because Ubuntu 23.10 and newer restrict unprivileged user
+  namespaces. <code>kern doctor</code> names it first and prints the fix
+  (<code>sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0</code>), which a VM restart undoes.</li>
+<li><strong>The resource caps do not bite</strong>: no <code>systemd --user</code> manager and no delegated <code>memory</code>
+  controller, so <code>--memory</code> is accepted and never enforced. kern says so at every box start instead
+  of pretending, and <code>--require-limits</code> refuses to run uncapped. The isolation itself (namespaces,
+  pivoted root, seccomp, Landlock) is unaffected.</li>
+</ul>
+<p>Neither of those applies to the Fedora guest above, which is the whole reason both are documented
+instead of one.</p>
+<p>Whichever guest you pick, <strong>no GPU and no GPIO</strong> are reachable from a Linux VM on a Mac. Apple
+exposes neither, which is why Docker Desktop has no GPU for containers either.</p>
+<p><a href="install.html">docs/INSTALL.md</a> has the detail and the way back to enforced caps.</p>
+<h2 id="is-it-safe-to-run-truly-hostile-untrusted-multi-tenant-code">Is it safe to run truly hostile, untrusted multi-tenant code?</h2>
+<p>The boundary is the Linux kernel, so a kernel privilege-escalation bug is an escape, and an unprivileged
+user namespace is itself kernel attack surface. This is the container model, not a kern quirk: Docker
+and Podman share the same kernel and the same escape condition, which is why gVisor and Firecracker
+exist. For strangers' hostile code on shared hardware, reach for a microVM (Firecracker, Kata) or
+gVisor. kern is honest about this in <a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a> before it makes any claim; its ground
+is semi-trusted or your-own code: CI, build steps, dev sandboxes, an agent's tool-calls under your
+supervision.</p>
+<h2 id="why-does-kern-version-print-000-from-a-source-build">Why does <code>kern --version</code> print <code>0.0.0</code> from a source build?</h2>
+<p>By design. The source is version-free (no stale number lives in git); the version lives in the git tag
+and the release. A published release binary reports the release version; a from-source <code>cargo install</code>
+reports <code>0.0.0</code>, which is expected and harmless.</p>
+<h2 id="where-is-the-gpu-support">Where is the GPU support?</h2>
+<p>Slices are not in this edition, they are on the <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md">roadmap</a>. What is here is the
+verdict: <code>kern doctor</code> reads sysfs and reports, per GPU, what a VRAM cap would be worth. <code>TIER-HW</code>
+means a MIG or SR-IOV partition is present, enforced by the device and not by the tenant. kern
+reads that the partition is there and has not measured the VRAM split, and says so on the line. <code>TIER-SOFT</code>, which is what consumer
+hardware gets, means a cooperative quota: useful for density, fairness and accidental overcommit, and
+not a boundary against code that is trying to get around it. Detection is read-only and caps nothing,
+so there is still nothing to attack. kern today virtualizes CPU (<code>vcpu:</code>), memory, disk (<code>vdisk:</code>)
+and devices (<code>vgpio:</code>).</p>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/FAQ.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

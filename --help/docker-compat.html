@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker compatibility: what maps and what does not | kern</title>
+<meta name="description" content="kern speaks Docker&#x27;s formats, so existing images and stacks work. It does not reimplement the Docker Engine API. This page is the reference: what is supporte">
+<link rel="canonical" href="https://getkern.dev/guide/docker-compat.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/docker-compat.html">
+<meta property="og:title" content="Docker compatibility: what maps and what does not">
+<meta property="og:description" content="kern speaks Docker&#x27;s formats, so existing images and stacks work. It does not reimplement the Docker Engine API. This page is the reference: what is supporte">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="docker-compatibility">Docker compatibility</h1>
+<p>kern speaks Docker's <strong>formats</strong>, so existing images and stacks work. It does <strong>not</strong> reimplement the
+Docker Engine API. This page is the reference: what is supported, what is not, and where the
+differences bite.</p>
+<p>Every FIGURE on this page is measured, and the measurement is named where it matters. Statements
+about what Docker does are measured against <strong>Docker 29.6.2</strong> on a real daemon (a Jetson Orin Nano,
+aarch64) and against <strong>podman 4.9.3</strong> rootless on the development host; where a question was not put
+to a daemon, the line says so. <a href="https://github.com/getkern/kern/blob/main/RUNTIME-PARITY.md">RUNTIME-PARITY.md</a> carries those measurements one
+by one.</p>
+<h2 id="what-compose-compatibility-means-here-in-three-numbers">What "compose compatibility" means here, in three numbers</h2>
+<p>Three different questions, three different numbers. Quoting one under another's definition is the
+mistake this project already made once and corrected (see the v0.9.32 errata in
+<a href="https://github.com/getkern/kern/blob/main/CHANGELOG.md">CHANGELOG.md</a>), so
+each one carries its definition and its denominator.</p>
+<p>Corpus: 259 real compose files, one per repository, sampled across 733 repositories, listed one per
+row in <code>docs/compose-corpus-neutral.tsv</code> with the repository, the path inside it and the sha256 of
+the bytes that were measured. The commit is NOT pinned, so a file may have changed since; the hash
+is the only thing that says what was read. Binary proven to be the working tree (the script refuses
+to measure otherwise).</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Answer</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Does kern ACCEPT the file?</td>
+<td><strong>247 / 259 = 95%</strong></td>
+<td><code>compose config</code> exits 0. ACCEPTED, not executed: of 41 files taken further and actually started, 19 did not come up (images that no longer resolve, host paths this corpus cannot carry, a FIFO in a layer, DNS). The 12 kern refuses, Docker 29.6.2 refuses too, so ON THIS CORPUS there is no file Docker accepts and kern rejects. Not a claim about every compose file: kern refuses at <code>config</code> two mappings sharing one host port, which Docker accepts and fails at <code>up</code>.</td>
+</tr>
+<tr>
+<td>Is it accepted with NO difference kern names?</td>
+<td><strong>198 / 259 = 76%</strong></td>
+<td>zero warning lines at <code>config</code> that are a behavioural difference, BEYOND the deviations declared below. Those deviations have no per-file warning (they apply to nearly every file), so they are declared once here instead of counted 259 times.</td>
+</tr>
+<tr>
+<td>The same, on a host that permits low ports</td>
+<td><strong>222 / 259 = 85%</strong></td>
+<td>the identical measurement in a network namespace with <code>net.ipv4.ip_unprivileged_port_start=0</code>, which is one <code>sysctl</code> on a real host. MEASURED, not derived by subtracting a cause: <code>compose-compat-rate.py --with-low-port-floor</code> runs both and prints both.</td>
+</tr>
+</tbody>
+</table>
+<p>THE FIRST NUMBER WAS 35% AND THEN 33% WHILE KERN GOT BETTER, and the reason is worth more than the
+number. It counts what kern SAYS it does differently, so it falls whenever kern learns of a
+difference it used to be silent about - <code>external:</code> networks cost two points the day they were
+measured. It rose to 72% when the default wiring changed to a network namespace per service, which
+is the arrangement Docker has: that single cause carried 135 files, 101 of them with nothing else.</p>
+<p>The gap between 95% and 76%, by cause (second column: files for which it is the ONLY cause):</p>
+<pre><code> 38   24   a privileged host port is republished above 1024 (rootless; not kern's to fix,
+           and 0 of 24 on a host whose port floor is 0)
+ 14    1   no daemon behind /var/run/docker.sock
+  7    1   `privileged: true` needs the operator's grant
+  2    1   `runtime: nvidia`: the GPU is a device grant here
+  1 each   logging driver, ipc:, a fixed address, an out-of-range port,
+           security_opt seccomp, an unimplemented key, platform:
+</code></pre>
+<p>ONE CAUSE LEFT IS NOT KERN'S AND CARRIES THE REST. 24 of the 49 remaining files publish a port below
+1024, which rootless the kernel refuses to bind: podman refuses the same port and names the same
+sysctl, Docker binds it because it is root. That is the whole distance between the two numbers in
+the table above.</p>
+<p>Every one of the 259 files is wired the way Docker wires it, so the shared-loopback cause is gone
+from this table and from the runtime. <code>--pod</code> still asks for the old wiring and still says what it
+costs.</p>
+<p>Of 259 real files, the only compose KEY kern reports as unimplemented is <code>runtime:</code>, on two files. A
+key no file in the corpus uses is not covered by that sentence: it says nothing about
+<code>deploy.replicas</code>, <code>cgroup_parent</code>, <code>userns_mode</code> or <code>mac_address</code>, which no file here writes.</p>
+<p>The corpus is 259 files found by their NAME. Nine of the twelve kern refuses are not compose files
+at all (<code>.bak</code>, <code>.dist</code>, <code>.old</code>, <code>.md</code>, <code>-e</code>), and Docker refuses them for the same reason; the
+denominator keeps them because removing the files a measurement dislikes is how a rate goes up.</p>
+<h2 id="the-perimeter">The perimeter</h2>
+<p>kern is a substitute for <code>docker compose</code> on files that do not need:</p>
+<ul>
+<li>the Engine API behind <code>/var/run/docker.sock</code> (14 files here: Traefik's docker provider,
+    Portainer, Watchtower, CI-in-docker). A reverse proxy CONFIGURED BY FILE rather than by the
+    socket does work across projects: see the <code>external:</code> network entry below,</li>
+<li><code>privileged: true</code> without an operator grant on the command line (7 files),</li>
+<li><code>runtime:</code> (2 files),</li>
+<li>a host port below 1024 kept where the file wrote it. 38 files publish one; they RUN, moved and
+    announced, and <code>compose ps --format json</code> reports the real address in <code>Publishers</code>. They are
+    outside the perimeter only when the port must BE 80, which is the ACME HTTP-01 case,</li>
+<li><code>--pod</code>, where a service that binds <code>127.0.0.1</code> does not keep it private from its peers. It is
+    no longer the default and it is no longer where a stack lands without asking; the census that
+    measured it (22 stacks read from inside, 2 with a loopback-only listener, both of them nominal)
+    is in <a href="https://github.com/getkern/kern/blob/main/RUNTIME-PARITY.md">RUNTIME-PARITY.md</a>,</li>
+<li>UDP between peers under the <code>--no-pod</code> relay wiring,</li>
+<li>files on a bind mount owned by the uid the service runs as: rootless maps them through the
+    subuid range, so a service running as 1000 writes files the host sees as 100999 (section 38),</li>
+<li>a stack that comes back after a reboot on its own: kern has no daemon, and the path is
+    <code>compose systemd</code> plus <code>loginctl enable-linger</code> (section 39),</li>
+<li>the image kern already built being reused when its context changed: kern rebuilds, Docker does
+    not without <code>--build</code>.</li>
+</ul>
+<p>Outside that list, on this corpus, kern accepts every file Docker accepts.</p>
+<table>
+<thead>
+<tr>
+<th>From your Docker setup</th>
+<th>kern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>OCI images</strong> (Docker Hub, GHCR, quay, Harbor, self-hosted)</td>
+<td>✅ pull &amp; run: multi-arch, <code>WWW-Authenticate</code> v2 auth, gzip <strong>+ zstd</strong>, digest-pinned <code>@sha256:</code> refs <strong>content-verified</strong> (the manifest is checked against the pin)</td>
+</tr>
+<tr>
+<td><strong><code>docker-compose.yml</code></strong></td>
+<td>✅ <code>kern compose &lt;file&gt; [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|watch\|port\|systemd\|run\|cp]</code> reads real-world files as-is: <code>depends_on</code> (+ <code>service_healthy</code>/<code>_completed</code> conditions), <code>healthcheck</code>, <code>deploy.resources.limits</code>, <code>ulimits</code>, <code>sysctls</code>, <code>labels</code>, <code>extra_hosts</code>, <code>init</code>, <code>stop_signal</code>/<code>stop_grace_period</code>, <strong><code>restart:</code></strong> (<code>always</code>/<code>unless-stopped</code>/<code>on-failure</code>), <code>devices</code>, <code>dns</code>/<code>dns_search</code>/<code>dns_opt</code>, <code>logging</code> <code>max-size</code>/<code>max-file</code>, <code>links</code>, <code>ipc</code>/<code>pid</code>, <code>tmpfs</code>, <code>mem_reservation</code>, <code>cpu_shares</code>, <code>platform</code>, <code>volumes_from</code>, <code>shm_size</code>, <code>secrets</code>, YAML <strong>anchors/merge</strong> (<code>&lt;&lt;: *x</code>), <strong><code>extends</code></strong>, <code>x-</code> extension fields, the project <strong><code>.env</code></strong>, <code>${VAR:-default}</code>, <code>${VAR:?err}</code> and bare <code>$VAR</code> interpolation, network <strong>aliases</strong>. Multiple files merge (<code>-f base.yml -f override.yml</code>), plus <code>-p</code>/<code>--env-file</code>/<code>--profile</code>. <code>up</code> <strong>reconciles</strong>: a service still matching the file is left running, a changed one is recreated</td>
+</tr>
+<tr>
+<td><strong>Dockerfile</strong> <code>build</code></td>
+<td>✅ <code>kern build</code>: all common instructions, <strong>multi-stage</strong> (+ <code>target:</code>), <code>COPY --from=…</code> (a build stage <strong>or</strong> an external image), <strong>COPY globs</strong>, BuildKit <strong>heredocs</strong>, <code>ADD &lt;url&gt;</code> (+ <code>--checksum</code>/<code>--chmod</code>), <code>COPY --chmod</code> (recursive, Docker-parity), <code>FROM scratch</code>, <code>SHELL</code>, <code># escape</code>/BOM, <code>--build-arg</code>, a <strong>whole-build cache</strong>, and honours <strong><code>.dockerignore</code></strong>. Daemonless: each <code>RUN</code> is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first</td>
+</tr>
+<tr>
+<td><strong><code>.dockerignore</code></strong> (also <strong><code>.kernignore</code></strong>)</td>
+<td>✅ excluded from the build context (last-match-wins, <code>!</code> re-include, <code>**</code>)</td>
+</tr>
+<tr>
+<td><strong><code>docker save</code> / <code>load</code> archives</strong></td>
+<td>✅ <code>kern save</code> / <code>kern load</code>: <code>docker load</code>-compatible</td>
+</tr>
+<tr>
+<td><strong><code>tag</code> / <code>push</code></strong> to a registry</td>
+<td>✅ <code>kern tag</code> / <code>kern push</code></td>
+</tr>
+<tr>
+<td><strong>Image management</strong> (<code>docker images</code> / <code>rmi</code> / <code>search</code>)</td>
+<td>✅ <code>kern images</code>, <code>kern rmi</code> (frees unshared layers), <code>kern search</code></td>
+</tr>
+<tr>
+<td><strong><code>docker commit</code></strong> (container → image)</td>
+<td>✅ <code>kern commit &lt;box&gt; &lt;image&gt;</code>: snapshots the box's filesystem; skips volumes/secrets</td>
+</tr>
+<tr>
+<td><strong><code>docker run</code> security flags</strong></td>
+<td>✅ <code>kern box</code>: <code>--apparmor &lt;profile&gt;</code>, <code>--cap-drop</code>/<code>--cap-add</code>, <code>--read-only</code>, <code>--tmpfs</code>, an opt-in <code>--security-profile untrusted</code> bundle, <code>--landlock-rw</code>; seccomp is <strong>always on</strong>. Not present: <strong>SELinux</strong> labelling, and a <strong>default</strong> AppArmor profile. Full posture: <a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a></td>
+</tr>
+<tr>
+<td><strong>Docker Engine API</strong> / <code>docker.sock</code></td>
+<td>❌ tools that attach to the socket will not connect</td>
+</tr>
+<tr>
+<td><strong>Swarm</strong> (multi-host orchestration)</td>
+<td>❌ no workaround: out of scope for a single-host, daemonless runtime</td>
+</tr>
+</tbody>
+</table>
+<h2 id="how-a-stack-is-wired">How a stack is wired</h2>
+<p>kern picks the wiring from the file, and says which one it picked.</p>
+<p><strong>A namespace per service, meeting on a bridge (the default, from two services up).</strong> This is
+Docker's arrangement: each service keeps its own <code>127.0.0.1</code>, so a port it binds on the loopback is
+private to it, two services can both listen on the same container port, and peers are reached by
+name over a real network. A single-service stack keeps the shared namespace, having no peer to be
+separated from.</p>
+<p>WHAT IT COSTS, MEASURED end to end on <code>up -d</code> with warm images, alternated against <code>--pod</code>: +17 ms
+for 2 services, +23 ms for 4, +27 ms for 8. It is nearly flat because the two things that made it
+per-service are gone - a veth peer is now created directly inside the member's namespace instead of
+being moved into it, which saves a full RCU grace period (14-22 ms) per service, and every NAT is
+attached concurrently before any service is released instead of one at a time (about 17 ms each).
+Before those two, the same eight-service stack cost +239 ms.</p>
+<p><strong>One shared namespace (<code>--pod</code>).</strong> Services reach each other by name on <code>127.0.0.1</code>: no bridge, no
+IPAM, no DNS server, and a bring-up flat in the number of services. Two services cannot both listen
+on the same container port here, and kern refuses such a stack rather than running it with one of
+them dead. <code>net.*</code> sysctls belong to the namespace and therefore to the whole stack. A port a service
+binds on the loopback is reachable by every peer, which under Docker it would not be.</p>
+<p><strong>A namespace per service with relays (<code>--no-pod</code>).</strong> Chosen automatically when the file's
+<code>networks:</code> leave two services with nothing in common, because one bridge would put them back on one
+network and drop the separation the file asked for. Peers are reached through per-service loopback
+aliases (<code>127.0.0.2</code> upward) carried by relays, so a namespace still holds only <code>lo</code> with no routes.
+The cost is a relay hop: measured at -34% bulk throughput and -16% connection rate.</p>
+<p><strong><code>networks:</code> is enforced in that wiring and inert in a pod.</strong> Two services with no network in common
+get no relay and no <code>/etc/hosts</code> entry, so the peer's name does not resolve at all. The boundary is
+the ABSENCE of a relay, not a filter, so no rule can be misconfigured into permissiveness. A service
+with no <code>networks:</code> key is on the implicit <code>default</code> network and is therefore separated from services
+that name one; measured over 240 real files, 52 have at least one pair that loses an edge and 40 are
+exactly that mixed case, so <code>up</code> names every cut pair before starting anything.</p>
+<p><strong>A network shared BETWEEN projects (<code>external: true</code>).</strong> A compose file declares it, <code>kern network
+create &lt;name&gt;</code> makes it, and services of different files on it resolve and reach each other by name -
+the reverse-proxy pattern. A file naming one that does not exist is REFUSED, measured against the
+reference: <code>docker compose up</code> answers <code>network X declared as external, but could not be found</code> and
+<code>docker compose config</code> renders the file anyway, which is what kern does too.</p>
+<p>IT IS RELAYS AND NOT A SHARED BRIDGE, and that is a property of rootless Linux rather than a choice.
+Measured, each refusal against a control that rules out the tool: from the initial user namespace,
+joining another holder's network namespace is EPERM (entering its user namespace first works); from
+inside one pod's user namespace, creating a veth whose peer lands in a sibling pod's network
+namespace is EPERM (both ends inside one pod works). Joining a network namespace needs
+<code>CAP_SYS_ADMIN</code> in the caller's own user namespace, and placing a link needs <code>CAP_NET_ADMIN</code> in the
+one that owns the target; a sibling has neither. A relay needs neither, because its two halves each
+enter only their own box. What that costs is a TCP hop and TCP only, and a peer answers on a port the
+file DECLARES, exactly as inside a <code>--no-pod</code> stack.</p>
+<p>EACH MEMBER GETS ONE ADDRESS ON THE NETWORK, <code>127.1.&lt;network&gt;.&lt;member&gt;</code>, which every other member
+binds locally to reach it and which it uses as its own source address. Those cannot collide with a
+stack's own peer aliases, which live in <code>127.0.0.2</code> through <code>127.0.0.254</code>. A stack that joins later
+is wired into the boxes already running - relays into them, and their <code>/etc/hosts</code> updated in place -
+and <code>down</code> takes both away again.</p>
+<p><strong>The host is outside the stack under every wiring.</strong> A listener on the host's own loopback is not
+reachable from a service, bridged or podded, and that is asserted with a positive control. Inside the
+stack the wirings differ and that difference is the point: the default separates the services'
+loopbacks as Docker does, and <code>--pod</code> puts them in one trust domain, where a service you do not trust
+with its peers does not belong.</p>
+<h2 id="egress">Egress</h2>
+<p><code>kern compose up</code> attaches <code>pasta</code> (the <code>passt</code> package) for NAT'd egress and DNS. Without <code>pasta</code>
+installed a pod comes up loopback-only and the bring-up line says so. Outside a pod each service gets
+its own NAT, attached while it is held at its pre-exec gate, so no workload ever sees a half-built
+network.</p>
+<p><code>internal: true</code> is a real boundary without a pod: a service confined to internal networks is given
+no NAT, so there is no route out of its namespace. Two exceptions are named rather than hidden: a
+service on the host network already has the host's connectivity, and a service with <code>restart:</code> becomes
+a systemd unit that <code>up</code> never holds. In a pod the key is all-or-nothing and <code>up</code> says which answer
+the stack got.</p>
+<p>The NAT does not reopen what segregation closed: measured from inside a segregated service, a public
+address connected while the host's own address answered <code>refused</code> on both a real listener and the
+segregated peer's published port.</p>
+<p>What pasta costs, measured on one host against the same targets: about <strong>3.6 ms per network round
+trip</strong>, and about 9% less download throughput. A pod has no DNS cache, so a host running a caching
+resolver answers a repeated name faster; on a name neither side had resolved before the pod was the
+faster of the two.</p>
+<h2 id="differences-that-bite">Differences that bite</h2>
+<p><strong>In one shared namespace the services share <code>127.0.0.1</code>.</strong> A port bound on the loopback is reachable
+from every peer, which under Docker it would not be: admin endpoints, <code>/metrics</code>, pprof, anything
+trusting <code>127.0.0.0/8</code> without authentication. <code>--no-pod</code> gives each service its own loopback.</p>
+<p><strong>A published port binds <code>0.0.0.0</code>, like Docker.</strong> kern used to bind <code>127.0.0.1</code>, which was the single
+largest source of behavioural difference: on a neutral corpus of 259 files, one per repository, 203
+(78%) publish at least one port. The narrower posture is one line, and it is a CEILING rather than a
+default, so a downloaded file cannot defeat it by writing an address:</p>
+<pre><code class="language-toml">[kern]
+publish_bind = &quot;127.0.0.1&quot;
+</code></pre>
+<p><strong>A service with no <code>mem_limit:</code> gets the host's RAM</strong>, as it does under Docker. It is not uncapped:
+the box carries a <code>memory.max</code> and <code>oom.group = 1</code>, so a failure stays attributable to its own cgroup
+instead of the host OOM killer picking a victim. <code>[kern] compose_memory_max</code> restores a strict ceiling
+and caps a bigger <code>mem_limit:</code> too; see <a href="config.html">CONFIG.md</a>.</p>
+<p><strong>An empty NAMED volume is seeded from the image</strong>, contents, owner and mode. Only when the volume is
+empty, and never for a bind mount of a host path. A multi-layer image is read through the
+kernel-merged overlay view, so a file a higher layer deleted does not come back.</p>
+<p><strong>The image's own <code>HEALTHCHECK</code> and <code>STOPSIGNAL</code> are used</strong> when the file declares none. A
+<code>healthcheck:</code> in the file replaces the image's entirely, numbers included, and that includes Docker
+25+'s <code>start_interval:</code> (how often to probe while inside <code>start_period:</code>), which is honoured from both
+the file and the image. An explicit
+<code>stop_signal:</code> wins even when it names <code>SIGTERM</code>; a signal name kern does not know leaves the box on
+<code>SIGTERM</code> rather than refusing to start it.</p>
+<p><strong>A service mounting <code>/var/run/docker.sock</code> has nothing to talk to.</strong> kern is daemonless. The mount
+succeeds and the service fails later inside its own code. Such a service needs real Docker.</p>
+<p><strong><code>restart:</code> in a pod does not survive a reboot.</strong> A pod member is supervised in-process and restarted
+on any exit of its WORKLOAD for the life of the stack, but a systemd unit cannot re-join the pod's
+network namespace. A box that never started is the one exception: it exits 125, it has no workload to
+restart, and retrying it is budgeted rather than endless.
+For reboot-survival run that service as a standalone box: <code>kern box &lt;name&gt; --restart unless-stopped</code>,
+which has no pod and therefore no pod egress.</p>
+<p><strong><code>devices:</code> is a bind, and its ceiling is the invoking user.</strong> A rootless box reaches exactly what
+the person who started it could already reach; a device the host does not have is refused by name
+before the box starts. <code>/dev/net/tun</code> maps to <code>--tun</code> instead, because creating a tunnel interface
+needs <code>CAP_NET_ADMIN</code> in the box's namespace.</p>
+<p><strong>Secrets are delivered at <code>/run/secrets/&lt;source&gt;</code></strong>, owned by the box's root, mode <code>0444</code> (the
+specification's default) or the <code>mode:</code> the file declares. <code>target:</code>, <code>uid:</code> and <code>gid:</code> are read and
+named as not applied.</p>
+<h2 id="what-is-refused-rather-than-dropped">What is refused rather than dropped</h2>
+<p><strong><code>${VAR:?message}</code></strong> with no value. That form exists to stop a file being rendered without it, and it
+is what a compose file writes for a password. Every variable with no value is named, not just the
+first. <code>${VAR}</code> and <code>${VAR:-default}</code> are unchanged.</p>
+<p><strong><code>RUN --mount=type=secret</code> and <code>type=ssh</code>.</strong> Dropping the flag runs the command unauthenticated:
+either a 401 pointing at the registry rather than at the discarded flag, or a build that succeeds
+against something public and ships the wrong result. <code>type=cache</code> and <code>type=bind</code> stay dropped,
+because those cost a rebuild and not a wrong answer.</p>
+<p><strong><code>external: true</code> on a volume that does not exist</strong>, as Docker refuses it. Create it with
+<code>kern volume create &lt;name&gt;</code> first, or drop the key and accept that the service starts on empty
+storage.</p>
+<p><strong>Two services on the same internal port under <code>--pod</code>.</strong> Declare the port each one listens on and
+the conflict goes away; <code>expose:</code> says the same thing and is honoured identically:</p>
+<pre><code class="language-yaml">services:
+  api:    { image: node:20-slim, port: 3000 }
+  admin:  { image: node:20-slim, port: 3100 }
+</code></pre>
+<p>kern passes it as <code>PORT</code>. That is a convention, not a contract: an image reading a variable of its own
+needs that one set instead.</p>
+<h2 id="resource-profiles-from-a-compose-file">Resource profiles from a compose file</h2>
+<p><code>x-kern-vcpu</code>, <code>x-kern-vdisk</code>, <code>x-kern-vgpio</code> and <code>x-kern-security-profile</code> attach a <code>kern.toml</code>
+profile to a service. <code>x-</code> is the specification's extension mechanism, so the file stays portable:
+Docker ignores the key and runs the service without the profile.</p>
+<p>A profile buys only what compose cannot already say. <code>cpus</code>, <code>cpuset</code> and <code>mem_limit</code> are compose's
+own and are used directly. A <code>tmpfs</code> size cap is honoured and charged to the box's memory cap.</p>
+<p><code>vgpio</code> is gated: a profile name means different hardware on different hosts, so <code>kern compose &lt;file&gt;
+config</code> prints what each name resolves to here, and <code>--allow-device-grants</code> (or the operator's own
+<code>kern.toml</code>) is required before it runs.</p>
+<p><strong>A profile kind this build does not have is named as absent rather than treated as a typo, and the
+difference is the whole point of the sentence.</strong> There is exactly one such kind here:
+<code>x-kern-vgpu:</code>. It is recognised, it is not available in this build, and a file carrying it runs
+without it:</p>
+<pre><code>kern: warning: compose: service 'app': 'x-kern-vgpu:' names the 'vgpu' profile kind, which this
+build of kern does not have - the key is ignored, and the service runs without it
+</code></pre>
+<p>A MISSPELLED key gets a different sentence, because it is a different problem: telling the author of
+<code>x-kern-vgpu</code> to check their spelling would be false, and telling the author of <code>x-kern-vgpi</code> that
+their key belongs to another build would be worse:</p>
+<pre><code>kern: warning: compose: service 'app': 'x-kern-vgpi:' is not read by this build - kern reads
+x-kern-vcpu, x-kern-vdisk, x-kern-vgpio, and x-kern-security-profile
+</code></pre>
+<p>Both are warnings and neither stops the stack: the specification requires every runtime to ignore an
+<code>x-</code> key, so refusing one would be the incompatibility this whole mechanism exists to avoid. What
+must never happen is silence, because a key nobody read is a CPU slice or a device the author
+believes they attached.</p>
+<h2 id="starting-a-stack-at-boot">Starting a stack at boot</h2>
+<p><code>kern compose &lt;file&gt; systemd</code> generates a unit. It adds no supervision beyond each service's own
+<code>restart:</code> policy. A single long-running box installs its own unit automatically; the stack path is
+manual on purpose.</p>
+<h2 id="everyday-docker-commands">Everyday <code>docker</code> commands</h2>
+<table>
+<thead>
+<tr>
+<th><code>docker …</code></th>
+<th><code>kern …</code></th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run</code> / <code>create</code></td>
+<td><code>box</code></td>
+<td>one verb; <code>-d</code> detaches, <code>-it</code> for a PTY, <code>--entrypoint</code> replaces the image's ENTRYPOINT and discards its CMD (<code>--entrypoint ""</code> clears it)</td>
+</tr>
+<tr>
+<td><code>exec</code></td>
+<td><code>exec</code></td>
+<td>joins the box's namespaces, with the box's own environment</td>
+</tr>
+<tr>
+<td><code>ps</code></td>
+<td><code>ps</code></td>
+<td><code>-a</code>/<code>--all</code>, <code>-q</code>, <code>--filter name=/status=/id=</code>, <code>--format '{{.Field}}'</code>, <code>--json</code></td>
+</tr>
+<tr>
+<td><code>logs</code></td>
+<td><code>logs</code></td>
+<td><code>--tail N</code>, <code>-f</code>/<code>--follow</code> (bounded read, cheap on GB-size logs)</td>
+</tr>
+<tr>
+<td><code>stop</code> / <code>kill</code></td>
+<td><code>stop</code> / <code>kill</code></td>
+<td><code>stop</code> sends <code>--stop-signal</code> (SIGTERM), waits <code>--stop-timeout</code> (10 s), then SIGKILLs what is left. <code>kill</code> is an ALIAS, not Docker's immediate kill: to skip the wait use <code>--stop-timeout 0</code>. A grace that provably cannot end is skipped, not sat out</td>
+</tr>
+<tr>
+<td><code>pause</code> / <code>unpause</code></td>
+<td><code>pause</code> / <code>unpause</code></td>
+<td>cgroup v2 freezer</td>
+</tr>
+<tr>
+<td><code>attach</code></td>
+<td><code>attach</code></td>
+<td>Ctrl-C detaches, box keeps running</td>
+</tr>
+<tr>
+<td><code>cp</code></td>
+<td><code>cp</code></td>
+<td>host↔box, symlinks cannot escape the box root</td>
+</tr>
+<tr>
+<td><code>inspect</code></td>
+<td><code>inspect</code></td>
+<td><code>--json</code></td>
+</tr>
+<tr>
+<td><code>stats</code></td>
+<td><code>stats</code></td>
+<td>per-box CPU / memory</td>
+</tr>
+<tr>
+<td><code>top</code> (box processes)</td>
+<td><code>exec &lt;box&gt; ps</code></td>
+<td>plus <code>kern top</code>, the live TUI</td>
+</tr>
+<tr>
+<td><code>rename</code></td>
+<td><code>rename</code></td>
+<td>in place, pid unchanged</td>
+</tr>
+<tr>
+<td><code>update</code></td>
+<td><code>update</code></td>
+<td>live cgroup caps, no restart (needs a delegated cgroup)</td>
+</tr>
+<tr>
+<td><code>wait</code></td>
+<td><code>wait</code></td>
+<td>the code the workload exited with, including after a clean <code>stop</code>. Exact where the box has its OWN cgroup, best-effort where it does not: on a host with no delegation a clean shutdown can still record <code>137</code>. <code>kern doctor</code> says which host you are on</td>
+</tr>
+<tr>
+<td><code>diff</code></td>
+<td><code>diff</code></td>
+<td>overlay-upper changes: <code>C</code> changed/added, <code>D</code> deleted</td>
+</tr>
+<tr>
+<td><code>events</code></td>
+<td><code>events</code></td>
+<td>poll-based stream (<code>start</code>/<code>die</code>/<code>rename</code>); daemonless, best-effort</td>
+</tr>
+<tr>
+<td><code>commit</code></td>
+<td><code>commit</code></td>
+<td>box → reusable image (warm start)</td>
+</tr>
+<tr>
+<td><code>start</code> (resume a stopped container)</td>
+<td><em>(none)</em></td>
+<td>a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume</td>
+</tr>
+<tr>
+<td><code>login</code> / <code>logout</code></td>
+<td><code>login</code> / <code>logout</code></td>
+<td><code>kern login [registry] [--username U]</code>, and see below</td>
+</tr>
+</tbody>
+</table>
+<h3 id="every-docker-compose-verb-and-flag-kern-accepts">Every <code>docker compose</code> verb and flag kern accepts</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Verbs</strong></td>
+<td><code>up</code>, <code>down</code>, <code>stop</code>, <code>start</code>, <code>restart</code>, <code>ps</code>, <code>logs</code>, <code>build</code>, <code>pull</code>, <code>config</code>, <code>watch</code>, <code>port</code>, <code>systemd</code>, <code>run</code>, <code>cp</code>, <code>exec</code> (with the <code>--</code> Docker users type)</td>
+</tr>
+<tr>
+<td><strong><code>up</code></strong></td>
+<td><code>-d</code>, <code>--wait</code>, <code>--wait-timeout</code>, <code>--exit-code-from</code>, <code>--abort-on-container-exit</code>, <code>--no-deps</code>, <code>--build</code> (<code>--no-build</code> is refused, not ignored), <code>--quiet-pull</code></td>
+</tr>
+<tr>
+<td><strong><code>down</code></strong></td>
+<td><code>-v</code>, <code>--remove-orphans</code>, <code>-t</code>/<code>--timeout</code>, <code>--rmi local\|all</code></td>
+</tr>
+<tr>
+<td><strong><code>run</code></strong></td>
+<td><code>-d</code>, <code>--rm</code>, <code>-T</code>, <code>--name</code>, <code>--entrypoint</code>, <code>-e</code>, <code>--user</code>, <code>--pull</code>, <code>--no-deps</code></td>
+</tr>
+<tr>
+<td><strong><code>ps</code></strong></td>
+<td><code>-q</code>, <code>--services</code>, <code>--format json</code> (Docker's field names beside kern's, plus <code>Publishers</code>)</td>
+</tr>
+<tr>
+<td><strong><code>build</code> / <code>pull</code></strong></td>
+<td><code>--build-arg</code>, <code>--ignore-pull-failures</code></td>
+</tr>
+<tr>
+<td><strong><code>config</code></strong></td>
+<td><code>--services</code> prints the names one per line and nothing else</td>
+</tr>
+<tr>
+<td><strong>Everywhere</strong></td>
+<td><code>-p</code>, <code>--env-file</code>, <code>--profile</code>, and <code>--flag=value</code> wherever <code>--flag value</code> works</td>
+</tr>
+<tr>
+<td><strong>Files read</strong></td>
+<td><code>docker-compose.override.yml</code>, <code>extends: {file: ...}</code>, the project <code>.env</code>, <code>env_file:</code> long form, anonymous volumes in long form, named volumes scoped to the project, a secret from an environment variable</td>
+</tr>
+<tr>
+<td><strong>Keys applied</strong></td>
+<td><code>cpu_shares</code>, <code>memswap_limit</code> (a total, unlike cgroup v2's field), <code>ulimits</code> (including the one-line mapping form), <code>runtime:</code>, <code>ipv4_address:</code>, <code>depends_on</code> conditions, <code>network_mode: service:X</code>, an image's own <code>HEALTHCHECK</code> / <code>STOPSIGNAL</code> / <code>Cmd</code> / <code>Entrypoint</code> / <code>Env</code>, a healthcheck in exec form, <code>--tmpfs uid=</code>/<code>gid=</code></td>
+</tr>
+<tr>
+<td><strong>Keys named, not dropped</strong></td>
+<td>an unknown service key (with the near-miss suggestion), <code>deploy.replicas</code> / <code>mode</code> / <code>placement</code> / <code>update_config</code> / <code>rollback_config</code> / <code>endpoint_mode</code>, <code>deploy.restart_policy</code>, and <code>deploy.resources.reservations</code>: a GPU request says the service runs WITHOUT the device and where a device comes from</td>
+</tr>
+<tr>
+<td><strong><code>network_mode: host</code></strong></td>
+<td>applied as Docker applies it, and stated: it removes the service's network isolation, its peers stop resolving it by name, and any <code>ports:</code> it declares is a no-op</td>
+</tr>
+</tbody>
+</table>
+<p>Peers resolve each other by service name, by <code>networks.&lt;net&gt;.aliases</code> and by the name a service
+announces. <code>external: true</code> joins a network shared between projects.</p>
+<p>What needs a daemon does not exist here: <code>swarm</code> / <code>service</code> / <code>stack</code>, <code>docker.sock</code>, and anything
+that attaches to it. Nor does <code>--gpus</code>: kern ships no GPU cap and says why in
+<a href="https://github.com/getkern/kern/blob/main/GPU-CLAIMS.md">GPU-CLAIMS.md</a>, so a workload that needs the whole card gets the whole card and there
+is no quota to ask for.</p>
+<h3 id="reaching-the-host-from-inside-a-box-hostdockerinternal">Reaching the host from inside a box: <code>host.docker.internal</code></h3>
+<p>Docker resolves that name inside a container to the host. kern does not invent the name, it gives you
+the mapping and lets you spell it, which is the same thing Docker does when you write it yourself:</p>
+<pre><code class="language-yaml">services:
+  app:
+    image: python:3.12-slim
+    extra_hosts: [&quot;host.docker.internal:host-gateway&quot;]
+</code></pre>
+<p>or on a box:</p>
+<pre><code class="language-sh">kern box app --image python:3.12-slim --add-host host.docker.internal:host-gateway -- python3 app.py
+</code></pre>
+<p><code>host-gateway</code> is the keyword, resolved to the address the box reaches the host on; the NAME beside it
+is yours, so <code>host.docker.internal</code>, <code>dockerhost</code> and <code>gateway</code> all work and all mean the same thing.
+Three spellings are accepted for the compose key (<code>extra_hosts</code>, and the <code>--add-host</code> flag, and
+<code>add_host = [...]</code> in a <code>kern.toml</code>), and <a href="https://github.com/getkern/kern/blob/main/examples/edge/add-host.sh">examples/edge/add-host.sh</a> runs it.</p>
+<p><strong>A box is on its own network namespace by default</strong>, so nothing reaches the host until you say so:
+that mapping IS the saying so.</p>
+<h3 id="a-private-registry-docker-login">A private registry: <code>docker login</code></h3>
+<p><code>kern login</code> is the same verb with the same shape:</p>
+<pre><code class="language-sh">kern login                      # Docker Hub
+kern login ghcr.io              # any registry, prompted for the credentials
+kern login registry.example.com --username alice
+kern logout ghcr.io
+</code></pre>
+<p>It follows the standard registry-v2 challenge, so any compliant registry works, and the credentials
+never touch <code>argv</code>: they are stored <code>0600</code> in a <code>0700</code> directory and handed to <code>curl</code> through a stdin
+config, so no same-uid process can read them from <code>/proc/&lt;pid&gt;/cmdline</code>. A Bearer challenge only sends
+them to the advertised token realm when that host is the registry host or a subdomain of its parent
+domain (the CVE-2020-15157 class), and otherwise fetches the token anonymously and says so. The full
+model is in <a href="https://github.com/getkern/kern/blob/main/SECURITY.md#registry-authentication">SECURITY.md</a>.</p>
+<h2 id="building-and-publishing-images">Building and publishing images</h2>
+<p><code>kern build</code> reads a Dockerfile and <code>kern push</code> sends the result to a registry. Each <code>RUN</code> is a real
+box rather than a layer commit, so a build is subject to the same isolation as a run.</p>
+<p><strong>Warm start (<code>kern commit</code>).</strong> Bake an expensive one-time setup (<code>apt</code>/<code>pip</code> installs, a warmed
+cache) into a reusable image instead of paying for it on every box start.</p>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/DOCKER-COMPAT.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

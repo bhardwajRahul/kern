@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threat model: what the boundary is, and what it is not | kern</title>
+<meta name="description" content="This is the structured view: who the attacker is, what they are after, where they get in, and which boundaries hold against them. It is the map; SECURITY.md ">
+<link rel="canonical" href="https://getkern.dev/guide/threat-model.html">
+<meta name="robots" content="index, follow, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/img/kern-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="kern">
+<meta property="og:url" content="https://getkern.dev/guide/threat-model.html">
+<meta property="og:title" content="Threat model: what the boundary is, and what it is not">
+<meta property="og:description" content="This is the structured view: who the attacker is, what they are after, where they get in, and which boundaries hold against them. It is the map; SECURITY.md ">
+<meta property="og:image" content="https://getkern.dev/og-image-v3.png">
+<style>
+:root{--bg:#fff;--ink:#1f2328;--dim:#636c76;--line:#d1d9e0;--link:#0969da;--panel:#f6f8fa;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--ink:#e6edf3;--dim:#8b949e;--line:#30363d;
+--link:#4493f8;--panel:#161b22}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
+padding:2rem 1rem 4rem}
+main{max-width:52rem;margin:0 auto}
+nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
+font-size:.9rem}
+nav a{margin-right:1rem;white-space:nowrap}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
+h2{font-size:1.35rem;margin:2.2rem 0 .8rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+h3{font-size:1.1rem;margin:1.6rem 0 .5rem}
+code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15em .35em;
+border-radius:4px}
+pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
+th{background:var(--panel)}
+blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
+footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
+color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<nav> <a href="/">kern</a> <a href="install.html">Install</a> <a href="resources.html">Resources</a> <a href="egress.html">Egress</a> <a href="config.html">Config</a> <a href="mcp.html">Mcp</a> <a href="docker-compat.html">Docker-Compat</a> <a href="threat-model.html">Threat Model</a> <a href="faq.html">Faq</a></nav>
+<main>
+<h1 id="threat-model">Threat model</h1>
+<p>This is the structured view: who the attacker is, what they are after, where they get in, and which
+boundaries hold against them. It is the map; <a href="https://github.com/getkern/kern/blob/main/SECURITY.md">SECURITY.md</a> is the per-mechanism
+detail (every flag, syscall and check, with the bypasses named) and <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md#known-gaps-and-what-would-settle-them">ROADMAP.md</a>
+is the register of what is not yet known or done. Where a number matters, ask the binary
+(<code>kern box &lt;name&gt; --image &lt;ref&gt; --show-config</code>) rather than trusting a figure copied into prose.</p>
+<p>The one rule this document keeps: <strong>a boundary and a governor are named separately.</strong> A boundary is
+enforced by the kernel and holds against the workload itself; a governor shapes an honest workload
+and a hostile first-party one steps around it. Conflating the two is the most expensive mistake a
+sandbox document can make, so every row below says which it is.</p>
+<h2 id="assumptions">Assumptions</h2>
+<p><strong>Trusted.</strong> The host kernel (reasonably current; kern's isolation is <em>built on</em> it, so a
+kernel privilege-escalation bug is an escape). The operator who runs <code>kern</code> (their uid, their
+credentials, their host paths). The <code>kern</code> binary itself (provenance is anchored with signed tags and
+an independent timestamp).</p>
+<p><strong>Untrusted.</strong> Everything the workload or an image author controls: the in-box process, the OCI image
+or <code>--rootfs</code>, the compose file, the bytes a registry returns, and any content reachable over the
+box's network.</p>
+<h2 id="assets-an-attacker-wants">Assets an attacker wants</h2>
+<ol>
+<li><strong>The host filesystem</strong> outside the box's rootfs (read a host file, write or corrupt one).</li>
+<li><strong>The host kernel, processes and mounts</strong> (escape the namespaces; see or signal host or peer-box
+   processes; reach the host mount tree).</li>
+<li><strong>A peer box's secrets and posture.</strong> kern's runtime registry holds other boxes' SSH host keys,
+   <code>--secret</code> values, and the recorded capability/seccomp/AppArmor posture that <code>kern exec</code> reproduces.
+   Reading it steals a peer's secrets; writing it forges a peer's posture to weaken that peer's <code>exec</code>.</li>
+<li><strong>The operator's registry credentials</strong> (lift them from argv, a world-readable file, or a token
+   redirect).</li>
+<li><strong>Host network reachability</strong> the box's own netns should not grant (reach a host-loopback service,
+   the LAN, or a host-side transport such as vsock on WSL2).</li>
+</ol>
+<h2 id="entry-points-untrusted-input">Entry points (untrusted input)</h2>
+<ul>
+<li><strong>The in-box workload</strong> - arbitrary code with a shell, syscalls, and the box's namespace surface.</li>
+<li><strong>The OCI image / <code>--rootfs</code></strong> - a crafted tar (path traversal, symlink or hardlink escape,
+  whiteout tricks, tar-parser desync) and hostile file modes.</li>
+<li><strong>The compose file</strong> - dependency cycles, restart contradictions, override merges.</li>
+<li><strong>The registry</strong> - a compromised or MITM'd host serving mismatched bytes, a downgraded transport,
+  or a token realm on a foreign host.</li>
+<li><strong>Host-path flags</strong> - <code>-v</code>, <code>--secret</code>, <code>--env-file</code>, <code>--rootfs</code>, the <code>kern build</code> context and <code>-f</code>
+  Dockerfile, <code>kern cp</code>, <code>kern save -o</code>: every path where the box or the image can aim a read or write
+  at a host location it should not reach, including kern's own registry.</li>
+<li><strong>The network</strong> - egress destinations, published ports, network volumes.</li>
+</ul>
+<h2 id="trust-boundaries-two-levels-stated-separately">Trust boundaries: two levels, stated separately</h2>
+<h3 id="real-kernel-enforced-holds-against-the-workload">REAL - kernel-enforced, holds against the workload</h3>
+<table>
+<thead>
+<tr>
+<th>Boundary</th>
+<th>Enforced by</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Process / mount / UTS / IPC isolation</td>
+<td><code>unshare</code> + <code>pivot_root</code>, root remounted read-only <strong>last</strong> (compile-enforced by a typestate)</td>
+<td>a box sees no host process, mount, or peer box</td>
+</tr>
+<tr>
+<td>Rootless privilege</td>
+<td>user namespace; box-root maps to an unprivileged host uid</td>
+<td>no host uid 0 unless the caller is real root, where <code>--privileged</code> is refused</td>
+</tr>
+<tr>
+<td>Dangerous syscalls</td>
+<td><strong>always-on seccomp, allowlist by default</strong> (moby's own default filter minus kern's 35): a syscall outside the allow set returns <code>ENOSYS</code> so honest software degrades instead of dying, while the mount/namespace/module/ptrace escape vectors hard-kill (<code>SIGSYS</code>); the wider denylist is the opt-out (<code>KERN_SECCOMP=denylist</code>)</td>
+<td>the new <strong>and</strong> classic mount API is denied, so a box cannot remount its root writable or unmask the cgroup; <code>clone</code> is filtered on its namespace flags and <code>clone3</code> is refused wholesale (<code>ENOSYS</code>, since its flags sit behind a pointer BPF cannot read), so a nested-userns escape is closed either way; verified across platforms</td>
+</tr>
+<tr>
+<td>Capabilities</td>
+<td>bounding + effective/permitted/inheritable drop before exec, <strong>verified by read-back</strong></td>
+<td>a re-added cap is effective only over the box's own user namespace, never the host-owned cgroupfs or mounts</td>
+</tr>
+<tr>
+<td><code>/proc</code> and devices</td>
+<td>sensitive <code>/proc</code> paths masked (<code>/proc/sys</code> read-only is fatal); <code>/dev</code> is a box-owned tmpfs with a deny-by-default node set; <code>MS_NODEV</code> + userns <code>SB_I_NODEV</code> make a fabricated node inert</td>
+<td>core_pattern and the sysrq/kcore class stay closed for a root-mapped box</td>
+</tr>
+<tr>
+<td>Fresh-fd hygiene</td>
+<td>inherited descriptors shed before exec (CVE-2016-9962 class)</td>
+<td>an SDK or CI fd cannot pass into the workload</td>
+</tr>
+<tr>
+<td>Untrusted-image extraction</td>
+<td>a tar-flavour-independent vetter (path/symlink/hardlink/whiteout/desync/bomb) + isolated staging + no-follow merge; every blob and every pinned manifest is sha256-verified before use</td>
+<td>the cross-layer and host-inode escape classes are closed structurally, not by trusting <code>tar</code></td>
+</tr>
+<tr>
+<td>Registry integrity</td>
+<td>TLS-pinned on every hop and redirect; realm pinning (CVE-2020-15157 class); credentials off argv</td>
+<td>a hostile registry cannot downgrade the transport or steal the token</td>
+</tr>
+<tr>
+<td>Optional LSM / write confinement</td>
+<td><code>--apparmor &lt;profile&gt;</code> (onexec, fail-closed) and <code>--landlock-rw</code> (opt-in, fail-closed: no Landlock on this kernel refuses the box rather than running it unconfined)</td>
+<td>layered over namespaces + seccomp when requested; absent by default</td>
+</tr>
+<tr>
+<td>Resource caps <strong>where the controller is delegated</strong></td>
+<td>cgroup v2 <code>memory.max</code> / <code>pids.max</code>, read back to confirm</td>
+<td>REAL on a delegating host; see the governor row for the rest</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cooperative-shapes-an-honest-workload-not-a-boundary">COOPERATIVE - shapes an honest workload, not a boundary</h3>
+<table>
+<thead>
+<tr>
+<th>Governor</th>
+<th>Why it is not a boundary</th>
+<th>Honest handling</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resource caps on a <strong>non-delegated</strong> host</td>
+<td>with no cgroup delegation kern cannot enforce a cap</td>
+<td>best-effort with a once-per-host warning; <code>--require-limits</code> makes the uncapped fallback <strong>fatal</strong> (refuse to start unless the cap reads back in force)</td>
+</tr>
+<tr>
+<td>Egress allowlist (<code>--egress-allow</code>)</td>
+<td>a domain sharing a CDN IP and SNI with an allowed one is reachable</td>
+<td>an application-layer allowlist for a semi-trusted workload, SSRF-guarded (a non-public resolve is refused), documented in <a href="egress.html">EGRESS.md</a> as not a hard exfiltration boundary</td>
+</tr>
+<tr>
+<td>vGPIO pin list</td>
+<td>GPIO is chip-granular: the character device exposes every line via ioctl, the kernel has no per-line mount boundary</td>
+<td><code>pins = [...]</code> is cooperative metadata; grant a <code>vgpio:</code> profile only to a workload you trust with that hardware</td>
+</tr>
+<tr>
+<td>The <code>--ssh</code> subtree</td>
+<td>sshd and its shells are forked before seccomp and the cap drop, and run the image's own binaries pre-filter</td>
+<td>for interactive access, not a hardened bastion; the interactive-trust surface you opted into</td>
+</tr>
+<tr>
+<td><code>--net host</code></td>
+<td>shares the host netns</td>
+<td>there is then no network isolation, by request</td>
+</tr>
+<tr>
+<td>GPU limits</td>
+<td>not shipped in this tree</td>
+<td>when they land, expect a cooperative governor for honest workloads, with the bypasses named here</td>
+</tr>
+</tbody>
+</table>
+<h2 id="attack-surface-mitigation-residual">Attack surface, mitigation, residual</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Mitigation</th>
+<th>Residual</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Escape via a crafted image</td>
+<td>in-process vetter + no-follow merge + digest verify</td>
+<td>an exotic-but-safe image is refused rather than extracted (fail-closed)</td>
+</tr>
+<tr>
+<td>Nested-namespace escape</td>
+<td><code>clone</code> flag filter + <code>clone3</code> refused wholesale (<code>ENOSYS</code>); mount API denied</td>
+<td>the userns surface itself is kernel attack surface (below)</td>
+</tr>
+<tr>
+<td>Remount root writable / unmask cgroup</td>
+<td>seccomp kills the mount API; child-userns caps ineffective over host-owned mounts</td>
+<td><code>--privileged</code> re-gains the classic <code>mount</code> syscalls, but caps ineffective over host-owned mounts keep root/cgroup unchanged, the new mount API stays blocked, and seccomp itself cannot be turned off</td>
+</tr>
+<tr>
+<td>Registry poisoning</td>
+<td>sha256 on blobs and pinned manifests; TLS + realm pinning</td>
+<td>trust in the host kernel's TLS stack via <code>curl</code></td>
+</tr>
+<tr>
+<td>Peer secret / posture theft</td>
+<td>inverted-default registry guard at <strong>every</strong> host-path entry, by device+inode identity</td>
+<td>the operator's own trusted source paths are trusted as such</td>
+</tr>
+<tr>
+<td>Secret disclosure</td>
+<td><code>/run/secrets</code> tmpfs mode 0400, off argv, <code>O_EXCL\|O_NOFOLLOW</code></td>
+<td>inline <code>NAME=value</code> is visible in the host <code>ps</code>, and is warned about</td>
+</tr>
+<tr>
+<td>Forged supervision signal</td>
+<td>watchdogs forked before the pid namespace; target from <code>fork()</code> or the host-only registry; pidfd-pinned</td>
+<td>a same-uid pid-reuse window on <code>--health-action restart</code>, sub-quantum and not attacker-targetable</td>
+</tr>
+<tr>
+<td>Syscall-surface enumeration</td>
+<td>a denied call is byte-identical to one the kernel lacks (<code>ENOSYS</code>)</td>
+<td>whether a mapped filter helps an attacker who already has code execution is recorded open in <a href="https://github.com/getkern/kern/blob/main/ROADMAP.md#known-gaps-and-what-would-settle-them">ROADMAP.md</a></td>
+</tr>
+</tbody>
+</table>
+<h2 id="non-goals-and-residual-risk">Non-goals and residual risk</h2>
+<ul>
+<li><strong>Not a microVM.</strong> kern shares the host kernel. A kernel privilege-escalation bug is an escape.
+  For actively hostile, multi-tenant code from strangers on one host, reach for a hardware-virtualized
+  boundary (Firecracker, Kata) or gVisor. That is not where kern competes.</li>
+<li><strong>An unprivileged user namespace is itself kernel attack surface.</strong> Running untrusted code hands it
+  the in-kernel namespace surface to probe. This is stated first, before any isolation claim.</li>
+<li><strong>Cooperative governors are bypassable by first-party code</strong>, by construction. See the table above.</li>
+<li><strong>A malicious operator is out of scope.</strong> kern runs with the operator's own privileges and paths.</li>
+<li><strong>Side channels, timing and hardware attacks are out of scope.</strong></li>
+</ul>
+<h2 id="verification">Verification</h2>
+<p>The claims are checked by asking the kernel what is true, not by asking kern to report on itself:</p>
+<ul>
+<li>Five adversarial suites in <a href="https://github.com/getkern/kern/tree/main/pentest/">pentest/</a> assert that a published port cannot tunnel into a
+  host service, that <code>--ssh</code> does not hand out the host's shell, that <code>kern exec</code> does not escape,
+  that a box cannot raise its own <code>memory.max</code> or see a cgroup above its own, that an ungranted device
+  does not cross, and that a SIGKILLed supervisor holds no host port. They run against a loopback
+  registry, so no account or network is needed; a host that cannot answer a question reports <code>SKIP</code>,
+  never a false pass.</li>
+<li>The tar byte-parser is fuzzed. Production code is panic-free (no <code>unwrap</code>/<code>expect</code>/<code>panic!</code> on any
+  reachable path). The boundaries have been exercised on x86_64, three ARM boards, WSL2, and a VPS.</li>
+<li>Three sequence/coverage properties are asserted by a test, not assumed: (1) the WHOLE mount API,
+  classic and the fd-based family (<code>fsopen</code>/<code>fsconfig</code>/<code>fsmount</code>/<code>move_mount</code>/<code>open_tree</code>/<code>fspick</code>/
+  <code>mount_setattr</code>), hard-kills with <code>SIGSYS</code> - not merely <code>ENOSYS</code>-by-allowlist - checked by
+  arch-correct number (x86_64 + aarch64) in <code>mount_api_family_is_hard_killed</code>, so "safe by
+  construction" never stands in for "killed". (2) The setup window carries no attacker code: the cap
+  drop (bounding + effective, read-back verified), Landlock and the seccomp filter are all in force
+  <strong>before</strong> the workload's <code>execvp</code>, and a source-level regression
+  (<code>no_untrusted_exec_before_the_seccomp_filter</code>) fails the build if any process-launch or fork is
+  introduced into <code>child_setup_and_exec</code> before the filter install - so the only untrusted binary
+  forked before the filter stays <code>--ssh</code>'s sshd, declared cooperative above. (3) The shared overlay
+  lower is isolating: <code>overlay_lower_is_shared_ro_across_boxes</code> builds a local image and asserts a
+  marker + seed rewrite in one box is invisible to a fresh box from the same image, and the lower's
+  host path is unreachable after the pivot.</li>
+<li>The discriminant is the standard: a claim is confirmed only when the same operation succeeds
+  outside a box and is refused inside one, or the reverse, so a green result cannot come from the
+  feature simply being absent.</li>
+</ul>
+<p>To reproduce:</p>
+<pre><code class="language-sh">cargo build --release
+sh pentest/run-with-local-registry.sh ./target/release/kern pentest/pentest-ports.sh
+</code></pre>
+</main>
+<footer>
+<a href="https://getkern.dev/">getkern.dev</a> &middot;
+<a href="https://github.com/getkern/kern/blob/main/docs/THREAT_MODEL.md">this page on GitHub</a> &middot;
+<a href="https://github.com/getkern/kern">source</a>
+</footer>
+</body>
+</html>

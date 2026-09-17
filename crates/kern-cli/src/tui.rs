@@ -64,6 +64,13 @@ enum Pending {
     PruneImages,                         // reclaim orphaned build layers
     DeleteBuild(String),                 // build id
     StopBox(String),                     // box name, from the Boxes tab
+    // THE BULK ACTIONS CARRY THEIR TARGETS, not just a count, and that is deliberate: the list is
+    // re-read every tick, so an action that re-derived "everything" at confirm time could act on a
+    // set the operator never saw. What was on screen when they pressed `D` is what gets deleted.
+    RemoveAllImages(Vec<String>),
+    DeleteAllBuilds(Vec<String>),
+    RemoveAllVolumes(Vec<String>),
+    StopAllBoxes(Vec<String>),
 }
 
 /// A multi-field input form. `active` is the focused field; typing edits its value.
@@ -802,6 +809,20 @@ fn nav_boxes(k: u8, sel: usize, rows: &[Row], mode: &mut Mode) -> bool {
             };
             return false;
         }
+        // The Boxes tab's bulk action is STOP, not delete: a box is a running process, and the verb
+        // that matches `s` is the one the CLI spells `kern stop --all`.
+        b'S' => {
+            let live: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+            if !live.is_empty() {
+                *mode = Mode::Confirm {
+                    prompt: format!("stop ALL {} running box(es)?  (y/n)", live.len()),
+                    action: Pending::StopAllBoxes(live),
+                };
+            }
+            // Like `s`: the prompt is the whole effect of the key, so there is nothing to refresh
+            // until the confirmation runs.
+            return false;
+        }
         // Pause and unpause stay immediate: both are reversible by the other key, so a mistaken
         // press costs a keystroke rather than the work. Asking for every key would make the prompt
         // noise, and noise is how a confirmation stops being read.
@@ -876,6 +897,21 @@ fn nav_storage(k: u8, sel: usize, vols: &[crate::volume::VolInfo], mode: &mut Mo
                 action: Pending::PruneVolumes,
             };
         }
+        // `p` reclaims the UNUSED ones; `D` removes every volume on the list, in use or not, and
+        // takes the data with it. The prompt says "and their data" because a volume is the one thing
+        // in this TUI whose deletion is not recoverable by pulling or rebuilding.
+        b'D' => {
+            if !vols.is_empty() {
+                let names: Vec<String> = vols.iter().map(|v| v.raw.clone()).collect();
+                *mode = Mode::Confirm {
+                    prompt: format!(
+                        "remove ALL {} volume(s) AND THEIR DATA?  this cannot be undone  (y/n)",
+                        names.len()
+                    ),
+                    action: Pending::RemoveAllVolumes(names),
+                };
+            }
+        }
         b'\r' | b'\n' => {
             if let Some(v) = vols.get(sel) {
                 *mode = Mode::Overlay(volume_detail(v));
@@ -900,6 +936,21 @@ fn nav_images(k: u8, sel: usize, images: &[crate::commands::ImageEntry], mode: &
                         crate::ui::scrub(&img.name)
                     ),
                     action: Pending::RemoveImage(img.name.clone()),
+                };
+            }
+        }
+        // `D` deletes the WHOLE tab, `d` one row: the pair is deliberate, and the shift is the
+        // friction. The prompt names the COUNT and what is lost, because "delete all?" tells an
+        // operator nothing about the blast radius of the key they are about to press.
+        b'D' => {
+            if !images.is_empty() {
+                let names: Vec<String> = images.iter().map(|i| i.name.clone()).collect();
+                *mode = Mode::Confirm {
+                    prompt: format!(
+                        "delete ALL {} cached image(s)?  they must be pulled again  (y/n)",
+                        names.len()
+                    ),
+                    action: Pending::RemoveAllImages(names),
                 };
             }
         }
@@ -928,6 +979,18 @@ fn nav_builds(k: u8, sel: usize, builds: &[crate::builds::Record], mode: &mut Mo
                 *mode = Mode::Confirm {
                     prompt: format!("delete build record '{}'?  (y/n)", b.id),
                     action: Pending::DeleteBuild(b.id.clone()),
+                };
+            }
+        }
+        b'D' => {
+            if !builds.is_empty() {
+                let ids: Vec<String> = builds.iter().map(|b| b.id.clone()).collect();
+                *mode = Mode::Confirm {
+                    prompt: format!(
+                        "delete ALL {} build record(s)?  the images they built stay  (y/n)",
+                        ids.len()
+                    ),
+                    action: Pending::DeleteAllBuilds(ids),
                 };
             }
         }
@@ -997,6 +1060,66 @@ fn perform_pending(action: Pending) -> Option<String> {
                 .err()
                 .map(|e| e.to_string())
         }
+        // A BULK ACTION REPORTS EVERY FAILURE, not the first. Stopping at the first error leaves the
+        // rest of the list untouched with no word about it, which reads as "the key did nothing" for
+        // items that were never attempted. Each one is tried, and the summary names how many of how
+        // many failed plus the first reason - enough to act on, short enough to fit the overlay.
+        Pending::RemoveAllImages(names) => bulk(
+            "image",
+            names.len(),
+            names.into_iter().map(|n| {
+                quiet_io(|| crate::commands::image_rm(&[n]))
+                    .err()
+                    .map(|e| e.to_string())
+            }),
+        ),
+        Pending::DeleteAllBuilds(ids) => bulk(
+            "build",
+            ids.len(),
+            ids.into_iter()
+                .map(|id| crate::builds::remove(&id).err().map(|e| e.to_string())),
+        ),
+        Pending::RemoveAllVolumes(names) => bulk(
+            "volume",
+            names.len(),
+            names.into_iter().map(|n| {
+                quiet_io(|| crate::volume::run(&["rm".to_string(), n]))
+                    .err()
+                    .map(|e| e.to_string())
+            }),
+        ),
+        Pending::StopAllBoxes(names) => bulk(
+            "box",
+            names.len(),
+            names.into_iter().map(|n| {
+                quiet_io(|| crate::commands::stop(std::slice::from_ref(&n), false))
+                    .err()
+                    .map(|e| e.to_string())
+            }),
+        ),
+    }
+}
+
+/// Run a bulk destructive action to the end and summarise what failed.
+///
+/// `None` when every item succeeded, which is what the caller treats as "no overlay, just refresh".
+/// Otherwise a line naming how many of how many failed and the FIRST reason: a list of twenty
+/// identical permission errors is not more informative than one, and it does not fit the pane.
+fn bulk(kind: &str, total: usize, results: impl Iterator<Item = Option<String>>) -> Option<String> {
+    let mut failed = 0usize;
+    let mut first: Option<String> = None;
+    for e in results.flatten() {
+        failed += 1;
+        if first.is_none() {
+            first = Some(e);
+        }
+    }
+    match (failed, first) {
+        (0, _) => None,
+        (n, Some(e)) => Some(format!(
+            "{n} of {total} {kind}(s) could not be removed: {e}"
+        )),
+        (n, None) => Some(format!("{n} of {total} {kind}(s) could not be removed")),
     }
 }
 
@@ -2375,23 +2498,27 @@ fn help_text() -> String {
        7 Storage    physical disks (read-only) and your named volumes\n\
      \n\
      BOXES tab - act on the selected box\n\
-       s  stop (asks first)   p  pause        u  unpause\n\
+       s  stop (asks first)   S  stop ALL (asks first)\n\
+       p  pause               u  unpause\n\
        Enter          view its logs (a box's own output)\n\
      \n\
      IMAGES tab\n\
-       d  delete      p  prune orphaned layers          Enter  detail\n\
+       d  delete      D  delete ALL cached images       p  prune orphaned layers\n\
+       Enter  detail\n\
      \n\
      BUILDS tab\n\
-       d  delete      Enter  view the build transcript\n\
+       d  delete      D  delete ALL build records       Enter  view the transcript\n\
      \n\
      PROFILES tab\n\
        n  new         e  edit         d  delete\n\
      \n\
      STORAGE tab\n\
-       n  new         e  edit         d  delete        Enter  details        p  prune unused\n\
+       n  new         e  edit         d  delete        Enter  details\n\
+       p  prune unused      D  remove ALL volumes and their data\n\
      \n\
      HEALTH colors:  green = healthy   red = unhealthy   dim = starting or no check\n\
-     Destructive actions (stop / delete / prune) ask y / n first."
+     Destructive actions (stop / delete / prune) ask y / n first.\n\
+     A SHIFTED key acts on the whole tab: its prompt names how many and what is lost."
         .to_string()
 }
 
@@ -2411,13 +2538,13 @@ fn nav_footer(
     let help = format!("   [{z}?{d}] help{z}");
     match tab {
         TAB_BOXES if !rows.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}p{d}]ause [{z}u{d}]npause [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}S{d}]top-all [{z}p{d}]ause [{z}u{d}]npause [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_IMAGES if !images.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_BUILDS if !builds.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_PROFILES => {
             let edit = if profs.is_empty() { "" } else { " [e]dit [d]elete" };
@@ -2427,7 +2554,7 @@ fn nav_footer(
             let ops = if vols.is_empty() {
                 ""
             } else {
-                " [e]dit [d]elete [⏎]info"
+                " [e]dit [d]elete [D]elete-all [⏎]info"
             };
             format!(
                 "{d}[{z}↑↓{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
@@ -2831,8 +2958,12 @@ fn storage_table(
         ));
         return s;
     }
-    let shown = vols.len().min(max_rows);
-    for (i, v) in vols[..shown].iter().enumerate() {
+    let (wstart, wend) = list_window(vols.len(), max_rows, sel);
+    for (i, v) in vols[wstart..wend]
+        .iter()
+        .enumerate()
+        .map(|(k, v)| (k + wstart, v))
+    {
         let (lead, col) = sel_marker(p, i == sel);
         // No quota = UNLIMITED (the volume can grow until the disk is full). A bare `-` read as
         // "unset/error"; `∞` says "no cap" at a glance (the `?` help and the create form spell it out).
@@ -2852,9 +2983,9 @@ fn storage_table(
             quota_cell
         ));
     }
-    if shown < vols.len() {
-        s.push_str(&format!("  {d}… {} more{z}\n", vols.len() - shown));
-    }
+    // Unconditional: the marker is empty when the whole list fits, so the caller has one code path
+    // and cannot forget the guard.
+    s.push_str(&list_marker(p, vols.len(), wstart, wend));
     s
 }
 
@@ -3062,6 +3193,51 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
 /// in-`top` mirror of `kern images`, sourced from the exact same [`crate::commands::image_entries`] so
 /// the two never drift. `repository:tag` is split on the last `:` (unless that tail holds a `/`, i.e. a
 /// `host:port/…` reference with no explicit tag → shown as `latest`).
+/// The slice of a list to draw so the SELECTED row is on screen, and the line that says what is
+/// hidden on either side of it.
+///
+/// 🔴 EVERY LIST PANE SLICED FROM ZERO. `images[..shown]` drew the first `max_rows` rows and nothing
+/// else, forever: the selection could walk past the last drawn row, but the window never followed it,
+/// so the cursor left the screen and the rest of the list was UNREACHABLE. Measured on a host with
+/// 309 cached images: `kern top` showed 25 and `… 284 more`, and no key reached the 284. The form
+/// two hundred lines up already scrolled correctly; the tables did not, and the whole difference was
+/// this offset.
+///
+/// ONE line of chrome, not two, and that is a hard constraint rather than a taste: the frame budget
+/// (`body_rows`) reserves exactly one row for the trailing marker, and a test asserts no tab renders
+/// more lines than the terminal has - a frame one row too tall scrolls the alternate screen and
+/// carries the tab bar off the top. So a single line reports BOTH directions instead of a marker
+/// above and another below.
+///
+/// The window moves as little as it can: descending, the selection sits on the last visible row
+/// rather than recentring, which keeps the list still under the eye instead of jumping half a page.
+fn list_window(len: usize, max_rows: usize, sel: usize) -> (usize, usize) {
+    if len <= max_rows {
+        return (0, len);
+    }
+    let start = sel
+        .saturating_sub(max_rows.saturating_sub(1))
+        .min(len - max_rows);
+    (start, start + max_rows)
+}
+
+/// The one-line position marker for a windowed list: what is above, what is below, or nothing at all
+/// when the whole list fits.
+fn list_marker(p: &Palette, len: usize, start: usize, end: usize) -> String {
+    let (d, z) = (p.d, p.z);
+    let (above, below) = (start, len.saturating_sub(end));
+    match (above, below) {
+        (0, 0) => String::new(),
+        (0, b) => format!("  {d}… {b} more below{z}\n"),
+        (a, 0) => format!("  {d}… {a} more above{z}\n"),
+        (a, b) => format!(
+            "  {d}… {a} above · {b} below  ({}-{} of {len}){z}\n",
+            start + 1,
+            end
+        ),
+    }
+}
+
 fn images_table(
     p: &Palette,
     images: &[crate::commands::ImageEntry],
@@ -3082,8 +3258,12 @@ fn images_table(
         return s;
     }
     let now = registry::now_unix();
-    let shown = images.len().min(max_rows);
-    for (i, img) in images[..shown].iter().enumerate() {
+    let (wstart, wend) = list_window(images.len(), max_rows, sel);
+    for (i, img) in images[wstart..wend]
+        .iter()
+        .enumerate()
+        .map(|(k, v)| (k + wstart, v))
+    {
         let (lead, col) = sel_marker(p, i == sel);
         let (repo, tag) = match img.name.rsplit_once(':') {
             Some((r, t)) if !t.contains('/') => (r, t),
@@ -3103,9 +3283,9 @@ fn images_table(
             fmt_uptime(now.saturating_sub(img.pulled)),
         ));
     }
-    if shown < images.len() {
-        s.push_str(&format!("  {d}… {} more{z}\n", images.len() - shown));
-    }
+    // Unconditional: the marker is empty when the whole list fits, so the caller has one code path
+    // and cannot forget the guard.
+    s.push_str(&list_marker(p, images.len(), wstart, wend));
     s
 }
 
@@ -3136,8 +3316,12 @@ fn builds_table(
         return s;
     }
     let now = registry::now_unix();
-    let shown = builds.len().min(max_rows);
-    for (i, bd) in builds[..shown].iter().enumerate() {
+    let (wstart, wend) = list_window(builds.len(), max_rows, sel);
+    for (i, bd) in builds[wstart..wend]
+        .iter()
+        .enumerate()
+        .map(|(k, v)| (k + wstart, v))
+    {
         let (lead, col) = sel_marker(p, i == sel);
         let (sc, label) = match bd.status {
             crate::builds::Status::Ok => (g, "ok".to_string()),
@@ -3160,9 +3344,9 @@ fn builds_table(
             fmt_uptime(now.saturating_sub(bd.started)),
         ));
     }
-    if shown < builds.len() {
-        s.push_str(&format!("  {d}… {} more{z}\n", builds.len() - shown));
-    }
+    // Unconditional: the marker is empty when the whole list fits, so the caller has one code path
+    // and cannot forget the guard.
+    s.push_str(&list_marker(p, builds.len(), wstart, wend));
     s
 }
 
@@ -3211,9 +3395,16 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         s.push_str(&format!("  {d}no running boxes{z}\n"));
         return s;
     }
-    let shown = rows.len().min(max_rows);
+    // The window starts wherever the selection is, so `i` stays the ABSOLUTE index into `rows`: the
+    // pod grouping and the tree connectors below both look at neighbours by absolute position, and a
+    // window-relative index would draw `└─` in the middle of a group.
+    let (wstart, wend) = list_window(rows.len(), max_rows, sel);
     let mut prev_pod = "";
-    for (i, r) in rows[..shown].iter().enumerate() {
+    for (i, r) in rows[wstart..wend]
+        .iter()
+        .enumerate()
+        .map(|(k, r)| (k + wstart, r))
+    {
         // Pod header when entering a new pod group - the `kern ps` tree view: standalone boxes are
         // flat, a pod's members sit under a `<pod> (pod · N boxes)` header, indented with ├─/└─.
         if !r.pod.is_empty() && r.pod != prev_pod {
@@ -3229,7 +3420,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         // every other column stays aligned. Empty for a standalone box.
         let connector = if r.pod.is_empty() {
             String::new()
-        } else if i + 1 >= shown || rows[i + 1].pod != r.pod {
+        } else if i + 1 >= wend || rows[i + 1].pod != r.pod {
             "└─ ".to_string()
         } else {
             "├─ ".to_string()
@@ -3298,9 +3489,9 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
             tasks
         ));
     }
-    if shown < rows.len() {
-        s.push_str(&format!("  {d}… {} more{z}\n", rows.len() - shown));
-    }
+    // Unconditional: the marker is empty when the whole list fits, so the caller has one code path
+    // and cannot forget the guard.
+    s.push_str(&list_marker(p, rows.len(), wstart, wend));
     s
 }
 
@@ -4037,6 +4228,132 @@ mod tests {
     /// twice over.
     ///
     /// Asserted against the real strings, so the two cannot drift apart again in silence.
+    /// The drawn window FOLLOWS the selection, so every row of a long list is reachable.
+    ///
+    /// 🔴 EVERY LIST PANE SLICED FROM ZERO. `images[..max_rows]` drew the first screenful and nothing
+    /// else: the selection walked past the last drawn row, the cursor left the screen, and the rest
+    /// of the list could not be reached by any key. Measured on a host with 309 cached images -
+    /// `kern top` showed 25 and `… 284 more`, forever.
+    ///
+    /// Asserted over the WHOLE range rather than at a few points, because the defect is precisely
+    /// "some selections are not covered", and a spot check picks the ones that are.
+    #[test]
+    fn the_list_window_keeps_every_selection_on_screen() {
+        for len in [1usize, 5, 25, 26, 309] {
+            for max_rows in [1usize, 5, 25] {
+                for sel in 0..len {
+                    let (start, end) = list_window(len, max_rows, sel);
+                    assert!(
+                        start <= sel && sel < end,
+                        "len={len} max_rows={max_rows} sel={sel}: window {start}..{end} hides the selection"
+                    );
+                    assert!(
+                        end <= len,
+                        "window {start}..{end} runs past the list of {len}"
+                    );
+                    assert!(
+                        end - start <= max_rows,
+                        "window {start}..{end} is taller than the {max_rows} rows available"
+                    );
+                    // The last row must be reachable: at the bottom the window ends AT the end.
+                    if sel + 1 == len {
+                        assert_eq!(end, len, "the last row is not reachable at sel={sel}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The marker names BOTH directions, and costs exactly one line.
+    ///
+    /// One line is a hard constraint, not a preference: the frame budget reserves a single row for
+    /// it, and a second marker line would push a full tab one row past the terminal - which scrolls
+    /// the alternate screen and carries the tab bar off the top. The invariant test next door
+    /// catches that, so this one states WHY the marker is shaped this way.
+    #[test]
+    fn the_list_marker_is_one_line_and_names_both_directions() {
+        let p = plain();
+        assert_eq!(
+            list_marker(&p, 10, 0, 10),
+            "",
+            "nothing hidden, nothing said"
+        );
+        let mid = list_marker(&p, 309, 76, 101);
+        assert_eq!(
+            mid.lines().count(),
+            1,
+            "the marker must fit one line: {mid:?}"
+        );
+        assert!(mid.contains("76"), "it must say what is above: {mid}");
+        assert!(mid.contains("208"), "and what is below: {mid}");
+        let top = list_marker(&p, 309, 0, 25);
+        assert!(
+            top.contains("284") && !top.contains("above"),
+            "at the top only below: {top}"
+        );
+        let bottom = list_marker(&p, 309, 284, 309);
+        assert!(
+            bottom.contains("284") && !bottom.contains("below"),
+            "at the bottom only above: {bottom}"
+        );
+    }
+
+    /// A shifted key asks before acting on the whole tab, and its prompt carries the COUNT.
+    ///
+    /// The count is the point. "delete all?" tells an operator nothing about the blast radius of the
+    /// key they are one keystroke from confirming; "delete ALL 309 cached image(s)?" does. Every bulk
+    /// key is checked for both properties - that it ARMS a confirmation rather than acting, and that
+    /// the prompt names how many.
+    #[test]
+    fn a_bulk_key_asks_first_and_its_prompt_names_how_many() {
+        let imgs: Vec<crate::commands::ImageEntry> = (0..7)
+            .map(|i| crate::commands::ImageEntry {
+                name: format!("img{i}:latest"),
+                size: 1,
+                pulled: 0,
+                dangling: false,
+            })
+            .collect();
+        let mut mode = Mode::Nav;
+        nav_images(b'D', 0, &imgs, &mut mode);
+        match &mode {
+            Mode::Confirm { prompt, action } => {
+                assert!(
+                    prompt.contains('7'),
+                    "the prompt must name the count: {prompt}"
+                );
+                assert!(
+                    matches!(action, Pending::RemoveAllImages(v) if v.len() == 7),
+                    "the action must carry the seven targets that were on screen"
+                );
+            }
+            _ => panic!("`D` on Images must arm a confirmation, not act"),
+        }
+
+        // An empty tab has nothing to confirm: the key does nothing rather than prompting about zero.
+        let mut mode = Mode::Nav;
+        nav_images(b'D', 0, &[], &mut mode);
+        assert!(
+            matches!(mode, Mode::Nav),
+            "`D` on an empty tab must not prompt"
+        );
+
+        // Boxes: the bulk verb is STOP, and it asks too.
+        let rows = vec![row("a", false), row("b", false)];
+        let mut mode = Mode::Nav;
+        nav_boxes(b'S', 0, &rows, &mut mode);
+        match &mode {
+            Mode::Confirm { prompt, action } => {
+                assert!(
+                    prompt.contains('2'),
+                    "the stop-all prompt names the count: {prompt}"
+                );
+                assert!(matches!(action, Pending::StopAllBoxes(v) if v.len() == 2));
+            }
+            _ => panic!("`S` on Boxes must arm a confirmation"),
+        }
+    }
+
     #[test]
     fn the_help_and_footer_describe_the_keys_that_actually_exist() {
         let help = help_text();

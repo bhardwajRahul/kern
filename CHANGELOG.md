@@ -7,6 +7,22 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`kern top` could not reach past the first screenful of any list.** Every pane drew its rows from
+index zero, so on a host with 309 cached images the Images tab showed 25 and `… 284 more`, and no key
+reached the 284: the selection walked off the bottom of the screen and the window never followed it.
+Images, Builds, Boxes and Storage all had it. The drawn window now follows the selection, moving as
+little as it can, and one status line reports what is hidden above AND below with the position in the
+list. One line, because the frame budget reserves exactly one row for it and a second would push a
+full tab past the terminal.
+
+**A shifted key acts on the whole tab, after asking.** `D` deletes every cached image, every build
+record, or every volume and its data; `S` stops every running box. Each one arms a confirmation whose
+prompt names HOW MANY and what is lost, because "delete all?" says nothing about the blast radius of
+the key about to be pressed. The targets are captured when the key is pressed rather than re-derived
+on confirm, so what was on screen is what gets acted on, and a bulk action runs to the end and reports
+how many of how many failed instead of stopping at the first.
+
+
 **A cell could forge a sandbox verdict with one leading space.** The neutralisation that stops a box
 printing `[sandbox: oom]` or `[exit 137]` and having a model read it as the sandbox's own verdict was
 anchored at column 0, so ` [sandbox: oom]` (one space, a tab, a NBSP, a zero-width space or a BOM in
