@@ -86,10 +86,10 @@ fn check_scope_toll() -> R {
         // say both and point at the row that decides. Deliberately still a tick and NOT a second
         // warning: the cgroup row above already carries the warning, and duplicating it would make a
         // single problem look like two. This row costs no probe, which is what its doc promises.
-        return R::ok(
-            "no systemd user manager here: no per-box scope is paid, and none is available to \
-             delegate a cap through either - whether caps bind is the cgroup row above"
-                .into(),
+        return R::ok_note(
+            "no systemd user manager here: no per-box scope is paid",
+            "and none is available to delegate a cap through either - whether caps bind is the \
+             cgroup row above",
         );
     }
     // THREE runs, report the median, and throw the first away. A single cold sample read 34.0 ms on a
@@ -135,9 +135,8 @@ fn check_scope_toll() -> R {
         ""
     };
     R::Warn(
-        format!(
-            "this session is outside the systemd user manager, so every box pays a transient scope to enforce its caps: at least {ms:.1} ms here, on top of the box itself{caveat}"
-        ),
+        "this session is outside the systemd user manager, so every box pays a transient scope"
+            .into(),
         // AND THE TWO CONSEQUENCES THAT ARE NOT ABOUT SPEED, because this row is the only place they
         // are reachable. The same boundary that costs a transient scope per box also stops `kern
         // exec` joining a box's cgroup: cgroup v2 delegation containment needs write access to the
@@ -150,7 +149,10 @@ fn check_scope_toll() -> R {
         // box's caps, and its own stderr is unreadable (measured: the detached supervisor's stdout
         // and stderr are one pipe nobody reads, and the box log stays 0 bytes). A consequence that
         // cannot announce itself where it happens has to be announced where it can be read.
-        "pay it ONCE: `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5). The same boundary stops `kern exec` joining a box's cgroup here, so it refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the uncapped command is intended (its namespaces, seccomp filter and AppArmor profile still apply); a `--health-cmd` probe is never refused and runs outside the box's caps on this host".into(),
+        format!(
+            "at least {ms:.1} ms here, on top of the box itself{caveat}. Pay it ONCE: \
+             `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5). The same boundary stops `kern exec` joining a box's cgroup here, so it refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the uncapped command is intended (its namespaces, seccomp filter and AppArmor profile still apply); a `--health-cmd` probe is never refused and runs outside the box's caps on this host"
+        ),
     )
 }
 
@@ -210,13 +212,15 @@ fn check_linger() -> R {
         );
     }
     R::Warn(
-        "systemd lingering is OFF for this user, so a DETACHED box dies when your last session ends: \
-         systemd stops `user@<uid>.service` and every box scope under it, and removes the \
-         /run/user/<uid> registry with it (measured on a Raspberry Pi 5: box, port and `kern logs` all \
-         gone 20 s after logout). It is also the first half of surviving a REBOOT: without it the \
-         user manager does not start at boot, so a unit from `kern compose <file> systemd` never runs"
-            .into(),
-        format!("`sudo loginctl enable-linger {user}` - one command, once per machine, and detached boxes then survive logout (this is the same requirement rootless podman documents)"),
+        "systemd lingering is OFF: a DETACHED box dies when your last session ends".into(),
+        format!(
+            "systemd stops `user@<uid>.service` and every box scope under it, and removes the \
+             /run/user/<uid> registry with it (measured on a Raspberry Pi 5: box, port and \
+             `kern logs` all gone 20 s after logout). It is also the first half of surviving a \
+             REBOOT: without it the user manager does not start at boot, so a unit from \
+             `kern compose <file> systemd` never runs. Fix: `sudo loginctl enable-linger {user}`, \
+             one command, once per machine (the same requirement rootless podman documents)"
+        ),
     )
 }
 
@@ -1078,8 +1082,11 @@ fn check_cgroup() -> R {
                 ))
             } else {
                 R::Warn(
-                    "memory/pids caps are enforced, but this kernel's `cpu` controller has no bandwidth interface (`cpu.max`) - `--cpus` is a SHARE here, not a ceiling".into(),
-                    "needs CONFIG_CFS_BANDWIDTH=y; memory and pids caps are unaffected".into(),
+                    "memory/pids caps are enforced, but this kernel's `cpu` controller has no `cpu.max`"
+                        .into(),
+                    "so `--cpus` is a SHARE here, not a ceiling; needs CONFIG_CFS_BANDWIDTH=y. \
+                     Memory and pids caps are unaffected"
+                        .into(),
                 )
             }
         }
@@ -1097,11 +1104,16 @@ fn check_cgroup() -> R {
                 have.join(" ")
             };
             R::Warn(
+                "systemd --user scope present but a `--memory` write does not bind in the box's \
+                 cap target"
+                    .into(),
                 format!(
-                    "systemd --user scope present but a `--memory` write does not bind in the box's cap target ({}; user manager delegates: {listed}) - `--memory` won't be enforced (`--cpus`/`--pids-limit` may still work)",
+                    "{}; user manager delegates: {listed}. `--memory` won't be enforced \
+                     (`--cpus`/`--pids-limit` may still work). Enable it: \
+                     /etc/systemd/system/user@.service.d/delegate.conf → [Service] \
+                     Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)",
                     memory_probe_sites_phrase()
                 ),
-                "enable it: /etc/systemd/system/user@.service.d/delegate.conf → [Service] Delegate=memory pids cpu cpuset, then reboot (common on Raspberry Pi OS)".into(),
             )
         }
     }
@@ -1322,11 +1334,13 @@ fn check_uid_range() -> R {
         ));
     }
     R::Warn(
-        "newuidmap/newgidmap or /etc/subuid missing - `--uid-range`, non-root `--user` and `--ssh` \
-         fall back to a single-uid map, so an official image that chowns to a service user (redis, \
-         postgres, nginx) fails at start"
+        "newuidmap/newgidmap or /etc/subuid missing: `--uid-range`, `--user` and `--ssh` get one uid"
             .into(),
-        steps.join(", then "),
+        format!(
+            "so an official image that chowns to a service user (redis, postgres, nginx) fails at \
+             start. Fix: {}",
+            steps.join(", then ")
+        ),
     )
 }
 
@@ -1541,11 +1555,15 @@ mod tests {
         let at = src
             .find(d)
             .unwrap_or_else(|| panic!("no memory-cap row says {d:?} any more - update this test"));
+        // FORWARD, to the end of THIS `R::Warn(` call, not backward to the nearest `format!`. The
+        // backward form broke the moment the phrase moved from the verdict into the hint, which is
+        // exactly the edit that made this row fit a terminal: it then read the PREVIOUS row's
+        // `format!` and reported a defect in a row that was correct.
         let start = src[..at]
-            .rfind("format!")
-            .expect("a denial row must be a format!");
+            .rfind("R::Warn(")
+            .expect("a denial row must be an R::Warn");
         let end = src[at..]
-            .find("format!")
+            .find("\n        }")
             .map(|o| at + o)
             .unwrap_or(src.len());
         assert!(
@@ -1738,6 +1756,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// EVERY VERDICT IN THIS FILE, INCLUDING THE ONES NO TEST CAN BUILD.
+    ///
+    /// The runtime gate below drives each PURE verdict over its whole input space, which is the right
+    /// check and still not enough: `check_scope_toll` and `check_linger` decide inside their own
+    /// probe, so their rows exist only on a host that is not this one and not the CI runner either.
+    /// Three CI rounds were spent finding them one per push - 154, then another, then another -
+    /// which is what a moving target looks like when the test can only see where it is standing.
+    ///
+    /// So this one does not run the code: it READS it. Every `R::ok`, `R::ok_note`, `R::Warn` and
+    /// `R::Fail` in the production half of this file, with its first argument resolved through string
+    /// continuations, a `format!` template, or a `const … : &str`. It found all six that were left in
+    /// one pass, the longest 448 characters.
+    ///
+    /// Only the LITERAL part is measured, so an interpolated `{path}` is not counted: what a host
+    /// substitutes is not something this file can bound. That is a floor, not a ceiling, and it is
+    /// the half that prose regressions live in.
+    #[test]
+    fn no_verdict_in_this_file_is_a_paragraph() {
+        let src = include_str!("doctor.rs");
+        let src = &src[..src
+            .find("#[cfg(test)]")
+            .expect("the test module must exist")];
+
+        /// Reads a Rust string literal starting at `bytes[i] == b'"'`, joining `\` continuations.
+        fn literal(b: &[u8], mut i: usize) -> String {
+            let mut out = String::new();
+            i += 1;
+            while i < b.len() {
+                match b[i] {
+                    b'\\' if i + 1 < b.len() => {
+                        if b[i + 1] == b'\n' {
+                            i += 2;
+                            while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+                                i += 1;
+                            }
+                        } else {
+                            out.push(b[i + 1] as char);
+                            i += 2;
+                        }
+                    }
+                    b'"' => return out,
+                    c => {
+                        out.push(c as char);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+
+        let b = src.as_bytes();
+        let mut checked = 0usize;
+        for ctor in ["R::ok_note(", "R::ok(", "R::Warn(", "R::Fail("] {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(ctor) {
+                let at = from + rel + ctor.len();
+                from = at;
+                let mut j = at;
+                while j < b.len() && (b[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                let lit = if b[j] == b'"' {
+                    literal(b, j)
+                } else if src[j..].starts_with("format!") {
+                    match src[j..].find('"') {
+                        Some(o) => literal(b, j + o),
+                        None => continue,
+                    }
+                } else {
+                    // A `const NAME: &str`, which is how the longest row in this file was spelled.
+                    let name: String = src[j..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                        .collect();
+                    if name.len() < 3 {
+                        continue;
+                    }
+                    let decl = format!("{name}: &str = ");
+                    match src
+                        .find(&decl)
+                        .and_then(|d| src[d..].find('"').map(|o| d + o))
+                    {
+                        Some(k) => literal(b, k),
+                        None => continue,
+                    }
+                };
+                checked += 1;
+                assert!(
+                    lit.len() <= ROW_MAX,
+                    "{} chars of verdict, move the tail to the note or the hint: {lit}",
+                    lit.len()
+                );
+            }
+        }
+        // Negative control: if the scan stops finding verdicts it passes on everything.
+        assert!(
+            checked > 30,
+            "only {checked} verdicts found: the scan broke"
+        );
     }
 
     /// Longest a row's two parts may be. Not a style preference: at 80 columns the verdict line is

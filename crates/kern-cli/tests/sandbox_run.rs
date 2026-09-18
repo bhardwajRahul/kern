@@ -11545,12 +11545,13 @@ fn doctor_names_the_escape_on_the_host_class_where_exec_refuses() {
     let src = fs::read_to_string("../kern-cli/src/doctor.rs")
         .or_else(|_| fs::read_to_string("crates/kern-cli/src/doctor.rs"))
         .expect("the doctor source is next to this test");
-    let anchor = "pay it ONCE: `systemd-run --user --scope bash`";
+    // ANCHORED ON THE COMMAND, not on the sentence around it and not on how the literal ends. Both
+    // of those moved when the row was split so it would fit a terminal - the remedy became a
+    // `format!` and its first word was recapitalised - and this test failed on a row that was
+    // correct. What must not move is the command the reader types and the three things it names.
+    let anchor = "`systemd-run --user --scope bash`";
     let start = src.find(anchor).expect("the scope-toll remedy must exist");
-    let end = src[start..]
-        .find("\".into(),")
-        .expect("the literal must end")
-        + start;
+    let end = src[start..].find("\n    )").expect("the R::Warn must end") + start;
     let literal = &src[start..end];
     for token in ["KERN_ALLOW_UNCAPPED", "kern exec", "health"] {
         assert!(
