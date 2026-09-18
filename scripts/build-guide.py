@@ -163,10 +163,22 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
 
 
 def main(argv: list[str]) -> int:
-    token = argv[2] if len(argv) > 2 else ""
+    usage = __doc__.strip().splitlines()[-1]
     if len(argv) not in (2, 3):
-        print(__doc__.strip().splitlines()[-1], file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 2
+    # `--help` USED TO BUILD A DIRECTORY CALLED `--help`. The out-dir is argv[1] and nothing looked
+    # at it, so asking this script for its usage created `./--help/` with nine HTML pages in it,
+    # which a later `git add -A` committed and pushed. A script whose first argument is a path it
+    # will `mkdir` must refuse an argument that is obviously a flag, and must answer the one flag
+    # every reader tries first.
+    if argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[1].startswith("-"):
+        print(f"refusing to treat {argv[1]!r} as an output directory\n{usage}", file=sys.stderr)
+        return 2
+    token = argv[2] if len(argv) > 2 else ""
     repo = pathlib.Path(__file__).resolve().parent.parent
     out = pathlib.Path(argv[1])
     out.mkdir(parents=True, exist_ok=True)

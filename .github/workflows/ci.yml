@@ -100,6 +100,11 @@ jobs:
           # checks that nothing goes around the chokepoints, which is a per-line question.
           python3 scripts/test-env-lock.py
           python3 scripts/progress-is-tty-gated.py
+          # Nothing tracked may read as a command-line flag, and no rendered guide page may be
+          # tracked at all. `build-guide.py --help` treated the flag as its output directory and
+          # built nine site pages into `./--help/`, which `git add -A` then pushed to main.
+          python3 scripts/tracked-paths-sane.py --self-check
+          python3 scripts/tracked-paths-sane.py
           # Every entry under a code section declares what it did about its own injection. A warning,
           # never a refusal: it cannot verify an executed injection (several suites here need hardware
           # CI does not have), so demanding one would leave it checking that a FILE EXISTS - state
