@@ -1002,7 +1002,8 @@ fn no_user_manager_verdict(state: kern_isolation::MemoryCapState, sites: &str) -
              expected in",
         ),
         MemoryCapState::PresentNotDelegated => R::Warn(
-            "cgroup v2, no systemd --user manager, and `memory` is listed but NOT delegated".into(),
+            "cgroup v2, no systemd --user manager, and `memory` is NOT delegated to a child cgroup"
+                .into(),
             format!(
                 "a `--memory` write is accepted and silently never bites ({sites}). {}",
                 delegation_hint()
