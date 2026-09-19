@@ -7204,16 +7204,19 @@ mod tests {
             // empty element that is punctuation rather than a word. Dropping exactly that last
             // element is what keeps a genuinely EMPTY argument (`''` is one word, not none)
             // distinguishable from a record carrying no words at all.
-            let mut words: Vec<&[u8]> = rec.split(|b| *b == 0).collect();
-            words.pop();
-            let want: Vec<String> = words
-                .into_iter()
-                .map(|w| String::from_utf8_lossy(w).into_owned())
-                .collect();
+            let mut want: Vec<&[u8]> = rec.split(|b| *b == 0).collect();
+            want.pop();
+            // COMPARED AS BYTES. Decoding the shell's words with `from_utf8_lossy` first would let
+            // two DIFFERENT byte sequences meet at the same replacement character and agree, which
+            // is unreachable while this alphabet is ASCII and would stop being unreachable the
+            // moment somebody widened it - a green earned by the comparison rather than by the
+            // splitter. The alphabet is the only thing keeping that latent, so the comparison does
+            // not lean on it.
+            let got = split_argv(input);
+            let got_bytes: Vec<&[u8]> = got.iter().map(|w| w.as_bytes()).collect();
             assert_eq!(
-                split_argv(input),
-                want,
-                "kern and /bin/sh disagree about {input:?}"
+                got_bytes, want,
+                "kern and /bin/sh disagree about {input:?} (kern said {got:?})"
             );
             compared += 1;
         }

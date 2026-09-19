@@ -176,6 +176,16 @@ def binary_is_the_tree(kern, explicit):
     current. Comparing the raw strings therefore refused the right binary, which is what the
     negative control caught. Dirt on either side is reported instead, because it is the one thing a
     matching commit cannot rule out.
+
+    WHAT IT DOES NOT DEFEND AGAINST, written down because a guard that is quiet about its edge gets
+    read as one that has none. The subject is an HONEST STALE binary: one built from an older
+    commit, which reports that commit and is refused. A binary that LIES in `--version` is accepted,
+    and demonstrably so - a two-line shell script echoing this checkout's `git describe` passes it.
+    That is not a hole to plug. The default path reads `target/release/kern`, the artefact this
+    tree's own `cargo build` writes; if something else is sitting there, no question put to THAT
+    binary can find out. Hashing it, sizing it or checking it is an ELF would raise the cost of a
+    lie without changing what the check can promise. What it promises is exactly this much: the
+    binary SAYS it is this commit, and a forgotten rebuild does not.
     """
     got = subprocess.run([kern, "--version"], capture_output=True, text=True).stdout.strip()
     print(got)

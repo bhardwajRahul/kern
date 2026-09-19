@@ -48,7 +48,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      -t allocates a PTY; -i only keeps stdin attached, so
                                                                      `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-                                                                     health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a)
+                                                                     health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a), newest first
+                                                                     a row is an INSTANCE, not a name: a name reused after a box exited appears once per instance, identified by PID
     {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
                                                                      --since/--until take 10m, 1h30m, unix seconds, or RFC3339 UTC; a line the index cannot place in time is kept
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
