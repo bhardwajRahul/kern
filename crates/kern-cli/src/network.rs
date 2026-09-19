@@ -777,7 +777,10 @@ pub fn print_list(json: bool) -> Result<(), Error> {
         println!("naming `external: true` needs before it will run.");
         return Ok(());
     }
-    println!("{:<24} {:>7}  BOXES", "NAME", "MEMBERS");
+    // MEASURED: the fixed 24 shifted MEMBERS for the whole table on any longer name, and a network a
+    // compose file declares `external:` is named by its author, not by kern.
+    let nw = crate::ui::name_col_width(names.iter().map(String::as_str), 24);
+    println!("{:<nw$} {:>7}  BOXES", "NAME", "MEMBERS");
     for n in &names {
         let live = members(n);
         let who: Vec<String> = live
@@ -785,7 +788,7 @@ pub fn print_list(json: bool) -> Result<(), Error> {
             .map(|m| format!("{} ({})", m.service, m.project))
             .collect();
         println!(
-            "{:<24} {:>7}  {}",
+            "{:<nw$} {:>7}  {}",
             n,
             live.len(),
             if who.is_empty() {

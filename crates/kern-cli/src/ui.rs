@@ -675,6 +675,67 @@ pub fn display_box_name<'a>(name: &'a str, pod: &str) -> &'a str {
         .unwrap_or(name)
 }
 
+/// How wide a NAME column has to be to hold the names that are going in it: at least `floor` (so
+/// short output is byte-for-byte what it has always been), at most `CEIL`.
+///
+/// ONE DEFINITION FOR FIVE TABLES, because it was five fixed numbers and four of them were wrong. A
+/// fixed width fails in one of two ways depending on whether the cell truncates, and BOTH were
+/// measured on this machine:
+///
+///   * `kern stats` (16), `kern volume ls` (28) and `kern network ls` (24) do not truncate, so a
+///     longer name pushes every column after it out of line for the whole table - including the
+///     header, which then lines up with no row at all. 16 is passed by every box the `kern-sandbox`
+///     SDK starts (`pysbx-` + 12 hex = 18), and 28 by a volume this host already has
+///     (`CEIJ-GPSDEGoTracker-49cf4a99_postgres_data`).
+///   * `kern history` (20) does truncate, and printed TWO DIFFERENT BOXES as the same string:
+///     `sdktest-cd95af93-wo…` for both `…-worker` and `…-workqueue`. A column whose job is to tell
+///     rows apart told them apart not at all.
+///
+/// THE CEILING IS NOT A TRUNCATION. Past it a row overflows exactly as it always did, which is the
+/// honest failure for a name nobody can shorten: the name is the identity `kern stop`, `kern logs`
+/// and `kern rm` take, and a table that is tidy because it hid the argument someone needs is not an
+/// improvement. `kern ps` settled that trade first; this is the same rule, spelled once.
+pub fn name_col_width<'a>(names: impl Iterator<Item = &'a str>, floor: usize) -> usize {
+    const CEIL: usize = 48;
+    names
+        .map(str::chars)
+        .map(Iterator::count)
+        .chain(std::iter::once(floor))
+        .max()
+        .unwrap_or(floor)
+        .min(CEIL.max(floor))
+}
+
+#[cfg(test)]
+mod name_col_tests {
+    use super::name_col_width;
+
+    #[test]
+    fn the_column_holds_the_longest_name_between_the_floor_and_the_ceiling() {
+        // Empty and all-short: exactly the floor, so existing output is unchanged.
+        assert_eq!(name_col_width(std::iter::empty(), 16), 16);
+        assert_eq!(name_col_width(["a", "bc"].into_iter(), 16), 16);
+        // The two names that were measured overflowing their table.
+        assert_eq!(name_col_width(["pysbx-2ec9191e4825"].into_iter(), 16), 18);
+        assert_eq!(
+            name_col_width(
+                ["CEIJ-GPSDEGoTracker-49cf4a99_postgres_data"].into_iter(),
+                28
+            ),
+            42
+        );
+        // Ceilinged, not truncated: the caller overflows past 48 rather than hiding the identity.
+        assert_eq!(name_col_width([&"x".repeat(80)[..]].into_iter(), 16), 48);
+        // A floor ABOVE the ceiling is still honoured - no table silently narrows.
+        assert_eq!(name_col_width([&"x".repeat(80)[..]].into_iter(), 60), 60);
+        // CHARS, not bytes: a multi-byte name must not be over-counted into a wider column.
+        assert_eq!(
+            name_col_width(["é".repeat(20).as_str()].into_iter(), 16),
+            20
+        );
+    }
+}
+
 #[cfg(test)]
 mod display_name_tests {
     use super::display_box_name;

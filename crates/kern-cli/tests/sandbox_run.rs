@@ -13280,3 +13280,104 @@ fn a_piped_top_reports_a_real_cpu_percent_per_box() {
         );
     }
 }
+
+/// `kern history` printed two DIFFERENT boxes as the same line.
+///
+/// MEASURED, with a compose stack whose services were `worker` and `workqueue`: both rows read
+/// `sdktest-cd95af93-wo…`, different pids, no way to tell which log belonged to which. The name cell
+/// was a fixed 20 that TRUNCATED, and a project scope (`<project>-<hash8>-`) is 17 of those 20, so
+/// three characters of the service name survived. `kern ps` had already settled this trade for its
+/// own table - truncation is worse than overflow, because the name is the identity `kern logs` takes
+/// - and this table was not brought along.
+///
+/// The two names here are built to collide under the OLD rule and to be distinct under the new one,
+/// so the test fails for the reason it is named after and not because a table is merely wide.
+#[test]
+fn history_tells_two_boxes_apart_when_their_names_share_a_long_prefix() {
+    let Some(bb) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let rootfs = build_rootfs(&bb, "histname");
+    let xdg = std::env::temp_dir().join(format!("kern-it-histname-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+    // 22 characters of shared prefix, then one differing character: identical at 20, distinct whole.
+    let a = "hist-shared-prefix-aaa-one";
+    let b = "hist-shared-prefix-aaa-two";
+    assert_eq!(
+        a[..20],
+        b[..20],
+        "the fixture must collide under the old width"
+    );
+
+    let mut started = None;
+    for n in [a, b] {
+        started = Some(
+            kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args([
+                    "box",
+                    n,
+                    "--rootfs",
+                    &rootfs_s,
+                    "-d",
+                    "--",
+                    "/bin/busybox",
+                    "sleep",
+                    "10",
+                ])
+                .output()
+                .expect("run kern"),
+        );
+    }
+    let said_start = started.as_ref().map(said).unwrap_or_default();
+    if host_cannot_build_a_box(&said_start) {
+        eprintln!("skip: this host cannot build a box: {said_start}");
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["history", "-n", "10"])
+        .output()
+        .expect("run kern history");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", a, b])
+        .output();
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_dir_all(&rootfs);
+
+    // `history` is reconstructed from captured log files, which a host that cannot capture them does
+    // not have. Nothing to tell apart is not the same as telling them apart wrongly.
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("hist-shared-prefix"))
+        .collect();
+    if rows.len() < 2 {
+        eprintln!(
+            "skip: this host recorded {} of the 2 boxes in history",
+            rows.len()
+        );
+        return;
+    }
+    let names: Vec<String> = rows
+        .iter()
+        .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        names.contains(&a.to_string()) && names.contains(&b.to_string()),
+        "two different boxes must be nameable from this table; it printed {names:?}"
+    );
+    assert_ne!(
+        names[0], names[1],
+        "two different boxes rendered as the same string - the name cell truncated away the only \
+         part that told them apart: {text}"
+    );
+}

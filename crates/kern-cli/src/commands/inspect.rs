@@ -517,21 +517,17 @@ pub fn ps(
         // named `<project>-<hash8>-<service>`, which passes 16 for any service name at all, so the
         // stack views - the ones a person looks at while a demo is running - were the ones that
         // broke. MEASURED: `psbug-749cf899-secret` is 21 characters and shifted every column after
-        // it.
+        // it. The rule, and the reason for the floor and the ceiling, now lives in one place:
+        // `ui::name_col_width`, which four other tables had each got wrong in their own way.
         //
-        // FLOORED AT 16 so the short output this has always produced is byte-for-byte what it was,
-        // and CEILINGED at 48 rather than truncating: the name is the identity `kern stop` takes,
-        // and a table that is pretty because it hid the argument someone needs is not an
-        // improvement. Past the ceiling a row overflows exactly as it always did, which is the
-        // honest failure for a name nobody can shorten.
-        let nw = rows
-            .iter()
-            .map(|(b, _, _, _)| crate::ui::display_box_name(&b.name, &b.pod).chars().count())
-            .chain(exited.iter().map(|e| e.name.chars().count()))
-            .chain(std::iter::once(16))
-            .max()
-            .unwrap_or(16)
-            .min(48);
+        // The LIVE rows measure their DISPLAYED name (a pod member drops the project prefix) and the
+        // exited section its full one, because that is what each prints.
+        let nw = crate::ui::name_col_width(
+            rows.iter()
+                .map(|(b, _, _, _)| crate::ui::display_box_name(&b.name, &b.pod))
+                .chain(exited.iter().map(|e| e.name.as_str())),
+            16,
+        );
         // On a TTY, truncate COMMAND to the remaining width so a long command never wraps (like
         // `docker ps`); piped/non-TTY prints it whole so scripts get the full line.
         let tty = std::io::stdout().is_terminal();
@@ -700,8 +696,12 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
         println!("{out}");
     } else {
         let p = crate::ui::Palette::detect();
+        // MEASURED, like `ps` above and for the same reason - this table was simply left out of that
+        // fix. The FULL registry name, not the pod-stripped one: `stats` has no pod tree to supply
+        // the context a bare service name would be missing.
+        let nw = crate::ui::name_col_width(boxes.iter().map(|b| b.name.as_str()), 16);
         println!(
-            "{d}{:<16} {:>8} {:>9} {:>9}{z}",
+            "{d}{:<nw$} {:>8} {:>9} {:>9}{z}",
             "NAME",
             "PID",
             "MEM",
@@ -713,7 +713,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
             let mem = registry::mem_bytes(b.cgroup_pid()).map_or("-".into(), human_bytes);
             let cpu = registry::cpu_usec(b.cgroup_pid())
                 .map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6));
-            let name = format!("{}{}{:<16}{}", p.b, p.c, b.name, p.z);
+            let name = format!("{}{}{:<nw$}{}", p.b, p.c, b.name, p.z);
             println!("{name} {:>8} {:>9} {:>9}", b.pid, mem, cpu);
         }
     }
@@ -1275,8 +1275,13 @@ pub fn history(count: usize) -> Result<(), Error> {
         return Ok(());
     }
     let now = registry::now_unix();
+    // MEASURED, and here the fixed 20 failed the other way: this cell TRUNCATES, so it printed two
+    // different boxes as one string. A compose stack with services `worker` and `workqueue` gave two
+    // rows both reading `sdktest-cd95af93-wo…`, different pids, no way to tell which log is which.
+    // The column is measured now and truncates only past the shared ceiling.
+    let nw = crate::ui::name_col_width(rows.iter().map(|(n, _, _, _)| n.as_str()), 20);
     println!(
-        "{d}{:<20} {:>8} {:>12}  STATUS{z}",
+        "{d}{:<nw$} {:>8} {:>12}  STATUS{z}",
         "NAME",
         "PID",
         "WHEN",
@@ -1290,8 +1295,8 @@ pub fn history(count: usize) -> Result<(), Error> {
             format!("{}exited{}", p.d, p.z)
         };
         println!(
-            "{b}{c}{:<20}{z} {:>8} {:>12}  {status}",
-            truncate(name, 20),
+            "{b}{c}{:<nw$}{z} {:>8} {:>12}  {status}",
+            truncate(name, nw),
             pid,
             fmt_age(now.saturating_sub(*mtime)),
             b = p.b,

@@ -1689,3 +1689,113 @@ fn kern_does_not_translate_a_docker_command_line() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A name longer than the column must widen the column, not shift every row after it.
+///
+/// FOUR TABLES HAD A FIXED NAME WIDTH and `kern ps` had already been fixed; these are the ones that
+/// fix did not reach. `volume ls` and `network ls` are asserted here because they need no box, no
+/// user namespace and no busybox, so this guard runs on every host - including the CI runners where
+/// the box-based half of it would honestly skip.
+///
+/// MEASURED BEFORE THE FIX, not supposed: this host already had a compose stack's
+/// `CEIJ-GPSDEGoTracker-49cf4a99_postgres_data` (42 chars) in its volume directory, and it pushed
+/// SIZE and QUOTA out of line for every row of `volume ls`, header included - a table whose header
+/// lines up with no row in it.
+///
+/// THE TEST OWNS ITS STATE: `XDG_DATA_HOME` moves the volume directory and `XDG_RUNTIME_DIR` the
+/// network directory, so it neither reads the developer's real volumes nor leaves anything behind.
+/// That also makes the expected width exactly computable, which is the whole assertion: the column
+/// is as wide as the longest name, so the cell after it starts at the same offset in the header and
+/// in every row.
+#[test]
+fn a_long_name_widens_the_column_instead_of_shifting_the_row() {
+    let tmp = std::env::temp_dir().join(format!("kern-it-colw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let data = tmp.join("data");
+    let run = tmp.join("run");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    let k = |args: &[&str]| -> String {
+        let o = kern()
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_RUNTIME_DIR", &run)
+            .args(args)
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+
+    // `NAME` padded to `nw`, then one separator space, in the header AND in every row.
+    let aligned = |table: &str, nw: usize, names: &[&str], what: &str| {
+        let mut lines = table.lines();
+        let header = lines.next().unwrap_or_default();
+        let cell =
+            |l: &str| -> String { l.chars().take(nw).collect::<String>().trim().to_string() };
+        assert_eq!(
+            cell(header),
+            "NAME",
+            "{what}: header NAME cell is not {nw} wide: {header:?}"
+        );
+        assert_eq!(
+            header.chars().nth(nw),
+            Some(' '),
+            "{what}: no separator after the header's NAME cell: {header:?}"
+        );
+        for l in lines.filter(|l| !l.trim().is_empty()) {
+            assert!(
+                names.contains(&cell(l).as_str()),
+                "{what}: the first {nw} columns of a row are not one whole name - \
+                 the column did not widen and every cell after it is shifted: {l:?}"
+            );
+            assert_eq!(
+                l.chars().nth(nw),
+                Some(' '),
+                "{what}: no separator after a row's NAME cell: {l:?}"
+            );
+        }
+    };
+
+    // VOLUMES: floor 28, so a 35-character name is what proves the column moved.
+    let long_vol = "a-volume-name-that-is-thirty-four-x";
+    assert_eq!(long_vol.len(), 35);
+    k(&["volume", "create", long_vol]);
+    k(&["volume", "create", "shortvol"]);
+    aligned(
+        &k(&["volume", "ls"]),
+        35,
+        &[long_vol, "shortvol"],
+        "volume ls",
+    );
+
+    // NETWORKS: floor 24, so a 29-character name proves the same for that table.
+    let long_net = "a-network-name-of-twentyeight";
+    assert_eq!(long_net.len(), 29);
+    k(&["network", "create", long_net]);
+    k(&["network", "create", "net2"]);
+    aligned(
+        &k(&["network", "ls"]),
+        29,
+        &[long_net, "net2"],
+        "network ls",
+    );
+
+    // AND THE FLOOR IS UNCHANGED: with only short names the tables are exactly as wide as they were
+    // before any of this, so the fix cannot have quietly reformatted everyone's output.
+    k(&["volume", "rm", long_vol]);
+    k(&["network", "rm", long_net]);
+    aligned(
+        &k(&["volume", "ls"]),
+        28,
+        &["shortvol"],
+        "volume ls, short names only",
+    );
+    aligned(
+        &k(&["network", "ls"]),
+        24,
+        &["net2"],
+        "network ls, short names only",
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

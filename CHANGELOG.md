@@ -343,6 +343,17 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**Four tables had a fixed NAME width, and `kern history` printed two different boxes as one line.**
+`kern ps` was widened to fit its longest name some releases ago; `stats`, `history`, `volume ls` and
+`network ls` were not, each with its own number. The three that do not truncate (`stats` 16,
+`network ls` 24, `volume ls` 28) shifted PID, MEM, CPU, SIZE, QUOTA and MEMBERS for the whole table
+on any longer name, header included, so the header lined up with no row in it; 16 is passed by every
+box the sandbox SDK starts, and 28 by a volume a compose stack leaves behind. `history` truncates
+instead, and a project scope is 17 of its 20 characters: a stack with services `worker` and
+`workqueue` gave two rows both reading `…-wo…`, different pids, no way to tell which log was which.
+One rule for all five now, floored at each table's old width so short output is unchanged and
+ceilinged rather than truncating, because the name is the identity `kern stop` and `kern logs` take.
+
 **A piped `kern top` reported every box at 0% CPU.** The pane's per-box CPU% is a delta between two
 samples, and the one-shot form a pipe selects took only one, so every box read `0%` unconditionally.
 Measured: a box pegging a full core read `0%` across 24 consecutive snapshots while its own cgroup

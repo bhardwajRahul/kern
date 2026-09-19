@@ -926,15 +926,21 @@ fn list() -> Result<(), Error> {
     // Same `meta.json`-sidecar detection, scrubbing and sort as the TUI - one scanner, `entries()`.
     // SIZE is the data actually stored; QUOTA is the cap set at create (`--size`), shown so an empty
     // volume with a quota reads as `0 B / 2.0G` instead of a bare, confusing `0 B`.
+    // MEASURED on this host, which is why it is not hypothetical: a compose stack had already left
+    // `CEIJ-GPSDEGoTracker-49cf4a99_postgres_data` here, 42 characters, and the fixed 28 pushed SIZE
+    // and QUOTA out of line for every row of the table. `entries()` is scanned once and reused, since
+    // the width has to be known before the header prints.
+    let vols: Vec<_> = entries();
+    let nw = crate::ui::name_col_width(vols.iter().map(|v| v.name.as_str()), 28);
     println!(
-        "{d}{:<28} {:>10} {:>10}{z}",
+        "{d}{:<nw$} {:>10} {:>10}{z}",
         "NAME",
         "SIZE",
         "QUOTA",
         d = p.d,
         z = p.z
     );
-    for v in entries() {
+    for v in vols {
         // No quota = UNLIMITED → `∞` (not a bare `-`, which reads as unset/error). `∞` is 1 glyph but
         // 3 bytes; `kern_common::pad_visible` right-pads to 10 COLUMNS (not `{:>10}`, which counts bytes
         // and would misalign). Same helper as the `kern top` Storage tab, so the two can't drift.
@@ -946,7 +952,7 @@ fn list() -> Result<(), Error> {
             "  (unusable: not a kern-created name)"
         };
         println!(
-            "{b}{c}{:<28}{z} {:>10} {d}{}{flag}{z}",
+            "{b}{c}{:<nw$}{z} {:>10} {d}{}{flag}{z}",
             v.name,
             human_bytes(v.size),
             kern_common::pad_visible(&quota, 10),
