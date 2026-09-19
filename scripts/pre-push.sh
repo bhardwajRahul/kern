@@ -43,8 +43,16 @@ for g in no-ai-slop stale-numbers docker-vocabulary md-links flat-continuation \
          tracked-paths-sane; do
     step "$g" python3 "scripts/$g.py"
 done
-# The em-dash gate needs a UTF-8 locale: under LC_ALL=C it matches nothing and reports a FALSE green.
-step "no em-dash" sh -c 'LC_ALL=C.UTF-8 grep -rl "$(printf "—")" --include="*.md" . | grep -v ./target || true; ! LC_ALL=C.UTF-8 grep -rq "$(printf "—")" --include="*.md" --exclude-dir=target .'
+# NO SEPARATE EM-DASH STEP, and the reason is the whole point of this file. The first version had
+# one, spelled `grep --include="*.md"`, and it was WEAKER than the gate it paraphrased: `no-ai-slop`
+# scans every tracked file for that character, not just markdown. So this script passed itself green
+# while carrying an em-dash in this very line, and CI - which runs the real gate - went red. A fast
+# script that RESTATES a check will drift below it and hand out false greens; it must CALL it. Every
+# step above is the same script CI runs, by name.
+#
+# IT READS WHAT GIT TRACKS, so `git add` your new files before trusting a green from it. An
+# untracked file is invisible to these gates and to CI alike, right up to the commit that adds
+# it. Verified both ways: an em-dash in a staged `.sh` and in a tracked `.rs` each turn this red.
 
 if [ "$FULL" -eq 1 ]; then
     step "integration suite" cargo test -q -p getkern
