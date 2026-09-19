@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kern-sandbox"
-version = "0.2.25"
+version = "0.2.26"
 description = "kern is a fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and LLM-generated code; kern-sandbox is its Python binding. Run untrusted or agent-generated code (Python/JS/Bash) in a real, kernel-enforced box, one per call, with no cloud, no account and no VM."
 readme = "README.md"
 requires-python = ">=3.9"
