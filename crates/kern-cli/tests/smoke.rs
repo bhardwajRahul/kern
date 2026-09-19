@@ -1612,3 +1612,80 @@ fn build_check_reports_without_building_and_its_status_is_the_answer() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// KERN DOES NOT ANSWER TO ANOTHER TOOL'S NAME, whatever the file it is invoked through is called.
+///
+/// Until 2026-09-19 a symlink called `docker` made this binary read its own `argv[0]`, rewrite a
+/// Docker command line into kern's dialect and run it. What that cost is measurable and was
+/// measured: `examples/benchmark.py` shells out to whatever `docker` is on PATH, and on a machine
+/// carrying the symlink it published OUR binary as the competitor - `docker run --rm  4.2 ms` beside
+/// a real podman at 285 ms in the same run - because `docker --version` answered for kern.
+///
+/// The compatibility kern does offer is untouched and is not this: `kern box` takes Docker's common
+/// flags and `kern compose` reads a `docker-compose.yml` unchanged. Borrowing the NAME added only
+/// the ability to type `docker` instead of `kern`.
+///
+/// Asserted through a real symlink rather than by grepping for a deleted module, because the
+/// behaviour is what a user meets and a module can come back under any name.
+#[test]
+fn kern_does_not_translate_a_docker_command_line() {
+    let dir = std::env::temp_dir().join(format!("kern-noshim-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let link = dir.join("docker");
+    let _ = std::fs::remove_file(&link);
+    if std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kern"), &link).is_err() {
+        eprintln!("skip: cannot create a symlink here");
+        return;
+    }
+
+    // It says what it is. A shim answered this with kern's version too, so this alone is not the
+    // assertion - it is the control that the binary under the link really is ours.
+    let v = std::process::Command::new(&link).arg("--version").output();
+    let Ok(v) = v else {
+        eprintln!("skip: cannot spawn through the symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let ver = String::from_utf8_lossy(&v.stdout).to_lowercase();
+    assert!(
+        ver.contains("kern"),
+        "invoked as docker it must name itself kern: {ver:?}"
+    );
+
+    // THE ASSERTION. `docker run --rm IMAGE cmd` is Docker's grammar, and the shim turned it into
+    // `kern box NAME --image IMAGE -- cmd`. kern's own parser has no `--rm` on `run`, so a binary
+    // that still translated would succeed here and one that does not must refuse in kern's voice.
+    let out = std::process::Command::new(&link)
+        .args(["run", "--rm", "alpine", "/bin/true"])
+        .output()
+        .expect("spawn through the symlink");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a Docker command line was accepted through a `docker` symlink: the shim is back. \
+         stderr={err:?}"
+    );
+    assert!(
+        err.contains("kern"),
+        "the refusal must come from kern in its own words, not from a translation layer: {err:?}"
+    );
+
+    // And `docker compose version` must not claim to BE the other tool. That one line said
+    // `Docker Compose version <kern's number>` while `--version` and `info` both answered `kern`,
+    // and its own comment claimed the surface "has never claimed to be Docker". It had.
+    let c = std::process::Command::new(&link)
+        .args(["compose", "version"])
+        .output()
+        .expect("spawn through the symlink");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&c.stdout),
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(
+        !all.contains("Docker Compose version"),
+        "kern announced itself as Docker Compose: {all:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

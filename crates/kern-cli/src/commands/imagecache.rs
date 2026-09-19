@@ -41,14 +41,14 @@ pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
 /// ## Why it could not be done above this function
 ///
 /// Both callers that already offered an override faked it by PREPENDING to the user's command: the
-/// `docker` shim did `command.insert(0, ep)` and the compose parser did `b.command = entrypoint ++
-/// command`. That composes to `IMAGE_ENTRYPOINT ++ override ++ args`, which is correct only for an
+/// `docker` shim (removed on 2026-09-19) did `command.insert(0, ep)` and the compose parser did
+/// `b.command = entrypoint ++ command`. That composes to `IMAGE_ENTRYPOINT ++ override ++ args`, which is correct only for an
 /// image that has no `Entrypoint` - and an image with one is exactly when an override is needed.
 /// Measured against `quay.io/keycloak/keycloak:26.1`, whose entrypoint is `kc.sh`: asking for a
 /// shell produced `kc.sh sh -c …` and the image answered `Unknown option: 'sh'`. A field report hit
 /// that and could not get a shell inside the image to diagnose a crash loop.
 ///
-/// One mechanism, at the bottom, so the flag, the shim and compose cannot disagree about it.
+/// One mechanism, at the bottom, so the flag and compose cannot disagree about it.
 pub(crate) fn resolve_image_command(
     user_command: &[String],
     ssh: bool,

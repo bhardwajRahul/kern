@@ -48,7 +48,7 @@ by folder:
 | [`ci/`](ci/) | 8 | the same steps locally and in GitHub Actions, air-gapped, pre-commit |
 | [`edge/`](edge/) | 13 | services with a published port, data pipelines, a database box, a watchdog |
 | [`resources/`](resources/) | 10 | CPU/memory caps, `vcpu:`/`vdisk:` profiles, fan-out, and the comparisons |
-| [`security/`](security/) | 7 | second uid, nesting, device grants, secrets, the docker-socket shim |
+| [`security/`](security/) | 6 | second uid, nesting, device grants, secrets, bind-rootfs edges, the tun device |
 
 | Example | What it shows |
 |---|---|
