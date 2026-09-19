@@ -143,6 +143,46 @@ class Battery:
         return rc, out, err
 
 
+def binary_is_the_tree(kern, explicit):
+    """Refuse a binary that is not the tree. A stale one passes every case and proves nothing.
+
+    The binary is ASKED what it is: `--version` carries the `git describe` its build baked in. Its
+    MTIME is not consulted, because a rebase rewrites files with identical content and moves every
+    mtime, so an mtime says when cargo last ran rather than what it compiled - which is how a whole
+    green run once described a commit that was not checked out.
+
+    An explicit `--kern` is somebody testing another build on purpose, and is left alone. A tree
+    that is not a checkout says so and continues.
+
+    What is compared is the COMMIT, with `-dirty` stripped from both sides. A `-dirty` suffix is a
+    statement about uncommitted content, not about identity, and it appears on either side
+    independently: editing this very file after building makes the tree dirty while the binary is
+    current. Comparing the raw strings therefore refused the right binary, which is what the
+    negative control caught. Dirt on either side is reported instead, because it is the one thing a
+    matching commit cannot rule out.
+    """
+    got = subprocess.run([kern, "--version"], capture_output=True, text=True).stdout.strip()
+    print(got)
+    if explicit:
+        return True
+    d = subprocess.run(["git", "describe", "--tags", "--always", "--dirty"],
+                       capture_output=True, text=True)
+    if d.returncode != 0:
+        print("  not a checkout: the binary was not matched against a commit")
+        return True
+    want = d.stdout.strip()
+    undirty = lambda s: s[: -len("-dirty")] if s.endswith("-dirty") else s  # noqa: E731
+    if undirty(want) not in undirty(got):
+        print(f"\nSTALE BINARY: it reports {got!r}, this tree is {want!r}.", file=sys.stderr)
+        print("A run against it measures another commit. Build it, then run this again:",
+              file=sys.stderr)
+        print("    cargo build --release", file=sys.stderr)
+        return False
+    if want.endswith("-dirty") or got.endswith("-dirty"):
+        print("  the commit matches; the content is not pinned, one of the two is dirty")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kern", default=None)
@@ -161,7 +201,8 @@ def main():
         print("no kern binary: build one or pass --kern PATH", file=sys.stderr)
         return 2
     print(f"binary: {kern}")
-    print(subprocess.run([kern, "--version"], capture_output=True, text=True).stdout.strip())
+    if not binary_is_the_tree(kern, explicit=a.kern is not None):
+        return 2
 
     work = tempfile.mkdtemp(prefix="kern-inventory-")
     compose_path = os.path.join(work, "docker-compose.yml")
