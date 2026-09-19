@@ -27,8 +27,10 @@ wall-clock deadline applied from **outside** the box, so code that hangs cannot 
 is worth on your machine is in [Safe by default](https://github.com/getkern/kern/blob/main/bindings/python/README.md#safe-by-default), and what it costs is in
 [Performance](https://github.com/getkern/kern/blob/main/bindings/python/README.md#performance); both are measured rather than asserted.
 
-Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
-(the MCP server below is this package's).
+The runtime this drives, its tests, the pentest suites and the other bindings are one repository:
+**[github.com/getkern/kern](https://github.com/getkern/kern)**. Node and TypeScript get the same
+binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox) (the MCP server below is
+this package's).
 
 ## Your loop reads a field, not a stack trace
 

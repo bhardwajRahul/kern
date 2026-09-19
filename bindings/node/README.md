@@ -21,8 +21,9 @@ unenforceable cap FATAL: the box refuses to start rather than run uncapped. It a
 other refusal does, as `fault.type === "startup_failed"` on the result, NOT as an exception from the
 constructor, so a caller that only catches exceptions will walk past it.
 
-Dependency-free: it shells out to the `kern` binary and does not re-implement isolation in
-JavaScript.
+The runtime this drives, its tests and the other bindings are one repository:
+**[github.com/getkern/kern](https://github.com/getkern/kern)**. Dependency-free: it shells out to
+the `kern` binary and does not re-implement isolation in JavaScript.
 
 **Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall or a missing
 interpreter each arrive as a typed `fault` on the result, beside stdout and the exit code, so the
