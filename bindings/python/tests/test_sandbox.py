@@ -3844,3 +3844,54 @@ def test_the_two_bindings_refuse_the_same_credential_names():
     assert js_set("REFUSED_MOUNT_PAIRS") == {
         f"{a}/{b}" for a, b in kern._REFUSED_MOUNT_PAIRS
     }
+
+
+def test_the_uid_range_is_skipped_exactly_when_cap_drop_all_makes_it_useless():
+    """`--image` maps a sub-uid RANGE by default, and mapping it forks two SETUID HELPERS.
+
+    MEASURED on this tree: `parent:idmap` is 22 us with a single-uid map and ~1048 us with the range,
+    and a box built from this class's own argv goes 4298 -> 3234 us, a paired core-pinned difference
+    of 1083 us (25%) with a 95% interval of [-1184, -952]. That is the largest single item left in a
+    cold box.
+
+    IT BUYS THIS SANDBOX NOTHING under the default, and that is measured rather than argued:
+    `os.setuid(1000)` inside a cell is refused EITHER WAY when `ALL` is dropped (EPERM with the range,
+    EINVAL without), because the capability the range serves is gone. `pip install --target` installs
+    the same files either way, and an image whose files are not root-owned reads the same.
+
+    SO IT IS CONDITIONAL, and this test is mostly about the condition. `cap_drop=()` is a documented
+    choice that keeps the capabilities, and there the range DOES work - taking it away would remove
+    behaviour somebody asked for. A narrower set is treated the same way: only `ALL` is the signal.
+    """
+    for cap_drop, want in (
+        (("ALL",), True),  # the default
+        (("CAP_ALL",), True),  # the same thing, spelled with the prefix kern also accepts
+        ((), False),  # documented opt-out: keeps the caps, so keep the range
+        (("NET_RAW",), False),  # narrower: SETUID survives, so the range still means something
+        (("NET_RAW", "ALL"), True),  # ALL anywhere in the list is enough
+    ):
+        sbx = Sandbox(cap_drop=cap_drop)
+        argv = sbx._base_argv("n", network=False, timeout_s=10, dry=True)
+        assert ("--no-uid-range" in argv) is want, (
+            f"cap_drop={cap_drop!r}: expected --no-uid-range {want}, got {not want}"
+        )
+
+
+def test_the_two_bindings_agree_on_when_to_skip_the_uid_range():
+    """One rule, two spellings. A caller moving between the SDKs must meet the same box shape.
+
+    Read out of the Node source rather than executed, so this runs without a node on PATH. It pins the
+    CONDITION, not just the flag: a binding that always passed the flag would break `capDrop: []`, and
+    one that never passed it would be a quarter slower, and neither would be visible from the other.
+    """
+    js = (Path(__file__).resolve().parents[2] / "node" / "index.js").read_text(encoding="utf-8")
+    # THE GATED FORM, not the two halves separately. The first version of this test asserted that
+    # `argv.push("--no-uid-range")` and `_singleUid` both appeared somewhere, and it stayed GREEN when
+    # the condition was deleted from the push and left behind in the constructor - which is the exact
+    # drift it exists to catch. Falsified by making that edit, which is how the hole was found.
+    assert 'if (this._singleUid) argv.push("--no-uid-range");' in js, (
+        "the Node binding no longer passes --no-uid-range GATED on a single-uid posture"
+    )
+    assert 'replace(/^CAP_/, "")' in js and '=== "ALL"' in js, (
+        "the Node binding no longer decides that posture from `ALL` being dropped"
+    )

@@ -2491,3 +2491,35 @@ test("the credential list covers the third cloud and does not fire on a lookalik
     else process.env.KERN_BIN = prev;
   }
 });
+
+test("the uid range is skipped exactly when capDrop ALL makes it useless", async () => {
+  // `--image` maps a sub-uid RANGE by default and mapping it forks two SETUID HELPERS. MEASURED:
+  // `parent:idmap` 22 us single-uid against ~1048 us ranged, and a box on this class's own argv 4298
+  // -> 3234 us, a paired core-pinned -1083 us (25%).
+  //
+  // IT BUYS THIS SANDBOX NOTHING under the default: `setuid(1000)` in a cell is refused either way
+  // once `ALL` is dropped. WITHOUT it the range does work, so the flag is conditional and the
+  // condition is what this test is about - `capDrop: []` is a documented choice.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  try {
+    for (const [capDrop, want] of [
+      [undefined, true], // the default
+      [["CAP_ALL"], true], // same thing, prefixed spelling
+      [[], false], // documented opt-out: keeps the caps, so keep the range
+      [["NET_RAW"], false], // narrower: SETUID survives, the range still means something
+      [["NET_RAW", "ALL"], true], // ALL anywhere in the list is enough
+    ]) {
+      const sbx = new Sandbox(capDrop === undefined ? {} : { capDrop });
+      const argv = sbx._baseArgv("n", { network: false, timeoutS: 10, dry: true });
+      assert.strictEqual(
+        argv.includes("--no-uid-range"),
+        want,
+        `capDrop=${JSON.stringify(capDrop)}: expected --no-uid-range ${want}`,
+      );
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});

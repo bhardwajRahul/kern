@@ -343,6 +343,20 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**The SDK paid a quarter of every cold box for a uid range its own posture made useless.** `kern box
+--image` maps a sub-uid range by default, so that an image degrading privilege in its entrypoint
+(postgres, nginx, apt's `_apt`) works; mapping it forks the two setuid helpers `newuidmap` and
+`newgidmap`. Measured: `parent:idmap` is 22 us with a single-uid map and ~1048 us with the range, and a
+box on the SDK's own argv goes 4298 to 3234 us, a paired core-pinned difference of **1083 us (25%)**,
+interval [-1184, -952]. It bought that box nothing, and that is measured rather than argued:
+`os.setuid(1000)` inside a cell is refused either way once `ALL` is dropped, EPERM with the range and
+EINVAL without, because the capability the range serves is already gone. `pip install --target` with
+network on installs the same files either way, and an image whose files are not root-owned
+(`postgres:16-alpine`, `node:20-slim`) reads the same. So both bindings now pass `--no-uid-range`,
+CONDITIONALLY: only when `ALL` is among the dropped capabilities, which is the default. `cap_drop=()`
+is a documented choice that keeps the capabilities, and there the range does work, so it is kept - a
+narrower set is treated the same way. A test fails if the two bindings stop agreeing on the condition.
+
 **The SDK mount guard refused AWS and Azure and accepted Google Cloud.** The list of credential
 directories a `mounts=` source may not contain covered eleven names and missed the third major cloud,
 plus the GitHub CLI's token directory. Measured on the published 0.2.27 with each directory created

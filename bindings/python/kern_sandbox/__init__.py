@@ -1833,6 +1833,7 @@ class Sandbox:
     _profile_args: list = field(default_factory=list, init=False, repr=False)
     _egress_allow: list = field(default_factory=list, init=False, repr=False)
     _cap_drop_args: list = field(default_factory=list, init=False, repr=False)
+    _single_uid: bool = field(default=False, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
     _entered: bool = field(default=False, init=False, repr=False)
@@ -1920,6 +1921,34 @@ class Sandbox:
         self._cap_drop_args = []
         for cap in self.cap_drop or ():
             self._cap_drop_args += ["--cap-drop", _validate_cap(cap)]
+        # SKIP THE UID RANGE EXACTLY WHEN THE CAPABILITY IT SERVES IS BEING DROPPED ANYWAY, which is
+        # the default and costs a quarter of a cold box.
+        #
+        # `kern box --image` maps a sub-uid RANGE by default, which exists so an image that degrades
+        # privilege in its entrypoint (postgres, nginx, apt's `_apt`) works. Mapping it forks two
+        # SETUID HELPERS, `newuidmap` and `newgidmap`. MEASURED on this tree: `parent:idmap` is 22 us
+        # with a single-uid map and ~1048 us with the range, and the whole box goes from 3234 to 4298
+        # us on this class's own argv - a paired, core-pinned difference of 1083 us (25%), interval
+        # [-1184, -952].
+        #
+        # IT BUYS THIS SANDBOX NOTHING when `ALL` is dropped, and that is measured rather than argued:
+        # `os.setuid(1000)` inside a cell is refused EITHER WAY under `--cap-drop ALL` (EPERM with the
+        # range, EINVAL without). Without `--cap-drop ALL` the range DOES work, which is why this is
+        # conditional and not unconditional - `cap_drop=()` is a documented choice and it keeps both
+        # the capability and the range.
+        #
+        # CHECKED, not assumed, for the two things a range could serve besides privilege drop:
+        # `pip install --target` with network on installs the same three files either way, and an
+        # image whose files are not root-owned (`postgres:16-alpine`, `node:20-slim`) reads the same.
+        # The class also exposes no `user=`, so nothing here can ask to run as a non-root uid.
+        #
+        # ONE MORE REASON IT IS THE RIGHT DEFAULT HERE: this class's own contract, stated at the top of
+        # the module, is that "single-uid maps box-root to the host user, so files the box creates are
+        # host-owned". The range never broke that (uid 0 still maps to the caller), but the flag is
+        # what the sentence describes.
+        self._single_uid = any(
+            c.upper().removeprefix("CAP_") == "ALL" for c in (self.cap_drop or ())
+        )
         # SAME GUARD AS `cap_drop` ABOVE, for the same reason: the wrong shape is the natural guess.
         # `setup=` is ONE SHELL COMMAND, and a list of package names is what a reader writes first
         # (measured on myself: `setup=["imageio-ffmpeg"]` surfaced as `AttributeError: 'list' object has
@@ -2036,6 +2065,8 @@ class Sandbox:
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`
         # fault; kern's backstop guarantees the box is actually gone a few seconds later.
         argv += self._cap_drop_args
+        if self._single_uid:
+            argv.append("--no-uid-range")
         argv += ["--timeout", str(int(timeout_s) + 5)]
         if self.memory_mb is not None:
             argv += ["--memory", f"{self.memory_mb}m"]

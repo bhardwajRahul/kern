@@ -1489,6 +1489,22 @@ class Sandbox {
     if (!Array.isArray(this.capDrop))
       throw new SandboxError("capDrop must be an array of capability names");
     this._capDropArgs = this.capDrop.flatMap((c) => ["--cap-drop", validateCap(c)]);
+    // SKIP THE UID RANGE EXACTLY WHEN THE CAPABILITY IT SERVES IS BEING DROPPED ANYWAY, which is the
+    // default and costs a quarter of a cold box. `kern box --image` maps a sub-uid RANGE by default
+    // (so an image that degrades privilege in its entrypoint works), and mapping it forks two SETUID
+    // HELPERS. MEASURED: `parent:idmap` 22 us single-uid against ~1048 us ranged, and the whole box
+    // 3234 against 4298 us on this class's argv - paired, core-pinned, -1083 us (25%).
+    //
+    // IT BUYS THIS SANDBOX NOTHING when `ALL` is dropped, measured rather than argued: `setuid(1000)`
+    // inside a cell is refused either way under `--cap-drop ALL` (EPERM with the range, EINVAL
+    // without). WITHOUT it the range does work, so this is conditional: `capDrop: []` is a documented
+    // choice and keeps both the capability and the range.
+    //
+    // KEPT IDENTICAL TO THE PYTHON BINDING, including the condition: two spellings of one rule drift,
+    // and a caller who moved between the SDKs would meet a different box shape in each.
+    this._singleUid = this.capDrop.some(
+      (c) => String(c).toUpperCase().replace(/^CAP_/, "") === "ALL",
+    );
     this._profileArgs = (this.profiles || []).map(validateProfile);
     this._egressAllow = (this.egressAllow || []).map(validateDomain);
     if (this.apparmor !== null) validateApparmor(this.apparmor);
@@ -1633,6 +1649,7 @@ class Sandbox {
     }
     // kern's own --timeout is a tight BACKSTOP just beyond our deadline; OUR wait is the authority.
     argv.push(...this._capDropArgs);
+    if (this._singleUid) argv.push("--no-uid-range");
     argv.push("--timeout", String(Math.floor(timeoutS) + 5));
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
