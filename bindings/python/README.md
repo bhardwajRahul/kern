@@ -389,10 +389,13 @@ One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `pytho
 released musl binary, p50 after a discarded warm-up. Your hardware will differ: measure and claim your
 own number, and take the p50 rather than the best run. The bare-box row read 3.9 here until the host
 was checked: it was the MINIMUM, and the machine had 300 orphaned box processes on it from test runs.
+It read 4.3 until it was measured again on 2026-09-19 and the p50 of three separate runs came out
+4.60, 4.94 and 5.00: 4.3 sat between the min and the p25, which is the same mistake in a smaller
+size.
 
 | call (p50) | kern-sandbox | docker |
 |---|---|---|
-| `run(["true"])`, bare box | **4.3 ms** | |
+| `run(["true"])`, bare box | **4.9 ms** | |
 | `run_code("print(1)")`, plus the CPython start | **14.3 ms** | ~290 ms |
 
 `run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost, not
