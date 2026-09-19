@@ -2,26 +2,18 @@
 
 **Run LLM-generated code in a fast, real sandbox, one fresh box per call.**
 
-Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
-interpreter starting inside it costs more than the box does. Both depend on your machine, so they are
-measured under [Performance](#performance) with the machine and the method beside them, and the
-runtime's own are in [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
-
 `kern-sandbox` is the Python binding for **[kern](https://getkern.dev)**: a rootless,
 kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
 tool-call, a model's generated snippet, a notebook cell, a CI step: code that runs before anyone
 reads it gets its own box, and the box is thrown away after.
 
 ```bash
-pip install kern-sandbox
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # the runtime
+pip install kern-sandbox                                                        # the API
 ```
 
-**It needs the `kern` binary**, because the isolation is the binary's and this package is the API in
-front of it. One line, no toolchain, and `$KERN_BIN` overrides where it looks:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-```
+Two lines because they are two things: the isolation is the binary's, and this package is the API in
+front of it. `$KERN_BIN` says where to find one you already have.
 
 ```python
 import kern_sandbox as kern
@@ -30,14 +22,10 @@ r = kern.run_code("import sys; print(sys.version)")
 print(r.stdout, r.success)
 ```
 
-Network off, memory and PID caps the kernel enforces **where your host delegates them**,
-capabilities dropped, a deny-by-default seccomp allowlist, and a wall-clock deadline applied from
-**outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your
-HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell
-in a container often does not. `kern doctor` says which you have, and `require_limits=True` makes an
-unenforceable cap FATAL: the box refuses to start rather than run uncapped. It arrives the way every
-other refusal does, as `fault.type == "startup_failed"` on the result, NOT as an exception from the
-constructor, so a caller that only catches exceptions will walk past it.
+Network off, capabilities dropped, a deny-by-default seccomp allowlist, memory and PID caps, and a
+wall-clock deadline applied from **outside** the box, so code that hangs cannot outlive it. What that
+is worth on your machine is in [Safe by default](#safe-by-default), and what it costs is in
+[Performance](#performance); both are measured rather than asserted.
 
 Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
 (the MCP server below is this package's).
@@ -307,6 +295,26 @@ and why `/tmp` is one of them, the bytecode route `deps_readonly` closes, the si
 `mounts=` enforce, scratch that does not survive a call, toolchains that need `HOME`, a `df` that
 describes the host, and the three things a server image asks for.
 
+### The caps bind where your host delegates a cgroup, and nowhere else
+
+This is a property of the HOST, not of kern. A desktop session has a delegated cgroup; a bare root
+shell in a container, a CI runner, or WSL2 without systemd often does not, and there `--memory` is
+accepted and never bites. Nothing in the sandbox changes: namespaces, seccomp and the read-only root
+are unaffected. What changes is whether a runaway allocation is stopped by the kernel or by the host
+running out of memory.
+
+`kern doctor` reports which of the two you have. `require_limits=True` makes an unenforceable cap
+FATAL, and the verb matters: the BOX refuses to start, so it arrives as
+`fault.type == "startup_failed"` on the result, **not** as an exception from the constructor. A
+caller that only catches exceptions will walk straight past it.
+
+```python
+with kern.Sandbox(memory_mb=128, require_limits=True) as sbx:
+    r = sbx.run_code(code)
+    if r.fault and r.fault.type == "startup_failed":
+        ...   # this host cannot enforce the cap; nothing ran
+```
+
 ## API
 
 **A `Sandbox` is a context manager, and `Sandbox(...)` alone is not entered.** The methods below are
@@ -361,6 +369,11 @@ shape rather than one box per call, with its own page:
 [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
 
 ## Performance
+
+**It is two numbers rather than one.** The box is the cheap part, and an interpreter starting inside
+it costs more than the box does, so a bare box and a `run_code` are different rows below and neither
+is "how fast kern is". The runtime's own numbers are in
+[BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
 
 One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `python:3.12-slim`, the
 released musl binary, p50 after a discarded warm-up. Your hardware will differ: measure and claim your
