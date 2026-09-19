@@ -57,8 +57,9 @@ confident wrong answer first and a correction second.
 - **Do not bump a caret dependency to the patch you just published.** `^0.2.12` already resolves 0.2.13
   (a caret on a zero-major version allows `>=0.2.12 <0.3.0`), so the bump buys nothing and costs a window:
   npm takes minutes to serve a new version, and CI ran `npm install` inside it and went red with
-  `ETARGET: No matching version found for kern-sandbox@^0.2.13`. Measured both halves: the published
-  `kern-pi` 1.0.1, which declares `^0.2.12`, installs 0.2.13 today. Raise the floor only when the
+  `ETARGET: No matching version found for kern-sandbox@^0.2.13`. Measured both halves, and again a
+  week later: the published `kern-pi` still declares `^0.2.12` and now installs 0.2.25, which is the
+  rule working rather than an example aging. Raise the floor only when the
   dependent needs something the older version does not have, and then publish, wait for the registry, and
   push after.
 - **Inserting code just above a `def`, `fn` or `class` inserts it BELOW whatever documents that item.**

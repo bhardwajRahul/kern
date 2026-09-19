@@ -11,10 +11,12 @@ blockchain via [OpenTimestamps](https://opentimestamps.org). One release, one pa
 Together they let anyone prove the release existed at a given time, with no trust in this repo, in
 GitHub, or in the author.
 
-> **A record for the release you can install, and no others.** Proofs for superseded releases were
-> removed with the releases themselves: a proof of when a build nobody can download was created is
-> not something anyone checks. What is here is what you can verify end to end, against the binary
-> the install line gives you.
+> **A record for every release you can still download.** One pair of files per published release,
+> including the one `releases/latest` serves, so what is here is what you can verify end to end
+> against the binary the install line gives you. This said the opposite of the truth once, in the
+> direction that matters: it promised a record for the installable release while the newest two,
+> v0.9.32 and v0.9.35, had none, and v0.9.35 is what the install line gives you. A claim about
+> provenance that is not itself checked is the last place to let one rot.
 
 ## Verify
 
