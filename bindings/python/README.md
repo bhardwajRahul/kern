@@ -24,8 +24,8 @@ print(r.stdout, r.success)
 
 Network off, capabilities dropped, a deny-by-default seccomp allowlist, memory and PID caps, and a
 wall-clock deadline applied from **outside** the box, so code that hangs cannot outlive it. What that
-is worth on your machine is in [Safe by default](#safe-by-default), and what it costs is in
-[Performance](#performance); both are measured rather than asserted.
+is worth on your machine is in [Safe by default](https://github.com/getkern/kern/blob/main/bindings/python/README.md#safe-by-default), and what it costs is in
+[Performance](https://github.com/getkern/kern/blob/main/bindings/python/README.md#performance); both are measured rather than asserted.
 
 Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
 (the MCP server below is this package's).

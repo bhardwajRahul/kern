@@ -4,7 +4,7 @@
 
 Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
 interpreter starting inside it costs more than the box does. Both depend on your machine, so they are
-measured under [Prewarming](#prewarming-a-box-ready-before-the-call-arrives) with the machine and the method beside them, and the
+measured under [Prewarming](https://github.com/getkern/kern/blob/main/bindings/node/README.md#prewarming-a-box-ready-before-the-call-arrives) with the machine and the method beside them, and the
 runtime's own are in [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
 
 `kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**: a rootless,
