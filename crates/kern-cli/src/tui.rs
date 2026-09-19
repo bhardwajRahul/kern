@@ -1906,12 +1906,36 @@ fn volume_detail(v: &crate::volume::VolInfo) -> String {
 }
 
 /// Snapshot the Boxes table once (used when stdout is not a TTY - e.g. piped).
+///
+/// EVERY RATE IN THIS PANE IS A DELTA, so a one-shot has to take the pair itself. The host CPU%
+/// already did (two `/proc/stat` samples ~120 ms apart); the per-box CPU% and the box-start rate did
+/// not, and both are wrong in the same direction - `collect_rows(&HashMap::new())` has no previous
+/// sample, so it takes the `None => 0.0` arm for every box, and a `HostStats::default()` carries
+/// `box_starts_total: 0`, which is the arm that prints a blank line instead of the rate.
+///
+/// MEASURED, both: a box pegging a full core read `0%` here across 24 consecutive snapshots while its
+/// own cgroup `cpu.stat` and its workload's `/proc/<pid>/stat` ticks both said 100%, and the
+/// interactive tab beside it said `100%` too. A wrong number is worse than an absent one on this
+/// surface: piped `top` is what a script, CI, or an agent reads, and 0% is not obviously a
+/// placeholder. The start-rate line matters for the same reader - an SDK firing ~ms boxes leaves the
+/// live list empty, and that line is the only place its work shows up.
+///
+/// One sleep, not three: the first half of all three samples is taken before it.
 pub fn snapshot() -> Result<(), crate::error::Error> {
     let p = Palette::detect();
-    // Two `/proc/stat` samples ~120 ms apart give a real host CPU% even for a one-shot snapshot.
     let (_, s1) = read_host(None);
+    let prev_rows = sample_box_cpu();
+    let (mut prev_box, mut box_hist) = (None, Vec::new());
+    sample_rate(crate::runstats::box_total(), &mut prev_box, &mut box_hist);
     std::thread::sleep(std::time::Duration::from_millis(120));
-    let (host, _) = read_host(s1);
+    let (mut host, _) = read_host(s1);
+    let bt = crate::runstats::box_total();
+    (
+        host.box_starts_per_sec,
+        host.box_starts_peak,
+        host.box_starts_spark,
+    ) = sample_rate(bt, &mut prev_box, &mut box_hist);
+    host.box_starts_total = bt;
     let mem_pct = host.mem_pct();
     println!(
         "host: CPU {:.0}%  RAM {} / {} ({:.0}%)  load {:.2} ({} cores)",
@@ -1922,12 +1946,25 @@ pub fn snapshot() -> Result<(), crate::error::Error> {
         host.load1,
         host.cores
     );
-    let (rows, _) = collect_rows(&HashMap::new());
-    print!(
-        "{}",
-        boxes_table(&p, &rows, usize::MAX, usize::MAX, &HostStats::default())
-    );
+    let (rows, _) = collect_rows(&prev_rows);
+    print!("{}", boxes_table(&p, &rows, usize::MAX, usize::MAX, &host));
     Ok(())
+}
+
+/// The ONLY thing `collect_rows` wants from a previous frame: each box's `(cpu_usec, instant)`. Split
+/// out so a one-shot snapshot can take the earlier half of the pair without paying for a whole
+/// `collect_rows` - no health sidecars, no `/proc` isolation walk, no pod sort. Keyed on `pid` and
+/// read through `cgroup_pid()` exactly as `collect_rows` does, because a key or a cgroup that
+/// disagreed would silently miss every box and land back on the `0%` this exists to fix.
+fn sample_box_cpu() -> HashMap<i32, (u64, Instant)> {
+    let now = Instant::now();
+    registry::list()
+        .into_iter()
+        .map(|b| {
+            let usec = registry::box_stats(b.cgroup_pid()).cpu_usec.unwrap_or(0);
+            (b.pid, (usec, now))
+        })
+        .collect()
 }
 
 /// Read the registry and compute each box's frame-to-frame CPU%, returning the rows and the new
@@ -3922,6 +3959,41 @@ mod tests {
         assert!(
             !none.contains("box starts"),
             "no rate header before any box has started"
+        );
+    }
+
+    #[test]
+    fn the_one_shot_snapshot_keeps_the_pair_every_rate_here_needs() {
+        // THE GATE THAT ALWAYS RUNS. The end-to-end guard for this
+        // (`a_piped_top_reports_a_real_cpu_percent_per_box`) needs busybox, a user namespace AND a
+        // delegated per-box cgroup, and honestly SKIPS without them - which is most CI runners, the
+        // one place nobody reads a skip line. So the rule is also asserted where it cannot skip: in
+        // this file's own source.
+        //
+        // THE RULE: every number in this pane except MEM/PIDS/UPTIME is a DELTA between two samples.
+        // `snapshot()` is the one caller with no previous frame to subtract, so it has to take both
+        // halves itself. The two spellings below are precisely how it failed to: an empty map makes
+        // `collect_rows` take its `None => 0.0` arm for every box, and a default `HostStats` carries
+        // `box_starts_total: 0`, the arm that prints a blank line where the rate belongs.
+        const SRC: &str = include_str!("tui.rs");
+        let body = SRC
+            .split_once("pub fn snapshot()")
+            .expect("snapshot() is still in this file")
+            .1;
+        let body = &body[..body.find("\n}\n").expect("snapshot() has an end")];
+        for bad in ["HashMap::new()", "HostStats::default()"] {
+            assert!(
+                !body.contains(bad),
+                "`snapshot()` passes `{bad}`, which discards the earlier half of a delta and makes \
+                 every box read 0% CPU (measured: 0% for a box the cgroup said was at 100%). Take \
+                 the first sample before the sleep this function already does, as it does for the \
+                 host CPU%."
+            );
+        }
+        // The positive side, so deleting the samples rather than renaming them cannot pass either.
+        assert!(
+            body.contains("sample_box_cpu()") && body.contains("sample_rate("),
+            "`snapshot()` no longer takes the earlier half of the per-box CPU and box-start samples"
         );
     }
 

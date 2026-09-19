@@ -13128,3 +13128,155 @@ fn logs_on_a_live_foreground_box_explains_itself_instead_of_looping() {
     let merr = String::from_utf8_lossy(&miss.stderr);
     assert!(merr.contains("no logs for box"), "{merr:?}");
 }
+
+/// A PIPED `kern top` must report a real per-box CPU%, not 0 for everything.
+///
+/// THE DEFECT THIS GUARDS was measured, not imagined: a box pegging a full core read `0%` across 24
+/// consecutive snapshots while its own cgroup `cpu.stat` and its workload's `/proc/<pid>/stat` ticks
+/// both said 100%, and the interactive tab beside it said `100%`. `snapshot()` called
+/// `collect_rows(&HashMap::new())`, and with no previous sample every box takes the `None => 0.0`
+/// arm. The pane is a DELTA pane, so a one-shot has to take the pair itself - the host CPU% in the
+/// same function already did.
+///
+/// It matters because of WHO reads the piped form: a script, a CI step, or an agent driving the SDK.
+/// A missing number is a question; a `0%` is an answer, and it was the wrong one.
+///
+/// THE JUDGE IS NOT `top`. The box's own cgroup `cpu.stat` is read straight from cgroupfs over a
+/// window of the same length, so the test knows independently whether this host is even showing the
+/// spinner any CPU. Under parallel tests on a small runner it may not be - and then the test SKIPS
+/// with that measurement in the message instead of asserting into noise. That is a capability
+/// question about the host, answered by measuring it, not an assumption.
+///
+/// THE IDLE BOX IS THE CONTROL. A column hard-wired to 100 would pass the busy assertion on its own;
+/// the sleeper has to read 0 in the same snapshot for the busy reading to mean anything.
+#[test]
+fn a_piped_top_reports_a_real_cpu_percent_per_box() {
+    let Some(bb) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let rootfs = build_rootfs(&bb, "topcpu");
+    let xdg = std::env::temp_dir().join(format!("kern-it-topcpu-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+    let burn = format!("topburn-{}", std::process::id());
+    let idle = format!("topidle-{}", std::process::id());
+
+    let start = |name: &str, argv: &[&str]| -> std::process::Output {
+        let mut args = vec!["box", name, "--rootfs", &rootfs_s, "-d", "--"];
+        args.extend_from_slice(argv);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&args)
+            .output()
+            .expect("run kern")
+    };
+    // Two spinners, not one: the cell prints `{:>4.0}%`, so a single process that only gets a few
+    // percent of a core on a contended runner rounds to the very `0` under test. Alive for ~2 s.
+    let started = start(
+        &burn,
+        &[
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "while :; do :; done & while :; do :; done",
+        ],
+    );
+    let said_start = said(&started);
+    if host_cannot_build_a_box(&said_start) {
+        eprintln!("skip: this host cannot build a box: {said_start}");
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    }
+    let _ = start(&idle, &["/bin/busybox", "sleep", "30"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let top = |name: &str| -> Option<String> {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .arg("top")
+            .output()
+            .expect("run kern top");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains(name))
+            .map(|l| l.trim().to_string())
+    };
+    // `NAME PID UPTIME MEM CPU% PIDS …` - the cell that ends in `%`.
+    let cpu_of = |row: &str| -> Option<f64> {
+        row.split_whitespace()
+            .find_map(|c| c.strip_suffix('%')?.parse::<f64>().ok())
+    };
+    let mem_of =
+        |row: &str| -> Option<String> { row.split_whitespace().nth(3).map(str::to_string) };
+
+    // THE INDEPENDENT JUDGE: the burn box's own cgroup, found by name under kern's delegated slice.
+    let burn_cpu_stat = find_kern_slice().and_then(|slice| {
+        fs::read_dir(&slice).ok()?.flatten().find_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            (n.contains(&burn) && e.path().join("cpu.stat").exists())
+                .then(|| e.path().join("cpu.stat"))
+        })
+    });
+    let usage = |p: &Path| -> Option<u64> {
+        fs::read_to_string(p).ok()?.lines().find_map(|l| {
+            l.strip_prefix("usage_usec ")
+                .and_then(|v| v.trim().parse().ok())
+        })
+    };
+    let judged = burn_cpu_stat.as_ref().and_then(|p| {
+        let u1 = usage(p)?;
+        let t = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let u2 = usage(p)?;
+        Some(u2.saturating_sub(u1) as f64 / 1e6 / t.elapsed().as_secs_f64() * 100.0)
+    });
+
+    let burn_row = top(&burn);
+    let idle_row = top(&idle);
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &burn, &idle])
+        .output();
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_dir_all(&rootfs);
+
+    let Some(burn_row) = burn_row else {
+        eprintln!("skip: the busy box did not register on this host");
+        return;
+    };
+    // Capability, measured: no per-box cgroup reading means no MEM and no CPU% is POSSIBLE here, so
+    // asserting would test the host and not kern.
+    if mem_of(&burn_row).as_deref() == Some("-") {
+        eprintln!("skip: no per-box cgroup reading on this host (MEM is '-'): {burn_row}");
+        return;
+    }
+    let Some(judged) = judged else {
+        eprintln!("skip: could not read the box's own cpu.stat, so there is no judge: {burn_row}");
+        return;
+    };
+    if judged < 20.0 {
+        eprintln!(
+            "skip: this host gave the spinner only {judged:.1}% over the window, \
+             which `{{:>4.0}}%` may legitimately round to 0: {burn_row}"
+        );
+        return;
+    }
+
+    let shown = cpu_of(&burn_row).unwrap_or(-1.0);
+    assert!(
+        shown >= 1.0,
+        "a box the cgroup says is using {judged:.0}% CPU reads {shown}% in a piped `kern top`; \
+         this is the one-shot taking no previous sample: {burn_row}"
+    );
+    // THE CONTROL, in the same snapshot: a sleeper must not inherit the busy box's number.
+    if let Some(idle_row) = idle_row {
+        let idle_cpu = cpu_of(&idle_row).unwrap_or(-1.0);
+        assert!(
+            (0.0..1.0).contains(&idle_cpu),
+            "a sleeping box must read 0%, not {idle_cpu}%: {idle_row}"
+        );
+    }
+}

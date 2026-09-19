@@ -25,8 +25,7 @@ before fixing it would leave the broken one in the field on purpose. The two:
 
   * **`-i` no longer allocates a pseudo-terminal**, on `box` and on `exec`. `-t`/`-it` do. A script
     that used `-i` to get a terminal must now say `-t`; every script that used it the way docker
-    means it - `exec -i <box> psql … < file.sql` - stops hanging. The `docker` shim forwards the flag
-    verbatim, so it inherits both halves of this.
+    means it - `exec -i <box> psql … < file.sql` - stops hanging.
   * **`inspect --format` refuses a name kern holds no record of**, where it used to print `exited`
     and exit 0. A wait loop testing for `exited` ended immediately on a misspelled service and the
     script carried on as though the step had completed.
@@ -343,6 +342,16 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 **Three other `doctor` rows were a paragraph wide.** A passing row had nowhere to put a qualification
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
+
+**A piped `kern top` reported every box at 0% CPU.** The pane's per-box CPU% is a delta between two
+samples, and the one-shot form a pipe selects took only one, so every box read `0%` unconditionally.
+Measured: a box pegging a full core read `0%` across 24 consecutive snapshots while its own cgroup
+`cpu.stat` and its workload's `/proc/<pid>/stat` ticks both said 100%, and the interactive tab said
+`100%` at the same moment. The same call dropped the box-START rate, which is the only place an SDK
+firing ~ms boxes shows up at all - the live list is empty by the time you read it. Both now take
+their earlier sample before the 120 ms the function already sleeps for the host CPU%, so `kern top |
+…` answers what the terminal answers. A wrong number costs more than a missing one here: the piped
+form is what a script, a CI step or an agent reads, and `0%` does not look like a placeholder.
 
 **The Boxes tab of `kern top` says what it lists.** Every other list pane has a caption and the row
 budget reserves one for all of them, so this tab was spending the line on nothing; it now names the
