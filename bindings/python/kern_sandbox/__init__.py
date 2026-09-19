@@ -3964,6 +3964,9 @@ class _WarmPool:
         self._ready: "list[_WarmBox]" = []
         self._starting = 0
         self._closed = False
+        # Quante box questo pool ha FATTO PARTIRE. Serve solo a decidere se la reclamazione finale
+        # vale un sottoprocesso: un pool che non ha mai avviato nulla non ha scratch da recuperare.
+        self._started_total = 0
         self._orders: "queue.Queue" = queue.Queue()
         self._worker: "threading.Thread | None" = None
 
@@ -4070,6 +4073,8 @@ class _WarmPool:
             ok = False
         with self._lock:
             self._starting -= 1
+            if ok:
+                self._started_total += 1
             keep = ok and not self._closed
             if keep:
                 self._ready.append(box)
@@ -4085,6 +4090,7 @@ class _WarmPool:
             self._closed = True
             boxes, self._ready = self._ready, []
             worker = self._worker
+            started = self._started_total
         for b in boxes:
             b.kill()
         if worker is not None:
@@ -4094,6 +4100,37 @@ class _WarmPool:
             # thread must never be able to hold up a caller's `with` block.
             self._orders.put(None)
             worker.join(timeout=5)
+        # RECLAIM THE SCRATCH THE KILLS LEFT BEHIND, or a prewarmed session leaks directories into a
+        # tmpfs for as long as it runs.
+        #
+        # MEASURED, and it is the pool that is special rather than kern. A box ends here by SIGKILL of
+        # the supervisor's process group, which is what makes `stop_processes` fast and idempotent - and
+        # a process killed that way never runs its own teardown, so its scratch directory stays. The
+        # cold path does not have this: its box exits normally and removes its own. So prewarming turns
+        # what kern treats as the CRASH case into the routine one, and `recover` is the command kern
+        # ships for exactly that ("reclaim orphaned scratch of dead boxes"). Measured before the fix:
+        # `prewarm=4` plus two calls left SIX directories under `$XDG_RUNTIME_DIR/kern/scratch`, and
+        # `kern prune` did not take them - only `gc`/`recover` did - while the same two calls without
+        # prewarming left none.
+        #
+        # ONCE, AT CLOSE, not per box. Reclaiming after every cell would put a subprocess back on the
+        # path whose entire purpose is to have none: a prewarmed call is ~0.4 ms here and spawning kern
+        # costs several. This bounds the residue to one session instead of forever.
+        #
+        # It asks KERN rather than deleting paths itself: the scratch layout is kern's, and an SDK that
+        # rebuilt `<runtime>/kern/scratch/<name>-<pid>` from its own guesses would be a second copy of
+        # a rule only one side owns. Never raises, and bounded: teardown may not fail a caller's `with`
+        # block, nor hold it open.
+        if started:
+            try:
+                subprocess.run(  # noqa: S603 - argv list, no shell
+                    [self._sbx._kern, "recover"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
 
 def _unique_name() -> str:

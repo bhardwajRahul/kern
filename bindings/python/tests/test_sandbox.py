@@ -3736,3 +3736,48 @@ def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
             os.environ.pop("KERN_BIN", None)
         else:
             os.environ["KERN_BIN"] = prev
+
+
+@integration
+def test_a_prewarmed_session_leaves_no_scratch_behind():
+    """A PREWARMED SESSION MUST NOT LEAK DIRECTORIES INTO A tmpfs.
+
+    MEASURED before the fix: `prewarm=4` plus two calls left SIX directories under
+    `$XDG_RUNTIME_DIR/kern/scratch`, and they stayed. The same two calls without prewarming left
+    none, so it is the pool that is special, not kern.
+
+    The cause is the thing that makes the pool fast. A warm box ends by SIGKILL of the supervisor's
+    process group - idempotent, instant, and uncatchable, so the supervisor never runs its own
+    teardown and its scratch survives it. kern treats that as the crash case and ships `recover`
+    for it; prewarming just makes the crash case routine. So the pool reclaims once when it closes.
+
+    The assertion is on the DIRECTORY COUNT on disk rather than on anything the SDK reports, because
+    the SDK is the thing under test: it said the boxes were gone (and they were - zero kern
+    processes) while their directories stayed.
+    """
+    scratch = Path(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())) / "kern" / "scratch"
+
+    def live() -> int:
+        if not scratch.is_dir():
+            return 0
+        return len([d for d in os.listdir(scratch) if d.startswith("pysbx-")])
+
+    before = live()
+    with Sandbox(image="python:3.12-slim", prewarm=4, timeout_s=60) as sbx:
+        # The pool fills on a worker thread, so a claim made immediately takes the cold path and
+        # starts nothing to leak. Wait for boxes to exist, or this test passes without measuring.
+        for _ in range(60):
+            if live() > before:
+                break
+            time.sleep(0.2)
+        assert live() > before, "the pool never started a box: nothing here is being tested"
+        for _ in range(2):
+            assert sbx.run_code("pass").exit_code == 0
+    for _ in range(25):  # teardown is bounded, not instant
+        if live() <= before:
+            break
+        time.sleep(0.2)
+    assert live() <= before, (
+        f"a prewarmed session left {live() - before} scratch directories in {scratch}; "
+        "they accumulate in a tmpfs for as long as an agent runs"
+    )
