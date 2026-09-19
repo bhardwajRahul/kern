@@ -32,10 +32,17 @@ step() {
 
 # THE ORDER IS CHEAPEST-FIRST so the fastest thing that can be wrong says so first.
 step "fmt"                     cargo fmt --all --check
-step "unit tests"              cargo test -q -p getkern --bin kern
+# EVERY CRATE, NOT JUST THE BINARY. `-p getkern --bin kern` ran 717 tests and the workspace has
+# 1199: the 482 it never saw are the parsers - kern-compose, kern-oci, kern-common, kern-isolation -
+# and CI runs `cargo test --all`, so this file's promise to say what CI will say did not hold for
+# any of them. Measured warm: 2.1s for the binary alone, 12.3s for the workspace. Ten seconds
+# against the 6.5 minutes of the CI round they prevent is the trade this whole file argues for.
+# `--lib --bins` keeps the integration suite out; it is what `--full` adds.
+step "unit tests"              cargo test -q --workspace --lib --bins
 # The runner executes as an ordinary user inside a cgroup it cannot write. A developer shell sits in
 # its own delegated scope, so every assertion that assumes "a process may enter its own cgroup"
-# passes here and fails there. This runs the unit tests in THAT shape.
+# passes here and fails there. This runs the unit tests in THAT shape. STILL JUST THE BINARY: the
+# shape being reproduced is a cgroup one, and the crates above do not touch a cgroup.
 step "unit tests, CI host shape" sh scripts/as-ci-host.sh cargo test -q -p getkern --bin kern
 step "clippy -D warnings"      cargo clippy --release --workspace --all-targets
 for g in no-ai-slop stale-numbers docker-vocabulary md-links flat-continuation \

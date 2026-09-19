@@ -142,6 +142,22 @@ class Battery:
                 print(f"          | {line}")
         return rc, out, err
 
+    def assert_that(self, label, script_line, ok, detail):
+        """Record a judgement about output ALREADY collected, in the same ledger as a run.
+
+        Some questions are about the SHAPE of an answer rather than its presence - which row came
+        first, how many there were - and `want_out` can only ask whether a substring occurs. Those
+        would otherwise be checked with a bare `assert` that stops the battery at the first
+        disagreement and leaves the remaining cases unmeasured.
+        """
+        if ok:
+            self.passed += 1
+            print(f"  ok    {label}")
+        else:
+            self.failed.append((label, script_line, detail, ""))
+            print(f"  FAIL  {label}")
+            print(f"          {detail}")
+
 
 def binary_is_the_tree(kern, explicit):
     """Refuse a binary that is not the tree. A stale one passes every case and proves nothing.
@@ -163,15 +179,23 @@ def binary_is_the_tree(kern, explicit):
     """
     got = subprocess.run([kern, "--version"], capture_output=True, text=True).stdout.strip()
     print(got)
-    if explicit:
-        return True
+    undirty = lambda s: s[: -len("-dirty")] if s.endswith("-dirty") else s  # noqa: E731
     d = subprocess.run(["git", "describe", "--tags", "--always", "--dirty"],
                        capture_output=True, text=True)
+    if explicit:
+        # AN ESCAPE HATCH THAT ANNOUNCES ITSELF. `--kern` is how you put an installed binary, or one
+        # built elsewhere, to the same battery, so it must not refuse. It used to say nothing at
+        # all, which let `--kern $(which kern)` in a script report a green about whatever was on
+        # PATH while reading as a verdict on this tree. The check still runs; only its power to
+        # refuse is dropped.
+        if d.returncode == 0 and undirty(d.stdout.strip()) not in undirty(got):
+            print(f"  NOT THIS TREE: --kern was given, so this runs anyway. The result describes "
+                  f"{got!r}, not {d.stdout.strip()!r}.")
+        return True
     if d.returncode != 0:
         print("  not a checkout: the binary was not matched against a commit")
         return True
     want = d.stdout.strip()
-    undirty = lambda s: s[: -len("-dirty")] if s.endswith("-dirty") else s  # noqa: E731
     if undirty(want) not in undirty(got):
         print(f"\nSTALE BINARY: it reports {got!r}, this tree is {want!r}.", file=sys.stderr)
         print("A run against it measures another commit. Build it, then run this again:",
@@ -287,12 +311,34 @@ def main():
         print("\ncontracts")
         b.check("compose wait returns the status", "docker compose wait tests  # $? is the suite's",
                 ["compose", "docker-compose.yml", "wait", "setup"], want_rc=0, timeout=240)
-        b.check("compose push skips what it did not build",
+        # NON-ZERO, AND THIS LINE USED TO SAY 0. No service in this file declares `build:`, so the
+        # verb publishes nothing; exiting 0 there lets `compose push && deploy` deploy after
+        # publishing nothing. The assertion encoded the defect until it was put to an outside
+        # reading, which is the same way the `split_argv` trailing-backslash case was found.
+        b.check("compose push refuses when it published nothing",
                 "docker compose push  # only services with a build section",
                 ["compose", "docker-compose.yml", "push"],
-                want_out="declares no `build:`", want_rc=0)
+                want_out="declares no `build:`", want_rc=1)
         b.check("ps --last is newest CREATED", "docker ps -n 2",
                 ["ps", "--last", "2", "--format", "{{.Names}}"])
+        # THE ORDER IS THE ANSWER, not just the count. `--last` asks about recency, so the newest
+        # box has to be the FIRST row; it used to be the last, because the cut was made on one
+        # ordering and the rows were then printed in another.
+        #
+        # TWO BOXES OF ITS OWN, and not the stack's. Reading the answer off the stack requires
+        # knowing which service is newest, and `restart db` a few lines up makes that DB, not the
+        # service that started last - an assumption that read as a code defect until the start
+        # times were looked at. These two are created here, a second apart, so which is newer is
+        # not a matter of interpretation. A second is many kernel ticks; boxes created inside ONE
+        # tick are not ordered by this flag and nothing here pretends otherwise.
+        b.run(["box", "order-a", "--image", "alpine:3.19", "-d", "--", "sleep", "60"])
+        time.sleep(1.2)
+        b.run(["box", "order-b", "--image", "alpine:3.19", "-d", "--", "sleep", "60"])
+        _, order_out, _ = b.run(["ps", "--last", "2", "--format", "{{.Names}}"])
+        names = [n.strip() for n in order_out.splitlines() if n.strip()]
+        b.assert_that("ps --last puts the newest FIRST", "docker ps -n 2",
+                      names == ["order-b", "order-a"], f"rows were {names}, wanted the newer first")
+        b.run(["stop", "order-a", "order-b"])
         b.check("images --filter without a tag", "docker images --filter reference=alpine",
                 ["images", "--filter", "reference=alpine"], want_out="alpine:3.19")
 

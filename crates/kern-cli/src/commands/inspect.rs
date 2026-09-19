@@ -302,20 +302,29 @@ pub fn ps(
                 .filter(|(_, live, _)| !*live)
                 .map(|(_, _, i)| *i)
                 .collect();
-            (
-                boxes
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| keep_live.contains(i))
-                    .map(|(_, b)| b)
-                    .collect(),
-                exited
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| keep_exited.contains(i))
-                    .map(|(_, e)| e)
-                    .collect(),
-            )
+            // NEWEST FIRST, AND THE SAME ORDER TWICE FOR THE SAME BOXES. Plain `ps` lists oldest
+            // first, which is the registry's order and stays that way; `--last N` asks a question
+            // ABOUT RECENCY, and answering it in the opposite order made "the newest" the bottom
+            // row. The rows were also not stable: the registry sorts on a start time measured in
+            // clock ticks, so boxes created inside the same tick tied and kept whatever order the
+            // directory happened to be read in, which is why four boxes started in a loop could
+            // come back in any arrangement. NAME BREAKS THE TIE because it is the one key that is
+            // unique, present on both records and independent of how the entries were read.
+            let mut boxes: Vec<_> = boxes
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep_live.contains(i))
+                .map(|(_, b)| b)
+                .collect();
+            let mut exited: Vec<_> = exited
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep_exited.contains(i))
+                .map(|(_, e)| e)
+                .collect();
+            boxes.sort_by(|a, b| b.starttime.cmp(&a.starttime).then(a.name.cmp(&b.name)));
+            exited.sort_by(|a, b| b.starttime.cmp(&a.starttime).then(a.name.cmp(&b.name)));
+            (boxes, exited)
         }
     };
     // `-q`/`--quiet`: names only, one per line - scriptable, e.g. `kern stop $(kern ps -q)`. An exited

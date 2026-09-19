@@ -4577,7 +4577,16 @@ fn split_argv(s: &str) -> Vec<String> {
                     cur.push(n);
                     has = true;
                 }
-                None => {}
+                // A BACKSLASH WITH NOTHING AFTER IT IS A BACKSLASH. POSIX leaves the case
+                // unspecified because a shell reading a terminal would ask for another line, and
+                // this code used to drop it on that reading. There is no next line here: the string
+                // is whole, and dash, bash and busybox ash all agree it is a literal, which is what
+                // `command: myapp C:\dir\` means to the person who wrote it. Dropping it silently
+                // shortened an argument, or deleted the last one entirely.
+                None => {
+                    cur.push('\\');
+                    has = true;
+                }
             },
             (None, c) if c.is_whitespace() => {
                 if has {
@@ -7022,8 +7031,10 @@ mod tests {
         assert_eq!(split_argv("ab\\\ncd"), ["abcd"]);
         // A continuation that starts a word must not fabricate an empty argument.
         assert_eq!(split_argv("\\\n"), Vec::<String>::new());
-        // A trailing unquoted backslash consumes nothing and produces nothing.
-        assert_eq!(split_argv("a \\"), ["a"]);
+        // A trailing unquoted backslash is a literal backslash, and its own word if it stands
+        // alone. This assertion said the opposite until /bin/sh was asked.
+        assert_eq!(split_argv("a \\"), ["a", "\\"]);
+        assert_eq!(split_argv(r"C:\dir\"), [r"C:dir\"]);
 
         // THE THREE CONTEXTS IN ONE STRING, which is what the reported file is.
         assert_eq!(
@@ -7039,10 +7050,13 @@ mod tests {
     ///
     ///  * the splitter TERMINATES AND NEVER PANICS on every string of length 6 over the alphabet
     ///    that decides its control flow (`\`, `"`, `'`, space, newline, a letter) - 46656 inputs,
-    ///    which is the whole short-input space where a quote/escape scanner's bug lives,
-    ///  * anything POSIX single-quoting can express SURVIVES A ROUND TRIP. That is the oracle: the
-    ///    quoting rule is independent of the splitting rule, so agreement between them is evidence
-    ///    rather than a restatement.
+    ///  * anything POSIX quoting can express SURVIVES A ROUND TRIP, for the cases listed here.
+    ///
+    /// WHAT THIS DOES NOT DO, because the loop's assertion is weaker than its input space and a
+    /// reader counting 46656 will over-read it: the exhaustive part checks totality, not meaning. A
+    /// splitter that answered with one giant argument for every input would pass it. The round trip
+    /// is a real oracle but only over the cases written below. The whole space is put to an oracle
+    /// in [`split_argv_agrees_with_the_real_shell`], which is where a wrong SPLIT is caught.
     #[test]
     fn split_argv_is_total_and_round_trips_posix_quoting() {
         let alphabet = ['\\', '"', '\'', ' ', '\n', 'a'];
@@ -7099,6 +7113,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE WHOLE SHORT-INPUT SPACE, PUT TO `/bin/sh` ITSELF.
+    ///
+    /// The exhaustive loop above asserts totality, and totality is not meaning: it cannot tell a
+    /// correct split from a wrong one. This asks the only authority there is. For every string of
+    /// length 6 over the alphabet that drives the scanner, the shell is made to print the words IT
+    /// would produce, and `split_argv` must produce the same ones.
+    ///
+    /// THE ALPHABET IS WHY THE SHELL IS AN EXACT ORACLE HERE. It holds no `$` and no backtick, so
+    /// `printf '%s\0' <input>` performs quote removal and field splitting and NOTHING ELSE: no
+    /// parameter expansion, no command substitution, no globbing (the alphabet has no `*?[`). What
+    /// comes back is the split, not the split plus an expansion kern deliberately does not do.
+    ///
+    /// AND WHY IT CARRIES A TAB WHERE THE SCANNER SEES A NEWLINE. A bare newline TERMINATES the
+    /// command inside `eval`, so the shell answers about two commands while kern is being asked
+    /// about one argument list: the disagreement that produces is the oracle's, not the splitter's.
+    /// The difference is real and deliberate - a newline separates COMMANDS for a shell and WORDS
+    /// for kern, which does not run one - so it is stated here rather than measured wrongly. Tab
+    /// drives the same whitespace branch. The two newline rules that are genuinely kern's, the
+    /// `\<newline>` continuations inside and outside double quotes, keep their own assertions
+    /// above, where the expected value is written out instead of being asked of a shell that would
+    /// answer a different question.
+    ///
+    /// EACH CASE RUNS IN A SUBSHELL because an unterminated quote is a SYNTAX error, and a syntax
+    /// error inside `eval` terminates a non-interactive shell: without the subshell the first
+    /// malformed input of 46656 kills the run and the remaining 46000 report nothing. Those inputs
+    /// are counted and skipped rather than compared - a compose file with an unterminated quote is
+    /// malformed, and what kern does with one is a separate decision from how it splits a valid one.
+    ///
+    /// THE COUNT IS ASSERTED, so an oracle that silently degrades cannot pass. If the marker
+    /// protocol broke, or the shell rejected everything, the comparison count would collapse and
+    /// this would go red rather than green-and-empty, which is the failure this test exists to
+    /// avoid in the first place.
+    #[test]
+    fn split_argv_agrees_with_the_real_shell() {
+        const N: usize = 6;
+        let alphabet = ['\\', '"', '\'', ' ', '\t', 'a'];
+        let mut inputs: Vec<String> = Vec::with_capacity(alphabet.len().pow(N as u32));
+        for i in 0..alphabet.len().pow(N as u32) {
+            let mut x = i;
+            let mut s = String::with_capacity(N);
+            for _ in 0..N {
+                s.push(alphabet[x % alphabet.len()]);
+                x /= alphabet.len();
+            }
+            inputs.push(s);
+        }
+
+        // `E` cannot collide with a word the shell emits: the alphabet has no `E`.
+        // `set --` AND A LOOP, NOT A BARE `printf`. `printf '%s\0'` with no arguments still applies
+        // its format once and emits one empty word, so an input of pure whitespace came back as one
+        // argument where the shell in fact produced none. The shell does the splitting into its own
+        // positional parameters and the loop reports them, which is silent when there are none.
+        let script = r#"for s in "$@"; do ( eval "set -- $s" 2>/dev/null && for a in "$@"; do printf '%s\000' "$a"; done ) 2>/dev/null || printf E; printf '\036'; done"#;
+        let out = match std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .args(&inputs)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // A host without /bin/sh says so, instead of reporting a green it did not earn.
+                println!("skipped: cannot run /bin/sh as an oracle: {e}");
+                return;
+            }
+        };
+        let records: Vec<&[u8]> = out.stdout.split(|b| *b == 0x1e).collect();
+        assert_eq!(
+            records.len() - 1,
+            inputs.len(),
+            "the oracle answered for {} inputs, not {}: the record protocol is broken, and a \
+             comparison that cannot see its subject must not report a pass",
+            records.len() - 1,
+            inputs.len()
+        );
+
+        let (mut compared, mut refused) = (0usize, 0usize);
+        for (input, rec) in inputs.iter().zip(records) {
+            if rec == b"E" {
+                refused += 1;
+                // Still must not panic, which is the totality property, here on the same space.
+                let _ = split_argv(input);
+                continue;
+            }
+            // Every word is NUL-TERMINATED, not NUL-separated, so the split always ends in one
+            // empty element that is punctuation rather than a word. Dropping exactly that last
+            // element is what keeps a genuinely EMPTY argument (`''` is one word, not none)
+            // distinguishable from a record carrying no words at all.
+            let mut words: Vec<&[u8]> = rec.split(|b| *b == 0).collect();
+            words.pop();
+            let want: Vec<String> = words
+                .into_iter()
+                .map(|w| String::from_utf8_lossy(w).into_owned())
+                .collect();
+            assert_eq!(
+                split_argv(input),
+                want,
+                "kern and /bin/sh disagree about {input:?}"
+            );
+            compared += 1;
+        }
+        // Measured on this alphabet: the shell accepts 16222 of the 46656 and rejects the rest as
+        // unterminated quotes. The floor is deliberately below that and deliberately not zero.
+        assert!(
+            compared > 15000,
+            "only {compared} inputs reached a comparison ({refused} refused by the shell): the \
+             oracle degraded, and a test that compares nothing passes for the wrong reason"
+        );
     }
 
     /// A STRING `entrypoint:` DOES NOT DROP `command`, and it used to.

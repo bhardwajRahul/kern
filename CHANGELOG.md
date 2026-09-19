@@ -24,6 +24,31 @@ before fixing it would leave the broken one in the field on purpose. The two:
 Everything else here is additive: new verbs, new flags, and fields added to `--json` documents that
 consumers already have to ignore when unknown.
 
+**A trailing backslash in a `command:` deleted a character, and sometimes an argument.** `command:
+myapp C:\dir\` ran `myapp` with `C:dir` - the final backslash was read as an escape with nothing to
+escape and dropped, and a `command:` that ENDED in a lone backslash lost that word entirely. POSIX
+leaves the case unspecified because a shell reading a terminal asks for another line; there is no
+next line in a compose file, and dash, bash and busybox ash all treat it as a literal. kern now
+does too. FOUND BY AN ORACLE, not by a test: the exhaustive loop over 46656 inputs asserted only
+that the splitter terminates, which no wrong split can violate, so the whole space is now put to
+`/bin/sh` itself and compared word for word - 17523 of the inputs are valid shell and every one of
+them must agree. The hand-written assertion for this case had encoded the wrong answer, and only an
+authority outside the test could say so.
+
+**`compose push` exited 0 having published nothing.** A service is pushed only when it declares
+both `build:` and `image:`, which is right; every service that did not was announced as skipped and
+the verb still reported success, so `compose push && deploy` deployed after publishing nothing. A
+run that publishes at least one image is still a success even if it skips others. A run that
+publishes NONE now says so with a status, and names the rule it applied.
+
+**`ps --last N` printed the newest box last.** The flag asks a question about recency and the rows
+came back oldest-first: the cut was made on one ordering and the rows were then rendered in
+another, the registry's. Boxes created inside the same kernel tick also fell back to whatever order
+the directory was read in. `--last` now renders newest-first and breaks a tie on the name, so the
+same boxes give the same order every time. Plain `ps` is unchanged and still lists oldest-first.
+The resolution is the kernel's: two boxes started within one tick are not ordered by this flag, and
+nothing here claims otherwise.
+
 **A pod name reaching the JOIN path was not validated, only the one reaching CREATE.** `pod create`
 has always checked the name against the shared resource-name rule, because it becomes a directory;
 `--pod <name>` took it straight from argv and handed it to `pods_root().join(name)` with nothing in

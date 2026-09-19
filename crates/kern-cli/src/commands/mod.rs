@@ -7991,6 +7991,21 @@ fn run_terminal_verb(
                     ),
                 }
             }
+            // PUBLISHING NOTHING IS NOT A SUCCESS, and exiting 0 here said it was. The comment
+            // above already draws the distinction and the code did not honour it: every skip
+            // printed a note to stderr and the verb still exited 0, so `compose push && deploy`
+            // deployed after publishing nothing, which is the whole shape this verb exists inside.
+            // A run that published at least one image is a success even if it skipped others: the
+            // file said what was its to publish and it went. A run that published NONE has not
+            // done what its name says, and says so with a status a script can read.
+            if pushed == 0 {
+                return Err(Error::Compose(
+                    "compose push: no image was published. Only a service with BOTH `build:` (the \
+                     bytes are this project's) and `image:` (the name to publish them under) is \
+                     pushed; the notes above name each service that was skipped and why"
+                        .into(),
+                ));
+            }
             println!("compose push: {pushed} image(s) published");
             return Ok(true);
         }
