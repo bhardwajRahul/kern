@@ -3002,6 +3002,29 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
             want.to_string(),
             "`kern wait` must print the same code `ps -a` shows"
         );
+        // AND THE THIRD SURFACE, which used to deny the box had ever existed. `kern inspect` on a
+        // box that just exited answered "nothing named '<name>' ... `kern pull <name>` fetches one",
+        // sending a reader to fetch an IMAGE named after their own box. It still refuses - inspect
+        // reports a RUNNING box - but it must refuse about the right subject and point at the
+        // surface that has the answer.
+        let i = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["inspect", name, "--json"])
+            .output()
+            .expect("run kern");
+        let err = String::from_utf8_lossy(&i.stderr);
+        assert!(
+            err.contains(&format!("it exited with {want}")),
+            "`kern inspect` on an exited box must name the code `ps -a` shows, got: {err}"
+        );
+        assert!(
+            err.contains("kern ps -a"),
+            "it must point at the surface that carries the answer, got: {err}"
+        );
+        assert!(
+            !err.contains("kern pull"),
+            "it must not send a reader to pull an image named after their box, got: {err}"
+        );
     }
     if !ran {
         eprintln!("skip: no box started in this environment");

@@ -676,10 +676,25 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     let cache = crate::commands::imagecache::cache_dir();
     let safe = crate::commands::imagecache::sanitize_ref(name);
     if !crate::commands::imagecache::cache_entry_complete(&cache, &safe) {
-        // ONE MESSAGE NAMING BOTH SUBJECTS, because at this point neither exists and a reader told
-        // only about boxes goes looking for the wrong thing.
+        // THREE SUBJECTS, NOT TWO. A reader who reaches here has usually just watched a box run,
+        // and the third case is the one they are in: the box EXITED. `kern ps -a` lists it with its
+        // code and `kern ps -a --json` carries the same as a field, so answering "nothing named
+        // that, try `kern pull`" sent them to fetch an image named after their own box. Same
+        // reasoning `wait` already applies a few hundred lines up: `ps -a` lists the box with its
+        // code, so no other surface here may deny that it existed.
+        if let Some(exited) = crate::registry::list_exited()
+            .into_iter()
+            .find(|e| e.name == *name)
+        {
+            return Err(Error::NotRunning(format!(
+                "no running box named '{name}': it exited with {}. `kern ps -a` lists recently-exited boxes and `kern ps -a --json` carries the code as a field; `kern inspect` reports a box while it runs",
+                exited.code
+            )));
+        }
+        // NEITHER EXISTS, so name both subjects: a reader told only about boxes goes looking for
+        // the wrong thing.
         return Err(Error::NotRunning(format!(
-            "nothing named '{name}': no running box, and no image in the local cache. `kern images` lists images and `kern pull {name}` fetches one"
+            "nothing named '{name}': no running box, no exit record for one, and no image in the local cache. `kern ps -a` lists recently-exited boxes, `kern images` lists images and `kern pull {name}` fetches one"
         )));
     }
     let cfg = crate::commands::imagecache::read_image_config(&cache.join(format!("{safe}.image")));
