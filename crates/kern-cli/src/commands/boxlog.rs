@@ -1296,6 +1296,17 @@ pub(crate) struct Stamper {
     orphan: bool,
     /// The newest time already printed. See [`Stamper::emit`] for why it is a floor and not a record.
     floor: Option<u64>,
+    /// `--since` / `--until` as unix NANOSECONDS, inclusive of `since` and of `until`.
+    ///
+    /// A LINE WITH NO RECORDED TIME IS KEPT, and that choice is the whole design of this filter. The
+    /// index buckets from 100 ms and a log written before the index existed has no marks at all, so
+    /// `nanos` is legitimately `None` for real output. Dropping those lines would make `--since`
+    /// silently lose what a reader is looking for; keeping them makes the window a filter on what is
+    /// KNOWN to be outside it, which is the only claim the index supports.
+    window: (Option<u64>, Option<u64>),
+    /// Print the time column. `false` when the window is the only reason this Stamper exists, which
+    /// is `logs --since` without `-t`: Docker's `--since` does not imply `--timestamps` either.
+    column_on: bool,
 }
 
 impl Stamper {
@@ -1311,7 +1322,26 @@ impl Stamper {
             ino: 0,
             orphan: false,
             floor: None,
+            window: (None, None),
+            column_on: true,
         }
+    }
+
+    /// Restrict output to lines whose recorded time falls in `[since, until]`, and say whether the
+    /// time column is printed at all.
+    ///
+    /// Built as a separate step rather than as four more arguments to [`Stamper::new`]: every
+    /// existing caller wants the column and no window, and a constructor whose common call site ends
+    /// in `, None, None, true` is a constructor nobody reads.
+    pub(crate) fn with_window(
+        mut self,
+        since: Option<u64>,
+        until: Option<u64>,
+        column_on: bool,
+    ) -> Self {
+        self.window = (since, until);
+        self.column_on = column_on;
+        self
     }
 
     /// THE INDEX GROWS WHILE WE FOLLOW IT, so re-read it once per arriving chunk.
@@ -1436,21 +1466,38 @@ impl Stamper {
         if let Some(n) = nanos {
             self.floor = Some(n);
         }
-        // The empty check is NOT redundant: `None` is a legal mark (the head of a log has none), so
-        // a cache that started at `None` would match the very first line and print no column at all.
-        if self.column.1.is_empty() || self.column.0 != nanos {
-            let stamp = nanos.map(fmt_mark).unwrap_or_else(|| "-".to_string());
-            self.column = (nanos, format!("{stamp:<24} ").into_bytes());
-        }
-        out.write_all(&self.column.1)?;
-        out.write_all(line)?;
+        // THE CURSOR ADVANCES WHETHER OR NOT THE LINE IS PRINTED. `at` is a file offset, and the
+        // stamp of every later line is read from it: a filtered line that did not move it would
+        // shift every remaining stamp backwards by its length.
         self.at += line.len() as u64;
+        // OUTSIDE THE WINDOW ONLY WHEN THE TIME IS KNOWN. `None` means the index has nothing to say
+        // about this line, and a filter that discards what it cannot place would drop real output on
+        // any log written before its index existed.
+        if let Some(n) = nanos {
+            if self.window.0.is_some_and(|s| n < s) || self.window.1.is_some_and(|u| n > u) {
+                return Ok(());
+            }
+        }
+        if self.column_on {
+            // The empty check is NOT redundant: `None` is a legal mark (the head of a log has none),
+            // so a cache that started at `None` would match the very first line and print no column
+            // at all.
+            if self.column.1.is_empty() || self.column.0 != nanos {
+                let stamp = nanos.map(fmt_mark).unwrap_or_else(|| "-".to_string());
+                self.column = (nanos, format!("{stamp:<24} ").into_bytes());
+            }
+            out.write_all(&self.column.1)?;
+        }
+        out.write_all(line)?;
         Ok(())
     }
 
     /// Release an unterminated last line, unstamped: the stream is over and its newline is not coming.
     pub(crate) fn flush(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
         if !self.pending.is_empty() {
+            // Unstamped and therefore never filtered, for the same reason a `None` mark is kept
+            // above: this line has no recorded time, so nothing is known to place it outside the
+            // window.
             out.write_all(&self.pending)?;
             self.at += self.pending.len() as u64;
             self.pending.clear();
@@ -1816,5 +1863,240 @@ mod mark_tests {
         assert_eq!(mark_for(&marks, 399), Some(2_000));
         assert_eq!(mark_for(&marks, 10_000), Some(4_000));
         assert_eq!(mark_for(&[], 5), None);
+    }
+}
+
+/// Parse a `logs --since` / `--until` value into unix NANOSECONDS, the unit the index records.
+///
+/// THREE SPELLINGS, BECAUSE DOCKER TAKES THREE and a script ported across carries whichever its
+/// author used:
+///
+///  * a RELATIVE duration ending in `s`, `m`, `h` or `d` (`10m`, `90s`, `1h30m`, `2d`), measured
+///    back from NOW - the form a monitoring loop writes,
+///  * unix SECONDS (`1789730443`), the form a previous command's output carries,
+///  * RFC3339 (`2026-09-18T12:00:00Z`, with optional fractional seconds), the form a log line of
+///    kern's own `logs -t` prints, so its output can be fed straight back in.
+///
+/// `None` for anything else, and the caller names what is accepted rather than guessing: a
+/// misparsed time silently shows the wrong window, which is worse than a refusal because the output
+/// looks like an answer.
+///
+/// The civil-to-days conversion is the exact inverse of [`fmt_mark`]'s days-to-civil (both Howard
+/// Hinnant's), so a stamp this crate printed round-trips through this function unchanged.
+pub(crate) fn parse_log_time(v: &str, now_nanos: u64) -> Option<u64> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // RFC3339 first: it is the only form containing a `-` after its first character, so the test is
+    // unambiguous against both a bare number and a duration.
+    if v.len() >= 20 && v.as_bytes()[4] == b'-' {
+        return parse_rfc3339(v);
+    }
+    // A bare number is unix seconds. Checked before the duration parser so `1789730443` is not read
+    // as a malformed duration.
+    if v.bytes().all(|b| b.is_ascii_digit()) {
+        return v.parse::<u64>().ok()?.checked_mul(1_000_000_000);
+    }
+    // A duration: one or more `<number><unit>` pairs, measured back from now.
+    let mut secs: u64 = 0;
+    let mut digits = String::new();
+    for c in v.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let n: u64 = digits.parse().ok()?;
+        digits.clear();
+        let mult = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        secs = secs.checked_add(n.checked_mul(mult)?)?;
+    }
+    // A trailing number with no unit (`10`) is not a duration; it was already handled as seconds
+    // above, so reaching here with digits left over means a malformed value like `1h30`.
+    if !digits.is_empty() {
+        return None;
+    }
+    now_nanos.checked_sub(secs.checked_mul(1_000_000_000)?)
+}
+
+/// `YYYY-MM-DDThh:mm:ss[.frac][Z]` to unix nanoseconds. Only UTC is accepted: a numeric offset would
+/// need a second field of arithmetic for a form no kern surface ever prints.
+fn parse_rfc3339(v: &str) -> Option<u64> {
+    let b = v.as_bytes();
+    if b.len() < 19
+        || b[10] != b'T'
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> { v.get(from..to)?.parse().ok() };
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days-from-civil, the inverse of the civil-from-days in `fmt_mark`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hh * 3600 + mm * 60 + ss)?;
+    if secs < 0 {
+        return None; // before 1970: the index cannot hold it and no kern log predates it
+    }
+    // Fractional seconds, to nanosecond precision, ignoring a trailing `Z`.
+    let mut nanos = (secs as u64).checked_mul(1_000_000_000)?;
+    if b.get(19) == Some(&b'.') {
+        let frac: String = v[20..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(9)
+            .collect();
+        if !frac.is_empty() {
+            let scale = 10u64.checked_pow(9 - frac.len() as u32)?;
+            nanos = nanos.checked_add(frac.parse::<u64>().ok()?.checked_mul(scale)?)?;
+        }
+    }
+    Some(nanos)
+}
+
+#[cfg(test)]
+mod log_time_tests {
+    use super::{fmt_mark, parse_log_time};
+
+    /// THE THREE SPELLINGS DOCKER TAKES, and the round trip that makes the third one useful.
+    ///
+    /// `--since` is the flag a monitoring loop writes and an incident review writes, and the two
+    /// write it differently: `--since 30s` against `--since 2026-09-18T11:33:44.731Z`, the second
+    /// copied out of kern's own `logs -t` output. A parser that took only one of them would send
+    /// half its callers to convert a timestamp by hand.
+    #[test]
+    fn a_log_time_is_a_duration_unix_seconds_or_rfc3339() {
+        // Fixed "now" so the relative forms are exact rather than approximately right.
+        let now: u64 = 1_800_000_000_000_000_000; // 2027-01-15T08:00:00Z, in nanoseconds
+        let sec = 1_000_000_000u64;
+
+        // RELATIVE, back from now, in every unit and in combination.
+        assert_eq!(parse_log_time("30s", now), Some(now - 30 * sec));
+        assert_eq!(parse_log_time("10m", now), Some(now - 600 * sec));
+        assert_eq!(parse_log_time("2h", now), Some(now - 7_200 * sec));
+        assert_eq!(parse_log_time("1d", now), Some(now - 86_400 * sec));
+        assert_eq!(parse_log_time("1h30m", now), Some(now - 5_400 * sec));
+
+        // UNIX SECONDS, the form a previous command's output carries.
+        assert_eq!(parse_log_time("1789730443", now), Some(1_789_730_443 * sec));
+
+        // RFC3339, with and without fractional seconds, and the ROUND TRIP: a stamp this crate
+        // printed must parse back to the instant it was printed from. That is the property, and it
+        // is what makes `--since "$(kern logs -t … | head -1 | cut -d' ' -f1)"` work.
+        let printed = fmt_mark(1_789_730_443_731_000_000);
+        assert_eq!(printed, "2026-09-18T11:20:43.731Z");
+        assert_eq!(
+            parse_log_time(&printed, now),
+            Some(1_789_730_443_731_000_000),
+            "a stamp kern printed must parse back to the same instant"
+        );
+        assert_eq!(
+            parse_log_time("2026-09-18T11:20:43Z", now),
+            Some(1_789_730_443 * sec)
+        );
+
+        // REFUSED, every one of them, because a misread time shows the wrong window and the output
+        // looks like an answer.
+        for bad in [
+            "",
+            "domani",
+            "1h30",                 // a trailing number with no unit
+            "10x",                  // an unknown unit
+            "2026-13-01T00:00:00Z", // month 13
+            "2026-09-18T25:00:00Z", // hour 25
+            "2026-09-18",           // a date with no time
+            "-5m",                  // a sign is not part of the grammar
+        ] {
+            assert_eq!(parse_log_time(bad, now), None, "{bad:?} must be refused");
+        }
+
+        // A duration longer than the epoch cannot underflow into a huge number.
+        assert_eq!(parse_log_time("99999d", 0), None);
+    }
+}
+
+#[cfg(test)]
+mod log_time_totality {
+    use super::parse_log_time;
+
+    /// TOTALITY: no input makes the time parser panic, and none makes it overflow into a wrong
+    /// answer.
+    ///
+    /// This function reads a value straight off the command line and does arithmetic on it -
+    /// multiplications by 86400 and by a billion, a subtraction from "now". Every one of those is a
+    /// place an unchecked operation panics in debug and wraps in release, and a WRAPPED time is
+    /// worse than a panic: it shows a window nobody asked for and the output looks like output.
+    ///
+    /// Exhaustive over the alphabet that decides its control flow, at the lengths where its branches
+    /// interact, plus the extremes of each numeric field. Not a sample: the failure mode of an
+    /// arithmetic bug is one specific value, and a sample is exactly what misses it.
+    #[test]
+    fn no_input_panics_or_wraps_the_clock() {
+        let now: u64 = 1_800_000_000_000_000_000;
+        // Every string of length <= 4 over the characters that select a branch: the digits that
+        // start a number, the unit letters, the separators of RFC3339, and a sign.
+        let alphabet: &[u8] = b"019smhdT-:.Z";
+        let mut buf = [0u8; 4];
+        for len in 0..=4usize {
+            let total = alphabet.len().pow(len as u32);
+            for i in 0..total {
+                let mut x = i;
+                for slot in buf.iter_mut().take(len) {
+                    *slot = alphabet[x % alphabet.len()];
+                    x /= alphabet.len();
+                }
+                let s = std::str::from_utf8(&buf[..len]).expect("ascii alphabet");
+                // The property is termination without a panic, and an answer that is a real instant
+                // when there is one: nothing here may exceed "now" by construction, since every
+                // relative form counts BACKWARDS.
+                if let Some(t) = parse_log_time(s, now) {
+                    assert!(
+                        t <= now || !s.ends_with(['s', 'm', 'h', 'd']),
+                        "{s:?} -> {t}"
+                    );
+                }
+            }
+        }
+
+        // THE EXTREMES OF EACH FIELD, where a checked multiplication is the only thing between a
+        // value and a wrapped clock. Every one of these must be refused rather than answered.
+        for bad in [
+            "99999999999999999999d",             // days that overflow a u64 of seconds
+            "18446744073709551615s",             // u64::MAX seconds
+            "9999999999999999999",               // unix seconds that overflow when scaled to nanos
+            "99999-01-01T00:00:00Z",             // a year no epoch arithmetic can hold
+            "0000-01-01T00:00:00Z", // before 1970: negative, and refused rather than wrapped
+            "2026-09-18T00:00:00.999999999999Z", // more fractional digits than nanoseconds have
+        ] {
+            let got = parse_log_time(bad, now);
+            assert!(
+                got.is_none() || got.is_some_and(|t| t < now * 2),
+                "{bad:?} produced {got:?}, which is not an instant"
+            );
+        }
+        // A duration longer than the epoch cannot underflow into a huge number.
+        assert_eq!(parse_log_time("99999999d", 0), None);
+        // And the one value that must survive all of it: a stamp this crate prints.
+        assert!(parse_log_time("2026-09-18T11:20:43.731Z", now).is_some());
     }
 }

@@ -497,11 +497,27 @@ pub fn run(args: &[String]) -> Result<(), Error> {
     match args.first().map(String::as_str) {
         Some("create" | "c") => create(&args[1..]),
         Some("ls" | "list") => {
+            // `--format json` IS DOCKER'S SPELLING of what `--json` asks for here, and a script
+            // ported across carries it. Mapped onto the one renderer; any other template is refused
+            // by name rather than silently printing the human table to a caller expecting fields.
             crate::cli::reject_unknown_flags(
                 "volume ls",
                 &refs,
-                &["--json", "-q", "--quiet", "--filter"],
+                &["--json", "-q", "--quiet", "--filter", "--format"],
             )?;
+            let fmt = refs.iter().enumerate().find_map(|(i, a)| {
+                a.strip_prefix("--format=").map(str::to_string).or_else(|| {
+                    (*a == "--format").then(|| refs.get(i + 1).map(|v| (*v).to_string()))?
+                })
+            });
+            if let Some(f) = fmt.as_deref() {
+                if !f.eq_ignore_ascii_case("json") {
+                    return Err(crate::error::Error::Cli(format!(
+                        "volume ls --format '{f}': only `json` is supported here (a kern volume carries a name, a size and a quota, and no template fields beyond them)"
+                    )));
+                }
+            }
+            let as_json = refs.contains(&"--json") || fmt.is_some();
             // `--filter name=<substring>`: Docker's, and the only filter a script actually writes
             // here - Sentry's `install.sh` asks `volume ls -q --filter name=sentry-postgres` to decide
             // whether a database volume from an older release exists. A filter kern cannot answer is
@@ -524,7 +540,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                     }
                 },
             };
-            if refs.contains(&"--json") {
+            if as_json {
                 list_json()
             } else if refs.contains(&"-q") || refs.contains(&"--quiet") {
                 // `-q`: THE NAMES, ONE PER LINE, AND NOTHING ELSE - Docker's spelling, and the form a

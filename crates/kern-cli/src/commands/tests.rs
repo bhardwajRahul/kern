@@ -1857,6 +1857,7 @@ mod net_resource_tests {
             user: Some("999:999".into()),
             exposed_ports: vec![(5432, false), (1194, true)],
             stop_signal: Some("SIGQUIT".into()),
+            labels: vec!["maintainer=a <b@c>".into(), "team=infra".into()],
             healthcheck: Some(kern_oci::ImageHealthcheck {
                 test: vec!["CMD-SHELL".into(), "pg_isready".into()],
                 interval_ns: Some(300_000_000_000),
@@ -2235,6 +2236,9 @@ mod net_resource_tests {
             user: Some("1000:1000".into()),
             exposed_ports: vec![(80, false), (53, true)],
             stop_signal: Some("SIGQUIT".into()),
+            // A label carrying a `=` in its VALUE, which is the shape that breaks a reader splitting
+            // on the last separator instead of the first.
+            labels: vec!["k=v=w".into(), "team=infra".into()],
             healthcheck: Some(kern_oci::ImageHealthcheck {
                 test: vec!["CMD-SHELL".into(), "test -f /ready".into()],
                 interval_ns: Some(30_000_000_000),
@@ -3193,15 +3197,145 @@ mod image_rm_tests {
             .unwrap();
         }
 
-        assert!(remove_image(&cache, "app1:latest").is_some());
+        // THE NUMBER IS PART OF THE ANSWER, and this test used to check only the layer's survival.
+        // `kern rmi` prints "freed N" from this return value, and a caller deciding whether a
+        // cleanup was worth it reads that number rather than the directory. Removing the first of
+        // two names for one image frees NOTHING - the bytes are still there, referenced by the
+        // second - so anything above zero here is the report claiming space that was not reclaimed.
+        // With `-t` repeatable, two names for one image is now the ordinary case on every release.
+        assert_eq!(
+            remove_image(&cache, "app1:latest"),
+            Some(0),
+            "removing one of two referrers frees no bytes, and must not claim to"
+        );
         assert!(
             lc.join(key).is_dir(),
             "a layer still referenced by another image must survive rmi"
         );
-        assert!(remove_image(&cache, "app2:latest").is_some());
+        assert_eq!(
+            remove_image(&cache, "app2:latest"),
+            Some(2048),
+            "the last referrer's removal frees the layer, and reports exactly its size"
+        );
         assert!(
             !lc.join(key).exists(),
             "an orphaned layer is reclaimed once its last referrer is gone"
+        );
+
+        crate::unset_global_env("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `down -v` MUST REMOVE A VOLUME A SERVICE WROTE TO, and it could not remove the common one.
+    ///
+    /// A volume carries the ownership of whatever wrote it, which rootless means a SUBUID: a
+    /// `postgres:17` service writes its data directory as uid 999 inside the box, 100998 on the
+    /// host, and an unprivileged caller cannot unlink inside a directory that uid owns.
+    /// `kern volume rm` has used the id-mapped remover for exactly this reason, in a comment naming
+    /// exactly this case, since before `down -v` existed - and `down -v` used plain `remove_dir_all`.
+    /// Two removers, one rule, and the one on the path everybody uses had drifted.
+    ///
+    /// MEASURED on a ten-service stack: `compose down -v` answered `removing volume
+    /// '<project>_postgres_data': Permission denied (os error 13)` and the `?` ended the loop, so the
+    /// three volumes AFTER it survived too. `reset.sh` reported a reset that had removed nothing and
+    /// the next `up` reused the old database.
+    ///
+    /// REPRODUCED WITHOUT A SUBUID, because a test cannot map one: a directory with mode `000` is
+    /// unreadable to its own owner and defeats `remove_dir_all` at the same syscall for the same
+    /// reason. The removal this asserts is the one that survives both.
+    #[test]
+    fn down_v_removes_a_volume_whose_contents_the_caller_cannot_unlink() {
+        let _g = crate::env_guard();
+        let tmp = std::env::temp_dir().join(format!("kern-downv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::set_global_env("XDG_DATA_HOME", &tmp);
+        let vols = crate::volume::volumes_dir();
+        std::fs::create_dir_all(&vols).unwrap();
+
+        // Two volumes of one project: the first is the unremovable one, the second proves the loop
+        // does not stop at it. Named so `<project>_` sorts them in that order for the walk below.
+        for name in ["proj_a-hard", "proj_b-easy"] {
+            let d = vols.join(name).join("data");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f"), b"x").unwrap();
+        }
+        let hard = vols.join("proj_a-hard").join("data");
+        // Mode 000: the owner cannot traverse it either, which is what `remove_dir_all` hits.
+        std::fs::set_permissions(
+            &hard,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
+        )
+        .unwrap();
+        assert!(
+            std::fs::remove_dir_all(&hard).is_err(),
+            "the premise: a plain remove must fail here, or this test proves nothing"
+        );
+
+        let svc = |vol: &str| crate::compose::ComposeBox {
+            name: format!("box-{vol}"),
+            volumes: vec![format!("{vol}:/data")],
+            ..Default::default()
+        };
+        let boxes = [svc("proj_a-hard"), svc("proj_b-easy")];
+        let n = remove_project_volumes(&boxes, "proj").expect("both volumes must be removable");
+        assert_eq!(n, 2, "the loop must not stop at the one it cannot unlink");
+        assert!(!vols.join("proj_a-hard").exists());
+        assert!(!vols.join("proj_b-easy").exists());
+
+        crate::unset_global_env("XDG_DATA_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `rmi X` MUST NOT CHARGE X FOR SOMEBODY ELSE'S DEBRIS.
+    ///
+    /// The orphan sweep is cache-wide, because that is the only way to find a layer whose last
+    /// referrer has just gone. `remove_image` added everything the sweep reclaimed to the number
+    /// `kern rmi` prints as "freed N", so a layer orphaned by an EARLIER removal that nobody had
+    /// swept was reported as space this image gave back.
+    ///
+    /// MEASURED on a working cache before the fix: one image built under two names, `rmi` of the
+    /// first printed `freed 140.3M`, `rmi` of the second printed `freed 140.3M` again, and `du` on
+    /// the layer store showed it unchanged across both - 280 MB claimed, nothing reclaimed. The
+    /// sweep was right to take the debris; the attribution was the defect. With `-t` repeatable,
+    /// two names for one image is the ordinary case on every release, so this is now reachable
+    /// from a plain build.
+    #[test]
+    fn rmi_does_not_charge_the_named_image_for_unrelated_orphans() {
+        let _g = crate::env_guard();
+        let tmp = std::env::temp_dir().join(format!("kern-rmicharge-{}", std::process::id()));
+        let cache = tmp.join("kern/images");
+        let lc = cache.join("L");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&lc).unwrap();
+        crate::set_global_env("XDG_CACHE_HOME", &tmp);
+
+        // MINE: 1 KiB, named by the image about to be removed and by nobody else.
+        let mine = "1111111111111111aaaaaaaaaaaaaaaa";
+        std::fs::create_dir_all(lc.join(mine)).unwrap();
+        std::fs::write(lc.join(mine).join("blob"), vec![0u8; 1024]).unwrap();
+        // DEBRIS: 64 KiB, named by no manifest at all - orphaned by some earlier removal.
+        let debris = "2222222222222222bbbbbbbbbbbbbbbb";
+        std::fs::create_dir_all(lc.join(debris)).unwrap();
+        std::fs::write(lc.join(debris).join("blob"), vec![0u8; 65536]).unwrap();
+
+        std::fs::write(cache.join("app-1111.ok"), "app:latest").unwrap();
+        std::fs::write(cache.join("app-1111.layers"), format!("base\n{mine}\n")).unwrap();
+
+        let freed = remove_image(&cache, "app:latest").expect("the image exists");
+        assert_eq!(
+            freed, 1024,
+            "only this image's own layer may be charged to it, not the 64 KiB of stray debris"
+        );
+        // THE DEBRIS IS STILL COLLECTED. Charging is about the sentence, not about the cleanup: a
+        // sweep that left orphans behind to keep its arithmetic tidy would trade a wrong number for
+        // a leaking cache, which is the worse of the two.
+        assert!(
+            !lc.join(debris).exists(),
+            "an unreferenced layer is still reclaimed, it is simply not billed to this image"
+        );
+        assert!(
+            !lc.join(mine).exists(),
+            "this image's own layer is gone too"
         );
 
         crate::unset_global_env("XDG_CACHE_HOME");
@@ -3835,9 +3969,13 @@ mod drift_tests {
     #[test]
     fn an_unchanged_service_is_left_alone_and_a_changed_one_is_recreated() {
         let want = definition_hash(&svc("x"));
-        assert_eq!(reconcile_decision(&inst(&want), &want), Reconcile::UpToDate);
+        let d = RecreatePolicy::OnDrift;
         assert_eq!(
-            reconcile_decision(&inst("deadbeef"), &want),
+            reconcile_decision(&inst(&want), &want, d),
+            Reconcile::UpToDate
+        );
+        assert_eq!(
+            reconcile_decision(&inst("deadbeef"), &want, d),
             Reconcile::Recreate
         );
     }
@@ -3848,8 +3986,36 @@ mod drift_tests {
         // recreate it on EVERY `up`; treating it as current costs at most one missed recreate, after
         // which it carries a fingerprint and behaves normally.
         assert_eq!(
-            reconcile_decision(&inst(""), "anything"),
+            reconcile_decision(&inst(""), "anything", RecreatePolicy::OnDrift),
             Reconcile::UpToDate
+        );
+    }
+
+    /// BOTH OVERRIDES ARE TOTAL: neither consults the fingerprint, so neither can be defeated by the
+    /// two inputs that decide the default answer - a matching hash, or a box that carries none.
+    ///
+    /// `--force-recreate` exists for the change the fingerprint CANNOT see (a bind-mounted config
+    /// rewritten between runs, a token another step injected), so an override that still deferred to
+    /// a matching hash would do nothing in exactly the case it was typed for.
+    #[test]
+    fn the_recreate_overrides_ignore_the_fingerprint_entirely() {
+        let want = definition_hash(&svc("x"));
+        for running in [inst(&want), inst("deadbeef"), inst("")] {
+            assert_eq!(
+                reconcile_decision(&running, &want, RecreatePolicy::Always),
+                Reconcile::Recreate,
+                "--force-recreate must recreate whatever the fingerprint says"
+            );
+            assert_eq!(
+                reconcile_decision(&running, &want, RecreatePolicy::Never),
+                Reconcile::UpToDate,
+                "--no-recreate must leave it alone whatever the fingerprint says"
+            );
+        }
+        // And the default is untouched by their existence.
+        assert_eq!(
+            reconcile_decision(&inst("deadbeef"), &want, RecreatePolicy::default()),
+            Reconcile::Recreate
         );
     }
 }

@@ -44,9 +44,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
-    {c}exec{z} <name> [-it] [--env K=V] [-w <dir>] [--] [CMD...]         Run CMD in a running box
-    {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=] [--format T]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps]         Show a box's output
+    {c}exec{z} <name> [-i|-t|-it] [--env K=V] [-w <dir>] [--] [CMD...]   Run CMD in a running box
+                                                                     -t allocates a PTY; -i only keeps stdin attached, so
+                                                                     `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
+    {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
+                                                                     health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a)
+    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
+                                                                     --since/--until take 10m, 1h30m, unix seconds, or RFC3339 UTC; a line the index cannot place in time is kept
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
                                                                      -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
@@ -58,8 +62,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
-    {c}build{z} -t <name> [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
-    {c}images{z} [--json]                                                List pulled (cached) images
+    {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
+    {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
+                                                                     Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
+                                                                     -t is repeatable: one build, every name applied (layers shared, not copied)
+    {c}images{z} [--json] [--filter K=V]                                  List pulled (cached) images
+                                                                     --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
@@ -68,8 +76,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Manage boxes{z}
     {c}top{z}                                                            Interactive task manager (TUI)
-    {c}stats{z} [--json] [name...]                                       Per-box memory + CPU
-    {c}inspect{z} <name> [--json]                                        Full detail for one box
+    {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
+    {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
+                                                                     (`-f '{{{{.State.Status}}}}'`, `docker inspect`'s own paths)
+    {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     {c}attach{z} <name>                                                  Stream a box's output live (Ctrl-C detaches)
     {c}cp{z} <box>:<src> <dst> | <src> <box>:<dst>                       Copy a file host<->box
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
@@ -86,7 +96,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} <file> [{cv}]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    {c}compose{z} [<file>] [{cv}]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+                                                                     With no file the directory is searched for docker-compose.yml, docker-compose.yaml, compose.yml, compose.yaml, kern.toml
+                                                                     up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix]
+                                                                     wait/events/images/push/rm/top/version scope the box-level verb to this stack; kill is an alias of stop
+                                                                     images takes --format json, as ps does; wait exits with the status of the first service to stop
     {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
                                                                      DEFAULT: a namespace per service, as soon as the stack has two of them.
                                                                      They meet on the pod's bridge, which is Docker's own arrangement.
@@ -118,7 +132,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml (alias: example)
     {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes (alias: vol)
-    {c}login{z} [registry] [--username U] / {c}logout{z} [registry]            Registry credentials (private pulls)
+    {c}login{z} [registry] [--username U] [--password-stdin|--password P] / {c}logout{z} [registry]  Registry credentials (private pulls)
+                                                                     The credentials are CHECKED against the registry before they are
+                                                                     stored, so a bad one fails here and not at the next push
 
   {d}Diagnostics{z}
     {c}doctor{z} [--apparmor-profile]                                    Preflight: will boxes run here?
@@ -145,7 +161,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
-    -it, -t, -i         Allocate an interactive PTY (shells/REPLs); foreground only
+    -it, -ti, -t        Allocate an interactive PTY (shells/REPLs); foreground only
+    -i, --interactive   Keep stdin attached WITHOUT a PTY, as docker's -i does. stdin is
+                        inherited either way, so this asks for what already happens: it is
+                        accepted so `-i < file.sql` runs here unchanged. A PTY would echo
+                        that file back and never see its EOF
     -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
                         like 8000-8010:8000-8010 works; binds 0.0.0.0 (all interfaces) like
                         Docker, use 127.0.0.1:H:B for loopback only, or set
@@ -186,7 +206,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
     --net [host|none]   Share the host network (bare/host); none = isolated (default)
-    --network <mode>    host = share host net (= --net); none = isolated (default)
+    --network <mode>    host = share host net (= --net); none = isolated (default); or the NAME of
+                        a running pod, which is what a `kern compose` stack is - so
+                        `--network <stack> -- <cmd>` is docker's `run --network <net>` for a one-off
+                        that has to talk to a stack (`kern pod ls` names them)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
@@ -819,6 +842,19 @@ pub fn update(
 /// monitor, not a guaranteed audit log. Boxes already running when `events` starts are NOT replayed
 /// (only NEW transitions are shown), matching `docker events`. Runs until interrupted (Ctrl-C).
 pub fn events() -> Result<(), Error> {
+    events_filtered(None)
+}
+
+/// [`events`], restricted to boxes whose name starts with `prefix`.
+///
+/// `kern compose <file> events` is the same stream narrowed to one stack. The filter is the NAME
+/// PREFIX and not the pod, for the reason `compose ps` documents: a `--no-pod` member carries an
+/// empty `pod` field, so a pod filter would stream nothing for exactly the stacks whose members are
+/// most separated. Box names are `<pod>-<service>` under both wirings.
+///
+/// Filtering at the SNAPSHOT means a box outside the stack can never produce an event here, not even
+/// a `die`: the unfiltered set was never recorded, so there is nothing to miss from it.
+pub fn events_filtered(prefix: Option<&str>) -> Result<(), Error> {
     use std::collections::HashMap;
     // Key on (pid, starttime), NOT pid alone: if a box dies and a NEW box reuses its pid within one
     // poll gap, the differing start-time makes them distinct keys -> a correct `die`+`start`, never a
@@ -826,6 +862,7 @@ pub fn events() -> Result<(), Error> {
     let snapshot = || -> HashMap<(i32, u64), String> {
         registry::list()
             .into_iter()
+            .filter(|b| prefix.is_none_or(|p| b.name.starts_with(p)))
             .map(|b| ((b.pid, b.starttime), b.name))
             .collect()
     };

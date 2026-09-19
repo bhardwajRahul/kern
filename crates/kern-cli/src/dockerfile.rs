@@ -63,6 +63,28 @@ pub enum Instr {
     Cmd(Vec<String>),
     Entrypoint(Vec<String>),
     Expose(String),
+    /// An instruction kern PARSES AND DOES NOT ACT ON, carried so it leaves a trace.
+    ///
+    /// `VOLUME` was dropped in the parser with a comment and no output: the build said nothing, the
+    /// image said nothing, and a reader had to know kern's source to learn that the line had no
+    /// effect. A dropped instruction is a difference between what the file says and what the image
+    /// is, and this codebase's rule about differences is that they are NAMED. Carrying it as an
+    /// instruction means one list describes the whole file, so `build --check` reports from the
+    /// parser's own output rather than from a second scanner that could disagree with it.
+    Dropped {
+        keyword: String,
+        /// One line, present tense, saying what happens instead. Shown by `build --check` and by a
+        /// real build.
+        why: &'static str,
+    },
+    /// `LABEL <key>=<value>` - one instruction per pair, so `LABEL a=1 b=2` arrives twice.
+    ///
+    /// IT WAS PARSED AND DROPPED, with a comment saying so, and the comment was honest about a gap
+    /// rather than describing a decision: `docker images --filter label=` cannot answer for an image
+    /// whose labels were thrown away at build time, and `org.opencontainers.image.*` is where a
+    /// build records its source commit and version. A pulled image's labels were read; a built one's
+    /// were not, so one cache held two kinds of image.
+    Label(String, String),
     /// `ADD <url> <dst>` - fetch a remote file into the image at build time. `checksum` is the
     /// optional BuildKit `--checksum=<algo>:<hex>` the executor verifies after download; `chmod` is the
     /// optional `--chmod=<octal>` mode (needed for the download-a-binary-and-run-it pattern, where the
@@ -689,7 +711,37 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                     out.push(Instr::Expose(p));
                 }
             }
-            "LABEL" | "MAINTAINER" => { /* metadata - parsed and ignored */ }
+            // `LABEL k=v [k2=v2 …]`, and `LABEL k v` - Docker's legacy space form, still in old
+            // Dockerfiles. `MAINTAINER` is the deprecated spelling of `LABEL maintainer=…` and is
+            // recorded as exactly that, which is what Docker itself does with it.
+            "LABEL" => {
+                let operands = split_ws(&subst(rest, &vars));
+                match operands.iter().any(|o| o.contains('=')) {
+                    // The `k=v` form, one pair per operand.
+                    true => {
+                        for o in &operands {
+                            if let Some((k, v)) = o.split_once('=') {
+                                if !k.is_empty() {
+                                    out.push(Instr::Label(k.to_string(), v.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    // The legacy `LABEL key value with spaces` form: one pair, the value being
+                    // everything after the first word.
+                    false => {
+                        if let Some((k, rest)) = operands.split_first() {
+                            out.push(Instr::Label(k.clone(), rest.join(" ")));
+                        }
+                    }
+                }
+            }
+            "MAINTAINER" => {
+                let who = subst(rest, &vars).trim().to_string();
+                if !who.is_empty() {
+                    out.push(Instr::Label("maintainer".to_string(), who));
+                }
+            }
             // VOLUME/HEALTHCHECK are ACCEPTED (parsed, not fatal) so a real-world upstream Dockerfile that
             // uses them builds instead of exploding - they were the two commonest reasons a `kern build`
             // of a stock image failed. They carry NO build-time filesystem effect, so we emit no Instr:
@@ -700,7 +752,15 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             //               doesn't yet BAKE it into the image config, so we accept it and (once, on the
             //               first HEALTHCHECK) tell the user to pass the health flags at `kern box` time,
             //               rather than silently dropping a health contract or failing the build.
-            "VOLUME" => { /* runtime mount point - advisory at build, mounted via `-v` at run */ }
+            // A runtime mount point. Docker only DECLARES it at build too (the anonymous volume is
+            // a run-time concern), so there is no filesystem effect to reproduce - but the line is
+            // recorded rather than vanishing, because "kern did nothing with this" is a fact the
+            // reader of a build is entitled to.
+            "VOLUME" => out.push(Instr::Dropped {
+                keyword: "VOLUME".to_string(),
+                why: "a declaration with no build-time effect; mount it at run with -v, or as a \
+                      compose `volumes:` entry",
+            }),
             // `SHELL ["/bin/bash","-c"]` swaps the shell that wraps subsequent shell-form
             // RUN/CMD/ENTRYPOINT. Must be a JSON exec array (Docker's rule); anything else is an error.
             "SHELL" => {
@@ -1299,6 +1359,55 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown:
 
 #[cfg(test)]
 mod tests {
+    /// `LABEL` REACHES THE IMAGE, in both of Docker's spellings, and `MAINTAINER` is one of them.
+    ///
+    /// It was parsed and dropped, with a comment saying "metadata - parsed and ignored". That is an
+    /// honest description of a gap rather than a decision: the pull path reads an image's labels, so
+    /// dropping them here left a cache holding two kinds of image, one of which
+    /// `images --filter label=` could answer about and one of which it could not.
+    #[test]
+    fn label_and_maintainer_reach_the_image_config() {
+        let vars = std::collections::HashMap::new();
+        let labels = |src: &str| -> Vec<(String, String)> {
+            super::parse(src, &vars)
+                .expect("parses")
+                .into_iter()
+                .filter_map(|i| match i {
+                    super::Instr::Label(k, v) => Some((k, v)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // The `k=v` form, several pairs on one line, which is what a real Dockerfile writes.
+        assert_eq!(
+            labels("FROM alpine\nLABEL a=1 b=2\n"),
+            [("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
+        // A quoted value with spaces stays one value.
+        assert_eq!(
+            labels("FROM alpine\nLABEL \"org.opencontainers.image.title\"=\"my app\"\n"),
+            [("org.opencontainers.image.title".into(), "my app".into())]
+        );
+        // DOCKER'S LEGACY SPACE FORM, still in old Dockerfiles: one pair, the value being everything
+        // after the key. Distinguished from the `k=v` form by the absence of any `=`, which is the
+        // same rule Docker uses.
+        assert_eq!(
+            labels("FROM alpine\nLABEL version 1.2.3\n"),
+            [("version".into(), "1.2.3".into())]
+        );
+        // `MAINTAINER` IS `LABEL maintainer=`, which is what Docker itself turns it into, rather
+        // than a second concept to carry.
+        assert_eq!(
+            labels("FROM alpine\nMAINTAINER Ada <ada@example.com>\n"),
+            [("maintainer".into(), "Ada <ada@example.com>".into())]
+        );
+        // Nothing to record is nothing recorded: an empty operand list must not push a pair with an
+        // empty key, which would then match `--filter label=` for every bare key.
+        assert!(labels("FROM alpine\nLABEL\n").is_empty());
+        assert!(labels("FROM alpine\nMAINTAINER\n").is_empty());
+    }
+
     /// DROPPING A FLAG IS ONLY HONEST WHEN THE COMMAND STILL MEANS WHAT IT SAID, and this test pins
     /// the line between the two kinds. MEASURED before the change: a `--mount=type=cache` RUN built
     /// successfully with the flag silently gone, so a `type=secret` one did too - and that build
@@ -1602,21 +1711,41 @@ mod tests {
         assert_eq!(parse(df, &ba()).unwrap()[0], from("alpine"));
     }
 
-    /// `VOLUME` STILL EMITS NOTHING; `HEALTHCHECK` AND `STOPSIGNAL` NOW REACH THE IMAGE CONFIG.
+    /// `VOLUME` CHANGES NO BYTE AND LEAVES A TRACE; `HEALTHCHECK` AND `STOPSIGNAL` REACH THE CONFIG.
     ///
-    /// All three used to be parsed and dropped so a stock upstream Dockerfile would build. For
-    /// `VOLUME` that is still right: it declares a runtime mount point and Docker's own build does
-    /// nothing with it either. For the other two it made a compose `build:` service lose a contract
-    /// the file states: a Dockerfile healthcheck vanished, and a peer with
-    /// `depends_on: condition: service_healthy` on that service could never be satisfied.
+    /// All three used to be parsed and dropped so a stock upstream Dockerfile would build. For the
+    /// last two that lost a contract the file states: a Dockerfile healthcheck vanished, and a peer
+    /// with `depends_on: condition: service_healthy` on that service could never be satisfied.
+    ///
+    /// For `VOLUME` the FILESYSTEM answer is still nothing, and that part has not changed: it
+    /// declares a runtime mount point, and Docker's own build does nothing with it either. What
+    /// changed is that it is no longer INVISIBLE. It emitted no instruction at all, so the build
+    /// printed nothing, the image recorded nothing, and only kern's source said the line had no
+    /// effect. It now carries an [`Instr::Dropped`], which is what lets a build announce it and
+    /// `build --check` report it - from the parser's own list, rather than from a second scan of the
+    /// file that could disagree with what the builder will actually execute.
+    ///
+    /// This test was RED when that changed, which is what it is for: the instruction stream is a
+    /// contract, and a deliberate change to it has to be written down rather than absorbed.
     #[test]
-    fn volume_emits_nothing_while_healthcheck_and_stopsignal_are_baked() {
+    fn volume_leaves_a_trace_while_healthcheck_and_stopsignal_are_baked() {
         let df = "FROM alpine\nVOLUME /data\nHEALTHCHECK --interval=30s --retries=2 CMD curl -f localhost || exit 1\nSTOPSIGNAL SIGQUIT\nRUN echo hi\n";
         let got = parse(df, &ba()).expect("a stock Dockerfile must build");
         assert_eq!(got[0], from("alpine"));
-        // VOLUME contributes nothing at all, so the next instruction is the healthcheck.
+        // A TRACE, NOT AN EFFECT: the instruction exists so a reader can be told, and carries a
+        // sentence saying what happens instead. Nothing downstream acts on it.
+        match &got[1] {
+            Instr::Dropped { keyword, why } => {
+                assert_eq!(keyword, "VOLUME");
+                assert!(
+                    why.contains("-v") || why.contains("volumes:"),
+                    "the note must say where a volume IS mounted: {why}"
+                );
+            }
+            other => panic!("VOLUME must leave a trace, got {other:?}"),
+        }
         assert_eq!(
-            got[1],
+            got[2],
             Instr::Healthcheck {
                 test: vec![
                     "CMD-SHELL".to_string(),
@@ -1629,9 +1758,9 @@ mod tests {
                 retries: Some(2),
             }
         );
-        assert_eq!(got[2], Instr::StopSignal("SIGQUIT".to_string()));
-        assert!(matches!(got[3], Instr::Run(_)));
-        assert_eq!(got.len(), 4);
+        assert_eq!(got[3], Instr::StopSignal("SIGQUIT".to_string()));
+        assert!(matches!(got[4], Instr::Run(_)));
+        assert_eq!(got.len(), 5);
         // THE EXEC FORM KEEPS ITS ARGV, and is told apart from the shell form by the first element,
         // exactly as the OCI config does.
         let exec = parse("FROM alpine\nHEALTHCHECK CMD [\"/bin/true\"]\n", &ba()).unwrap();

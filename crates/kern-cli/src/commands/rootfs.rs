@@ -1529,6 +1529,29 @@ fn materialize_dst_dirs(rootfs: &std::path::Path, chain: &[String], rel: &str) {
     }
 }
 
+/// Does `src_rel` resolve to a real path INSIDE `ctx`? The context-escape rule, on its own.
+///
+/// EXTRACTED SO THE DRY RUN CAN ASK IT. `kern build --check` reported "this Dockerfile builds here"
+/// for a file whose first `COPY ../../etc/passwd` the build then refused - a gate answering yes to
+/// something that does not build, which is the one answer a gate must never give. The rule lived
+/// inside the copier, so the only way to ask it was to perform the copy.
+///
+/// Returns the reason as a sentence, or `None` when the source is fine. Callers word their own error
+/// around it: the copier says "COPY source", the check says which instruction and which line.
+pub(crate) fn context_escape_reason(ctx: &std::path::Path, src_rel: &str) -> Option<String> {
+    // A glob is resolved by the copier against the context at build time and cannot be checked by
+    // path alone: `*.json` names no file until the directory is read. Left to the build rather than
+    // guessed at here, which is the direction that never refuses something that works.
+    if src_rel.contains(['*', '?', '[']) {
+        return None;
+    }
+    match std::fs::canonicalize(ctx.join(src_rel)) {
+        Err(e) => Some(format!("{src_rel}: {e}")),
+        Ok(src) if !src.starts_with(ctx) => Some(format!("{src_rel} escapes the build context")),
+        Ok(_) => None,
+    }
+}
+
 pub(crate) fn copy_into_rootfs(
     ctx: &std::path::Path,
     src_rel: &str,
@@ -1539,6 +1562,8 @@ pub(crate) fn copy_into_rootfs(
     chmod: Option<&str>,
 ) -> Result<(), Error> {
     // Source must resolve to a real path INSIDE the context (no `../`, no symlink pointing out).
+    // The rule itself is [`context_escape_reason`], so `build --check` asks the same question
+    // without performing the copy; this call site keeps its own wording.
     let src = std::fs::canonicalize(ctx.join(src_rel))
         .map_err(|e| Error::Sandbox(format!("COPY source '{src_rel}': {e}")))?;
     if !src.starts_with(ctx) {

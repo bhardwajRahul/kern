@@ -7,6 +7,272 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**This release changes two flags that already existed, so it is a MINOR and not a patch.** The
+stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on
+a minor bump, and only after a deprecation entry one release earlier. There was no such entry and
+there could not have been: both behaviours were defects, and announcing a defect for a release
+before fixing it would leave the broken one in the field on purpose. The two:
+
+  * **`-i` no longer allocates a pseudo-terminal**, on `box` and on `exec`. `-t`/`-it` do. A script
+    that used `-i` to get a terminal must now say `-t`; every script that used it the way docker
+    means it - `exec -i <box> psql … < file.sql` - stops hanging. The `docker` shim forwards the flag
+    verbatim, so it inherits both halves of this.
+  * **`inspect --format` refuses a name kern holds no record of**, where it used to print `exited`
+    and exit 0. A wait loop testing for `exited` ended immediately on a misspelled service and the
+    script carried on as though the step had completed.
+
+Everything else here is additive: new verbs, new flags, and fields added to `--json` documents that
+consumers already have to ignore when unknown.
+
+**A pod name reaching the JOIN path was not validated, only the one reaching CREATE.** `pod create`
+has always checked the name against the shared resource-name rule, because it becomes a directory;
+`--pod <name>` took it straight from argv and handed it to `pods_root().join(name)` with nothing in
+between, and `--network <name>` gave that path a second entrance. Nothing escapes in practice - the
+join then requires `<dir>/holder` to hold a live pid AND `<dir>/netns` to match that process's
+namespace inode, a conjunction an arbitrary directory does not satisfy - so this closes an asymmetry
+rather than a hole. It is worth closing anyway: a name that cannot NAME a pod should be refused as a
+name rather than as a lookup that happened to find nothing.
+
+**`compose images` takes `--format json`, as `compose ps` does, and stopped calling an image nobody
+has ever pulled "dangling".** The two verbs sit next to each other and a script reading one reads the
+other, so a table where the other has JSON is the gap `ps --format` already closed once. The state is
+now named: `cached`, `dangling`, `absent`, or `build` for a service with no `image:` to name. The
+order of those three questions was wrong and had been: `image_stat` answers "dangling" for an image
+with no payload, and an image that was never pulled has no payload either, so a ref nobody had
+fetched was reported as a BROKEN local image - sending a reader to `rmi` something that does not
+exist instead of to `pull` something that does.
+
+**`kern build --check`: what kern does with a Dockerfile, without building it.** `compose config`'s
+sibling. It parses the file the way a real build resolves it (Containerfile first, the same
+`-f`/`--build-arg`) and prints a verdict per instruction: honoured, or DROPPED with what happens
+instead. Nothing is pulled, no box starts, and the exit code is the answer - 0 if the file builds
+here, non-zero carrying the refusal, so it can gate somebody else's CI. The question it answers is
+the one nobody could answer without reading kern's source: "will my Dockerfile build here, and is
+there a line kern will quietly not act on?" - and a build answers it only after downloading a base
+image and running half the file.
+
+A `COPY` from the context is CHECKED and not merely listed, because "this builds here" has to mean
+it: the first version reported `builds here, and every line it contains has an effect` for a file
+whose opening `COPY ../../etc/passwd` the build then refused, which is the one answer a gate must
+never give. The rule is the copier's own, lifted out of it so the dry run can ask the question
+without performing the copy. A glob and a `COPY --from` are left to the build: one names no file
+until a directory is read, the other a filesystem that does not exist until that stage is built, and
+refusing something that works is the worse of the two errors.
+
+The report comes from the PARSER'S OWN instruction list, never from a second scan: a separate
+scanner would be a second opinion about what a Dockerfile says, and two opinions drift. That is also
+why `VOLUME` now leaves a trace instead of vanishing - it was dropped in the parser with a comment
+and no output, so the build said nothing, the image said nothing, and only kern's source recorded
+that the line had no effect. A real build now says it too, one line, at the step.
+
+**`compose down -v` could not remove the one volume every stack has.** A volume carries the
+ownership of whatever wrote it, which rootless means a SUBUID: `postgres:17` writes its data
+directory as uid 999 inside the box, 100998 on the host, and an unprivileged caller cannot unlink
+inside a directory that uid owns. `kern volume rm` has used the id-mapped remover for exactly this,
+in a comment naming exactly this case, since before `down -v` existed; `down -v` used a plain
+`remove_dir_all`. Two removers, one rule, and the one on the path everybody uses had drifted.
+MEASURED on a ten-service stack: `down -v` answered `Permission denied (os error 13)` on
+`<project>_postgres_data` and the error ended the loop, so the three volumes after it survived too -
+a `reset.sh` reporting a reset that had removed nothing, and the next `up` reusing the old database,
+which is the exact failure project-scoped volumes were introduced to end.
+
+**An image's `LABEL`s are read, on both paths that produce an image.** The pull path did not parse
+`config.Labels` and the build path discarded `LABEL` at the parser with a comment saying "metadata -
+parsed and ignored", which described a gap rather than a decision: `docker images --filter label=`
+cannot answer for an image whose labels were thrown away, and `org.opencontainers.image.*` is where
+a build records its source and its version. `MAINTAINER` is recorded as `LABEL maintainer=`, which is
+what Docker does with it. `images --filter` now takes all five of Docker's keys: `reference=`,
+`dangling=`, `label=`, and `before=`/`since=`, the last two relative to another image's cache time -
+the same value the PULLED column prints, so the filter and the column cannot disagree.
+
+**`compose push` would have published images the file did not build.** The first version pushed
+every service carrying an `image:`, which on an ordinary stack means `postgres:17` and
+`rabbitmq:3-management` - images the file merely names and the cache merely pulled. MEASURED on a
+two-service file: it went straight at `postgres:17` and got as far as squashing it before failing for
+an unrelated reason; with credentials and a writable namespace it would have succeeded, publishing
+somebody else's image under your name from a verb whose author expected it to publish theirs. `push`
+now publishes what the file BUILDS: `build:` says the bytes are this project's, `image:` says where
+they go, and a service with one and not the other is named as skipped.
+
+**`compose wait` exited 0 whatever the service did.** The entire use of the verb is
+`docker compose wait tests` in a CI job that branches on the status, which Docker documents as the
+exit code of the first container to stop; printing the numbers and exiting 0 reports every failing
+suite as a pass. The services are now polled together rather than in file order, since "first to
+stop" is not "first in the file". `kern wait <box>` still prints and exits 0: it is older, its
+contract is frozen with the CLI, and a script already reading its stdout is correct. The two are
+spelled differently on purpose.
+
+**`ps --last N` answered a different question from Docker's.** It ordered on "how long ago did this
+box last do something" - `now - started` for a live one, `exited_ago` for a dead one - which are two
+questions wearing one name: a box created an hour ago and finished a second ago came out NEWER than
+one created a second ago. It now orders on the kernel start-time, the one clock both records hold and
+the one that means CREATED, so `-n 2` is the two most recently created across both lists.
+
+**`images --filter reference=alpine` matched nothing while `kern images` listed three.** A pattern
+naming no tag now matches any tag; one that names a tag is still matched whole. Stated as kern's
+rule rather than Docker's: this was not put to a daemon, and the reference filter's exact behaviour
+there is not something this repository has measured.
+
+**`up --no-deps` waited out its whole timeout on a dependency that had already completed.** A
+condition is keyed to the run that satisfies it, which is right for an ordinary `up` and impossible
+under `--no-deps`: the caller has said the dependencies will not be started, so requiring a
+completion under THIS run's token asks for something that can never happen. MEASURED on the line a
+real rebuild script runs, `up -d --build --force-recreate --no-deps <service>` against a stack
+already up: kern waited 120 seconds and reported `timed out waiting for 'setup' to complete` about a
+service that had completed minutes earlier and was sitting in `kern ps -a` with exit 0. Under
+`--no-deps` the question is now "has it completed, ever, as far as kern still knows", answered from
+the same exit record `kern ps -a` and `kern wait` read; and a condition that nothing in this
+invocation can satisfy is refused AT ONCE, naming the flag, instead of being waited out.
+
+**A new gate runs a real deployment's command shapes against a real stack.**
+`scripts/deployment-cli-battery.py` brings up a three-service stack and runs the 42 distinct
+command lines one deployment's scripts, `package.json` and CI actually contain - verbatim, because
+a green line means the script needed no edit - plus the four `build:` shapes a compose file declares
+and the token chain a real rebuild script wraps around them,
+checking each one's exit code and output. It exists because the compose-compat rate measures what
+kern does with a FILE, and every defect this release fixes was in the commands wrapped AROUND the
+file, where no corpus was looking. It found one on its first run, the `--no-deps` timeout above.
+
+**Eight `docker compose` verbs that did not exist: `wait`, `events`, `images`, `push`, `rm`, `top`,
+`version`, and `kill`.** Seven are the box-level verb kern already had, scoped to one stack, which is
+the shape `compose ps` established; `kill` is `stop` under the name Docker gives the harder one, and
+inherits kern's existing statement that the grace comes from `--stop-timeout` rather than being
+skipped. `top` reads the CGROUP rather than running a `ps` inside the box, so it answers for a
+distroless or `FROM scratch` service too. `rm` removes what kern actually has to remove, the exit
+record that keeps a finished service in `kern ps -a`, and refuses while a selected service is still
+running. `create` and `scale` are now refused BY NAME with the reason the concept is absent: both
+used to fall through and be read as a service name, so `compose f.yml create` answered "no such
+service: create" and sent the reader to look for a service nobody wrote.
+
+**`logs --since` and `--until`, on a box and on a stack.** The window is read from the timestamp
+index `logs -t` already prints from, and takes the three spellings Docker takes: a duration back from
+now (`30s`, `1h30m`), unix seconds, or RFC3339 UTC - the last of which is exactly what kern's own
+`logs -t` prints, so its output feeds straight back in. A line the index cannot place in time is
+KEPT: the index buckets from 100 ms and a log written before it existed has no marks at all, so
+discarding what cannot be placed would silently lose real output. A value that does not parse is
+refused with the three forms named, because a misread time shows the wrong window and wrong output
+looks like output. `compose logs` also gains `-t` and `--no-log-prefix`; `-t` is two flags there and
+the verb decides which, as it does under Docker (`logs -t` is timestamps, `down -t 30` is a grace).
+
+**`ps --filter health=`, `ps --no-trunc`, `ps --last N`, `images --filter`, `stats --no-stream`.**
+`health=` is the one a readiness loop writes, and it reads the health VERDICT rather than the merged
+status column, so a paused box with a passing check is still `healthy` here; `none` is the box that
+declares no healthcheck, which an empty string cannot express in a `k=v` filter. `--last N` counts
+across live AND exited boxes on one ordering, because "the last N containers" is one question, and it
+implies `-a`. `images --filter` takes the two keys the cache can answer (`reference=` with `*`,
+`dangling=`) and refuses the others by name rather than accepting a filter that silently matches
+everything. `stats --no-stream` names what kern has always done: a daemonless runtime has no stream
+to tail, and `kern top` is the live view. `volume ls` and `network ls` take `--format json` as a
+second spelling of `--json`; any other template is refused rather than printing a human table to a
+caller that asked for fields. `cp -a/--archive` is refused with its reason: it preserves uid/gid, and
+a rootless copy crosses a subuid range where the box's uid 999 is the host's 100998.
+
+**`kern inspect --json` carries `status`, and one function decides that word everywhere.** The
+document held `health`, which is empty for the majority of boxes, and not the field a script reaches
+for first. `ps`, `inspect` and `inspect -f` now read one function for the word, which fixes what none
+of them said before: a PAUSED box reported `running` from `inspect` while `kern ps` reported
+`paused`, because `inspect` tested the health verdict for a word the health verdict never contains.
+
+`inspect` still reports a box WHILE IT RUNS. A box that has exited is refused, by name and with its
+code, pointing at `kern ps -a`; the value a script wants from it is served by `inspect -f
+'{{.State.ExitCode}}'`, which reads the same exit record.
+
+**`kern rmi` charged the image you named for somebody else's debris.** The orphan-layer sweep is
+cache-wide, because that is the only way to find a layer whose last referrer has just gone, and every
+byte it reclaimed was added to the "freed N" line. MEASURED on a working cache: one image built under
+two names, `rmi` of the first printed `freed 140.3M`, `rmi` of the second printed `freed 140.3M`
+again, and `du` on the layer store was unchanged across both - 280 MB claimed, nothing reclaimed. The
+sweep still takes every orphan it finds, because the cache's health is not the caller's arithmetic;
+only the layers the named image's own manifest listed are charged to it. With `-t` now repeatable,
+two names for one image is the ordinary case on every release.
+
+**`kern box --network <name>` joins a running pod, which is what a stack is.** `docker run --rm
+--network <stack-net> <image> <cmd>` is how a one-off talks to a running stack: generate a token,
+seed a database, run a migration. kern answered `--network <host|none>`, a usage line naming neither
+of the two joinable things it has. A name now reaches the same slot `--pod` fills, and what the name
+IS gets decided where the registry is already being read rather than in the parser: a running pod is
+joined, a `kern network` is named as the different object it is (a compose file declares it
+`external: true`; a single box cannot join one), and a name that is neither lists the pods that are
+running.
+
+**The teardown note contradicted the line four rows above it.** A stack whose services start and then
+exit printed `compose up: 2 box(es) started.` and then `removed pod 'x' again: no service started, so
+it held nothing`. The guard's condition is "does the pod hold anything NOW" and its sentence said
+"nothing ever started", which are different statements that agree only when nothing did start. The
+bring-up now tells the guard how many it started, so the two cases are said separately: nothing came
+up, which sends a reader to the errors above, or everything that came up has already finished, which
+sends them to `kern ps -a`.
+
+**`up --force-recreate`, `up --no-recreate` and `up -V/--renew-anon-volumes` are honoured.** They
+were refused, and the first of them ends a real rebuild script on its own line
+(`up -d --build --force-recreate --no-deps <service>`, after a step wrote a file the definition does
+not hash). kern's `up` compares a fingerprint and leaves a service whose definition still matches
+running, which is Docker's default and the right one; these are the two overrides of that comparison,
+and both are total, so neither can be defeated by a box that carries no fingerprint. Writing both at
+once is refused by name rather than resolved by precedence. `-V` discards the anonymous volumes of
+the services this `up` STARTS, not of the ones it leaves running: kern names an anonymous volume from
+the service and its mount path instead of a random id, which is what makes it persist across `up`,
+and the wider reading would delete storage from under a service nobody asked to touch.
+
+**`kern compose <verb>` finds the file, like `kern up` already did.** `docker compose up -d` is
+written from the directory that holds the file, and the verb form answered a usage dump naming a
+positional `<file>` it did not have to require. The same four Docker names plus `kern.toml` are
+searched, and the refusal when none is there now lists every name it tried (the hand-written sentence
+had already drifted and omitted `docker-compose.yaml`). A bare `kern compose` still prints usage:
+discovery answers which file, not which verb.
+
+**`kern port <box> [<container-port>]`.** The compose form has answered this for a stack for some
+time and the bare one did not exist, so a script holding a box name had nowhere to ask. It reads the
+RUNNING box rather than the file, so it reports what was actually bound, which on a rootless runtime
+is the whole point (a privileged port is republished above 1024). With no port it lists every mapping
+in Docker's `<port>/<proto> -> <address>` form; `/tcp` or `/udp` narrows to exactly that protocol.
+The compose verb now shares its selection code, so the two cannot drift.
+
+**`inspect -f` is accepted, and no longer answers for a box that does not exist.** `--format` was
+implemented and `-f`, the spelling every wait loop uses, was `unknown flag`. Worse, the lookup was
+"is it running?", so every name that was not running rendered `.State.Status` as `exited` with exit
+status 0: `until [ "$(kern inspect -f '{{.State.Status}}' setup)" = exited ]` ENDED IMMEDIATELY on a
+misspelled service and the script carried on as though the step had completed. A name kern holds no
+record of is now refused, and `.State.ExitCode` was added, since the question after "did it finish?"
+is "did it finish well?".
+
+**`kern login` checks the credentials before it stores them, and has a real `--password-stdin`.** It
+stored whatever it was given and printed `logged in`: a deliberately wrong password for Docker Hub
+was accepted and written over the existing entry, which holds one credential per registry. Two things
+followed, and both were live: a CI job that pipes a token in continues on exit 0 and discovers an
+expired one several steps later at the `push`, and a typo replaces a working credential with a broken
+one. The pair is now verified against the registry through the same challenge the pull path uses, the
+registry's own diagnosis is carried through, and nothing is written unless it is accepted. Login's
+flags are also checked now: `--password-stdin` was read by nothing and appeared to work because stdin
+is read anyway when it is not a terminal, so a misspelling would have behaved identically.
+
+**A `command:` carrying an escaped quote was silently truncated.** Inside a quoted string the
+splitter had no case for a backslash, so `\"` ENDED the string instead of escaping a quote in it, and
+everything after it was split on whitespace and handed to `sh` as positional parameters instead of as
+part of its `-c` script. A real stack found it: a service whose script prints
+`echo \"…retry $i…\"` and then runs `nginx -g 'daemon off;'` printed the first two words, exited 0,
+and never started nginx, with no warning at any layer. The backslash now follows POSIX in each of the
+three contexts it means something different in: unquoted it escapes the next character and continues
+a line, inside single quotes nothing is special, and inside double quotes it escapes exactly `$`,
+`` ` ``, `"`, `\` and a newline while staying literal before anything else, so `"C:\path"` and
+`"\n"` still reach the workload unchanged.
+
+**`exec -i` allocated a pseudo-terminal, so `exec -i <box> psql … < file.sql` never returned.** `-i`
+and `-t` were one flag. A PTY echoes its input, rewrites `\n` as `\r\n`, and never receives the EOF a
+redirected file cannot send, so the canonical way to feed SQL, a migration or a fixture into a
+running service hung and corrupted its own output on the way. They are now two flags, as they are on
+docker: `-t`/`-it` allocate the terminal, `-i` keeps stdin attached and allocates nothing. stdin was
+always inherited, so `-i` names what already happens and nothing else changes. `kern box` takes the
+same split, for `run -i img < file`.
+
+**`build -t a -t b` kept only the last name.** Both flags parsed, the second won, nothing was said.
+A release pipeline writes `build -t repo:$VERSION -t repo:latest .` and pushes each name, so the
+`push repo:$VERSION` on the next line failed on an image that had never existed. `-t` is now
+repeatable and every name is applied to the finished image through the same content-shared path
+`kern tag` uses, which references layers rather than copying them: N names cost one build and one
+manifest write each. Every name is validated when it is read, so an invalid fourth `-t` is refused
+before the build is paid for, and a name that cannot be applied fails the command rather than
+warning, because the caller's next line is a `push` of exactly that name.
 **`kern compose --help` ended with two lines about networks.** They are the tail of `network create`
 in the full reference, and they were printed under `compose ps` as though they described it, because
 the per-verb filter read a line's first word before its indentation and that continuation begins

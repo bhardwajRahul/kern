@@ -143,6 +143,9 @@ pub(crate) fn write_image_config(
     for a in &c.cmd {
         line("cmd", a);
     }
+    for l in &c.labels {
+        line("label", l);
+    }
     for e in &c.env {
         line("env", e);
     }
@@ -199,6 +202,7 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
             "entrypoint" => c.entrypoint.push(v.to_string()),
             "cmd" => c.cmd.push(v.to_string()),
             "env" => c.env.push(v.to_string()),
+            "label" => c.labels.push(v.to_string()),
             "workdir" => c.workdir = Some(v.to_string()),
             "user" => c.user = Some(v.to_string()),
             "expose" => {
@@ -604,6 +608,28 @@ pub(crate) fn sweep_unreachable_images(cache: &std::path::Path) -> (usize, u64) 
 /// Delete build-layer dirs in `L/` not referenced by any `<tag>.layers` manifest. Returns
 /// `(count, bytes_freed)`. Only touches `L/<32hex>` entries, never a pulled/built image itself.
 pub(crate) fn sweep_orphan_layers(cache: &std::path::Path) -> (usize, u64) {
+    sweep_orphan_layers_charged(cache, None)
+}
+
+/// [`sweep_orphan_layers`], with a say over WHICH of the layers it reclaims are charged to the
+/// caller's number.
+///
+/// THE SWEEP IS CACHE-WIDE AND THE REPORT WAS NOT. `remove_image` returns the bytes `kern rmi`
+/// prints as "freed N", and it added everything this sweep reclaimed - including layers orphaned by
+/// some EARLIER removal that nobody had swept yet. MEASURED on a working cache: two names of one
+/// image, `rmi` of the first printed `freed 140.3M` and `rmi` of the second printed `freed 140.3M`
+/// again, while `du` on the layer store showed it unchanged across both. The bytes were real debris
+/// and the sweep was right to take it; the sentence attributing it to the image just named was not.
+///
+/// `charge = Some(keys)` counts only the reclaimed layers whose key is in `keys`, which for a
+/// removal is the set that image's own manifest named. Everything orphaned is still DELETED - the
+/// sweep's job is the cache's health, not the caller's arithmetic - and the returned count is the
+/// total reclaimed, so `gc` keeps reporting the whole cleanup. `None` charges everything, which is
+/// what `gc` means by the same number.
+pub(crate) fn sweep_orphan_layers_charged(
+    cache: &std::path::Path,
+    charge: Option<&std::collections::HashSet<String>>,
+) -> (usize, u64) {
     // The cache is a PARAMETER, not `cache_dir()`. `remove_image` already takes one so it can be
     // driven against a temp tree by a test, and this call ignored it and swept the real user cache -
     // so a unit test deleting from a fabricated cache reached into the developer's layer store.
@@ -642,9 +668,15 @@ pub(crate) fn sweep_orphan_layers(cache: &std::path::Path) -> (usize, u64) {
             continue;
         }
         if e.path().is_dir() {
-            freed += dir_size(&e.path());
+            // Sized BEFORE the delete and charged only if the delete succeeded: a directory that
+            // could not be removed is still on disk, and counting it is how a "freed" number comes
+            // to describe bytes that are still there.
+            let sz = dir_size(&e.path());
             if std::fs::remove_dir_all(e.path()).is_ok() {
                 count += 1;
+                if charge.is_none_or(|keys| keys.contains(key)) {
+                    freed += sz;
+                }
             }
         } else {
             let _ = std::fs::remove_file(e.path()); // an orphaned `.ok`
@@ -821,6 +853,16 @@ pub(crate) fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
     // image owns no dir here - its bytes live in the shared `L/` cache, accounted by the orphan sweep
     // below.
     let mut freed = 0u64;
+    // THE LAYER KEYS THESE STEMS NAME, read BEFORE their manifests are removed, so the sweep below
+    // can charge this removal for its OWN layers and no others. A manifest that cannot be read
+    // contributes nothing to the set: an unreadable one means this removal cannot claim those bytes,
+    // which is the conservative direction for a number a person reads as "space I got back".
+    let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stem in &stems {
+        if let Ok(body) = std::fs::read_to_string(cache.join(format!("{stem}.layers"))) {
+            mine.extend(body.lines().skip(1).map(|l| l.trim().to_string()));
+        }
+    }
     for stem in &stems {
         let flat = cache.join(stem);
         let diff = cache.join(format!("{stem}.diff"));
@@ -843,8 +885,9 @@ pub(crate) fn remove_image(cache: &std::path::Path, want: &str) -> Option<u64> {
         }
     }
     // Reclaim layers this image was the last to reference (the sweep fails closed, so a shared layer is
-    // never dropped while another image's manifest still names it).
-    let (_, layer_freed) = sweep_orphan_layers(cache);
+    // never dropped while another image's manifest still names it). The sweep still takes every
+    // orphan it finds; only the ones THIS image named are charged to the number the caller prints.
+    let (_, layer_freed) = sweep_orphan_layers_charged(cache, Some(&mine));
     Some(freed + layer_freed)
 }
 

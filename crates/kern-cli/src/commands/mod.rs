@@ -2494,6 +2494,17 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
                 || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
         }),
         "id" => b.pid.to_string() == *v,
+        // `health=` READS THE VERDICT, not the merged status column: a paused box with a passing
+        // healthcheck is `paused` there and still `healthy` here, and a readiness loop wants the
+        // second answer. `none` is the box that declares no healthcheck, which is the one value an
+        // empty string cannot express in a `k=v` filter.
+        "health" => {
+            let h = registry::health_of(&b.name, b.pid);
+            match v.as_str() {
+                "none" => h.is_empty(),
+                want => h == want,
+            }
+        }
         // Mirror `box_status`'s priority so the filter never drifts from the STATUS column: orphaned
         // wins, and a `running`/`paused` query must therefore EXCLUDE an orphaned box (its supervisor
         // is dead - it is not simply running).
@@ -2517,29 +2528,58 @@ fn exited_matches(e: &registry::ExitedBox, filters: &[(String, String)]) -> bool
         "name" => e.name.contains(v.as_str()),
         "pod" => e.pod == *v,
         "id" => e.pid.to_string() == *v,
+        // An exited box kept no health verdict, so it is `none` and nothing else - the same answer
+        // `label=` gives for the same reason, and the honest one: the record does not hold it.
+        "health" => v == "none",
         "status" => v == "exited",
         _ => false,
     })
 }
 
-/// One box's display status: `paused` (frozen by `kern pause`), else its health-check verdict, else
-/// `empty` when no health check is configured. The single source of truth for `ps`'s HEALTH column,
-/// `ps --format {{.Status}}`, and `--filter status=` - so they never drift on what "paused" means.
-fn box_status(b: &registry::Instance, empty: &str) -> String {
+/// One RUNNING box's LIFECYCLE status, in the vocabulary Docker's `.State.Status` uses: is the
+/// process there, and is it moving? Health is a different question and a different field.
+///
+/// THE TWO QUESTIONS WERE ANSWERED BY TWO DIFFERENT PIECES OF CODE, and one of them was wrong.
+/// `box_status` below reads the cgroup freezer, which is the only thing that knows a box is paused;
+/// `inspect --format '{{.State.Status}}'` tested `health == "paused"` instead, and `health_of`
+/// never returns that word. MEASURED on a frozen box: `kern ps --format '{{.Status}}'` printed
+/// `paused` while `kern inspect -f '{{.State.Status}}'` printed `running`, about the same box in the
+/// same second. `orphaned` was invisible to it for the same reason.
+///
+/// `orphaned` is kern's own word and has no Docker equivalent; it is reported as itself rather than
+/// mapped onto `running`, because the supervisor being dead is exactly what a caller comparing
+/// against `running` needs to not be told.
+fn box_lifecycle_status(b: &registry::Instance) -> &'static str {
     // ORPHANED wins over every other status: the supervisor is dead but the box's PID 1 / `-p` forwarder
     // are still running (and still holding the host port). Surfacing it is the whole point - the box used
     // to vanish from `ps` here - and `kern stop <name>` reaps it via `cgroup.kill`.
     if b.orphaned {
-        return "orphaned".to_string();
+        return "orphaned";
     }
     if registry::is_paused(b.cgroup_pid()) {
-        return "paused".to_string();
+        return "paused";
     }
-    let h = registry::health_of(&b.name, b.pid);
-    if h.is_empty() {
-        empty.to_string()
-    } else {
-        h
+    "running"
+}
+
+/// One box's display status: `paused` (frozen by `kern pause`), else its health-check verdict, else
+/// `empty` when no health check is configured. The single source of truth for `ps`'s HEALTH column,
+/// `ps --format {{.Status}}`, and `--filter status=` - so they never drift on what "paused" means.
+///
+/// Built ON [`box_lifecycle_status`] rather than beside it: this column MERGES two questions (what
+/// is it doing, and is it well), which is right for a table with one column for both, and every
+/// other surface needs them apart.
+fn box_status(b: &registry::Instance, empty: &str) -> String {
+    match box_lifecycle_status(b) {
+        "running" => {
+            let h = registry::health_of(&b.name, b.pid);
+            if h.is_empty() {
+                empty.to_string()
+            } else {
+                h
+            }
+        }
+        other => other.to_string(),
     }
 }
 
@@ -3237,6 +3277,14 @@ fn mapped_uid_count() -> u32 {
 pub struct BuildArgs<'a> {
     /// `-t <name[:tag]>`: the local image name to store the result under. Required.
     pub tag: Option<&'a str>,
+    /// Every `-t` AFTER the first, applied to the finished image as an additional name.
+    ///
+    /// Docker's `-t` is repeatable and every name it is given ends up on the image. kern kept the
+    /// LAST one only, in silence: `build -t repo:1.2.3 -t repo:latest .` left `repo:1.2.3`
+    /// non-existent, so the `push repo:1.2.3` that every release pipeline runs next failed on a
+    /// name nothing had ever created. Applied through [`tag`], which shares layers rather than
+    /// copying them, so N names cost one build and N manifest writes.
+    pub extra_tags: &'a [String],
     /// `-f <file>`: the Dockerfile path. `None` → `<context>/Dockerfile`.
     pub file: Option<&'a str>,
     /// The build context directory (default `.`) - the root COPY/ADD sources resolve against.
@@ -3909,6 +3957,14 @@ fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile
                 }
             }
         }
+        // `LABEL k=v`: LAST WRITER WINS on a repeated key, which is Docker's rule and the one a
+        // `FROM` chain needs - a derived image overriding its base's `version` label must not leave
+        // both in the config for a filter to match either.
+        Instr::Label(k, v) => {
+            let prefix = format!("{k}=");
+            config.labels.retain(|l| !l.starts_with(&prefix));
+            config.labels.push(format!("{k}={v}"));
+        }
         _ => {}
     }
 }
@@ -4363,15 +4419,47 @@ fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error
 /// A dependency that DIES before satisfying its condition aborts immediately (adversarial-review 2a) -
 /// we don't burn the full timeout on an already-decided outcome. The registry's liveness (a dep no
 /// longer in `list()` and with no completion recorded) is the death signal.
+///
+/// `no_deps` CHANGES WHAT A CONDITION CAN MEAN, and this is not a shortcut. The token scoping above
+/// is right for an ordinary `up`: a dependency must complete in THIS run, and a sidecar left by a
+/// previous one must not satisfy it. Under `--no-deps` the caller has said the dependencies will not
+/// be started, so requiring a completion under this run's token asks for something that can never
+/// happen - the wait is guaranteed to burn the whole timeout and then fail.
+///
+/// MEASURED, on the line a real rebuild script runs:
+/// `up -d --build --force-recreate --no-deps <service>` on a stack already up, whose service depends
+/// on a one-shot that had completed successfully minutes earlier and is sitting in `kern ps -a` with
+/// exit 0. kern waited 120 seconds and reported `timed out waiting for 'setup' to complete`, about a
+/// service that HAD completed. So under `--no-deps` the question becomes "has this dependency
+/// completed, ever, as far as kern still knows", answered from the same `waitexit` breadcrumb
+/// `kern ps -a` and `kern wait` read; and a dependency that is neither satisfied nor going to be
+/// started is refused AT ONCE rather than waited out, because nothing in this invocation will change
+/// the answer.
 fn wait_for_conditions(
     b: &crate::compose::ComposeBox,
     pod: &str,
     token: &str,
     wait_timeout: Option<u64>,
+    no_deps: bool,
 ) -> Result<(), Error> {
     use std::time::{Duration, Instant};
     if b.depends_healthy.is_empty() && b.depends_completed.is_empty() {
         return Ok(());
+    }
+    /// Did `dep` complete successfully in an EARLIER run that kern still has a record of?
+    ///
+    /// Reads the `waitexit` breadcrumb rather than compose's token-scoped `exit/` sidecar, because
+    /// the whole point is that the completion happened under a different token. The record is
+    /// transient (an hour), so "kern no longer knows" and "it never completed" are the same answer
+    /// here, and both are reported as the dependency not being satisfied.
+    /// BOUNDED BY THE BOX NAME, which is `<pod>-<service>` and therefore this stack's alone - two
+    /// projects cannot collide here unless a `container_name:` makes them share one name, and two
+    /// stacks sharing a box name were already unable to run together for the same reason.
+    fn completed_earlier(dep: &str) -> Option<i32> {
+        registry::list_exited()
+            .into_iter()
+            .find(|e| e.name == dep)
+            .map(|e| e.code)
     }
     // `--wait-timeout N` BOUNDS THIS GATE TOO, and it used not to. MEASURED before: a stack whose
     // dependency never resolves its health check (a `test` that always fails under a long
@@ -4395,6 +4483,15 @@ fn wait_for_conditions(
             "  ⋯ waiting for '{dep}' to become healthy (for '{}')",
             b.name
         );
+        // Under `--no-deps` a dependency that is not even running will never become healthy here:
+        // nothing is going to start it. Refuse now, naming the flag, instead of spending the whole
+        // timeout to say the same thing less clearly.
+        if no_deps && !is_box_alive(dep) {
+            return Err(Error::Compose(format!(
+                "box '{}': --no-deps was given, so '{dep}' will not be started, and it is not running - its `service_healthy` condition can never be met. Bring it up first, or drop --no-deps",
+                b.name
+            )));
+        }
         loop {
             let status = current_health(dep);
             if status == "healthy" {
@@ -4447,6 +4544,28 @@ fn wait_for_conditions(
 
     // `depends_completed`: poll each dep's stack+run-scoped exit sidecar until it completes; require 0.
     for dep in &b.depends_completed {
+        // `--no-deps`: THE COMPLETION THIS RUN CANNOT WITNESS. Answered from the exit record rather
+        // than from this run's token, and answered BEFORE the loop, so a dependency that completed
+        // successfully is satisfied at once and one that did not is refused at once. A non-zero
+        // earlier exit is a failure, not a reason to keep waiting: it is the same record `kern ps -a`
+        // shows, and the service is not going to run again in this invocation.
+        if no_deps && registry::exit_of(&key_of(dep)).is_none() {
+            match completed_earlier(dep) {
+                Some(0) => continue,
+                Some(code) => {
+                    return Err(Error::Compose(format!(
+                        "box '{}': dependency '{dep}' completed with exit {code} (in an earlier run - --no-deps means this one will not re-run it) - run `kern logs {dep}` for the reason",
+                        b.name
+                    )))
+                }
+                None => {
+                    return Err(Error::Compose(format!(
+                        "box '{}': --no-deps was given, so '{dep}' will not be started, and kern holds no record of it having completed - its `service_completed_successfully` condition can never be met. Bring it up first, or drop --no-deps",
+                        b.name
+                    )))
+                }
+            }
+        }
         eprintln!("  ⋯ waiting for '{dep}' to complete (for '{}')", b.name);
         loop {
             if let Some(code) = registry::exit_of(&key_of(dep)) {
@@ -4537,6 +4656,43 @@ pub enum ComposeAction {
     /// one thing it cannot do for itself is come back after a reboot, and where that unit belongs is
     /// a decision about the user's machine. No side effects.
     Systemd,
+    /// `wait [service...]`: block until the selected services have exited and print each code.
+    ///
+    /// The same waiter `kern wait` uses, so a service that has ALREADY exited answers at once from
+    /// its exit record rather than blocking forever on a box that is gone.
+    Wait,
+    /// `events`: stream this stack's box start/die/rename events until interrupted.
+    ///
+    /// Scoped by the stack's own name prefix, which is the identity that holds in both wirings - a
+    /// `--no-pod` member carries an empty `pod` field, so filtering on the pod would stream nothing
+    /// for exactly the stacks whose members are most separated.
+    Events,
+    /// `images`: what each service runs, and what that costs in the local cache.
+    ///
+    /// Answered from the FILE and the cache, not from the registry, so it says the same thing
+    /// whether the stack is up or down - which is what a deploy script checking "do I have these
+    /// locally" needs.
+    Images,
+    /// `push`: publish each service's `image:` from the local cache to its registry.
+    ///
+    /// The other half of `build`: a stack whose services declare both `build:` and `image:` is built
+    /// locally and pushed under the name the file already carries. A service with no `image:` has no
+    /// name to push to and is skipped by name rather than silently.
+    Push,
+    /// `rm`: drop the exit records of this stack's services that have finished.
+    ///
+    /// kern has no "created but stopped" container to remove, so what `docker compose rm` reclaims
+    /// here is the breadcrumb `kern ps -a` reads - which is what makes a finished service keep
+    /// appearing after it is done with.
+    Rm,
+    /// `top`: the processes each running service holds, read from its cgroup.
+    ///
+    /// From the CGROUP and not from a `ps` inside the box: the box's image need not contain one, and
+    /// a distroless or `FROM scratch` service is exactly the case where "what is it running" is
+    /// hardest to answer by other means.
+    Top,
+    /// `version`: what compose surface this build implements.
+    Version,
 }
 
 /// Every compose sub-verb, in the order the help prints them. THE list: `from_verb`, the help line
@@ -4560,6 +4716,18 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
     ("run", ComposeAction::Run),
     ("cp", ComposeAction::Cp),
     ("exec", ComposeAction::Exec),
+    ("wait", ComposeAction::Wait),
+    ("events", ComposeAction::Events),
+    ("images", ComposeAction::Images),
+    ("push", ComposeAction::Push),
+    ("rm", ComposeAction::Rm),
+    ("top", ComposeAction::Top),
+    ("version", ComposeAction::Version),
+    // `kill` IS `stop`, under the name Docker gives the harder one. kern's box-level `kill` is
+    // already documented as an alias rather than Docker's immediate SIGKILL (the grace comes from
+    // the box's own `--stop-timeout`, and `--stop-timeout 0` is how you skip it), so the compose
+    // verb inherits that one definition instead of growing a second answer to the same question.
+    ("kill", ComposeAction::Stop),
 ];
 
 impl ComposeAction {
@@ -4778,17 +4946,163 @@ enum Reconcile {
     Recreate,
 }
 
+/// `a.b.c.d:port` from a published mapping's host side, which is the shape `docker port` prints and
+/// the shape a caller substitutes straight into a URL.
+fn published_address(m: &kern_isolation::PortMap) -> String {
+    format!(
+        "{}.{}.{}.{}:{}",
+        m.bind_ip >> 24 & 0xff,
+        m.bind_ip >> 16 & 0xff,
+        m.bind_ip >> 8 & 0xff,
+        m.bind_ip & 0xff,
+        m.host
+    )
+}
+
+/// The one mapping a caller means by a bare container port.
+///
+/// TCP FIRST, THEN UDP, AND NEVER BOTH: two protocols can legitimately share one box port, and
+/// printing two lines would break the `addr=$(kern port …)` shape this exists to serve. TCP is the
+/// default protocol of a `ports:` entry, so it is the one a caller means when they did not say.
+fn published_mapping(
+    published: &[kern_isolation::PortMap],
+    want_port: u16,
+) -> Option<&kern_isolation::PortMap> {
+    published
+        .iter()
+        .find(|m| m.box_port == want_port && !m.udp)
+        .or_else(|| published.iter().find(|m| m.box_port == want_port))
+}
+
+/// A container port as a caller wrote it, `8080` or `8080/udp`, validated BEFORE anything is looked
+/// up so a typo is named as a typo instead of reported as "not published", which would send the
+/// reader to the wrong file.
+fn parse_container_port(want: &str) -> Result<(u16, Option<bool>), Error> {
+    let (num, proto) = match want.split_once('/') {
+        Some((n, "tcp")) => (n, Some(false)),
+        Some((n, "udp")) => (n, Some(true)),
+        Some((_, other)) => {
+            return Err(Error::Cli(format!(
+                "'{other}' is not a protocol; write <port>, <port>/tcp or <port>/udp"
+            )))
+        }
+        None => (want, None),
+    };
+    match num.parse::<u16>() {
+        Ok(p) if p > 0 => Ok((p, proto)),
+        _ => Err(Error::Cli(format!(
+            "'{want}' is not a container port; it must be a number in 1..=65535"
+        ))),
+    }
+}
+
+/// `kern port <box> [<container-port>[/tcp|/udp]]`: what the host serves for a running box's port.
+///
+/// IT EXISTS BECAUSE THE COMPOSE FORM DID AND THE BARE ONE DID NOT. `kern compose <file> port <svc>
+/// <port>` has answered this for a stack for some time, and `kern port <box> <port>` - the shape
+/// `docker port` has, and the shape a script reaching for ONE box writes - was `unknown command
+/// 'port'`. A tool that can answer a question for a stack and not for a box is not answering the
+/// question, it is answering a question about compose.
+///
+/// READ FROM THE RUNNING BOX, never from a file or a flag: the registry entry says what was actually
+/// bound, and the exit code is as much the contract as the output, so every "no answer" path is an
+/// `Err` rather than an empty line with status 0.
+///
+/// With no port, EVERY mapping is listed in Docker's `<box>/<proto> -> <host addr>` form, which is a
+/// different question ("what does this serve?") with a different shape of answer.
+pub fn port(name: &str, want: Option<&str>) -> Result<(), Error> {
+    // Parsed first, so `kern port web notaport` is a usage error whether or not `web` is running.
+    let wanted = want.map(parse_container_port).transpose()?;
+    let Some(inst) = registry::find(name) else {
+        return Err(Error::Cli(format!(
+            "no running box '{name}' - `kern ps` lists them"
+        )));
+    };
+    let published = crate::ports::parse_display_list(&inst.ports);
+    if published.is_empty() {
+        return Err(Error::Cli(format!("box '{name}' publishes no ports")));
+    }
+    let Some((want_port, want_udp)) = wanted else {
+        // Docker's listing form, ordered as the box recorded it.
+        for m in &published {
+            println!(
+                "{}/{} -> {}",
+                m.box_port,
+                if m.udp { "udp" } else { "tcp" },
+                published_address(m)
+            );
+        }
+        return Ok(());
+    };
+    // An explicit `/tcp` or `/udp` is a NARROWING and is honoured exactly: asking for `53/udp` and
+    // being handed the TCP mapping would be a wrong answer dressed as a helpful one.
+    let hit = match want_udp {
+        Some(udp) => published
+            .iter()
+            .find(|m| m.box_port == want_port && m.udp == udp),
+        None => published_mapping(&published, want_port),
+    };
+    let Some(m) = hit else {
+        let have: Vec<String> = published
+            .iter()
+            .map(|m| format!("{}/{}", m.box_port, if m.udp { "udp" } else { "tcp" }))
+            .collect();
+        // `want.unwrap_or_default()` would print an empty string here, but this arm is only reached
+        // when `wanted` was `Some`, which only happens when `want` was: echo back exactly what was
+        // typed, protocol suffix included.
+        return Err(Error::Cli(format!(
+            "container port {} is not published by '{name}'; it publishes: {}",
+            want.unwrap_or_default(),
+            have.join(", ")
+        )));
+    };
+    println!("{}", published_address(m));
+    Ok(())
+}
+
+/// `up --force-recreate` / `up --no-recreate`: the two ways a caller overrides the comparison.
+///
+/// THE COMPARISON IS THE DEFAULT AND IS USUALLY RIGHT, so both of these exist for the cases where the
+/// caller knows something the fingerprint cannot see. `--force-recreate` is the one a deploy script
+/// reaches for after writing a file the definition does not hash (a bind-mounted config, a secret, a
+/// token another step injected); `--no-recreate` is the one that says "bring up what is missing and
+/// touch nothing that is running", which is how a stack is extended without disturbing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecreatePolicy {
+    /// Compare the definition fingerprint: recreate what changed, leave what did not. Docker's
+    /// default, and kern's.
+    #[default]
+    OnDrift,
+    /// `--force-recreate`: recreate every running service, whether or not its definition moved.
+    Always,
+    /// `--no-recreate`: leave every running service alone, even one whose definition moved.
+    Never,
+}
+
 /// Decide, for one running service, whether the file still describes it.
 ///
 /// A box registered by an older kern (or started outside compose) carries no fingerprint. Treating
 /// that as "changed" would recreate it on every `up` forever; treating it as "up to date" is the
 /// conservative choice and costs at most one missed recreate, after which the box carries a
 /// fingerprint and behaves normally.
-fn reconcile_decision(running: &registry::Instance, want: &str) -> Reconcile {
-    if running.def_hash.is_empty() || running.def_hash == want {
-        Reconcile::UpToDate
-    } else {
-        Reconcile::Recreate
+///
+/// THE POLICY IS CHECKED BEFORE THE FINGERPRINT, and both overrides are total: neither consults the
+/// hash, so neither can be defeated by a box that carries none.
+fn reconcile_decision(
+    running: &registry::Instance,
+    want: &str,
+    policy: RecreatePolicy,
+) -> Reconcile {
+    match policy {
+        RecreatePolicy::Always => Reconcile::Recreate,
+        RecreatePolicy::Never => Reconcile::UpToDate,
+        RecreatePolicy::OnDrift => {
+            if running.def_hash.is_empty() || running.def_hash == want {
+                Reconcile::UpToDate
+            } else {
+                Reconcile::Recreate
+            }
+        }
     }
 }
 
@@ -6309,6 +6623,22 @@ fn remove_project_volumes(
     boxes: &[crate::compose::ComposeBox],
     project: &str,
 ) -> Result<usize, Error> {
+    remove_project_volumes_matching(boxes, project, |_| true)
+}
+
+/// [`remove_project_volumes`], narrowed to the volumes whose BARE name (the part after the
+/// `<project>_` scope) satisfies `wanted`.
+///
+/// ONE deletion path, so the safety checks cannot drift: `down -v` passes a predicate that accepts
+/// everything, `up --renew-anon-volumes` one that accepts only the synthesised `anon-` names. Those
+/// checks are what bound it - named (not a host path), scoped to this project, never `external:`,
+/// never followed outside the volumes directory - and writing the second caller as its own loop is
+/// how one of them would eventually lose one of the four.
+fn remove_project_volumes_matching(
+    boxes: &[crate::compose::ComposeBox],
+    project: &str,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<usize, Error> {
     let dir = crate::volume::volumes_dir();
     let base = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
     let prefix = format!("{project}_");
@@ -6324,6 +6654,7 @@ fn remove_project_volumes(
             ) || !src.starts_with(&prefix)
                 || b.external_volumes.iter().any(|e| e == src)
                 || done.iter().any(|d| d == src)
+                || !src.strip_prefix(&prefix).is_some_and(&wanted)
             {
                 continue;
             }
@@ -6339,7 +6670,22 @@ fn remove_project_volumes(
                      remove it"
                 )));
             }
-            std::fs::remove_dir_all(&real)
+            // `remove_tree_mapped`, NOT `remove_dir_all`, and `kern volume rm` has said so in a
+            // comment since before this function existed - the two removers drifted and only one of
+            // them was right.
+            //
+            // A volume a service wrote to carries that service's ownership, which rootless means a
+            // SUBUID: `postgres:17` writes its data directory as uid 999 inside the box, which is
+            // 100998 on the host, and an unprivileged caller cannot unlink inside a directory that
+            // uid owns. MEASURED on a ten-service stack: `compose down -v` answered
+            // `removing volume '<project>_postgres_data': Permission denied (os error 13)` and, worse,
+            // the `?` ended the whole loop - so the three volumes AFTER it were left behind too, and
+            // `reset.sh` reported a reset that had removed nothing. The next `up` then reused the old
+            // database, which is the exact failure project-scoped volumes were introduced to end.
+            //
+            // Inside an id-mapped namespace those uids are ours and `CAP_DAC_OVERRIDE` applies, so
+            // the retry finishes what the first pass started. Same function, same reason, as `rmi`.
+            crate::commands::remove_tree_mapped(&real)
                 .map_err(|e| Error::Volume(format!("removing volume '{src}': {e}")))?;
             done.push(src.to_string());
         }
@@ -6529,6 +6875,12 @@ struct TerminalOpts<'a> {
     rmi: Option<bool>,
     tail: Option<usize>,
     follow: bool,
+    /// `logs -t/--timestamps`.
+    log_timestamps: bool,
+    /// `logs --since` / `--until`, as unix nanoseconds.
+    log_window: (Option<u64>, Option<u64>),
+    /// `logs --no-log-prefix`: no `=== <service> ===` heading between blocks.
+    no_log_prefix: bool,
     /// `-a/--all` for `ps`: also list the stack's recently-exited services.
     all: bool,
     services: &'a [String],
@@ -7019,16 +7371,10 @@ fn run_terminal_verb(
                     )))
                 }
             };
-            // Parse the wanted port BEFORE looking anything up, so a typo is named as a typo instead
-            // of reported as "not published", which would send the reader to the wrong file.
-            let want_port: u16 = match want.parse::<u16>() {
-                Ok(p) if p > 0 => p,
-                _ => {
-                    return Err(Error::Compose(format!(
-                        "'{want}' is not a container port; it must be a number in 1..=65535"
-                    )))
-                }
-            };
+            // Parsed BEFORE anything is looked up, by the same function `kern port` uses, so a typo
+            // is named as a typo instead of reported as "not published" (which would send the
+            // reader to the wrong file) and the two verbs cannot disagree about what a port is.
+            let (want_port, want_udp) = parse_container_port(want)?;
             // BOTH SPELLINGS, because the caller's word has already been mapped: the selection
             // above rewrites a known service name into its scoped box name, so `svc` arrives here as
             // `<pod>-<token>-web` for a valid service and as the raw word for an unknown one. Match
@@ -7054,13 +7400,14 @@ fn run_terminal_verb(
                     b.service
                 )));
             }
-            // TCP first, then UDP, and never both: two protocols can legitimately share one box port,
-            // and printing two lines would break the `addr=$(...)` shape this exists to serve. TCP is
-            // the default protocol of a `ports:` entry, so it is the one a caller means by default.
-            let hit = published
-                .iter()
-                .find(|m| m.box_port == want_port && !m.udp)
-                .or_else(|| published.iter().find(|m| m.box_port == want_port));
+            // Selection shared with `kern port` (TCP first, then UDP, never both), and an explicit
+            // `/tcp`/`/udp` narrows to exactly that protocol.
+            let hit = match want_udp {
+                Some(udp) => published
+                    .iter()
+                    .find(|m| m.box_port == want_port && m.udp == udp),
+                None => published_mapping(&published, want_port),
+            };
             let Some(m) = hit else {
                 let have: Vec<String> = published
                     .iter()
@@ -7075,14 +7422,7 @@ fn run_terminal_verb(
                     have.join(", ")
                 )));
             };
-            println!(
-                "{}.{}.{}.{}:{}",
-                m.bind_ip >> 24 & 0xff,
-                m.bind_ip >> 16 & 0xff,
-                m.bind_ip >> 8 & 0xff,
-                m.bind_ip & 0xff,
-                m.host
-            );
+            println!("{}", published_address(m));
             return Ok(true);
         }
         ComposeAction::Ps => {
@@ -7134,6 +7474,10 @@ fn run_terminal_verb(
                 all,
                 std::slice::from_ref(&filter),
                 template,
+                // The compose view has no presentation flags of its own yet: `--no-trunc`/`--last`
+                // are `kern ps`'s, and threading a default here keeps the ONE renderer rather than
+                // growing a second entry point that could drift from it.
+                PsView::default(),
             );
             // The lines below explain a DEGRADED stack to a person. A machine-readable form has no
             // room for prose, and a script parsing NDJSON must not be handed a sentence.
@@ -7229,7 +7573,11 @@ fn run_terminal_verb(
                 return Ok(true);
             }
             for (i, name) in wanted.iter().enumerate() {
-                if wanted.len() > 1 {
+                // `--no-log-prefix` DROPS THE HEADING. With several services the output is only
+                // readable because each block says whose it is; a downstream parser wants the lines
+                // and nothing else, and until this flag existed it had to strip kern's own headings
+                // to get them.
+                if wanted.len() > 1 && !o.no_log_prefix {
                     if i > 0 {
                         println!();
                     }
@@ -7237,9 +7585,7 @@ fn run_terminal_verb(
                 }
                 // A service that never started (or already exited) has no log: report it and keep
                 // going, so one missing service can't hide the others' output.
-                // `false`: `compose logs` has no `-t` yet, and passing one here silently would be a flag
-                // the compose parser refuses. One surface at a time.
-                if let Err(e) = logs(name, tail, follow, false) {
+                if let Err(e) = logs(name, tail, follow, o.log_timestamps, o.log_window) {
                     eprintln!("compose logs: {name}: {e}");
                 }
             }
@@ -7465,9 +7811,320 @@ fn run_terminal_verb(
             crate::boxcp::cp(&to_box(a), &to_box(b))?;
             return Ok(true);
         }
+        ComposeAction::Wait => {
+            // THE EXIT CODE IS THE ANSWER, not the printed number, and that is the difference
+            // between this verb and `kern wait`. A CI job writes `docker compose wait tests` and
+            // branches on the status; Docker documents it as the code of the FIRST container to
+            // stop, and a version of this that always exited 0 would report every failing suite as
+            // a pass. `kern wait <box>` keeps printing and exiting 0 - it is older than this verb,
+            // its contract is frozen with the CLI, and a script reading its stdout is already
+            // correct. The two are spelled differently on purpose and each says so.
+            //
+            // FIRST TO STOP means observed first, so the boxes are polled TOGETHER rather than
+            // waited on in file order: a sequential wait would report whichever service the file
+            // happens to list first, which is not the same question. Every service is still waited
+            // for, as Docker does, so the verb means "the stack has finished" and not "one of them
+            // has".
+            let names: Vec<String> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.clone())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Compose(format!("no services selected in {file}")));
+            }
+            let mut pending: Vec<String> = names.clone();
+            let mut first: Option<i32> = None;
+            while !pending.is_empty() {
+                pending.retain(|n| {
+                    let code = match registry::find_ref(n) {
+                        // Still in the registry: still running, whatever a stale sidecar says.
+                        Some(_) => return true,
+                        None => registry::list_exited()
+                            .into_iter()
+                            .find(|e| e.name == *n)
+                            .map(|e| e.code),
+                    };
+                    match code {
+                        Some(c) => {
+                            println!("{} {c}", short_service_name(n, pod));
+                            // ONLY THE FIRST is adopted: a later service's status is reported on
+                            // stdout and does not overwrite the one this verb promised to return.
+                            if first.is_none() {
+                                first = Some(c);
+                            }
+                            false
+                        }
+                        // Gone from the registry with no record: a foreground box left no
+                        // supervisor to write one, and there is no code to adopt. Reported and
+                        // dropped, rather than polled forever for a number that is not coming.
+                        None => {
+                            eprintln!(
+                                "kern: service '{}' is gone and left no exit record (a foreground box has no supervisor to write one)",
+                                short_service_name(n, pod)
+                            );
+                            false
+                        }
+                    }
+                });
+                if !pending.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            return match first {
+                Some(0) | None => Ok(true),
+                Some(c) => Err(Error::Workload(c)),
+            };
+        }
+        ComposeAction::Events => {
+            // SCOPED BY THE NAME PREFIX AND NOT BY THE POD, for the reason `ps` above documents at
+            // length: a `--no-pod` member carries an empty `pod` field, so a pod filter would stream
+            // nothing for exactly the stacks whose members are most separated. Box names are already
+            // `<pod>-<service>` in both wirings.
+            events_filtered(Some(&format!("{pod}-")))?;
+            return Ok(true);
+        }
+        ComposeAction::Images => {
+            // FROM THE FILE AND THE CACHE, never from the registry: the answer must be the same
+            // whether the stack is up or down, which is what a deploy script asking "do I have these
+            // locally" needs. A service that only declares `build:` has no image reference to report
+            // and says so, rather than being left out of a list its author expects to be complete.
+            let cache = cache_dir();
+            // `--format json`: THE SAME SPELLING `compose ps` TAKES, on the same flag, because a
+            // script that reads one of these two reads the other. It was a table and nothing else,
+            // so `compose images --format json` printed columns to a caller parsing fields - the
+            // failure `ps --format` already had and already fixed.
+            let as_json = o.ps_format.is_some_and(|f| f.eq_ignore_ascii_case("json"));
+            // One row per service, computed once, so the table and the JSON describe the same set.
+            let rows: Vec<(String, String, u64, &'static str)> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| match b.image.as_deref().filter(|i| !i.is_empty()) {
+                    Some(i) => {
+                        let stem = sanitize_ref(i);
+                        let (bytes, dangling) = image_stat(&cache, &stem);
+                        // IS IT HERE AT ALL, THEN IS IT WHOLE, and in that order. `image_stat`
+                        // answers "dangling" for an image with no payload, and an image that was
+                        // never pulled has no payload either - so asking about dangling first
+                        // reported a ref nobody has ever fetched as a BROKEN local image, which
+                        // sends the reader to `rmi` something that does not exist instead of to
+                        // `pull` something that does. The `.ok` sentinel is the "we have this"
+                        // marker; only past it does dangling mean what it says.
+                        let state = if !cache.join(format!("{stem}.ok")).exists() {
+                            "absent"
+                        } else if dangling {
+                            "dangling"
+                        } else {
+                            "cached"
+                        };
+                        (b.service_name().to_string(), i.to_string(), bytes, state)
+                    }
+                    // A service that only BUILDS has no image reference to report, which is a fact
+                    // and not a blank: an empty string here would read as "no image", and the
+                    // service does have one, it just does not have a NAME for it yet.
+                    None => (b.service_name().to_string(), String::new(), 0, "build"),
+                })
+                .collect();
+            if as_json {
+                let out = kern_common::json_array(&rows, |(svc, img, bytes, state)| {
+                    format!(
+                        "{{\"service\":{},\"image\":{},\"size_bytes\":{},\"state\":{}}}",
+                        json_str(svc),
+                        json_str(img),
+                        bytes,
+                        json_str(state),
+                    )
+                });
+                println!("{out}");
+                return Ok(true);
+            }
+            let p = crate::ui::Palette::detect();
+            println!(
+                "{d}{:<24} {:<44} {:>10}{z}",
+                "SERVICE",
+                "IMAGE",
+                "SIZE",
+                d = p.d,
+                z = p.z
+            );
+            for (svc, img, bytes, state) in &rows {
+                let (image, size) = match *state {
+                    "build" => ("(build)".to_string(), "-".to_string()),
+                    "dangling" => (crate::ui::scrub(img), "dangling".to_string()),
+                    "cached" => (crate::ui::scrub(img), human_bytes(*bytes)),
+                    _ => (crate::ui::scrub(img), "not cached".to_string()),
+                };
+                println!("{svc:<24} {image:<44} {size:>10}");
+            }
+            return Ok(true);
+        }
+        ComposeAction::Push => {
+            // A SERVICE WITHOUT `build:` IS NOT YOURS TO PUBLISH, and the first version of this verb
+            // did not know that. It pushed every service carrying an `image:`, which on an ordinary
+            // stack means `postgres:17` and `rabbitmq:3-management` - images the file merely names
+            // and the cache merely pulled. MEASURED on a two-service file: `compose push` went
+            // straight at `postgres:17` and got as far as squashing it before failing for an
+            // unrelated reason. With credentials and a writable namespace it would have succeeded,
+            // which is the outcome worth designing against: publishing somebody else's image under
+            // your name, from a verb the author expected to publish theirs.
+            //
+            // Docker's rule is the one that makes sense and it is the one applied here: `push`
+            // publishes what this file BUILDS. `build:` says the bytes are this project's; `image:`
+            // says where they go. A service with one and not the other is named as skipped, because
+            // "nothing happened" and "nothing needed to happen" are different answers and only one
+            // of them is good news.
+            let mut pushed = 0usize;
+            for b in boxes.iter().filter(|b| selected(b)) {
+                let image = b.image.as_deref().filter(|i| !i.is_empty());
+                match (b.build.is_some(), image) {
+                    (true, Some(i)) => {
+                        push(i, None)?;
+                        pushed += 1;
+                    }
+                    (true, None) => eprintln!(
+                        "kern: note: service '{}' builds an image but declares no `image:`, so there is no name to push it under - skipped",
+                        b.service_name()
+                    ),
+                    (false, _) => eprintln!(
+                        "kern: note: service '{}' declares no `build:`, so its image is not this project's to publish - skipped",
+                        b.service_name()
+                    ),
+                }
+            }
+            println!("compose push: {pushed} image(s) published");
+            return Ok(true);
+        }
+        ComposeAction::Rm => {
+            // WHAT THERE IS TO REMOVE HERE IS THE BREADCRUMB. kern has no "created but stopped"
+            // container, so `docker compose rm`'s object does not exist; what does exist, and what
+            // makes a finished service keep showing up in `kern ps -a`, is its exit record. Removing
+            // those is the honest reading of the verb, and it is bounded to this stack.
+            //
+            // A RUNNING SERVICE IS REFUSED, as Docker refuses to remove a running container without
+            // `-f`: silently leaving it out would report a number that does not match the file.
+            let running: Vec<&str> = boxes
+                .iter()
+                .filter(|b| selected(b) && registry::find(&b.name).is_some())
+                .map(|b| b.service_name())
+                .collect();
+            if !running.is_empty() {
+                return Err(Error::Compose(format!(
+                    "these services are still running: {}. Stop them first \
+                     (`kern compose {file} stop`), then `rm`",
+                    running.join(", ")
+                )));
+            }
+            // THE SAME REAPER `down` USES, bounded to this pod and these names: one definition of
+            // "which sidecar belongs to this stack", so `rm` cannot reach a record `down` would
+            // leave alone, or miss one it would take.
+            let names: Vec<String> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.clone())
+                .collect();
+            let removed = registry::clear_waitexit_pod(pod, &names);
+            println!("compose rm: {removed} service record(s) removed");
+            return Ok(true);
+        }
+        ComposeAction::Top => {
+            // READ FROM THE CGROUP, not from a `ps` inside the box. The image need not contain one,
+            // and a distroless or `FROM scratch` service is exactly the case where "what is this
+            // running" is hardest to answer any other way. A host that cannot delegate a cgroup has
+            // no list to give, and says so per service instead of printing an empty table that reads
+            // as "no processes".
+            let mut any = false;
+            for b in boxes.iter().filter(|b| selected(b)) {
+                let Some(inst) = registry::find(&b.name) else {
+                    continue;
+                };
+                any = true;
+                let p = crate::ui::Palette::detect();
+                println!("{}{}{}{}", p.b, p.c, b.service_name(), p.z);
+                match box_processes(inst.pid1_recorded) {
+                    Some(procs) if !procs.is_empty() => {
+                        println!("{d}{:>8}  COMMAND{z}", "PID", d = p.d, z = p.z);
+                        for (pid, cmd) in procs {
+                            println!("{pid:>8}  {}", crate::ui::scrub(&cmd));
+                        }
+                    }
+                    Some(_) => println!("  (no processes)"),
+                    None => println!(
+                        "  (no delegated cgroup on this host, so the process list cannot be read - \
+                         `kern doctor` says which host you are on)"
+                    ),
+                }
+            }
+            if !any {
+                println!("compose top: no service of this stack is running");
+            }
+            return Ok(true);
+        }
+        ComposeAction::Version => {
+            // WHAT THIS BUILD IMPLEMENTS, in one line a script can read, and the verbs it accepts.
+            // Not a Compose Specification version number: kern implements a SUBSET, and printing
+            // `2.x` would claim conformance nobody has measured.
+            println!(
+                "kern {} - compose subset: {}",
+                kern_common::VERSION,
+                compose_verbs_help()
+            );
+            return Ok(true);
+        }
         ComposeAction::Up | ComposeAction::Start | ComposeAction::Run | ComposeAction::Exec => {}
     }
     Ok(false)
+}
+
+/// The name the FILE gives a box, from the scoped name the registry holds.
+///
+/// A reader of a compose file knows `tests`, not `<project>-<hash>-tests`, and echoing the scoped
+/// form back at them is the step that sends people looking for a service their file does not
+/// contain. Falls back to the full name when the prefix is not there, which is a box renamed by
+/// `container_name:` and therefore already the name its author chose.
+fn short_service_name(box_name: &str, pod: &str) -> String {
+    box_name
+        .strip_prefix(&format!("{pod}-"))
+        .unwrap_or(box_name)
+        .to_string()
+}
+
+/// The processes in a box's cgroup, as `(pid, command line)`, newest kernel order.
+///
+/// `None` when the box has no cgroup of its own to read - a rootless host with no delegation, which
+/// is a real configuration and not an error. An empty `Vec` means the cgroup exists and holds
+/// nothing, which is a different fact and gets a different sentence at the call site.
+///
+/// The command line comes from `/proc/<pid>/cmdline` (NUL-separated argv) and falls back to
+/// `/proc/<pid>/comm` for a kernel thread or a process whose argv has been cleared. Every read is
+/// best-effort: a process that exits between the listing and the read is skipped rather than
+/// failing the whole table.
+fn box_processes(pid1: i32) -> Option<Vec<(i32, String)>> {
+    let dir = kern_isolation::box_cgroup_dir(pid1)?;
+    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;
+    let mut out = Vec::new();
+    for line in procs.lines() {
+        let Ok(pid) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|b| {
+                b.split(|c| *c == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .ok()
+                    .map(|s| format!("[{}]", s.trim()))
+            })
+            .unwrap_or_else(|| "(gone)".to_string());
+        out.push((pid, cmd));
+    }
+    Some(out)
 }
 /// `kern compose <file>` - bring up a stack of boxes (detached) in `depends_on` order. Each
 /// service is launched via a fresh `kern box -d` subprocess, so it gets its own scope + registry
@@ -7571,6 +8228,25 @@ pub struct ComposeOpts<'a> {
     pub env_file: Option<&'a str>,
     /// `--profile` (repeatable): profiles to activate, like `COMPOSE_PROFILES`.
     pub profiles: &'a [String],
+    /// `logs -t/--timestamps`: prefix each line with the time the index recorded for it.
+    pub log_timestamps: bool,
+    /// `logs --since` / `--until` as unix nanoseconds. See `boxlog::Stamper::window` for why a line
+    /// the index cannot place is kept rather than dropped.
+    pub log_window: (Option<u64>, Option<u64>),
+    /// `logs --no-log-prefix`: drop the `=== <service> ===` heading, so the output of several
+    /// services is one stream a downstream parser can read without stripping kern's own lines.
+    pub no_log_prefix: bool,
+    /// `up --force-recreate` / `up --no-recreate`. See [`RecreatePolicy`].
+    pub recreate: RecreatePolicy,
+    /// `up -V/--renew-anon-volumes`: discard this project's ANONYMOUS volumes before bring-up, so
+    /// each is seeded from its image again instead of carrying the last run's contents.
+    ///
+    /// kern names an anonymous volume from the service and the path it mounts at
+    /// (`<project>_anon-<service>-<path>`) rather than from a random id, which is what makes it
+    /// reused across `up` the way Compose reuses Docker's. That reuse is the whole thing this flag
+    /// turns off, and the derived name is also what BOUNDS the deletion: only this project's
+    /// volumes, and only the ones it synthesised.
+    pub renew_anon_volumes: bool,
 }
 
 /// Derive a STABLE, per-stack pod name from a compose file path. Uses the parent DIRECTORY name
@@ -8266,7 +8942,7 @@ size = "2g"
 mod lifecycle;
 pub(crate) use lifecycle::*;
 
-mod boxlog;
+pub(crate) mod boxlog;
 pub(crate) use boxlog::*;
 
 mod rootfs;

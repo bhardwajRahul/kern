@@ -262,9 +262,43 @@ fn join_pod_and_bind_its_files(
     on_bridge: bool,
 ) -> Result<Option<i32>, Error> {
     let Some(pod) = pod else { return Ok(None) };
+    // VALIDATED ON THE WAY IN, not only on the way out. `pod create` has always checked the name
+    // against the shared resource-name rule (letters, digits, `_`, `-`, `.`, no traversal, no
+    // leading `-`/`.`) because it becomes a DIRECTORY; the join path took the name straight from
+    // argv and handed it to `pod_dir`, which is `pods_root().join(name)` with nothing in between.
+    //
+    // Nothing escapes in practice - the join then requires `<dir>/holder` to hold a live pid AND
+    // `<dir>/netns` to match that process's namespace inode, a conjunction an arbitrary directory
+    // does not satisfy - so this is closing an asymmetry rather than a hole. It is worth closing
+    // anyway: a name that cannot NAME a pod should be refused as a name, not as a lookup that
+    // happened to find nothing, and `--network <name>` gave that path a second entrance.
+    crate::pod::validate_join_name(pod)?;
+    // THE NAME REACHES HERE FROM TWO FLAGS, and the refusal has to serve both. `--pod <name>` is
+    // kern's own spelling; `--network <name>` is the Docker habit (`run --rm --network <stack-net>`,
+    // the one-off that talks to a running stack), and a stack started by `kern compose` IS a pod, so
+    // the two are one operation. What the name can be is checked HERE rather than in the parser: the
+    // answer depends on runtime state, and a parser that reads the registry is a parser whose result
+    // depends on which boxes happen to be running.
     let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
+        // A `kern network` is a DIFFERENT object with the same shape of name, and it is the thing a
+        // reader who typed `--network` is most likely to have meant. Say which one it found.
+        if crate::network::exists(pod) {
+            return Error::Sandbox(format!(
+                "'{pod}' is a kern NETWORK, not a pod. A network is joined by a compose file \
+                 declaring it `external: true`, not by a single box; for a one-off on a stack's \
+                 network run it as a service of that file: \
+                 `kern compose <file> run --rm <service> <cmd>`"
+            ));
+        }
+        let live = crate::pod::live_names();
+        let known = if live.is_empty() {
+            "no pod is running".to_string()
+        } else {
+            format!("running: {}", live.join(", "))
+        };
         Error::Sandbox(format!(
-            "no running pod '{pod}' - create it first with `kern pod create {pod}`"
+            "no running pod '{pod}' ({known}) - create it with `kern pod create {pod}`, or name a \
+             stack's pod, which `kern pod ls` lists"
         ))
     })?;
     // A BRIDGE MEMBER GETS NEITHER THE ENTRY NOR THE FILE, and this is not an optimisation.

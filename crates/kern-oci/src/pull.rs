@@ -100,6 +100,14 @@ pub struct ImageConfig {
     /// `config.StopSignal` - the signal the image asks to be stopped with (`SIGQUIT` for nginx,
     /// `SIGWINCH` for apache). `None` when the image says nothing, which means `SIGTERM`.
     pub stop_signal: Option<String>,
+    /// `config.Labels` as `KEY=VALUE` strings, in the order the config lists them.
+    ///
+    /// READ BECAUSE A FILTER CANNOT BE ANSWERED FROM NOTHING. `docker images --filter label=k=v` is
+    /// how a build pipeline finds its own images among a shared cache, and kern refused the key
+    /// outright because the cache kept no value for it - a truthful refusal, and a gap. The labels
+    /// are also what `org.opencontainers.image.*` metadata lives in, so an image's source commit and
+    /// version are readable without pulling its config again.
+    pub labels: Vec<String>,
     /// `config.Healthcheck` - the check the IMAGE ships, used when the compose file declares none.
     ///
     /// Docker runs an image's own `HEALTHCHECK` whether or not the compose file mentions one, and
@@ -492,8 +500,30 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         user: first_str(cfg, "User").and_then(nonempty),
         exposed_ports: exposed_ports_after(cfg),
         stop_signal: first_str(cfg, "StopSignal").and_then(nonempty),
+        labels: labels_after(cfg),
         healthcheck: healthcheck_after(cfg),
     }
+}
+
+/// The image's `config.Labels` as `KEY=VALUE`, or empty when it declares none.
+///
+/// SCOPED TO THE LABELS OBJECT, for the reason `healthcheck_after` is: a scan across the whole blob
+/// would pick up keys from anywhere. The object is a flat `{"k":"v", …}` map of strings, so the
+/// quoted runs inside it alternate key, value, key, value - which is the only structure this needs
+/// and the only one Docker writes there. A key with no value (a truncated object) is dropped rather
+/// than paired with the next key's value.
+pub(crate) fn labels_after(cfg: &str) -> Vec<String> {
+    let Some(obj) = object_after(cfg, "Labels") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut strings = crate::json::quoted_strings(obj);
+    while let (Some(k), Some(v)) = (strings.next(), strings.next()) {
+        if !k.is_empty() {
+            out.push(format!("{k}={v}"));
+        }
+    }
+    out
 }
 
 /// The image's own `config.Healthcheck`, or `None` when it declares none.
@@ -1060,6 +1090,27 @@ fn without_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// The registry's OWN diagnosis, lifted out of an auth/token error body and SCRUBBED.
+///
+/// ONE FUNCTION, TWO CALLERS, and the second is why it exists. The token-fetch path carried a remote
+/// `message` into an error and stripped its control characters, with a test pinning that rule; the
+/// credential check `kern login` runs was then written beside it and lifted the same field WITHOUT
+/// the strip, because the rule lived in an expression rather than in a name. A registry that answers
+/// a failed login with `denied\e[2K\e[1A\e[32m logged in` repaints the line above it and leaves
+/// the operator reading a success that did not happen.
+///
+/// Control characters include newline and tab, which is also what keeps a multi-line reply from
+/// breaking a single-line error. An empty or whitespace-only value is `None`: a registry that says
+/// nothing must not produce an error that says nothing either.
+fn registry_diagnosis(body: &str) -> Option<String> {
+    first_str(body, "message")
+        .or_else(|| first_str(body, "details"))
+        .or_else(|| first_str(body, "error_description"))
+        .or_else(|| first_str(body, "error"))
+        .map(|m| without_control_chars(&m))
+        .filter(|m| !m.trim().is_empty())
+}
+
 /// Escape a value for curl's `-K` config double-quoted string: backslash-escape `\` and `"`, and
 /// DROP control characters (`\n`/`\r`/…). A newline would otherwise close the `user = "…"` line and
 /// let a crafted credential inject an arbitrary curl directive; control chars can't appear in a valid
@@ -1208,13 +1259,7 @@ pub(crate) fn discover_auth_scoped(
                     // where the text is guaranteed to be attacker-influenced. Control characters
                     // include newline and tab, which is also what keeps a multi-line reply from
                     // breaking the single-line error format.
-                    let why = first_str(&s, "message")
-                        .or_else(|| first_str(&s, "details"))
-                        .or_else(|| first_str(&s, "error_description"))
-                        .or_else(|| first_str(&s, "error"))
-                        .map(|m| without_control_chars(&m))
-                        .filter(|m| !m.trim().is_empty());
-                    match why {
+                    match registry_diagnosis(&s) {
                         Some(m) => OciError::Registry(format!(
                             "{registry} refused the token request: {m} (the credentials reached it, \
                              so this is about what that account may do with this name, not about \
@@ -1294,6 +1339,114 @@ fn host_from_authority(authority: &str) -> String {
 enum Challenge {
     Bearer { realm: String, service: String },
     Basic,
+}
+
+/// Does `registry` ACCEPT these credentials? The check `kern login` runs before it stores anything.
+///
+/// IT USED TO STORE WHATEVER IT WAS GIVEN AND PRINT `logged in`. MEASURED: `kern login --username
+/// AWS` with the password `x` answered `logged in to registry-1.docker.io as AWS` and wrote that
+/// pair to the credential store, over whatever was there. Two things follow from a login that
+/// cannot fail, and both were live. A CI job runs
+/// `aws ecr get-login-password | kern login --username AWS --password-stdin <ecr>` and continues on
+/// exit 0, so an expired or empty token is discovered several steps later at the `push`, reported as
+/// a push problem. And the store holds ONE entry per registry, so a typo silently replaces working
+/// credentials with broken ones.
+///
+/// THE CHECK IS THE SAME CHALLENGE DANCE A PULL DOES, with two differences: the credentials are the
+/// ones being tested rather than the ones on disk, and the token is requested WITHOUT a repository
+/// scope, because there is no repository here - the question is "are you who you say you are", not
+/// "may you read that". The credential-host guard is the same and is not optional: a registry that
+/// points its `realm` at another host does not get told the password, and the check fails loudly
+/// rather than quietly proving nothing.
+///
+/// An OPEN registry (no `401` on `/v2/`) has nothing to verify against and cannot reject anything;
+/// that is reported as success, because refusing would make `kern login` impossible against a
+/// registry whose write path authenticates and whose read path does not.
+pub fn verify_credentials(registry: &str, user: &str, pass: &str) -> Result<(), OciError> {
+    let headers = crate::net::head_headers(&format!("{}/v2/", reg_base(registry)))?;
+    if http_status(&headers) != 401 {
+        return Ok(());
+    }
+    match parse_www_authenticate(&headers) {
+        Some(Challenge::Bearer { realm, service }) => {
+            if !realm_host_trusted(&realm, registry) {
+                return Err(OciError::Registry(format!(
+                    "{registry} points its authentication at a different host ({realm}) - refusing \
+                     to send it a password. Nothing was stored"
+                )));
+            }
+            let sep = if realm.contains('?') { '&' } else { '?' };
+            let url = format!("{realm}{sep}service={service}");
+            let mut base = vec!["-sSL"];
+            base.extend_from_slice(reg_pin(registry));
+            base.extend_from_slice(&[
+                "--max-redirs",
+                "5",
+                "--max-filesize",
+                "8000000",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
+                "--",
+                url.as_str(),
+            ]);
+            let body = crate::net::curl_with_config(&base, &curl_user_config(user, pass))?;
+            let s = String::from_utf8_lossy(&body);
+            if first_str(&s, "token").is_some() || first_str(&s, "access_token").is_some() {
+                return Ok(());
+            }
+            // The registry's OWN diagnosis when it has one: `incorrect username or password` from
+            // Hub, `DENIED` from GHCR. A generic sentence here would send the reader to look at
+            // their network while the answer was in the body.
+            //
+            // SCRUBBED, because that text is REMOTE and lands on a terminal. A registry that answers
+            // a failed login with `denied\e[2K\e[1A\e[32m logged in` repaints the line above and
+            // leaves the operator reading a success that did not happen. Same rule, same function,
+            // as the token-fetch path one screen down.
+            let why =
+                registry_diagnosis(&s).unwrap_or_else(|| "the registry rejected them".to_string());
+            Err(OciError::Registry(format!(
+                "{registry} did not accept the credentials for '{user}': {why}"
+            )))
+        }
+        // A `Basic` registry answers the ping itself once the header is right, so the ping IS the
+        // check: 401 again means the pair is wrong.
+        Some(Challenge::Basic) => {
+            let url = format!("{}/v2/", reg_base(registry));
+            let mut args = vec!["-sS"];
+            args.extend_from_slice(reg_pin(registry));
+            args.extend_from_slice(&[
+                "--max-filesize",
+                "1000000",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "30",
+                "-o",
+                "/dev/null",
+                "-D",
+                "-",
+                "--",
+                url.as_str(),
+            ]);
+            let out = crate::net::curl_with_config(&args, &curl_user_config(user, pass))?;
+            let headers = String::from_utf8_lossy(&out);
+            match http_status(&headers) {
+                200..=299 => Ok(()),
+                401 | 403 => Err(OciError::Registry(format!(
+                    "{registry} did not accept the credentials for '{user}'"
+                ))),
+                other => Err(OciError::Registry(format!(
+                    "{registry} answered {other} to the credential check; nothing was stored"
+                ))),
+            }
+        }
+        None => Err(OciError::Registry(format!(
+            "{registry} asked for authentication in a scheme kern does not implement (neither \
+             Bearer nor Basic); nothing was stored"
+        ))),
+    }
 }
 
 /// Parse the `WWW-Authenticate` header from a raw HTTP response-header block.
@@ -3121,6 +3274,30 @@ mod token_error_tests {
             !clean.chars().any(|c| c.is_control()),
             "no control character may survive: {clean:?}"
         );
+        // THE RULE IS A FUNCTION, and this is what both callers reach. It was an expression written
+        // out at one call site, and the credential check `kern login` runs was then written beside
+        // it lifting the same field without the strip: a rule that lives in an expression is copied,
+        // and a copy is where it stops matching. Exercising the extractor covers both.
+        use super::registry_diagnosis;
+        let body = format!("{{\"errors\":[{{\"code\":\"DENIED\",\"message\":\"{hostile}\"}}]}}");
+        let lifted = registry_diagnosis(&body).expect("a message must be found");
+        assert!(
+            !lifted.chars().any(|c| c.is_control()),
+            "no control character may reach a terminal: {lifted:?}"
+        );
+        assert!(
+            lifted.starts_with("denied"),
+            "the words survive: {lifted:?}"
+        );
+        // A body with nothing to say produces NOTHING, so a caller falls back to its own sentence
+        // rather than printing an empty diagnosis.
+        assert_eq!(registry_diagnosis("{}"), None);
+        assert_eq!(registry_diagnosis("{\"message\":\"   \"}"), None);
+        // The preference order is the one both callers relied on.
+        assert_eq!(
+            registry_diagnosis("{\"error\":\"e\",\"message\":\"m\"}").as_deref(),
+            Some("m")
+        );
         assert!(
             clean.starts_with("denied"),
             "the readable text is kept: {clean:?}"
@@ -4934,5 +5111,50 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::labels_after;
+
+    /// AN IMAGE'S LABELS ARE READ, and they were dropped on both paths that produce an image.
+    ///
+    /// `docker images --filter label=` cannot answer for an image whose labels were thrown away, and
+    /// `org.opencontainers.image.*` is where a build records its source commit and its version. The
+    /// pull path did not parse them and the build path discarded them at the parser with a comment
+    /// saying so, so the cache held images about which one true question could not be asked.
+    #[test]
+    fn labels_are_read_from_the_config_and_only_from_the_labels_object() {
+        // The ordinary shape, in the order the config lists them.
+        let cfg = r#"{"Cmd":["nginx"],"Labels":{"maintainer":"NGINX Docker Maintainers","org.opencontainers.image.version":"1.27"}}"#;
+        assert_eq!(
+            labels_after(cfg),
+            [
+                "maintainer=NGINX Docker Maintainers",
+                "org.opencontainers.image.version=1.27"
+            ]
+        );
+
+        // SCOPED TO THE OBJECT, which is the property that stops an unrelated field becoming a
+        // label: `Env` is a sibling and its strings must not be paired into this list.
+        let sibling = r#"{"Env":["PATH=/usr/bin","TZ=UTC"],"Labels":{"a":"1"},"User":"root"}"#;
+        assert_eq!(labels_after(sibling), ["a=1"]);
+
+        // Absent, empty, and a value carrying JSON escapes (Go escapes `<`, `>` and `&` by default,
+        // which is exactly how a maintainer's email address arrives).
+        assert!(labels_after(r#"{"Cmd":["sh"]}"#).is_empty());
+        assert!(labels_after(r#"{"Labels":{}}"#).is_empty());
+        assert_eq!(
+            labels_after(r#"{"Labels":{"maintainer":"a <b@c>"}}"#),
+            ["maintainer=a <b@c>"]
+        );
+
+        // A KEY WITH NO VALUE IS DROPPED, not paired with the next key's value - the failure mode of
+        // reading a flat map as a flat list of strings, and the one that would silently mislabel
+        // every image after a truncated one.
+        assert_eq!(labels_after(r#"{"Labels":{"a":"1","b"}}"#), ["a=1"]);
+        // An empty key is not a label.
+        assert_eq!(labels_after(r#"{"Labels":{"":"1","b":"2"}}"#), ["b=2"]);
     }
 }

@@ -95,6 +95,7 @@ Outside that list, on this corpus, kern accepts every file Docker accepts.
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd**, digest-pinned `@sha256:` refs **content-verified** (the manifest is checked against the pin) |
 | **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|watch\|port\|systemd\|run\|cp]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
+| **Dockerfile** `build` (dry run) | ✅ `kern build --check [ctx]` parses the file and reports what kern does with every instruction, building nothing: honoured, or `dropped` with what happens instead. A `COPY` from the context is resolved against it, so a source that escapes or is missing fails the check rather than the build; a glob or a `COPY --from` is left to the build, which is where it becomes answerable. Exit 0 if it builds here, non-zero with the refusal if it does not, so it can gate a pipeline before a base image is pulled |
 | **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: `docker load`-compatible |
@@ -316,16 +317,17 @@ manual on purpose.
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` / `create` | `box` | one verb; `-d` detaches, `-it` for a PTY, `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD (`--entrypoint ""` clears it) |
-| `exec` | `exec` | joins the box's namespaces, with the box's own environment |
-| `ps` | `ps` | `-a`/`--all`, `-q`, `--filter name=/status=/id=`, `--format '{{.Field}}'`, `--json` |
-| `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs) |
+| `run` / `create` | `box` | one verb; `-d` detaches, `-t`/`-it` for a PTY (`-i` alone keeps stdin attached without one, as on docker), `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD (`--entrypoint ""` clears it). `--network <name>` joins a running POD, which is what a `kern compose` stack is, so a one-off can talk to a stack the way `docker run --network <net>` does |
+| `exec` | `exec` | joins the box's namespaces, with the box's own environment. `-t` allocates a PTY and `-i` does NOT, as on docker, so `exec -i <box> psql … < seed.sql` feeds a file in without a terminal echoing it back |
+| `ps` | `ps` | `-a`/`--all`, `-q`, `--filter name=/status=/id=/label=/pod=/health=`, `--format '{{.Field}}'`, `--json`, `--no-trunc`, `--last N`/`-n N` (counts across live and exited, implies `-a`) |
+| `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs), `-t`, `--since`/`--until`. The window is read from the same index `-t` prints from; a line the index cannot place in time is KEPT, because the index buckets from 100 ms and discarding what it cannot place would lose real output |
 | `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s), then SIGKILLs what is left. `kill` is an ALIAS, not Docker's immediate kill: to skip the wait use `--stop-timeout 0`. A grace that provably cannot end is skipped, not sat out |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
 | `attach` | `attach` | Ctrl-C detaches, box keeps running |
 | `cp` | `cp` | host↔box, symlinks cannot escape the box root |
-| `inspect` | `inspect` | `--json` |
-| `stats` | `stats` | per-box CPU / memory |
+| `inspect` | `inspect` | `--json`, and `-f`/`--format` with docker's own paths: `.State.Status`, `.State.Running`, `.State.Paused`, `.State.Pid`, `.State.ExitCode`, `.State.Health.Status`, `.Name`, `.Image`. A field kern cannot answer truthfully is refused by name, and so is a box kern has no record of: a wait loop reading `exited` for a misspelled name would take it for done |
+| `stats` | `stats` | per-box CPU / memory. `--no-stream` is accepted and names what already happens: kern prints a snapshot, `kern top` is the live view |
+| `images` | `images` | `--json`, and all five of Docker's `--filter` keys: `reference=` (a pattern, `*` allowed, no tag means any tag), `dangling=`, `label=` (`k` or `k=v`), `before=`/`since=` (another image's ref). An image's `LABEL`s are read on both paths that produce one, a pull and a build |
 | `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
@@ -334,20 +336,26 @@ manual on purpose.
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
 | `start` (resume a stopped container) | *(none)* | a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume |
-| `login` / `logout` | `login` / `logout` | `kern login [registry] [--username U]`, and see below |
+| `login` / `logout` | `login` / `logout` | `kern login [registry] [--username U] [--password-stdin]`. The credentials are CHECKED against the registry before they are stored, so a bad one fails here rather than at the next push, and a failed attempt leaves a working credential in place |
+| `port` | `port` | `kern port <box> [<container-port>[/tcp\|/udp]]`: the host address serving that port, or every mapping when no port is named. Read from the running box, so it reports what was actually bound rather than what the file asked for |
 
 ### Every `docker compose` verb and flag kern accepts
 
 | | |
 |---|---|
-| **Verbs** | `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`, `pull`, `config`, `watch`, `port`, `systemd`, `run`, `cp`, `exec` (with the `--` Docker users type) |
-| **`up`** | `-d`, `--wait`, `--wait-timeout`, `--exit-code-from`, `--abort-on-container-exit`, `--no-deps`, `--build` (`--no-build` is refused, not ignored), `--quiet-pull` |
+| **Verbs** | `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`, `pull`, `config`, `watch`, `port`, `systemd`, `run`, `cp`, `exec` (with the `--` Docker users type), `wait`, `events`, `images`, `push`, `rm`, `top`, `version`, `kill` (= `stop`). `create` and `scale` are refused by name: kern has no created-but-not-started state and no replica count |
+| **`wait`** | exits with the status of the first service to stop, as Docker's does, after waiting for all of them. `kern wait <box>` PRINTS the code and exits 0: that contract is older and frozen |
+| **`push`** | publishes only the services the file BUILDS (`build:` plus `image:`). A service that merely names an upstream image is skipped by name: it is not this project's to publish |
+| **`up`** | `-d`, `--wait`, `--wait-timeout`, `--exit-code-from`, `--abort-on-container-exit`, `--no-deps`, `--build` (`--no-build` is refused, not ignored), `--quiet-pull`, `--force-recreate`, `--no-recreate` (writing both is refused by name), `-V`/`--renew-anon-volumes` |
 | **`down`** | `-v`, `--remove-orphans`, `-t`/`--timeout`, `--rmi local\|all` |
 | **`run`** | `-d`, `--rm`, `-T`, `--name`, `--entrypoint`, `-e`, `--user`, `--pull`, `--no-deps` |
 | **`ps`** | `-q`, `--services`, `--format json` (Docker's field names beside kern's, plus `Publishers`) |
+| **`logs`** | `--tail`, `-f`, `-t`, `--since`, `--until` (a duration, unix seconds, or RFC3339 UTC), `--no-log-prefix` |
+| **`images`** | `--format json`, with a `state` per service: `cached`, `dangling`, `absent`, or `build` for a service that has no `image:` to name |
 | **`build` / `pull`** | `--build-arg`, `--ignore-pull-failures` |
 | **`config`** | `--services` prints the names one per line and nothing else |
 | **Everywhere** | `-p`, `--env-file`, `--profile`, and `--flag=value` wherever `--flag value` works |
+| **The file** | positional (`kern compose f.yml up`), behind `-f` before the verb, or OMITTED: with no file the directory is searched for `docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `compose.yaml`, `kern.toml`, so `kern compose up -d` works where `docker compose up -d` does. A bare `kern compose` still prints usage rather than guessing a verb |
 | **Files read** | `docker-compose.override.yml`, `extends: {file: ...}`, the project `.env`, `env_file:` long form, anonymous volumes in long form, named volumes scoped to the project, a secret from an environment variable |
 | **Keys applied** | `cpu_shares`, `memswap_limit` (a total, unlike cgroup v2's field), `ulimits` (including the one-line mapping form), `runtime:`, `ipv4_address:`, `depends_on` conditions, `network_mode: service:X`, an image's own `HEALTHCHECK` / `STOPSIGNAL` / `Cmd` / `Entrypoint` / `Env`, a healthcheck in exec form, `--tmpfs uid=`/`gid=` |
 | **Keys named, not dropped** | an unknown service key (with the near-miss suggestion), `deploy.replicas` / `mode` / `placement` / `update_config` / `rollback_config` / `endpoint_mode`, `deploy.restart_policy`, and `deploy.resources.reservations`: a GPU request says the service runs WITHOUT the device and where a device comes from |

@@ -150,6 +150,42 @@ pub(crate) fn str_array_after(json: &str, key: &str) -> Vec<String> {
     out
 }
 
+/// Every quoted string in `json`, in order, with escapes decoded.
+///
+/// FOR A FLAT MAP OF STRINGS, where the quoted runs alternate key, value, key, value - an OCI
+/// config's `Labels` being the one that matters here. It shares its scanner with
+/// [`str_array_after`] in behaviour but not in code, and the difference is deliberate: that one
+/// takes a KEY and finds its array, this one takes the object it has already been handed. Merging
+/// them would mean a function that sometimes searches and sometimes does not.
+///
+/// A truncated escape ends the scan, returning what was already complete, which is the same
+/// direction [`str_array_after`] fails in: lose the tail, never invent one.
+pub(crate) fn quoted_strings(json: &str) -> impl Iterator<Item = String> + '_ {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut chars = json.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_str {
+            in_str = c == '"';
+            continue;
+        }
+        match c {
+            '"' => {
+                out.push(std::mem::take(&mut cur));
+                in_str = false;
+            }
+            '\\' => match decode_escape(&mut chars) {
+                Some(Some(ch)) => cur.push(ch),
+                Some(None) => {}
+                None => break,
+            },
+            _ => cur.push(c),
+        }
+    }
+    out.into_iter()
+}
+
 /// Split a `[...]` array into its top-level `{...}` objects.
 pub(crate) fn split_objects(arr: &str) -> Vec<&str> {
     let b = arr.as_bytes();

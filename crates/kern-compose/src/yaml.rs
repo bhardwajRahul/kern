@@ -4499,20 +4499,67 @@ fn command_value(node: &Node) -> Vec<String> {
 
 /// Split a command STRING into an argv the way a shell would tokenise it, without running one.
 ///
-/// Quotes GROUP and are removed; a backslash escapes the next character outside single quotes, which
-/// is what lets `sh -c "npm ci && npm run dev"` arrive as three arguments with the `&&` intact
-/// INSIDE the third. Everything else is separated on whitespace. There is no expansion of any kind:
-/// `$VAR` was already substituted by the compose interpolation pass long before this runs, and a
-/// `$` that survived it is a literal the workload is meant to see.
+/// Quotes GROUP and are removed; a backslash escapes, which is what lets
+/// `sh -c "npm ci && npm run dev"` arrive as three arguments with the `&&` intact INSIDE the third.
+/// Everything else is separated on whitespace. There is no expansion of any kind: `$VAR` was already
+/// substituted by the compose interpolation pass long before this runs, and a `$` that survived it
+/// is a literal the workload is meant to see.
+///
+/// THE BACKSLASH IS NOT THE SAME CHARACTER IN ALL THREE CONTEXTS, and treating it as one silently
+/// TRUNCATED commands. POSIX 2.2.1-2.2.3 gives three different rules, and this function now gives
+/// three:
+///
+///  * unquoted: `\<c>` is a literal `<c>`, and `\<newline>` is a line continuation (both vanish),
+///  * single quotes: NOTHING is special, a backslash included, until the closing `'`,
+///  * double quotes: the backslash escapes exactly `$`, `` ` ``, `"`, `\` and a newline. Before any
+///    OTHER character it is a literal backslash and the character keeps its own meaning.
+///
+/// MEASURED, and this is what the rule costs when it is missing. The `\"` in
+///
+/// ```text
+/// command: >
+///   sh -c "echo A; echo \"B C\"; echo D; sleep 40"
+/// ```
+///
+/// used to close the quote instead of escaping it, because INSIDE a quote there was no backslash
+/// case at all: the backslash fell through to "copy this character", the `"` after it was then read
+/// as the closing quote, and the escape became two separate tokens. The argv became
+/// `["sh", "-c", "echo", "A;", "echo", "\\B", "C\";", …]`: `sh -c` received `echo` as its script and
+/// everything after it as positional parameters, so the box printed `A`, printed `B`, and exited 0
+/// without ever reaching `echo D` or the `sleep`. The real file this came from (a Hatchet dashboard)
+/// ends its script with `nginx -g 'daemon off;'`, which therefore never ran: the service exited
+/// clean, restarted on failure, and served nothing, with no warning at any layer.
 ///
 /// An unterminated quote yields what it has rather than an error: the file is malformed, and the
 /// workload's own argument parser gives a better message about it than this function could.
 fn split_argv(s: &str) -> Vec<String> {
-    let (mut out, mut cur, mut has) = (Vec::new(), String::new(), false);
+    // ONE scratch buffer, sized from the input and REUSED across arguments: an argument never holds
+    // more bytes than the whole string, so the buffer never grows again after this. Each finished
+    // argument is cloned out at its exact length (`clone` allocates `len`, not `capacity`), which is
+    // the allocation the returned `Vec<String>` owns and cannot be avoided. `mem::take` was the
+    // alternative and is worse on both counts: it hands the oversized buffer to the first argument
+    // and makes every later one grow from zero.
+    let (mut out, mut cur, mut has) = (Vec::new(), String::with_capacity(s.len()), false);
     let mut quote: Option<char> = None;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         match (quote, c) {
+            // DOUBLE QUOTES, BACKSLASH. THIS ARM DID NOT EXIST, which is the whole defect: the
+            // backslash fell through to the copy-verbatim arm below and the `"` after it closed the
+            // string. POSIX names four escapable characters plus the newline; any other backslash is
+            // data, so `"C:\path"` and `"\n"` reach the workload unchanged.
+            (Some('"'), '\\') => match chars.next() {
+                Some(n @ ('$' | '`' | '"' | '\\')) => cur.push(n),
+                // Line continuation: the backslash and the newline both vanish, and no word
+                // boundary is created. `has` is already true, set by the opening quote.
+                Some('\n') => {}
+                Some(n) => {
+                    cur.push('\\');
+                    cur.push(n);
+                }
+                // A trailing backslash inside an unterminated quote is data, not an error.
+                None => cur.push('\\'),
+            },
             // Inside single quotes nothing is special, not even a backslash: shell rules.
             (Some('\''), '\'') | (Some('"'), '"') => quote = None,
             (Some(_), _) => cur.push(c),
@@ -4522,15 +4569,20 @@ fn split_argv(s: &str) -> Vec<String> {
                 // would shift every argument after it by one position.
                 has = true;
             }
-            (None, '\\') => {
-                if let Some(n) = chars.next() {
+            (None, '\\') => match chars.next() {
+                // Unquoted line continuation: both characters vanish and no word is delimited, so
+                // `has` is left exactly as it was rather than forced true.
+                Some('\n') => {}
+                Some(n) => {
                     cur.push(n);
                     has = true;
                 }
-            }
+                None => {}
+            },
             (None, c) if c.is_whitespace() => {
                 if has {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(cur.clone());
+                    cur.clear();
                     has = false;
                 }
             }
@@ -6916,6 +6968,137 @@ mod tests {
             cmd("services:\n  a:\n    image: alpine\n    command:\n      - a\n      - b c\n"),
             ["a", "b c"]
         );
+    }
+
+    /// THE BACKSLASH MEANS THREE DIFFERENT THINGS, and collapsing them to one TRUNCATED commands.
+    ///
+    /// Reproduced from a Hatchet dashboard service whose script ends `nginx -g 'daemon off;'` after
+    /// an `echo \"…\"`. Inside a quoted string there was no backslash case at all, so `\"` ENDED the
+    /// string instead of escaping a quote inside it: everything from there on was split on
+    /// whitespace and arrived as positional parameters of `sh` rather than as part of its `-c`
+    /// script. MEASURED on a real box before the fix - the service printed `A`, printed `B`, exited
+    /// 0, and never reached the `nginx` that is the point of the service.
+    ///
+    /// Each case below is one line of POSIX 2.2.1-2.2.3, and every one of them is a case a compose
+    /// file in the wild actually writes.
+    #[test]
+    fn a_backslash_follows_posix_in_each_quoting_context() {
+        // THE REPORTED SHAPE, written the way the file writes it: a folded scalar carrying `\"`.
+        // The whole script must arrive as ONE argument, quotes restored.
+        let cmd = |y: &str| parse(y).unwrap().into_iter().next().unwrap().command;
+        assert_eq!(
+            cmd("services:\n  a:\n    image: alpine\n    command: >\n      sh -c \"echo A; echo \\\"B C\\\"; echo D\"\n"),
+            ["sh", "-c", "echo A; echo \"B C\"; echo D"]
+        );
+
+        // DOUBLE QUOTES: the four escapable characters, and nothing else.
+        assert_eq!(split_argv(r#""a \"b\" c""#), [r#"a "b" c"#]);
+        assert_eq!(split_argv(r#""a \\ b""#), [r"a \ b"]);
+        assert_eq!(split_argv(r#""a \$b""#), ["a $b"]);
+        assert_eq!(split_argv("\"a \\`b\""), ["a `b"]);
+        // A BACKSLASH BEFORE ANYTHING ELSE IS DATA, and this is the half that a "backslash always
+        // escapes" rule gets wrong in the other direction: a Windows path and a literal `\n` must
+        // survive a double-quoted argument intact.
+        assert_eq!(split_argv(r#""C:\path\to\file""#), [r"C:\path\to\file"]);
+        assert_eq!(split_argv(r#""line\nfeed""#), [r"line\nfeed"]);
+        // A backslash at the very end of an unterminated quote is data, not a panic and not a drop.
+        assert_eq!(split_argv("\"a \\"), ["a \\"]);
+        // Line continuation inside double quotes: both characters vanish, no word is delimited.
+        assert_eq!(split_argv("\"a \\\nb\""), ["a b"]);
+
+        // SINGLE QUOTES: nothing is special, the backslash included. `'daemon off;'` is the shape
+        // that matters, and `'a\"b'` must keep both the backslash and the quote.
+        assert_eq!(
+            split_argv(r#"nginx -g 'daemon off;'"#),
+            ["nginx", "-g", "daemon off;"]
+        );
+        assert_eq!(split_argv(r#"'a\"b'"#), [r#"a\"b"#]);
+        assert_eq!(split_argv(r"'a\b'"), [r"a\b"]);
+
+        // UNQUOTED: the backslash escapes the next character, whatever it is, and a backslash
+        // before a newline is a line continuation that joins the two halves into ONE word.
+        assert_eq!(split_argv(r"a\ b"), ["a b"]);
+        assert_eq!(split_argv(r#"a\"b"#), [r#"a"b"#]);
+        assert_eq!(split_argv("ab\\\ncd"), ["abcd"]);
+        // A continuation that starts a word must not fabricate an empty argument.
+        assert_eq!(split_argv("\\\n"), Vec::<String>::new());
+        // A trailing unquoted backslash consumes nothing and produces nothing.
+        assert_eq!(split_argv("a \\"), ["a"]);
+
+        // THE THREE CONTEXTS IN ONE STRING, which is what the reported file is.
+        assert_eq!(
+            split_argv(r#"sh -c "echo \"x\"; nginx -g 'daemon off;'""#),
+            ["sh", "-c", r#"echo "x"; nginx -g 'daemon off;'"#]
+        );
+    }
+
+    /// TOTALITY AND A ROUND TRIP, because a hand-written table only proves the cases someone thought
+    /// of, and the case nobody thought of is the one that shipped.
+    ///
+    /// Two properties, neither of which any single assertion above implies:
+    ///
+    ///  * the splitter TERMINATES AND NEVER PANICS on every string of length 6 over the alphabet
+    ///    that decides its control flow (`\`, `"`, `'`, space, newline, a letter) - 46656 inputs,
+    ///    which is the whole short-input space where a quote/escape scanner's bug lives,
+    ///  * anything POSIX single-quoting can express SURVIVES A ROUND TRIP. That is the oracle: the
+    ///    quoting rule is independent of the splitting rule, so agreement between them is evidence
+    ///    rather than a restatement.
+    #[test]
+    fn split_argv_is_total_and_round_trips_posix_quoting() {
+        let alphabet = ['\\', '"', '\'', ' ', '\n', 'a'];
+        let n = alphabet.len();
+        let mut buf = String::with_capacity(6);
+        for i in 0..n.pow(6) {
+            buf.clear();
+            let mut x = i;
+            for _ in 0..6 {
+                buf.push(alphabet[x % n]);
+                x /= n;
+            }
+            // No panic, and no argument can outnumber the characters that could have separated them.
+            let out = split_argv(&buf);
+            assert!(out.len() <= buf.len(), "impossible argv width for {buf:?}");
+        }
+
+        // POSIX single-quoting: `'` ends the literal, so an embedded `'` is written `'\''`. Nothing
+        // else inside is special, which is exactly the rule the splitter implements for that context.
+        let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+        let cases: Vec<Vec<String>> = vec![
+            vec!["sh".into(), "-c".into(), "echo \"B C\"; sleep 1".into()],
+            vec![r"C:\path\to\file".into(), r"back\slash".into()],
+            vec!["it's".into(), "\"quoted\"".into(), "both'\"mixed".into()],
+            vec!["".into(), "after an empty one".into()],
+            vec!["multi\nline".into(), "tab\there".into()],
+            vec!["accentata è".into(), "日本語 argument".into()],
+            vec![r#"nginx -g 'daemon off;'"#.into()],
+            vec![r"$HOME".into(), "`cmd`".into(), r"\$escaped".into()],
+        ];
+        // POSIX double-quoting: the backslash escapes exactly these four, and the order matters -
+        // backslashes are doubled FIRST, or the escapes added after would be escaped in turn. This
+        // is the context the defect lived in, so the round trip here exercises the fixed path
+        // against a rule written independently of it.
+        let quote_dq = |s: &str| {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                if matches!(c, '\\' | '"' | '$' | '`') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+            out
+        };
+        for args in cases {
+            for q in [&quote as &dyn Fn(&str) -> String, &quote_dq] {
+                let line = args.iter().map(|a| q(a)).collect::<Vec<_>>().join(" ");
+                assert_eq!(
+                    split_argv(&line),
+                    args,
+                    "round trip lost something for {line:?}"
+                );
+            }
+        }
     }
 
     /// A STRING `entrypoint:` DOES NOT DROP `command`, and it used to.

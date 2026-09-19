@@ -305,7 +305,16 @@ pub enum Command {
     /// `kern build -t <name> [-f Dockerfile] [--build-arg K=V] [<context>]`: build a local image
     /// from a Dockerfile subset.
     Build {
+        /// `--check`: parse the Dockerfile, report what kern does with every instruction, and build
+        /// nothing. `compose config`'s sibling for a Dockerfile.
+        check: bool,
+        /// The FIRST `-t`: the name the build itself is stored under.
         tag: Option<String>,
+        /// Every LATER `-t`, applied to the finished image as an alias. Docker takes one `-t` per
+        /// name and applies them all; kern kept only the last and said nothing, so a CI line like
+        /// `build -t repo:$VERSION -t repo:latest .` produced `:latest` alone and the `push
+        /// repo:$VERSION` that followed it failed on an image that had never been named.
+        extra_tags: Vec<String>,
         file: Option<String>,
         context: String,
         build_args: Vec<String>,
@@ -381,6 +390,9 @@ pub enum Command {
     /// `kern images [--json]`: list pulled (cached) images.
     Images {
         json: bool,
+        /// `--filter reference=<pattern>` / `--filter dangling=<bool>`, repeatable and ANDed. The
+        /// two keys kern's cache can answer; any other is refused at parse time by name.
+        filters: Vec<(String, String)>,
     },
     /// `kern rmi <image>...`: remove cached images by ref (or sanitized stem), reclaiming any layers
     /// left referenced by no other image.
@@ -431,6 +443,9 @@ pub enum Command {
         all: bool,
         filters: Vec<(String, String)>,
         format: Option<String>,
+        /// `--no-trunc` and `--last N`: how the listing is PRESENTED, as opposed to which boxes it
+        /// holds. See [`commands::PsView`].
+        view: commands::PsView,
     },
     /// `kern stats [--json] [name...]`: per-box memory + CPU (all boxes, or just the named ones).
     Stats {
@@ -445,6 +460,9 @@ pub enum Command {
         /// Prefix each line with the recorded time of the mark it falls after. See
         /// `boxlog::MARK_EVERY` for why that is a bucket and not a per-line instant.
         timestamps: bool,
+        /// `--since` / `--until` as unix nanoseconds: show only lines the index places inside the
+        /// window. A line the index cannot place is KEPT (see `boxlog::Stamper::window`).
+        window: (Option<u64>, Option<u64>),
     },
     /// `kern inspect <name> [--json]`: full detail for one running box (identity + resources).
     Inspect {
@@ -487,6 +505,13 @@ pub enum Command {
         old: String,
         new: String,
     },
+    /// `kern port <box> [<container-port>[/tcp|/udp]]`: the host address serving a running box's
+    /// port, or every mapping it has. `docker port`, for one box rather than a stack.
+    Port {
+        name: String,
+        /// `None` lists every mapping, as `docker port <container>` with no port does.
+        container_port: Option<String>,
+    },
     /// `kern update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
     Update {
         name: String,
@@ -518,6 +543,12 @@ pub enum Command {
     Login {
         registry: Option<String>,
         username: Option<String>,
+        /// `-p/--password <value>`: the password on the command line, where `ps` can read it.
+        /// Docker's own help deprecates it; kern accepts it and says what it costs.
+        password: Option<String>,
+        /// `--password-stdin`: read the password from stdin with no prompt, which is the form every
+        /// CI pipeline uses (`… get-login-password | kern login -u AWS --password-stdin <reg>`).
+        password_stdin: bool,
     },
     /// `kern logout [registry]`: remove stored registry credentials.
     Logout {
@@ -558,6 +589,18 @@ pub enum Command {
         /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`
         /// every image it names.
         rmi: Option<bool>,
+        /// `up --force-recreate` / `up --no-recreate`: the override of the drift comparison that
+        /// decides which running services `up` leaves alone. See [`commands::RecreatePolicy`].
+        recreate: commands::RecreatePolicy,
+        /// `up -V/--renew-anon-volumes`: discard the anonymous volumes of the services this `up`
+        /// starts, instead of carrying the previous run's contents into them.
+        renew_anon_volumes: bool,
+        /// `logs -t/--timestamps`.
+        log_timestamps: bool,
+        /// `logs --since` / `--until`, as unix nanoseconds.
+        log_window: (Option<u64>, Option<u64>),
+        /// `logs --no-log-prefix`: no `=== <service> ===` heading between services' blocks.
+        no_log_prefix: bool,
         action: commands::ComposeAction,
         no_pod: bool,
         /// `--bridge`: wire the stack the way Docker does. Each service keeps its OWN network
@@ -980,9 +1023,40 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `images`: list pulled (cached) images.
         Some("images") => {
-            reject_unknown_flags("images", &rest, &["--json"])?;
+            reject_unknown_flags("images", &rest, &["--json", "--filter"])?;
+            // `--filter` with the two keys a cache actually has an answer for. Docker's other keys
+            // (`before=`, `since=`, `label=`) need per-image metadata kern's cache does not keep, so
+            // they are refused BY NAME rather than accepted and ignored: a filter that silently
+            // matches everything is a listing a script reads as "these are the ones that matched".
+            let mut filters: Vec<(String, String)> = Vec::new();
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--filter" {
+                    let kv = rest
+                        .get(i + 1)
+                        .ok_or(Error::Usage("images --filter needs key=value"))?;
+                    let (k, v) = kv.split_once('=').ok_or(Error::Usage(
+                        "images --filter expects key=value (reference=alpine*, dangling=true)",
+                    ))?;
+                    match k {
+                        "reference" | "dangling" | "label" | "before" | "since" => {}
+                        other => {
+                            return Err(Error::Cli(format!(
+                                "images --filter {other}=: kern's image cache keeps no value for that key. It has reference= (a name pattern, `*` allowed), dangling= (true|false), label= (k or k=v), and before=/since= (another image's ref)"
+                            )))
+                        }
+                    }
+                    if k == "dangling" && !matches!(v, "true" | "false") {
+                        return Err(Error::Usage("images --filter dangling=true|false"));
+                    }
+                    filters.push((k.to_string(), v.to_string()));
+                    i += 1;
+                }
+                i += 1;
+            }
             Command::Images {
                 json: rest.contains(&"--json"),
+                filters,
             }
         }
         // `rmi <image>...`: delete cached images (the counterpart to `pull`).
@@ -1114,6 +1188,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `cp <src> <dst>`: copy a file host<->box (one side is `<box>:<path>`).
         Some("cp") => {
+            // `-a`/`--archive` ASKS FOR WHAT ROOTLESS CANNOT GIVE, and saying so is the only honest
+            // answer. Docker's flag preserves uid/gid across the copy; a rootless box's files are
+            // owned through a subuid range, so a file the box sees as `postgres` (999) is 100998 on
+            // the host and there is no uid to preserve on either side of the boundary. kern's `cp`
+            // already preserves the MODE, which is the half that survives the mapping. Refused by
+            // name rather than accepted as a no-op: a backup script passing `-a` and getting files
+            // it cannot restore is the failure this refusal exists to prevent.
+            if rest.iter().any(|a| *a == "-a" || *a == "--archive") {
+                return Err(Error::Cli(
+                    "cp -a/--archive preserves uid/gid, which a rootless copy cannot: the box's ids live in a subuid range and do not exist on the host (a box's uid 999 is the host's 100998). The mode IS preserved without the flag; for ownership, copy inside the box and set it there".to_string(),
+                ));
+            }
             reject_unknown_flags("cp", &rest, &[])?;
             let pos: Vec<&str> = rest
                 .iter()
@@ -1139,12 +1225,23 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 "ps",
                 &rest,
                 &[
-                    "--json", "-q", "--quiet", "--filter", "--format", "-a", "--all",
+                    "--json",
+                    "-q",
+                    "--quiet",
+                    "--filter",
+                    "--format",
+                    "-a",
+                    "--all",
+                    "--no-trunc",
+                    "--last",
+                    "-n",
                 ],
             )?;
             let json = rest.contains(&"--json");
             let quiet = rest.iter().any(|a| *a == "-q" || *a == "--quiet");
-            let all = rest.iter().any(|a| *a == "-a" || *a == "--all");
+            let mut all = rest.iter().any(|a| *a == "-a" || *a == "--all");
+            let no_trunc = rest.contains(&"--no-trunc");
+            let mut last: Option<usize> = None;
             let mut filters = Vec::new();
             let mut format = None;
             let mut i = 1;
@@ -1164,6 +1261,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     ))?;
                     format = Some((*f).to_string());
                     i += 1;
+                } else if rest[i] == "--last" || rest[i] == "-n" {
+                    let v = rest
+                        .get(i + 1)
+                        .ok_or(Error::Usage("ps --last/-n needs a count"))?;
+                    last = Some(
+                        v.parse::<usize>()
+                            .map_err(|_| Error::Usage("ps --last/-n expects a whole number"))?,
+                    );
+                    // `--last` IMPLIES `-a`, as Docker's does: "the last N containers" means the
+                    // last N, and a flag that silently skipped every finished one would answer a
+                    // different question from the one it names.
+                    all = true;
+                    i += 1;
                 }
                 i += 1;
             }
@@ -1173,11 +1283,17 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 all,
                 filters,
                 format,
+                view: commands::PsView { no_trunc, last },
             }
         }
         // `stats`: per-box memory + CPU.
         Some("stats") => {
-            reject_unknown_flags("stats", &rest, &["--json"])?;
+            // `--no-stream` NAMES WHAT ALREADY HAPPENS. `docker stats` streams a live table and
+            // `--no-stream` prints one snapshot and exits; kern's `stats` has only ever printed the
+            // snapshot, because a daemonless runtime has no event stream to tail. Refusing the flag
+            // sent a monitoring script that had it back to edit a line whose meaning kern already
+            // honoured, so it is accepted; `kern top` is the live view.
+            reject_unknown_flags("stats", &rest, &["--json", "--no-stream"])?;
             Command::Stats {
                 json: rest.contains(&"--json"),
                 names: rest[1..]
@@ -1191,11 +1307,31 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("logs") => {
             let (mut lname, mut tail, mut follow) = (None, None, false);
             let mut timestamps = false;
+            let (mut since, mut until) = (None, None);
+            let now_nanos = log_clock_now();
             let mut i = 1;
             while i < rest.len() {
                 match rest[i] {
                     "-f" | "--follow" => follow = true,
                     "-t" | "--timestamps" => timestamps = true,
+                    // `--since`/`--until`: the flags a monitoring loop writes (`logs --since 30s`)
+                    // and the ones an incident review writes (an RFC3339 pair). A value that does
+                    // not parse is REFUSED with the three forms named: a silently misread time
+                    // shows the wrong window, and wrong output that looks like output is the worst
+                    // of the three outcomes.
+                    "--since" | "--until" => {
+                        let key = rest[i];
+                        let v = rest.get(i + 1).ok_or(Error::Usage(
+                            "logs --since/--until <10m|1h30m|1789730443|2026-09-18T12:00:00Z>",
+                        ))?;
+                        let t = parse_log_window(key, v, now_nanos)?;
+                        if key == "--since" {
+                            since = Some(t);
+                        } else {
+                            until = Some(t);
+                        }
+                        i += 1;
+                    }
                     "--tail" => {
                         let v = rest
                             .get(i + 1)
@@ -1219,16 +1355,28 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 }
                 i += 1;
             }
+            // AN EMPTY WINDOW IS A TYPO, NOT A QUERY. `--since 5m --until 10m` asks for lines after
+            // five minutes ago and before ten minutes ago, which is nothing: printing an empty log
+            // reads as "the box said nothing" and sends the reader to look at the box.
+            if let (Some(s), Some(u)) = (since, until) {
+                if s > u {
+                    return Err(Error::Cli(
+                        "logs: --since is later than --until, so the window is empty (a duration counts BACK from now, so --since 10m --until 5m is the interval you want)"
+                            .to_string(),
+                    ));
+                }
+            }
             match lname {
                 Some(name) => Command::Logs {
                     name,
                     tail,
                     follow,
                     timestamps,
+                    window: (since, until),
                 },
                 None => {
                     return Err(Error::Usage(
-                        "logs <name> [--tail N] [-f|--follow] [-t|--timestamps]",
+                        "logs <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]",
                     ))
                 }
             }
@@ -1242,8 +1390,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // refused BY NAME rather than guessed, which is the rule the `version`/`info` renderer
         // already follows.
         Some("inspect") => {
-            reject_unknown_flags("inspect", &rest, &["--json", "--format"])?;
-            let format = flag_value(&rest, "--format");
+            // `-f` IS THE SPELLING PEOPLE ACTUALLY TYPE. `docker inspect -f '{{.State.Status}}' <c>`
+            // is the line in every wait loop and every deploy script; `--format` was accepted and
+            // `-f` was `unknown flag "-f"`, so a script ported across had to be edited for a flag
+            // that does the same thing under a shorter name. Both spellings, one value.
+            reject_unknown_flags("inspect", &rest, &["--json", "--format", "-f"])?;
+            let format = flag_value(&rest, "--format").or_else(|| flag_value(&rest, "-f"));
             // The NAME is the first positional that is not a flag's value. Walked explicitly,
             // because `--format '{{.State.Running}}' <name>` puts a non-flag token immediately after
             // a flag and a naive "first token without a dash" takes the template for the box.
@@ -1254,7 +1406,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     skip_next = false;
                     continue;
                 }
-                if *a == "--format" {
+                if *a == "--format" || *a == "-f" {
                     skip_next = true;
                     continue;
                 }
@@ -1435,6 +1587,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 _ => return Err(Error::Usage("rename <old> <new>")),
             }
         }
+        // `port <box> [<container-port>]`: what the host serves for that box's port. Docker's verb,
+        // for ONE box; `kern compose <file> port <service> <port>` is the same question for a stack
+        // and reaches the same selection code.
+        Some("port") => {
+            reject_unknown_flags("port", &rest, &[])?;
+            let mut pos = rest.iter().skip(1).filter(|a| !a.starts_with('-'));
+            match pos.next() {
+                Some(name) => Command::Port {
+                    name: (*name).to_string(),
+                    container_port: pos.next().map(|p| (*p).to_string()),
+                },
+                None => return Err(Error::Usage("port <box> [<container-port>[/tcp|/udp]]")),
+            }
+        }
         Some("history") => {
             reject_unknown_flags("history", &rest, &["-n"])?;
             Command::History {
@@ -1446,10 +1612,31 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `login [registry] [--username U]` / `logout [registry]`: registry credentials.
         Some("login") => {
+            // AN UNKNOWN FLAG IS REFUSED HERE, and it was not. `--password-stdin` was read by
+            // nothing, and because the password is read from stdin anyway when stdin is not a
+            // terminal, `kern login -u AWS --password-stdin` APPEARED to work: the flag was
+            // discarded, the prompt was printed into the CI log, and the piped line was consumed as
+            // the password. It happened to do the right thing; nothing said so, and a typo
+            // (`--password-stidn`) would have done the same thing just as silently.
+            reject_unknown_flags(
+                "login",
+                &rest,
+                &["--username", "-u", "--password-stdin", "-p", "--password"],
+            )?;
             let username = flag_value(&rest, "--username").or_else(|| flag_value(&rest, "-u"));
             // The positional registry is the first bare token that ISN'T the value of `--username`/`-u`.
-            let registry = positional_after_flags(&rest, &["--username", "-u"]);
-            Command::Login { registry, username }
+            let registry = positional_after_flags(&rest, &["--username", "-u", "-p", "--password"]);
+            // `-p/--password <value>` is Docker's, and Docker deprecates it in its own help for the
+            // reason that applies here too: the value lands in argv, where any process on the host
+            // reads it out of `/proc/<pid>/cmdline`. Accepted, because refusing a flag a script
+            // already has helps nobody, and named for what it costs.
+            let password = flag_value(&rest, "--password").or_else(|| flag_value(&rest, "-p"));
+            Command::Login {
+                registry,
+                username,
+                password,
+                password_stdin: rest.contains(&"--password-stdin"),
+            }
         }
         Some("logout") => Command::Logout {
             registry: positional_after_flags(&rest, &[]),
@@ -1479,9 +1666,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let usage: &'static str = COMPOSE_USAGE
                 .get_or_init(|| {
                     format!(
-                        "compose <file>... [{}] [-p NAME] [--env-file F] [--profile P] [--no-pod] \
-                         [-d] [--tail N] [-f] [-a] [service...]",
-                        crate::commands::compose_verbs_help()
+                        "compose [<file>...] <{}> [-p NAME] [--env-file F] [--profile P] \
+                         [--no-pod] [-d] [--tail N] [-f] [-a] [service...] - with no file, the \
+                         directory is searched for {}",
+                        crate::commands::compose_verbs_help(),
+                        COMPOSE_FILE_NAMES.join(", ")
                     )
                 })
                 .as_str();
@@ -1522,6 +1711,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut run_cmd: Vec<String> = Vec::new();
             let mut run_rm = false;
             let mut no_deps = false;
+            // `--force-recreate` / `--no-recreate`: tracked as two booleans rather than one policy
+            // so the contradiction of writing BOTH can be refused by name, the way Docker refuses it.
+            let mut force_recreate = false;
+            let mut no_recreate = false;
+            let mut renew_anon_volumes = false;
+            let mut log_timestamps = false;
+            let (mut log_since, mut log_until) = (None, None);
+            let mut no_log_prefix = false;
+            let log_now = log_clock_now();
             let mut services: Vec<String> = Vec::new();
             let mut it = rest.iter().skip(1).peekable();
             while let Some(a) = it.next() {
@@ -1573,6 +1771,14 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 ))
                             }
                         }
+                    }
+                    // `-t` IS TWO FLAGS AND THE VERB DECIDES WHICH, exactly as it does under
+                    // Docker: `compose logs -t` asks for timestamps, `compose down -t 30` for a stop
+                    // grace. The guarded arm comes FIRST, so the verb is consulted before the
+                    // fallback claims the token; written the other way round the compiler says so
+                    // (`unreachable pattern`), which is how the ordering was found.
+                    "-t" | "--timestamps" if action == Some(commands::ComposeAction::Logs) => {
+                        log_timestamps = true
                     }
                     // `-t/--timeout <secs>`: the stop grace for THIS teardown, replacing what each
                     // box recorded at start. `0` is a real value (Docker reads it as "kill now"), so
@@ -1734,6 +1940,30 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 | Some(commands::ComposeAction::Exec)
                         ) => {}
                     "--no-deps" => no_deps = true,
+                    // `up --force-recreate`: recreate every running service, drift or no drift. The
+                    // line a deploy script writes after changing something the definition does not
+                    // hash - a bind-mounted config file, a token injected into a shared volume by
+                    // the step before. kern compares a fingerprint and leaves a matching service
+                    // alone, which is right by default and wrong exactly here.
+                    "--force-recreate" => force_recreate = true,
+                    // `up --no-recreate`: start what is missing, touch nothing that is running, even
+                    // where the file HAS moved.
+                    "--no-recreate" => no_recreate = true,
+                    // `up -V/--renew-anon-volumes`: discard the anonymous volumes of the services
+                    // this `up` starts, instead of carrying the previous run's contents into them.
+                    "-V" | "--renew-anon-volumes" => renew_anon_volumes = true,
+                    "--no-log-prefix" => no_log_prefix = true,
+                    "--since" | "--until" => {
+                        let v = inline_or_next(inline, &mut it).ok_or(Error::Usage(
+                            "compose logs --since/--until <10m|1h30m|1789730443|2026-09-18T12:00:00Z>",
+                        ))?;
+                        let t = parse_log_window(key, &v, log_now)?;
+                        if key == "--since" {
+                            log_since = Some(t);
+                        } else {
+                            log_until = Some(t);
+                        }
+                    }
                     // `up --exit-code-from S`: the CI line that turns a test service's status into
                     // the job's. MEASURED on Docker 29.6.2: it implies `--abort-on-container-exit`,
                     // the whole stack is torn down when ANY service exits, and the status reported
@@ -1804,6 +2034,15 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 action = Some(act);
                                 continue;
                             }
+                            // A DOCKER VERB KERN DOES NOT HAVE IS REFUSED BY NAME, before it can be
+                            // read as something else. Without this, `kern compose f.yml create`
+                            // parsed `create` as a SERVICE name and reported "no such service:
+                            // create", which sends the reader to look at their file for a service
+                            // they never wrote. The word is a verb; the answer has to be about the
+                            // verb.
+                            if let Some(why) = refused_compose_verb(w) {
+                                return Err(Error::Compose(why));
+                            }
                         }
                         if file.is_none() {
                             file = Some(w.to_string());
@@ -1821,8 +2060,24 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     }
                 }
             }
+            // NO FILE NAMED IS `docker compose <verb>`, WHICH IS HOW THE COMMAND IS ACTUALLY
+            // WRITTEN. Every README, every `npm start`, every `Makefile` runs `docker compose up -d`
+            // from the directory holding the file, and kern answered a usage dump listing a
+            // positional `<file>` it did not have to require: `kern up` and `kern down` have
+            // discovered the file in the working directory since they existed, from the same four
+            // names Docker looks for. The verb form now reaches the same discovery, so the two
+            // spellings cannot disagree about which file a directory means.
+            //
+            // A BARE `kern compose` STILL PRINTS USAGE. Discovery answers "which file", not "which
+            // verb", and a lone `kern compose` has named neither: guessing `up` there would start a
+            // stack on a keystroke, which is the one outcome nobody would have wanted.
             if files.is_empty() {
-                return Err(Error::Usage(usage));
+                if action.is_none() {
+                    return Err(Error::Usage(usage));
+                }
+                let found = discover_compose_file().ok_or_else(no_compose_file_here)?;
+                file = Some(found.clone());
+                files.push(found);
             }
             // `--` AFTER THE SERVICE IS A SEPARATOR, NOT THE PROGRAM TO RUN. The loop above sends
             // everything after the service name into the command, flags and all, which is what makes
@@ -1838,6 +2093,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_cmd.remove(0);
             }
             let _ = file;
+            // THE TWO CONTRADICT EACH OTHER AND ARE REFUSED TOGETHER, by name, as Docker refuses
+            // them. Picking one silently would recreate a stack somebody asked not to touch, or
+            // leave one somebody asked to replace, and either way the command line said otherwise.
+            let recreate =
+                match (force_recreate, no_recreate) {
+                    (true, true) => return Err(Error::Compose(
+                        "--force-recreate and --no-recreate cannot be combined: one says recreate \
+                         every running service, the other says recreate none"
+                            .to_string(),
+                    )),
+                    (true, false) => commands::RecreatePolicy::Always,
+                    (false, true) => commands::RecreatePolicy::Never,
+                    (false, false) => commands::RecreatePolicy::OnDrift,
+                };
             Command::Compose {
                 files,
                 action: action.unwrap_or(commands::ComposeAction::Up),
@@ -1850,6 +2119,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_env,
                 run_user,
                 rmi,
+                recreate,
+                renew_anon_volumes,
+                log_timestamps,
+                log_window: (log_since, log_until),
+                no_log_prefix,
                 no_pod,
                 bridge,
                 allow_privileged,
@@ -1891,11 +2165,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let force_pod = rest.contains(&"--pod");
             let allow_device_grants = rest.contains(&"--allow-device-grants");
             let allow_privileged = rest.contains(&"--allow-privileged");
-            let file = discover_compose_file().ok_or_else(|| {
-                Error::Compose(
-                    "no compose file in this directory (looked for docker-compose.yml, compose.yml, compose.yaml, kern.toml)".to_string(),
-                )
-            })?;
+            let file = discover_compose_file().ok_or_else(no_compose_file_here)?;
             Command::Compose {
                 files: vec![file],
                 action,
@@ -1910,6 +2180,30 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_env: Vec::new(),
                 run_user: None,
                 rmi: None,
+                // The shorthand carries the recreate overrides too: `kern up --force-recreate` in a
+                // directory is the same habit as the explicit form, and a flag that parses on one
+                // and not the other is a difference nobody can hold in their head.
+                recreate: match (
+                    rest.contains(&"--force-recreate"),
+                    rest.contains(&"--no-recreate"),
+                ) {
+                    (true, true) => {
+                        return Err(Error::Compose(
+                            "--force-recreate and --no-recreate cannot be combined: one says \
+                             recreate every running service, the other says recreate none"
+                                .to_string(),
+                        ))
+                    }
+                    (true, false) => commands::RecreatePolicy::Always,
+                    (false, true) => commands::RecreatePolicy::Never,
+                    (false, false) => commands::RecreatePolicy::OnDrift,
+                },
+                renew_anon_volumes: rest.contains(&"-V") || rest.contains(&"--renew-anon-volumes"),
+                // The `kern up`/`kern down` shorthand has no `logs` verb, so the log flags cannot be
+                // typed on it and carry their defaults rather than a parse nobody can reach.
+                log_timestamps: false,
+                log_window: (None, None),
+                no_log_prefix: false,
                 no_pod,
                 bridge,
                 allow_privileged,
@@ -2288,14 +2582,34 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 // `--network host|none`: the Docker-style spelling. `host` shares the host network
                 // (= `--net`); `none` is the default isolated loopback-only namespace, made explicit.
+                // A NAME IS A POD, which is the thing a compose stack IS. `docker run --rm --network
+                // <stack-net> <img> <cmd>` is how a one-off talks to a running stack - generating a
+                // token, seeding a database, running a migration - and kern answered
+                // `--network <host|none>`, a usage line naming neither of the two joinable things it
+                // has. A stack brought up by `kern compose` is a pod whose members resolve each
+                // other by name, so joining it by name is the same operation under a second
+                // spelling, and `--pod` keeps working unchanged.
+                //
+                // AN EXTERNAL `kern network` IS NOT THE SAME OBJECT and is not accepted here. It is
+                // built from per-pair relays planned across a whole project, which a standalone box
+                // has no part in; claiming to join one and wiring nothing would be the "accepted it
+                // and did something else" failure. The refusal says which of the two it found and
+                // what to run instead, rather than repeating the two words `host` and `none`.
                 "--network" => {
                     i += 1;
                     match rest.get(i).copied() {
                         Some("host") => share_net = true,
                         Some("none") => share_net = false,
+                        // THE NAME IS RECORDED, NOT RESOLVED. Whether it names a running pod, a
+                        // `kern network` or nothing is a question about runtime state, and a parser
+                        // that answers it is a parser whose result depends on which boxes happen to
+                        // be running - untestable without a live registry, and different on two
+                        // machines given one command line. `join_pod_and_bind_its_files` already
+                        // asks that question for `--pod` and now answers it for both flags.
+                        Some(name) if !name.starts_with('-') => pod = Some(name.to_string()),
                         _ => {
                             return Err(Error::Usage(
-                                "--network <host|none> (host = share host net; none = isolated)",
+                                "--network <host|none|pod-name> (host = share host net; none = isolated)",
                             ))
                         }
                     }
@@ -2669,8 +2983,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--show-config" => show_config = true,
                 "-q" | "--quiet" => quiet = true,
                 "--verbose" => verbose = true,
-                // `-it`/`-ti`/`-t`/`-i`: allocate an interactive PTY for the box (shells, REPLs).
-                "-it" | "-ti" | "-t" | "-i" | "--tty" | "--interactive" => tty = true,
+                // `-it`/`-ti`/`-t`: allocate an interactive PTY for the box (shells, REPLs).
+                //
+                // `-i` IS A DIFFERENT FLAG AND DOES NOT ALLOCATE ONE, for the reason measured on
+                // `exec` (see [`parse_exec`]): a PTY echoes its input, rewrites `\n` as `\r\n`, and
+                // never receives EOF from a redirected file, so `docker run -i img < file` - the
+                // shape a build or seeding script uses - would hang and corrupt its own output.
+                // kern's box inherits stdin either way, so `-i` names what already happens.
+                "-it" | "-ti" | "-t" | "--tty" => tty = true,
+                "-i" | "--interactive" => {}
                 "--rootfs" => {
                     i += 1;
                     rootfs = rest.get(i).map(|v| (*v).to_string());
@@ -3435,7 +3756,23 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
                 }
-                "-it" | "-ti" | "-t" | "-i" | "--tty" | "--interactive" => tty = true,
+                // `-t` ALLOCATES A PTY. `-i` DOES NOT, and treating them as one flag was a defect
+                // with a very large blast radius, because `docker exec -i <c> psql … < file.sql` is
+                // how every seeding and migration script in existence talks to a database.
+                //
+                // MEASURED before the fix, against a running box: `kern exec -i box cat < file`
+                // never returned (killed at 120 s), and what it had written was `line1\r\nline2\r\n`
+                // followed by the ECHO of its own input - a PTY's line discipline adding carriage
+                // returns and echoing, and never delivering EOF because a redirected file is not a
+                // terminal that can send one. The same command without `-i` exited 0 and wrote the
+                // file back byte for byte.
+                //
+                // Docker's two flags are two different things: `-t` allocates the pseudo-terminal,
+                // `-i` keeps stdin attached. kern's exec inherits stdin unconditionally, so `-i`
+                // names what already happens and is taken without side effects; only `-t` may reach
+                // for a PTY. `-it`/`-ti` ask for both and get both.
+                "-it" | "-ti" | "-t" | "--tty" => tty = true,
+                "-i" | "--interactive" => {}
                 s if s.starts_with('-') => {
                     return Err(Error::Usage("exec: unknown flag (see --help)"))
                 }
@@ -3656,9 +3993,22 @@ fn parse_network(rest: &[&str]) -> Result<Command, Error> {
             })
         }
         Some("ls" | "list") => {
-            reject_unknown_flags("network ls", &rest[1..], &["--json"])?;
+            // `--format json` IS THE SPELLING DOCKER USES for the same request `--json` makes here,
+            // and a script ported across carries it. Mapped onto the one renderer rather than
+            // growing a second output path; any OTHER template is refused by name, because kern has
+            // no per-network fields to render and a silently ignored template would print the human
+            // table to a caller that asked for something else.
+            reject_unknown_flags("network ls", &rest[1..], &["--json", "--format"])?;
+            let fmt = flag_value(&rest[1..], "--format");
+            if let Some(f) = fmt.as_deref() {
+                if !f.eq_ignore_ascii_case("json") {
+                    return Err(Error::Cli(format!(
+                        "network ls --format '{f}': only `json` is supported here (kern's networks carry a name and its members, and no template fields beyond them)"
+                    )));
+                }
+            }
             Ok(Command::NetworkList {
-                json: rest[1..].contains(&"--json"),
+                json: rest[1..].contains(&"--json") || fmt.is_some(),
             })
         }
         Some("rm" | "remove") => {
@@ -3692,47 +4042,30 @@ fn parse_network(rest: &[&str]) -> Result<Command, Error> {
 /// whose kern-side answer has not been. A flag with no entry gets the accurate general sentence
 /// rather than an invented equivalence.
 fn unknown_compose_flag(flag: &str) -> String {
-    // The `docker compose` flags most likely to be typed here, each with what kern does INSTEAD.
+    // The `docker compose` flags kern DOES NOT take, each with what it does instead.
+    //
+    // THIS TABLE IS PRUNED WHENEVER A FLAG IS IMPLEMENTED, and the pruning is the point. It used to
+    // carry an entry for every flag a switcher might type, including ones kern had since grown:
+    // `--no-deps` was still described as something kern "cannot be asked" to do, `--wait` as a flag
+    // with no equivalent, `--build` as a separate verb. Those sentences were unreachable - the
+    // parser accepts all three above, so this function is never called for them - which is exactly
+    // what makes a stale entry dangerous: it cannot fail a test, and it is read only by a person
+    // who has just hit the error, at the moment they are most likely to believe it.
     let known: &[(&str, &str)] = &[
-        (
-            "--no-deps",
-            "kern's `up <service>` starts that service's `depends_on` too, and cannot be asked not to",
-        ),
-        (
-            "--wait",
-            "kern's `up` already waits for the conditions the file declares (`service_healthy`, \
-             `service_completed_successfully`) and reports any service that died at startup",
-        ),
-        (
-            "--wait-timeout",
-            "kern's `up` waits on the file's own `depends_on` conditions; there is no separate timeout flag",
-        ),
-        (
-            "--exit-code-from",
-            "kern's `up` exits non-zero when a service dies at startup, and names it",
-        ),
-        (
-            "--abort-on-container-exit",
-            "kern's `up` exits non-zero when a service dies at startup, and names it",
-        ),
-        (
-            "--format",
-            "`kern ps --format T` and `kern ps --json` format the box list",
-        ),
-        ("--services", "`kern compose <file> config` lists the services"),
-        ("-q", "`kern ps -q` prints ids only"),
-        ("--quiet", "`kern ps -q` prints ids only"),
-        (
-            "--remove-orphans",
-            "kern's `down` stops the services THIS file declares; a box the file no longer names is \
-             left alone and `kern ps` still lists it",
-        ),
-        ("--build", "`kern compose <file> build` builds the `build:` services"),
         ("--scale", "kern has no replica count; a service is one box"),
         (
-            "--rm",
-            "`--rm` belongs to `docker compose run`, which kern does not have; \
-             `kern box --image <image> -- <command>` runs a one-off box",
+            "--compatibility",
+            "kern has no v1 naming to fall back to; boxes are named <project>-<service>",
+        ),
+        (
+            "--project-directory",
+            "kern resolves a service's relative paths against the FILE's directory; \
+             `-p/--project-name` sets the name the pod and the volumes are scoped by",
+        ),
+        (
+            "--attach-dependencies",
+            "an attached `kern compose <file> up` streams every service it started, dependencies \
+             included; there is nothing narrower to opt out of",
         ),
     ];
     let extra = known
@@ -3744,25 +4077,101 @@ fn unknown_compose_flag(flag: &str) -> String {
         "unknown flag '{flag}'.{extra} `kern compose` takes: -p/--project-name, \
          --env-file, --profile, --no-pod, --pod, --bridge, --allow-privileged, \
          --allow-device-grants, -d/--detach, -v/--volumes (on `down`), --tail N, -f/--follow, \
-         -a/--all"
+         -a/--all, --build, --no-deps, --force-recreate, --no-recreate, -V/--renew-anon-volumes, \
+         --wait, --wait-timeout, --exit-code-from, --abort-on-container-exit, --remove-orphans, \
+         --pull, -t/--timeout, --rmi, --format, --services, -q/--quiet, -T, --rm"
     )
 }
 
-/// Discover a compose file in the current directory for `kern up`/`down`. Prefers Docker's canonical
-/// names (so an existing project just works), then kern's own. Returns the first that exists.
-fn discover_compose_file() -> Option<String> {
-    for name in [
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "compose.yml",
-        "compose.yaml",
-        "kern.toml",
-    ] {
-        if std::path::Path::new(name).is_file() {
-            return Some(name.to_string());
+/// What to say about a `docker compose` verb kern does not implement.
+///
+/// EACH ONE IS A DECISION, not a gap waiting to be filled, and the sentence says which decision.
+/// `scale` has no meaning in a model where a service is one box; `create` has none in a model with
+/// no "created but not started" state to create INTO. Answering either with the generic verb list
+/// leaves the reader to work out which of sixteen words they should have typed, for a question whose
+/// answer is that the concept is absent.
+fn refused_compose_verb(verb: &str) -> Option<String> {
+    let why = match verb {
+        "scale" => {
+            "kern has no replica count: a service is one box. Declare the copies you want as \
+             separate services, or run the same image again with `kern compose <file> run`"
         }
-    }
-    None
+        "create" => {
+            "kern has no CREATED-but-not-started state for a box to be created into - a box exists \
+             by running. `up --no-start` has the same shape and the same answer; to prepare without \
+             starting, `kern compose <file> pull` fetches the images and \
+             `kern compose <file> build` builds what the file builds"
+        }
+        "alpha" | "beta" => {
+            "that is Docker's staging area for unreleased subcommands, and kern implements the \
+             released surface"
+        }
+        _ => return None,
+    };
+    Some(format!("`compose {verb}` is not implemented: {why}."))
+}
+
+/// "Now" in unix nanoseconds, for a `--since`/`--until` measured back from it.
+///
+/// Read ONCE per invocation and passed down, so `--since 10m --until 5m` describes one interval
+/// rather than two windows read from two instants five minutes apart.
+fn log_clock_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// One `--since`/`--until` value, for either verb that takes them, with the refusal that names what
+/// IS accepted.
+///
+/// ONE FUNCTION FOR TWO CALL SITES, because it is one grammar: `kern logs` and
+/// `kern compose <file> logs` both take these flags, and the sentence describing the three forms was
+/// written out at each of them. Two copies of a grammar's description drift, and the copy that
+/// drifts is the one a reader is holding at the moment their value was refused.
+///
+/// A value that does not parse is REFUSED rather than approximated: a misread time shows the wrong
+/// window, and wrong output that looks like output is the worst of the three outcomes.
+fn parse_log_window(flag: &str, v: &str, now: u64) -> Result<u64, Error> {
+    crate::commands::boxlog::parse_log_time(v, now).ok_or_else(|| {
+        Error::Cli(format!(
+            "logs {flag} '{v}': expected a duration back from now (10m, 90s, 1h30m, 2d), unix seconds (1789730443), or RFC3339 UTC (2026-09-18T12:00:00Z)"
+        ))
+    })
+}
+
+/// The file names a stack is discovered under, in the order they are tried: Docker's canonical four
+/// (so an existing project just works), then kern's own.
+///
+/// ONE ARRAY, because the refusal has to name exactly what was looked for. The sentence used to be
+/// written out by hand at the one call site and had already drifted: it listed four of these five,
+/// omitting `docker-compose.yaml`, so a directory holding that exact file was told kern had looked
+/// for it under a name it does not use. A list that is not the list is worse than no list.
+const COMPOSE_FILE_NAMES: [&str; 5] = [
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "kern.toml",
+];
+
+/// Discover a compose file in the current directory for `kern up`/`down` and for a `kern compose`
+/// invocation that named a verb but no file. Returns the first of [`COMPOSE_FILE_NAMES`] that exists.
+fn discover_compose_file() -> Option<String> {
+    COMPOSE_FILE_NAMES
+        .iter()
+        .find(|name| std::path::Path::new(name).is_file())
+        .map(|name| (*name).to_string())
+}
+
+/// The refusal when discovery found nothing, naming every name it tried and both ways to say it
+/// explicitly.
+fn no_compose_file_here() -> Error {
+    Error::Compose(format!(
+        "no compose file in this directory (looked for {}) - name one with \
+         `kern compose <file> <verb>` or `-f <file>`",
+        COMPOSE_FILE_NAMES.join(", ")
+    ))
 }
 
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
@@ -3839,7 +4248,10 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         }
         _ => {}
     }
-    let mut tag: Option<String> = None;
+    // EVERY `-t`, in the order written. The first names the build, the rest are applied to it.
+    let mut tags: Vec<String> = Vec::new();
+    // `--check`: parse and report, build nothing. See [`commands::build_check`].
+    let mut check = false;
     let mut file: Option<String> = None;
     let mut context: Option<String> = None;
     let mut build_args: Vec<String> = Vec::new();
@@ -3867,10 +4279,12 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
             }
         };
         match key {
+            // REPEATABLE, as docker's is. Each name is validated as it arrives, so an invalid
+            // fourth `-t` is refused before any work starts rather than after the build has run.
             "-t" | "--tag" => {
                 let t = value("-t <name[:tag]>")?;
                 check_reference(&t, "build -t")?;
-                tag = Some(t);
+                tags.push(t);
             }
             "-f" | "--file" => {
                 file = Some(value("-f <Dockerfile>")?);
@@ -3918,11 +4332,12 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
                 target = Some(t);
             }
             "-q" | "--quiet" => quiet = true,
+            "--check" => check = true,
             // NAMED, because "unknown build flag" sent a reader to re-read their whole command line
             // to find which word kern meant.
             s if s.starts_with('-') => {
                 return Err(Error::Build(format!(
-                    "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, -q/--quiet"
+                    "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, -q/--quiet, --check"
                 )))
             }
             s if context.is_none() => context = Some(s.to_string()),
@@ -3930,8 +4345,16 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         }
         i += 1;
     }
+    // One pass, no clone: the first name is the build's, the remainder are its aliases.
+    let mut named = tags.into_iter();
+    let tag = named.next();
+    let extra_tags: Vec<String> = named.collect();
+    // `--check` NEEDS NO `-t`: requiring a name for an image that is not going to exist would make
+    // the dry run harder to type than the build it is standing in for.
     Ok(Command::Build {
+        check,
         tag,
+        extra_tags,
         file,
         context: context.unwrap_or_else(|| ".".to_string()),
         build_args,
@@ -4141,20 +4564,33 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tty,
         } => commands::exec(&name, &command, &env, workdir.as_deref(), tty, false),
         Command::Build {
+            check,
             tag,
+            extra_tags,
             file,
             context,
             build_args,
             quiet,
             target,
-        } => commands::build(commands::BuildArgs {
-            tag: tag.as_deref(),
-            file: file.as_deref(),
-            context: &context,
-            build_args: &build_args,
-            quiet,
-            target: target.as_deref(),
-        }),
+        } => {
+            let a = commands::BuildArgs {
+                tag: tag.as_deref(),
+                extra_tags: &extra_tags,
+                file: file.as_deref(),
+                context: &context,
+                build_args: &build_args,
+                quiet,
+                target: target.as_deref(),
+            };
+            // ONE ARGUMENT STRUCT FOR BOTH, so `--check` resolves the Dockerfile, the context and
+            // the build args through exactly the fields a real build does: a report about a
+            // different file from the one that would be built would be worse than no report.
+            if check {
+                commands::build_check(a)
+            } else {
+                commands::build(a)
+            }
+        }
         Command::PodCreate {
             name,
             outbound,
@@ -4196,7 +4632,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ready_fd,
         } => crate::egress::pump_reexec(read_fd, box_port, &sock, ready_fd),
         Command::Search { query, json } => commands::search(&query, json),
-        Command::Images { json } => commands::images(json),
+        Command::Images { json, filters } => commands::images(json, &filters),
         Command::Rmi { images } => commands::image_rm(&images),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),
@@ -4228,6 +4664,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             all,
             filters,
             format,
+            view,
         } => commands::ps(
             if json {
                 commands::JsonShape::Array
@@ -4238,6 +4675,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             all,
             &filters,
             format.as_deref(),
+            view,
         ),
         Command::Stats { json, names } => commands::stats(json, &names),
         Command::Logs {
@@ -4245,7 +4683,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tail,
             follow,
             timestamps,
-        } => commands::logs(&name, tail, follow, timestamps),
+            window,
+        } => commands::logs(&name, tail, follow, timestamps, window),
         Command::Inspect { name, json, format } => {
             commands::inspect_formatted(&name, json, format.as_deref())
         }
@@ -4262,6 +4701,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
         Command::Recover => commands::recover(),
         Command::Rename { old, new } => commands::rename(&old, &new),
+        Command::Port {
+            name,
+            container_port,
+        } => commands::port(&name, container_port.as_deref()),
         Command::Update {
             name,
             memory,
@@ -4272,9 +4715,17 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Diff { name, json } => commands::diff(&name, json),
         Command::Events => commands::events(),
         Command::History { count } => commands::history(count),
-        Command::Login { registry, username } => {
-            crate::auth::login(registry.as_deref(), username.as_deref())
-        }
+        Command::Login {
+            registry,
+            username,
+            password,
+            password_stdin,
+        } => crate::auth::login(
+            registry.as_deref(),
+            username.as_deref(),
+            password.as_deref(),
+            password_stdin,
+        ),
         Command::Logout { registry } => crate::auth::logout(registry.as_deref()),
         Command::Completions { shell } => crate::completions::completions(&shell),
         Command::Top => commands::top(),
@@ -4290,6 +4741,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             run_env,
             run_user,
             rmi,
+            recreate,
+            renew_anon_volumes,
+            log_timestamps,
+            log_window,
+            no_log_prefix,
             no_pod,
             bridge,
             allow_privileged,
@@ -4324,6 +4780,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             build_args: &build_args,
             run_name: run_name.as_deref(),
             run_entrypoint: run_entrypoint.as_deref(),
+            recreate,
+            renew_anon_volumes,
+            log_timestamps,
+            log_window,
+            no_log_prefix,
             run_env: &run_env,
             run_user: run_user.as_deref(),
             rmi,
@@ -4528,6 +4989,334 @@ mod tests {
         assert!(
             p(&["pull", "ghcr.io/owner/name:1.2.3"]).is_ok(),
             "a fully qualified reference must still pull"
+        );
+    }
+
+    /// EVERY `-t` SURVIVES, and only the LAST one used to.
+    ///
+    /// `docker build -t repo:$VERSION -t repo:latest .` is how a release pipeline names an image it
+    /// is about to promote: one build, two names, a `push` of each. kern parsed both flags, kept the
+    /// second, and said nothing - so `repo:$VERSION` never existed and the `push repo:$VERSION` on
+    /// the next line failed on a name nothing had created. MEASURED before the fix:
+    /// `kern build -t probeone:1 -t probetwo:2 ctx` printed `built 'probetwo:2'` and `kern images`
+    /// listed `probetwo:2` alone.
+    #[test]
+    fn every_build_tag_is_kept_and_the_first_names_the_build() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let built = |a: &[&str]| match p(a) {
+            Ok((
+                _,
+                Command::Build {
+                    tag, extra_tags, ..
+                },
+            )) => (tag, extra_tags),
+            other => panic!("expected a Build command, got {other:?}"),
+        };
+
+        // The reported shape: the FIRST name is the build's, the rest are applied to it.
+        let (tag, extra) = built(&["build", "-t", "repo:1.2.3", "-t", "repo:latest", "."]);
+        assert_eq!(tag.as_deref(), Some("repo:1.2.3"));
+        assert_eq!(extra, ["repo:latest"]);
+
+        // Three names, order preserved, and `--tag` is the same flag.
+        let (tag, extra) = built(&["build", "-t", "a:1", "--tag", "b:2", "-t", "c:3", "ctx"]);
+        assert_eq!(tag.as_deref(), Some("a:1"));
+        assert_eq!(extra, ["b:2", "c:3"]);
+
+        // One name is unchanged: no extras, and nothing about the single-tag path moved.
+        let (tag, extra) = built(&["build", "-t", "only:1", "."]);
+        assert_eq!(tag.as_deref(), Some("only:1"));
+        assert!(extra.is_empty(), "a single -t must produce no aliases");
+
+        // An invalid LATER name is refused at parse time, before the build is paid for.
+        assert!(
+            p(&["build", "-t", "ok:1", "-t", "Bad-NAME:2", "."]).is_err(),
+            "the grammar applies to every -t, not only the first"
+        );
+    }
+
+    /// THE RECREATE OVERRIDES PARSE ON BOTH SPELLINGS OF `up`, AND CONTRADICT EACH OTHER LOUDLY.
+    ///
+    /// `up -d --build --force-recreate --no-deps <svc>` is one line out of a real rebuild script,
+    /// and `--force-recreate` was the one word in it kern refused, so the whole invocation died on a
+    /// flag whose meaning kern's reconciler could express exactly. `kern up` (the directory
+    /// shorthand) takes them too: a flag that parses on one spelling and not the other is a
+    /// difference nobody can hold in their head.
+    #[test]
+    fn the_recreate_overrides_parse_and_refuse_their_own_contradiction() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let policy = |a: &[&str]| match p(a) {
+            Ok((
+                _,
+                Command::Compose {
+                    recreate,
+                    renew_anon_volumes,
+                    ..
+                },
+            )) => (recreate, renew_anon_volumes),
+            other => panic!("expected a Compose command, got {other:?}"),
+        };
+
+        // The reported line, whole.
+        assert_eq!(
+            policy(&[
+                "compose",
+                "f.yml",
+                "up",
+                "-d",
+                "--build",
+                "--force-recreate",
+                "--no-deps",
+                "worker",
+            ]),
+            (commands::RecreatePolicy::Always, false)
+        );
+        assert_eq!(
+            policy(&["compose", "f.yml", "up", "--no-recreate"]),
+            (commands::RecreatePolicy::Never, false)
+        );
+        assert_eq!(
+            policy(&["compose", "f.yml", "up"]),
+            (commands::RecreatePolicy::OnDrift, false),
+            "the comparison stays the default"
+        );
+        // `-V` and its long spelling, which are one flag.
+        for v in ["-V", "--renew-anon-volumes"] {
+            assert_eq!(
+                policy(&["compose", "f.yml", "up", v]),
+                (commands::RecreatePolicy::OnDrift, true),
+                "{v} must set the renewal without touching the recreate policy"
+            );
+        }
+
+        // BOTH AT ONCE IS REFUSED BY NAME rather than resolved by precedence: whichever kern picked,
+        // half the readers would expect the other.
+        let err = p(&[
+            "compose",
+            "f.yml",
+            "up",
+            "--force-recreate",
+            "--no-recreate",
+        ])
+        .expect_err("the two contradict each other");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--force-recreate") && msg.contains("--no-recreate"),
+            "the refusal must name both flags: {msg}"
+        );
+    }
+
+    /// EVERY COMPOSE VERB THE HELP LISTS PARSES, AND EVERY ONE KERN REFUSES IS REFUSED BY NAME.
+    ///
+    /// The verb table is the single list behind `from_verb`, the help line and the usage error, so a
+    /// verb can never work while being absent from what the CLI says about itself. What that table
+    /// cannot catch is the OTHER direction: a Docker verb kern does not have used to fall through to
+    /// the bare-word arm and be read as a SERVICE name, so `compose f.yml create` answered "no such
+    /// service: create" and sent the reader to look at their file for a service nobody wrote.
+    #[test]
+    fn every_compose_verb_parses_and_the_absent_ones_are_refused_by_name() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        // The seven verbs added as thin scopings of a box-level verb, plus `kill`, which is `stop`
+        // under Docker's name for it.
+        for (verb, want) in [
+            ("wait", commands::ComposeAction::Wait),
+            ("events", commands::ComposeAction::Events),
+            ("images", commands::ComposeAction::Images),
+            ("push", commands::ComposeAction::Push),
+            ("rm", commands::ComposeAction::Rm),
+            ("top", commands::ComposeAction::Top),
+            ("version", commands::ComposeAction::Version),
+            ("kill", commands::ComposeAction::Stop),
+        ] {
+            match p(&["compose", "f.yml", verb]) {
+                Ok((_, Command::Compose { action, .. })) => {
+                    assert_eq!(action, want, "compose {verb}")
+                }
+                other => panic!("compose {verb}: expected a Compose command, got {other:?}"),
+            }
+        }
+        // REFUSED BY NAME, with the reason rather than a verb list: the concept is absent, so
+        // "did you mean one of these sixteen" answers a question nobody asked.
+        for (verb, word) in [("create", "started"), ("scale", "replica")] {
+            let err = p(&["compose", "f.yml", verb]).expect_err("{verb} must be refused");
+            let msg = format!("{err}");
+            assert!(msg.contains(verb), "the refusal must name the verb: {msg}");
+            assert!(
+                msg.contains(word),
+                "and say WHY kern has no such thing: {msg}"
+            );
+        }
+    }
+
+    /// `compose wait` RETURNS THE STATUS; `kern wait` PRINTS IT. Two verbs, two contracts, on
+    /// purpose.
+    ///
+    /// A CI job writes `docker compose wait tests` and branches on the exit code - that is the whole
+    /// use of the verb, and Docker documents it as the status of the first container to stop. The
+    /// first version of this printed the numbers and exited 0, which reports every failing suite as
+    /// a pass. `kern wait <box>` keeps printing and exiting 0: it is older, its contract is frozen
+    /// with the CLI, and a script already reading its stdout is correct.
+    ///
+    /// This test pins the SHAPES rather than the runtime behaviour (which needs live boxes and is
+    /// measured against them): that both verbs parse, and that the compose one carries the services
+    /// it was given.
+    #[test]
+    fn compose_wait_is_a_distinct_verb_from_the_box_level_wait() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        match p(&["compose", "f.yml", "wait", "tests"]).unwrap().1 {
+            Command::Compose {
+                action, services, ..
+            } => {
+                assert_eq!(action, commands::ComposeAction::Wait);
+                assert_eq!(services, ["tests"], "the named service reaches the verb");
+            }
+            other => panic!("expected Compose, got {other:?}"),
+        }
+        // The box-level verb is untouched and still takes bare names.
+        match p(&["wait", "boxa", "boxb"]).unwrap().1 {
+            Command::Wait { names } => assert_eq!(names, ["boxa", "boxb"]),
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    /// `compose logs -t` IS TIMESTAMPS AND `compose down -t 30` IS A TIMEOUT, on one flag.
+    ///
+    /// Docker overloads `-t` exactly this way and the verb is what disambiguates it. The guarded arm
+    /// has to be tried FIRST or the timeout arm claims every `-t`; written the other way round the
+    /// compiler says `unreachable pattern`, which is how the ordering was found rather than guessed.
+    #[test]
+    fn dash_t_is_timestamps_on_logs_and_a_timeout_everywhere_else() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        match p(&["compose", "f.yml", "logs", "-t"]) {
+            Ok((
+                _,
+                Command::Compose {
+                    log_timestamps,
+                    stop_timeout,
+                    ..
+                },
+            )) => {
+                assert!(log_timestamps, "logs -t asks for the time column");
+                assert_eq!(stop_timeout, None, "and not for a stop grace");
+            }
+            other => panic!("expected Compose, got {other:?}"),
+        }
+        match p(&["compose", "f.yml", "down", "-t", "30"]) {
+            Ok((
+                _,
+                Command::Compose {
+                    log_timestamps,
+                    stop_timeout,
+                    ..
+                },
+            )) => {
+                assert_eq!(stop_timeout, Some(30), "down -t is the stop grace");
+                assert!(!log_timestamps);
+            }
+            other => panic!("expected Compose, got {other:?}"),
+        }
+        // `--since`/`--until` reach the window, and an unparseable value is refused rather than
+        // silently showing a different window.
+        match p(&["compose", "f.yml", "logs", "--since", "10m"]) {
+            Ok((_, Command::Compose { log_window, .. })) => {
+                assert!(log_window.0.is_some() && log_window.1.is_none())
+            }
+            other => panic!("expected Compose, got {other:?}"),
+        }
+        assert!(p(&["compose", "f.yml", "logs", "--since", "domani"]).is_err());
+    }
+
+    /// `kern port <box> [<port>]` EXISTS, and the compose form is not the only way to ask.
+    #[test]
+    fn port_parses_with_and_without_a_container_port() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            p(&["port", "web", "80"]).unwrap().1,
+            Command::Port {
+                name: "web".to_string(),
+                container_port: Some("80".to_string()),
+            }
+        );
+        // No port is the listing form, as `docker port <container>` is.
+        assert_eq!(
+            p(&["port", "web"]).unwrap().1,
+            Command::Port {
+                name: "web".to_string(),
+                container_port: None,
+            }
+        );
+        // A protocol suffix reaches the command rather than being refused by the parser.
+        assert_eq!(
+            p(&["port", "web", "53/udp"]).unwrap().1,
+            Command::Port {
+                name: "web".to_string(),
+                container_port: Some("53/udp".to_string()),
+            }
+        );
+        assert!(p(&["port"]).is_err(), "a box is required");
+    }
+
+    /// `docker inspect -f …` IS THE SPELLING IN EVERY WAIT LOOP, and only `--format` was accepted.
+    #[test]
+    fn inspect_takes_both_spellings_of_format() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        for flag in ["-f", "--format"] {
+            match p(&["inspect", flag, "{{.State.Status}}", "web"]).unwrap().1 {
+                Command::Inspect { name, format, .. } => {
+                    assert_eq!(
+                        name, "web",
+                        "{flag}: the template must not be read as the box"
+                    );
+                    assert_eq!(format.as_deref(), Some("{{.State.Status}}"), "{flag}");
+                }
+                other => panic!("{flag}: expected Inspect, got {other:?}"),
+            }
+        }
+    }
+
+    /// `login` REFUSES A FLAG IT DOES NOT READ, and `--password-stdin` is now one it does.
+    ///
+    /// Nothing checked login's flags, so `--password-stdin` was discarded and the command still
+    /// happened to work: the password is read from stdin anyway when stdin is not a terminal. A
+    /// misspelling would have been discarded just as quietly, and the prompt it printed into a CI
+    /// log was the only sign either way.
+    #[test]
+    fn login_reads_the_password_flags_and_refuses_what_it_cannot() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        match p(&["login", "ghcr.io", "--username", "u", "--password-stdin"])
+            .unwrap()
+            .1
+        {
+            Command::Login {
+                registry,
+                username,
+                password,
+                password_stdin,
+            } => {
+                assert_eq!(registry.as_deref(), Some("ghcr.io"));
+                assert_eq!(username.as_deref(), Some("u"));
+                assert_eq!(password, None);
+                assert!(password_stdin);
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+        // The username's VALUE is not the registry, and neither is the password's.
+        match p(&["login", "-u", "alice", "-p", "secret"]).unwrap().1 {
+            Command::Login {
+                registry,
+                username,
+                password,
+                ..
+            } => {
+                assert_eq!(registry, None, "'alice'/'secret' are flag values");
+                assert_eq!(username.as_deref(), Some("alice"));
+                assert_eq!(password.as_deref(), Some("secret"));
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+        assert!(
+            p(&["login", "--password-stidn"]).is_err(),
+            "a misspelling must be refused, not discarded"
         );
     }
 
@@ -5477,15 +6266,92 @@ mod tests {
         ));
     }
 
+    /// `-t` ALLOCATES A PTY AND `-i` DOES NOT, which is Docker's split and was not kern's.
+    ///
+    /// The two used to set the same flag, so `-i` reached for a pseudo-terminal. MEASURED against a
+    /// running box before the fix: `kern exec -i box cat < file` never returned (killed at 120 s)
+    /// and wrote `line1\r\nline2\r\n` plus the echo of its own input - the line discipline adding
+    /// carriage returns, echoing, and never seeing the EOF a redirected file cannot send. That is
+    /// the exact shape of `docker exec -i <c> psql … < seed.sql`, which is how database seeding is
+    /// written everywhere.
     #[test]
-    fn box_it_flag_allocates_tty() {
-        for f in ["-it", "-ti", "-t", "-i", "--tty", "--interactive"] {
+    fn t_allocates_a_pty_and_i_only_keeps_stdin() {
+        for f in ["-it", "-ti", "-t", "--tty"] {
             let (_, cmd) = parse(&["box".into(), "x".into(), f.to_string()]).unwrap();
             assert!(matches!(cmd, Command::BoxRun { tty: true, .. }), "flag {f}");
+            let (_, cmd) = parse(&["exec".into(), "x".into(), f.to_string()]).unwrap();
+            assert!(matches!(cmd, Command::Exec { tty: true, .. }), "exec {f}");
         }
-        // off by default
+        // `-i` IS ACCEPTED AND ALLOCATES NOTHING: stdin is inherited either way, so the flag names
+        // what already happens and a redirected file reaches the workload byte for byte.
+        for f in ["-i", "--interactive"] {
+            let (_, cmd) = parse(&["box".into(), "x".into(), f.to_string()]).unwrap();
+            assert!(
+                matches!(cmd, Command::BoxRun { tty: false, .. }),
+                "box {f} must not allocate a PTY"
+            );
+            let (_, cmd) = parse(&["exec".into(), "x".into(), f.to_string()]).unwrap();
+            assert!(
+                matches!(cmd, Command::Exec { tty: false, .. }),
+                "exec {f} must not allocate a PTY"
+            );
+        }
+        // `-i -t` written apart is still both, which is what a script that spells them out types.
+        let (_, cmd) = parse(&["exec".into(), "x".into(), "-i".into(), "-t".into()]).unwrap();
+        assert!(matches!(cmd, Command::Exec { tty: true, .. }));
+        // off by default, on both verbs
         let (_, cmd) = parse(&["box".into(), "x".into()]).unwrap();
         assert!(matches!(cmd, Command::BoxRun { tty: false, .. }));
+        let (_, cmd) = parse(&["exec".into(), "x".into()]).unwrap();
+        assert!(matches!(cmd, Command::Exec { tty: false, .. }));
+    }
+
+    /// `--network <name>` IS A POD JOIN, and it used to be a usage error.
+    ///
+    /// `docker run --rm --network <stack-net> <img> <cmd>` is how a one-off talks to a running stack
+    /// (generate a token, seed a database, run a migration), and kern answered
+    /// `--network <host|none>`, a usage line naming neither of the two joinable things it has. A
+    /// stack brought up by `kern compose` IS a pod, so the name joins it; whether the name exists is
+    /// decided at bring-up, where the registry is already being read, and is measured against a live
+    /// pod rather than asserted here.
+    #[test]
+    fn a_network_name_is_carried_as_a_pod_join() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let (_, cmd) = p(&["box", "x", "--image", "alpine", "--network", "mystack"]).unwrap();
+        match cmd {
+            Command::BoxRun { pod, share_net, .. } => {
+                assert_eq!(pod.as_deref(), Some("mystack"));
+                assert!(!share_net, "a named network is not the host's network");
+            }
+            other => panic!("expected BoxRun, got {other:?}"),
+        }
+        // `--pod` is the same slot, so the two spellings cannot diverge.
+        let (_, cmd) = p(&["box", "x", "--image", "alpine", "--pod", "mystack"]).unwrap();
+        assert!(matches!(cmd, Command::BoxRun { pod: Some(ref n), .. } if n == "mystack"));
+
+        // THE TWO WORDS STILL MEAN WHAT THEY MEANT, and `none` especially: a Docker user's isolation
+        // request must never fall through to sharing the host's network.
+        let (_, cmd) = p(&["box", "x", "--image", "alpine", "--network", "host"]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                share_net: true,
+                ..
+            }
+        ));
+        let (_, cmd) = p(&["box", "x", "--image", "alpine", "--network", "none"]).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun {
+                share_net: false,
+                pod: None,
+                ..
+            }
+        ));
+        // A FLAG IS NOT A NETWORK NAME: `--network --detach` must be a usage error, not a box that
+        // tries to join a pod called `--detach` while `--detach` is silently eaten.
+        assert!(p(&["box", "x", "--image", "alpine", "--network", "-d"]).is_err());
+        assert!(p(&["box", "x", "--image", "alpine", "--network"]).is_err());
     }
 
     #[test]

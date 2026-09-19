@@ -1772,6 +1772,18 @@ pub fn add_member(name: &str, member: &str) -> Result<(), Error> {
 }
 
 /// `kern pod ls` - list pods (name, member count, alive/dead holder).
+/// The names of the pods whose holder is ALIVE, sorted: what a refusal can offer as alternatives.
+///
+/// Reads [`rows`] rather than the directory, so it cannot disagree with `kern pod ls` about what is
+/// running - which is the whole reason that scan was split out in the first place.
+pub fn live_names() -> Vec<String> {
+    rows()
+        .into_iter()
+        .filter(|(_, _, alive)| *alive)
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
 /// The pods on disk, sorted, as (name, member count, holder alive).
 ///
 /// Split out of [`list`] so the human table and `--json` read the SAME scan. Two scanners is how
@@ -2127,6 +2139,16 @@ pub fn remove(names: &[String]) -> Result<(), Error> {
 /// `kern __pod-holder` (hidden): become the pod's namespace holder - never returns.
 pub fn run_holder() -> ! {
     kern_isolation::run_pod_holder()
+}
+
+/// [`validate_name`] for a caller OUTSIDE this module: the join path, which reaches `pod_dir` with a
+/// name taken straight from `--pod`/`--network`.
+///
+/// Public because the check belongs at every entrance and not only at the one that creates the
+/// directory. One rule, one function: a second spelling of "which names are pods" is how the create
+/// path and the join path would come to disagree about what a pod is called.
+pub fn validate_join_name(name: &str) -> Result<(), Error> {
+    validate_name(name)
 }
 
 /// Pod names share the box-name charset (used as a directory + hostnames): `[A-Za-z0-9_.-]`, ≤64,

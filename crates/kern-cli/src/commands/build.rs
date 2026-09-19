@@ -173,11 +173,18 @@ pub fn build_prune(keep: usize) -> Result<(), Error> {
 /// from the context (symlink-safe both sides); `ENV`/`WORKDIR`/`USER`/`CMD`/`ENTRYPOINT` accumulate
 /// into the image config. The result is stored in the image cache so `kern box --image <name>` runs
 /// it with no pull (reusing the P1 config sidecar). Daemonless, dependency-free (curl/tar/cp).
-pub fn build(args: BuildArgs) -> Result<(), Error> {
-    let tag = args
-        .tag
-        .filter(|t| !t.is_empty())
-        .ok_or(Error::Usage("build needs -t <name[:tag]>"))?;
+/// The context directory and the Dockerfile a `BuildArgs` names, with the guards a build needs.
+///
+/// SHARED BY `build` AND `build --check`, because `--check` exists to answer "what will the build
+/// do", and a dry run that resolved a DIFFERENT file from the one that would be built would answer
+/// about the wrong thing while sounding authoritative. It was written out twice - the same
+/// Containerfile-then-Dockerfile order, copied - and a comment above the copy claimed the two were
+/// the same resolution. That claim is now a fact rather than a promise.
+///
+/// The two registry guards travel with it for the same reason: they are properties of reading these
+/// paths at all, not of executing them, and a check that read what a build refuses to read would be
+/// the one place the pair disagree.
+fn resolve_build_inputs(args: &BuildArgs) -> Result<(PathBuf, PathBuf), Error> {
     let ctx = std::fs::canonicalize(args.context)
         .map_err(|e| Error::Build(format!("build context '{}': {e}", args.context)))?;
     if !ctx.is_dir() {
@@ -227,15 +234,31 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
             dfpath.display()
         )));
     }
-    let text = std::fs::read_to_string(&dfcanon)
-        .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfpath.display())))?;
-    let mut bmap = std::collections::HashMap::new();
+    Ok((ctx, dfcanon))
+}
+
+/// `--build-arg K=V` pairs as a map, refusing a pair with no `=` rather than dropping it. Shared, so
+/// a value `--check` substitutes is the value the build would substitute.
+fn build_arg_map(args: &BuildArgs) -> Result<std::collections::HashMap<String, String>, Error> {
+    let mut m = std::collections::HashMap::new();
     for ba in args.build_args {
         let (k, v) = ba
             .split_once('=')
             .ok_or(Error::Usage("--build-arg expects K=V"))?;
-        bmap.insert(k.to_string(), v.to_string());
+        m.insert(k.to_string(), v.to_string());
     }
+    Ok(m)
+}
+
+pub fn build(args: BuildArgs) -> Result<(), Error> {
+    let tag = args
+        .tag
+        .filter(|t| !t.is_empty())
+        .ok_or(Error::Usage("build needs -t <name[:tag]>"))?;
+    let (ctx, dfcanon) = resolve_build_inputs(&args)?;
+    let text = std::fs::read_to_string(&dfcanon)
+        .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfcanon.display())))?;
+    let bmap = build_arg_map(&args)?;
     let instrs = crate::dockerfile::parse(&text, &bmap).map_err(Error::Build)?;
 
     let cache = cache_dir();
@@ -266,7 +289,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let mut rec = crate::builds::Record {
         id: id.clone(),
         tag: tag.to_string(),
-        dockerfile: dfpath.display().to_string(),
+        dockerfile: dfcanon.display().to_string(),
         context: ctx.display().to_string(),
         started,
         duration_ms: 0,
@@ -322,7 +345,23 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
             rec.tag
         ),
     );
-    result
+    result?;
+    // EVERY OTHER `-t` IS APPLIED HERE, and only after the build has succeeded: naming an image that
+    // does not exist is what `tag` refuses, and naming one that failed would be worse than losing the
+    // name. A failure to apply one is RETURNED rather than warned - the caller's next line is a
+    // `push` of that exact name, and a warning on stderr does not stop it.
+    //
+    // `tag` is content-shared (a layered image's manifest is copied, its layers are referenced), so
+    // this costs a manifest write per name and not a second build. A repeated name is a no-op there,
+    // so `-t x -t x` does not need de-duplicating here.
+    //
+    // [`tag`] announces each name itself (`tagged '<built>' → '<extra>'`), which says both what was
+    // built and what it is now also called. Printing a second line here said the same thing twice,
+    // and repeating the "run: kern box …" hint per name would suggest N images where there is one.
+    for extra in args.extra_tags {
+        crate::commands::tag(tag, extra)?;
+    }
+    Ok(())
 }
 
 /// Which stage `--target <name>` selects, or the refusal.
@@ -944,6 +983,22 @@ fn build_run(
                 );
                 i += 1;
             }
+            // CONFIG-ONLY, like EXPOSE above: a label changes what the image DECLARES and touches no
+            // file, so it costs no box and no layer. It used to be dropped at the parser, which is
+            // why `images --filter label=` could answer for a pulled image and not for a built one.
+            Instr::Label(k, _) => {
+                apply_declaration(&mut config, &instrs[i]);
+                announce(step, format!("LABEL {k}"));
+                i += 1;
+            }
+            // SAID OUT LOUD. An instruction kern parses and does not act on is a difference between
+            // what the file asks for and what the image becomes, and a difference nobody is told
+            // about is the defect this codebase spends most of its comments on. One line, at the
+            // step where the reader is already looking.
+            Instr::Dropped { keyword, why } => {
+                announce(step, format!("{keyword} - no effect here: {why}"));
+                i += 1;
+            }
             // CONFIG-ONLY, like CMD/ENTRYPOINT/EXPOSE: they change what the image DECLARES and never
             // the filesystem, so they are applied to `config` and do not advance the layer key.
             // Editing a healthcheck must not bust a cached RUN.
@@ -1309,6 +1364,22 @@ fn build_layered_cached(
                 );
                 i += 1;
             }
+            // CONFIG-ONLY, like EXPOSE above: a label changes what the image DECLARES and touches no
+            // file, so it costs no box and no layer. It used to be dropped at the parser, which is
+            // why `images --filter label=` could answer for a pulled image and not for a built one.
+            Instr::Label(k, _) => {
+                apply_declaration(&mut config, &instrs[i]);
+                announce(step, format!("LABEL {k}"));
+                i += 1;
+            }
+            // SAID OUT LOUD. An instruction kern parses and does not act on is a difference between
+            // what the file asks for and what the image becomes, and a difference nobody is told
+            // about is the defect this codebase spends most of its comments on. One line, at the
+            // step where the reader is already looking.
+            Instr::Dropped { keyword, why } => {
+                announce(step, format!("{keyword} - no effect here: {why}"));
+                i += 1;
+            }
             // CONFIG-ONLY, like CMD/ENTRYPOINT/EXPOSE: they change what the image DECLARES and never
             // the filesystem, so they are applied to `config` and do not advance the layer key.
             // Editing a healthcheck must not bust a cached RUN.
@@ -1337,6 +1408,149 @@ fn build_layered_cached(
         .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
     let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     announce_built(tag);
+    Ok(())
+}
+
+/// `kern build --check [ctx]`: what kern will do with this Dockerfile, WITHOUT building it.
+///
+/// THE QUESTION IT ANSWERS is the one nobody can answer by reading kern's source: "will my
+/// Dockerfile build here, and is there a line kern will quietly not act on?". A build answers it
+/// too, eventually, after downloading a base image and running half the file - which is the wrong
+/// moment and the wrong cost for a question about the FIRST line that does not work.
+///
+/// It is `compose config`'s sibling and is shaped like it: parse, validate, report, touch nothing.
+/// Nothing is pulled, no box starts, and the exit code is the answer - 0 if the file builds here,
+/// non-zero with the refusal if it does not, so it can be a gate in someone else's CI.
+///
+/// THE REPORT COMES FROM THE PARSER'S OWN OUTPUT and not from a second scan of the file. A separate
+/// scanner would be a second opinion about what a Dockerfile says, and two opinions drift: the
+/// instruction list is what the builder itself will execute, so a line reported here as honoured is
+/// honoured by construction. That is also why an instruction kern drops now carries an
+/// [`crate::dockerfile::Instr::Dropped`] rather than vanishing - a report can only describe what the
+/// list contains.
+pub fn build_check(args: BuildArgs) -> Result<(), Error> {
+    // ONE RESOLVER, shared with `build`, so this cannot report about a different file from the one
+    // that would be built - including the two registry guards, which are properties of reading these
+    // paths at all rather than of executing them.
+    let (ctx, dfcanon) = resolve_build_inputs(&args)?;
+    let text = std::fs::read_to_string(&dfcanon)
+        .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfcanon.display())))?;
+    let bmap = build_arg_map(&args)?;
+    let p = crate::ui::Palette::detect();
+    println!("{}{}{}{}", p.b, p.c, dfcanon.display(), p.z);
+
+    // A PARSE FAILURE IS THE ANSWER, not an obstacle to reporting one: the refusals kern has are
+    // precisely the lines that would stop a build (`ONBUILD`, an unknown instruction, a
+    // `RUN --mount=type=secret` whose credential cannot be delivered), and each already carries the
+    // line number and the reason. Printed as the error, with the exit code that goes with it.
+    let instrs = crate::dockerfile::parse(&text, &bmap).map_err(Error::Build)?;
+
+    let (mut honoured, mut dropped) = (0usize, 0usize);
+    let mut stages = 0usize;
+    for ins in &instrs {
+        let (kw, note) = match ins {
+            crate::dockerfile::Instr::From { image, as_name } => {
+                stages += 1;
+                (
+                    "FROM".to_string(),
+                    match as_name {
+                        Some(n) => format!("{image} as stage '{n}'"),
+                        None => image.clone(),
+                    },
+                )
+            }
+            crate::dockerfile::Instr::Run(argv) => (
+                "RUN".to_string(),
+                truncate(&argv.join(" ").replace('\n', " "), 68),
+            ),
+            crate::dockerfile::Instr::Copy {
+                srcs, dst, from, ..
+            } => {
+                // A CONTEXT COPY IS CHECKED, not merely listed. The verb's claim is "this builds
+                // here", and a file whose first `COPY ../../etc/passwd` the build refuses does NOT
+                // build here - reporting it as fine is a gate giving the one answer a gate must
+                // never give. MEASURED before this: `build --check` printed "builds here, and every
+                // line it contains has an effect" for exactly that file, and the build then stopped
+                // on it.
+                //
+                // Only a COPY FROM THE CONTEXT can be answered: a `COPY --from=<stage>` resolves
+                // against a filesystem that does not exist until that stage has been built, and a
+                // `--from=<image>` against one that has not been pulled. Those are listed and left
+                // to the build, which is the direction that never refuses something that works.
+                if from.is_none() {
+                    for src in srcs {
+                        if let Some(why) = crate::commands::context_escape_reason(&ctx, src) {
+                            return Err(Error::Build(format!(
+                                "COPY {why} - this Dockerfile does not build here"
+                            )));
+                        }
+                    }
+                }
+                (
+                    match from {
+                        Some(crate::dockerfile::CopyFrom::Stage(s)) => format!("COPY --from={s}"),
+                        Some(crate::dockerfile::CopyFrom::Image(i)) => format!("COPY --from={i}"),
+                        None => "COPY".to_string(),
+                    },
+                    format!("{} -> {dst}", truncate(&srcs.join(" "), 46)),
+                )
+            }
+            crate::dockerfile::Instr::WriteFile { dst, .. } => {
+                ("COPY <<EOF".to_string(), dst.clone())
+            }
+            crate::dockerfile::Instr::AddUrl { url, dst, .. } => (
+                "ADD <url>".to_string(),
+                format!("{} -> {dst}", truncate(url, 46)),
+            ),
+            crate::dockerfile::Instr::Env(k, _) => ("ENV".to_string(), k.clone()),
+            crate::dockerfile::Instr::Workdir(d) => ("WORKDIR".to_string(), d.clone()),
+            crate::dockerfile::Instr::User(u) => ("USER".to_string(), u.clone()),
+            crate::dockerfile::Instr::Cmd(a) => ("CMD".to_string(), truncate(&a.join(" "), 68)),
+            crate::dockerfile::Instr::Entrypoint(a) => {
+                ("ENTRYPOINT".to_string(), truncate(&a.join(" "), 68))
+            }
+            crate::dockerfile::Instr::Expose(p) => ("EXPOSE".to_string(), p.clone()),
+            crate::dockerfile::Instr::Label(k, _) => ("LABEL".to_string(), k.clone()),
+            crate::dockerfile::Instr::StopSignal(s) => ("STOPSIGNAL".to_string(), s.clone()),
+            crate::dockerfile::Instr::Healthcheck { test, .. } => {
+                ("HEALTHCHECK".to_string(), truncate(&test.join(" "), 68))
+            }
+            crate::dockerfile::Instr::Dropped { keyword, why } => {
+                dropped += 1;
+                println!("  {y}dropped{z}  {:<12} {why}", keyword, y = p.y, z = p.z);
+                continue;
+            }
+        };
+        honoured += 1;
+        println!(
+            "  {g}ok{z}       {:<12} {d}{}{z}",
+            kw,
+            crate::ui::scrub(&note),
+            g = p.g,
+            d = p.d,
+            z = p.z
+        );
+    }
+    // THE COUNTS ARE THE SUMMARY AND THE DROPPED ONE IS THE POINT. A file with no dropped line
+    // builds into exactly what it says; one with dropped lines builds into something slightly
+    // different, and the number is how a reader knows which of the two they have without re-reading
+    // the list.
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    println!(
+        "\n{stages} stage{}, {honoured} instruction{} kern acts on, {dropped} it does not",
+        plural(stages),
+        plural(honoured)
+    );
+    if dropped == 0 {
+        println!("this Dockerfile builds here, and every line it contains has an effect");
+    } else {
+        println!(
+            "this Dockerfile builds here; the {dropped} line{} above marked `dropped` {} no effect \
+             on the image",
+            plural(dropped),
+            if dropped == 1 { "has" } else { "have" }
+        );
+    }
     Ok(())
 }
 

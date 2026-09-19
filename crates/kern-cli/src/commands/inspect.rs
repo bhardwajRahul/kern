@@ -61,6 +61,21 @@ fn publishers_json(ports: &str) -> String {
     out
 }
 
+/// The two presentation knobs `docker ps` has that are not about WHICH boxes are listed.
+///
+/// A STRUCT AND NOT TWO BOOLEANS at the call site, because `ps(shape, quiet, all, filters, format,
+/// false, None)` says nothing about which `false` is which - the same reason [`JsonShape`] is an
+/// enum rather than a second boolean beside `quiet`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PsView {
+    /// `--no-trunc`: print the whole COMMAND even on a terminal, where it is truncated by default so
+    /// a long line never wraps.
+    pub no_trunc: bool,
+    /// `--last N` / `-n N`: keep only the N most recent boxes, newest first, across live and exited.
+    /// `Some(0)` lists nothing, which is what `docker ps -n 0` does.
+    pub last: Option<usize>,
+}
+
 /// How `ps` renders a machine-readable listing.
 ///
 /// AN ENUM AND NOT A SECOND BOOLEAN, because the two shapes are one decision with three outcomes,
@@ -84,11 +99,24 @@ pub fn ps(
     all: bool,
     filters: &[(String, String)],
     format: Option<&str>,
+    view: PsView,
 ) -> Result<(), Error> {
     // Validate every filter once, fail-fast on an unsupported key or status value.
     for (k, v) in filters {
         match k.as_str() {
             "name" | "id" | "label" | "pod" => {}
+            // `health=` IS THE ONE A READINESS LOOP WRITES. `status=` answers whether the box is
+            // there; this answers whether it is well, which is the question `depends_on:
+            // service_healthy` asks and the question a deploy script asks before it proceeds. The
+            // vocabulary is the registry's own, which is Docker's: a box with no healthcheck has an
+            // EMPTY verdict and matches no value, rather than being counted as healthy.
+            "health" => {
+                if !matches!(v.as_str(), "healthy" | "unhealthy" | "starting" | "none") {
+                    return Err(Error::Usage(
+                        "ps --filter health=: healthy | unhealthy | starting | none (none = the box declares no healthcheck)",
+                    ));
+                }
+            }
             "status" => {
                 if !matches!(
                     v.as_str(),
@@ -108,7 +136,7 @@ pub fn ps(
             }
             _ => {
                 return Err(Error::Usage(
-                    "ps --filter: supported keys are name=, status=, id=, label=, pod=",
+                    "ps --filter: supported keys are name=, status=, id=, label=, pod=, health=",
                 ))
             }
         }
@@ -232,6 +260,63 @@ pub fn ps(
             .collect()
     } else {
         Vec::new()
+    };
+    // `--last N` / `-n N`: THE N MOST RECENTLY CREATED, ACROSS BOTH LISTS. Docker counts containers,
+    // not "running containers and then some exited ones", so a stack where three services are still
+    // up and two have finished must answer `-n 2` with the two newest of the five - the cut is made
+    // here, on one ordering, and not by trimming each list to N.
+    //
+    // ORDERED ON THE KERNEL START-TIME, which is the one clock both records hold and the one that
+    // means CREATED. The first version of this sorted on "how long ago did it last do something" -
+    // `now - started` for a live box and `exited_ago` for a dead one - and those are two different
+    // questions wearing one name: a box created an hour ago that finished a second ago came out
+    // NEWER than one created a second ago, which is the opposite of what `--last` asks. The ticks
+    // are comparable within a boot, which is the only span either record survives (a live box dies
+    // with the machine, an exit record is reaped after an hour). `-n 0` lists nothing, as Docker's
+    // does.
+    let (boxes, exited) = match view.last {
+        None => (boxes, exited),
+        Some(n) => {
+            // (start-time ticks, is_live, index), newest first; `is_live` breaks a tie toward the
+            // running box, which is the one a reader is more likely to have meant.
+            let mut order: Vec<(u64, bool, usize)> = boxes
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.starttime, true, i))
+                .chain(
+                    exited
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.starttime, false, i)),
+                )
+                .collect();
+            order.sort_by_key(|(ticks, live, _)| (std::cmp::Reverse(*ticks), !*live));
+            order.truncate(n);
+            let keep_live: std::collections::HashSet<usize> = order
+                .iter()
+                .filter(|(_, live, _)| *live)
+                .map(|(_, _, i)| *i)
+                .collect();
+            let keep_exited: std::collections::HashSet<usize> = order
+                .iter()
+                .filter(|(_, live, _)| !*live)
+                .map(|(_, _, i)| *i)
+                .collect();
+            (
+                boxes
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep_live.contains(i))
+                    .map(|(_, b)| b)
+                    .collect(),
+                exited
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep_exited.contains(i))
+                    .map(|(_, e)| e)
+                    .collect(),
+            )
+        }
     };
     // `-q`/`--quiet`: names only, one per line - scriptable, e.g. `kern stop $(kern ps -q)`. An exited
     // box's name is already scrubbed at the source (`list_exited`), so it is safe to print raw here.
@@ -470,7 +555,11 @@ pub fn ps(
                         ports: &str,
                         cmd: &str| {
             let safe = crate::ui::scrub(cmd);
-            let cmd = if tty {
+            // `--no-trunc` TURNS THE TERMINAL RULE OFF. The default truncates on a TTY so a long
+            // command never wraps, which is right for reading and wrong for the moment you need the
+            // whole line - and until this flag existed the only way to get it was to pipe the output
+            // somewhere, which also turns off every other thing a person is looking at.
+            let cmd = if tty && !view.no_trunc {
                 truncate(&safe, width.saturating_sub(prefix_w).max(8))
             } else {
                 safe
@@ -793,11 +882,36 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
         .as_ref()
         .map(|i| registry::health_of(&i.name, i.pid))
         .unwrap_or_default();
-    // Docker's `.State.Status` vocabulary, restricted to the three states kern's registry can be in.
-    let status = match (&b, health.as_str()) {
-        (None, _) => "exited",
-        (Some(_), "paused") => "paused",
-        (Some(_), _) => "running",
+    // A BOX THAT NEVER EXISTED IS NOT AN EXITED BOX, and this used to answer `exited` for both.
+    //
+    // The lookup was "is it running?", so every name that was not running - a typo, a service from
+    // another stack, a box `down` removed an hour ago - rendered `.State.Status` as `exited` and
+    // `.State.Running` as `false`, with exit status 0. That is the answer a wait loop is looking
+    // for: `until [ "$(kern inspect -f '{{.State.Status}}' setup)" = exited ]` ENDS IMMEDIATELY on a
+    // misspelled service and the script proceeds as if the step had completed. Docker answers `No
+    // such object` and exits non-zero, and so does this now.
+    //
+    // The exited record is the `waitexit` breadcrumb `kern ps -a` reads, which is transient by
+    // design (an hour), so a box that exited long ago is genuinely unknown to kern rather than
+    // reported as anything. The refusal says so instead of leaving the reader to guess.
+    let exited = if running {
+        None
+    } else {
+        registry::list_exited().into_iter().find(|e| e.name == name)
+    };
+    if !running && exited.is_none() {
+        return Err(Error::NotRunning(format!(
+            "no box '{name}': it is not running, and kern holds no recent exit record for it \
+             (`kern ps -a` lists what exited within the last hour). Refusing rather than reporting \
+             it as exited, which a wait loop would read as done"
+        )));
+    }
+    // Docker's `.State.Status` vocabulary, from the ONE function that reads the freezer and the
+    // orphan flag. It used to be decided here by `health == "paused"`, a word `health_of` never
+    // returns, so a frozen box reported `running` while `kern ps` reported `paused`.
+    let status = match &b {
+        None => "exited",
+        Some(i) => box_lifecycle_status(i),
     };
     let field = |f: &str| -> Option<String> {
         match f {
@@ -808,6 +922,11 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
             // with no healthcheck. kern's registry uses the same words.
             "State.Health.Status" => Some(health.clone()),
             "State.Pid" => Some(b.as_ref().map_or(0, |i| i.pid1_recorded).to_string()),
+            // Docker reports 0 while a container runs and the real status once it has exited, which
+            // is exactly what the two sources here hold. It is the other half of the wait loop:
+            // having learnt that a one-shot service is `exited`, the next question is whether it
+            // exited WELL, and `kern ps -a` is a table rather than a value a script can test.
+            "State.ExitCode" => Some(exited.as_ref().map_or(0, |e| e.code).to_string()),
             "Name" => Some(format!("/{name}")),
             "Config.Image" | "Image" => b.as_ref().map(|i| i.rootfs.clone()),
             _ => None,
@@ -841,6 +960,10 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
 
 pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     let Some(b) = registry::find_ref(name) else {
+        // A RUNNING BOX, then an IMAGE. `inspect` reports a box WHILE IT RUNS, and an exited one is
+        // refused by `inspect_image` with its code and a pointer to `kern ps -a`, which is the
+        // surface that carries the answer. The value a script wants from an exited box is served by
+        // `inspect -f '{{.State.ExitCode}}'`, which reads the same exit record.
         return inspect_image(name, json);
     };
     let health = registry::health_of(&b.name, b.pid);
@@ -871,9 +994,17 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     if json {
         // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
         let num = json_num;
+        // THE ONE FIELD A SCRIPT ASKS FOR FIRST WAS NOT THERE. The document carried `health`, which
+        // is empty for the majority of boxes (no healthcheck), and nothing that answered "is it
+        // running?" - so `kern inspect x --json | jq -r .status` read `null` and every caller had to
+        // infer liveness from the presence of a `pid`. The vocabulary is the one `-f
+        // '{{.State.Status}}'` and `ps --format '{{.Status}}'` already print, so the three surfaces
+        // agree word for word: `running`, `paused`, `exited`.
+        let status = box_lifecycle_status(&b);
         println!(
-            "{{\"name\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
             json_str(&b.name),
+            json_str(status),
             b.pid,
             b.pid1_recorded,
             json_str(&b.rootfs),
@@ -898,6 +1029,11 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // Bold-cyan name header, matching the panel/tables. The name is charset-validated by
         // `BoxName`; rootfs/command are untrusted, so they go through `scrub`.
         println!("{}{}{}{}", p.b, p.c, b.name, p.z);
+        // The same word the JSON and the template print, so the three surfaces cannot be read as
+        // saying different things about one box. `paused` is the case worth a row of its own: a
+        // frozen box still has a pid, an uptime and a cgroup, and every other row here looks exactly
+        // as it does for a running one.
+        row("status", box_lifecycle_status(&b));
         row("pid", &b.pid.to_string());
         if b.pid1_recorded != 0 {
             // MARKED WHEN THE GATE REFUSES IT. The recorded number is what this row is for, and
@@ -1189,7 +1325,13 @@ fn open_newest_log(name: &str) -> Result<Option<(std::path::PathBuf, std::fs::Fi
 }
 
 /// `kern logs <name>` - print the captured stdout/stderr of the most recent box named `name`.
-pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> Result<(), Error> {
+pub fn logs(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+    timestamps: bool,
+    window: (Option<u64>, Option<u64>),
+) -> Result<(), Error> {
     use std::io::{Read, Seek, SeekFrom, Write};
     // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
     // whose log file persists) is used as-is.
@@ -1238,8 +1380,13 @@ pub fn logs(name: &str, tail: Option<usize>, follow: bool, timestamps: bool) -> 
     // bytes at this instant - so one subtraction covers both and neither needs `tail_file` to grow a
     // second return value.
     let file_len = f.metadata().map(|m| m.len()).unwrap_or(shown.len() as u64);
-    let mut stamper = timestamps.then(|| {
+    // A WINDOW NEEDS THE SAME MACHINERY AS THE COLUMN and not the column itself: `--since` is a
+    // filter on the recorded time, `-t` prints it, and Docker's `--since` does not imply
+    // `--timestamps`. One Stamper serves both, told which of the two jobs it has.
+    let windowed = window.0.is_some() || window.1.is_some();
+    let mut stamper = (timestamps || windowed).then(|| {
         crate::commands::boxlog::Stamper::new(&path, file_len.saturating_sub(shown.len() as u64))
+            .with_window(window.0, window.1, timestamps)
     });
     {
         let out = std::io::stdout();

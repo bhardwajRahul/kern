@@ -392,6 +392,11 @@ fn parse_image_config(json: &str) -> ImageConfig {
         workdir: str_field(cfg, "WorkingDir").filter(|s| !s.is_empty()),
         user: str_field(cfg, "User").filter(|s| !s.is_empty()),
         exposed_ports: crate::pull::exposed_ports_after(cfg),
+        // Same reason as every other field here: a loaded archive carries the same OCI config a
+        // pulled image does, so the two paths must agree on what they read from it. A label the
+        // pull path keeps and the load path drops would make `images --filter label=` answer
+        // differently about one image depending on how it arrived.
+        labels: crate::pull::labels_after(cfg),
         // A `kern load`ed archive carries the same OCI config a pulled image does, so it must yield
         // the same fields: a `docker save`d image whose HEALTHCHECK vanished on load would be a
         // difference between two doors into the same picture.

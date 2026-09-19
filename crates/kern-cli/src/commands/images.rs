@@ -7,8 +7,127 @@
 
 use super::*;
 
-pub fn images(json: bool) -> Result<(), Error> {
-    let rows = image_entries();
+/// Does cached image `r` (with its dangling flag) pass every `--filter`?
+///
+/// `reference=` is a GLOB on the reference as `kern images` prints it, with `*` standing for any run
+/// of characters - Docker's own shape (`alpine*`, `*/app:1.0`). A pattern with no `*` is an exact
+/// match, which is what someone typing a bare name means. `dangling=` is the cache's own health
+/// flag, already computed by `image_stat`, so the filter and the listing cannot disagree about it.
+fn image_matches(e: &ImageEntry, filters: &[(String, String)], pivot: Option<&ImageEntry>) -> bool {
+    let (reference, dangling) = (e.name.as_str(), e.dangling);
+    filters.iter().all(|(k, v)| match k.as_str() {
+        "dangling" => (v == "true") == dangling,
+        // `label=k=v` matches an exact pair, `label=k` the key whatever its value - the two forms
+        // Docker supports and the two `ps --filter label=` already implements, so one rule is
+        // spelled once for boxes and once for images rather than twice differently.
+        //
+        // THE SIDECAR IS READ HERE AND NOT IN THE LISTING, which is where it was first put. The
+        // listing is what `kern top` refreshes every second, so an eager read cost one
+        // `read_to_string` per cached image per FRAME - MEASURED at 313 images on this host - to
+        // serve a filter almost no invocation asks for. Read from the filter, it costs nothing until
+        // somebody writes `label=`, and then once per image.
+        //
+        // An image cached before labels were recorded has none, which is indistinguishable from an
+        // image that declares none: both are "no match", and neither is claimed to be anything else.
+        "label" => {
+            read_image_config(&cache_dir().join(format!("{}.image", sanitize_ref(reference))))
+                .labels
+                .iter()
+                .any(|l| {
+                    l == v
+                        || (!v.contains('=')
+                            && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
+                })
+        }
+        // `before=<ref>` / `since=<ref>` are RELATIVE TO ANOTHER IMAGE, which is what makes them
+        // usable in a cleanup script: "everything I cached before this one". An unknown ref matches
+        // NOTHING rather than everything - the conservative direction for a filter that usually
+        // precedes an `rmi`.
+        //
+        // THE PIVOT IS RESOLVED ONCE, BY THE CALLER, and handed in. It used to be looked up inside
+        // this predicate, which runs per image: a linear scan per entry over the same list, which is
+        // quadratic in the size of the cache. MEASURED at 313 images it is invisible (about 98 000
+        // string comparisons), which is exactly why it would have stayed - the shape is wrong before
+        // it is slow, and the fix is also the smaller code.
+        //
+        // The clock is the `.ok` sentinel's mtime, the same value `kern images` prints as PULLED, so
+        // the filter and the column can never disagree about which image is older.
+        "before" | "since" => match pivot {
+            None => false,
+            Some(p) if k == "before" => e.pulled < p.pulled,
+            Some(p) => e.pulled > p.pulled,
+        },
+        // A PATTERN WITH NO TAG MATCHES ANY TAG. `--filter reference=alpine` returning nothing while
+        // `kern images` lists three `alpine:` lines is the kind of answer that makes a reader
+        // distrust the whole listing. A pattern that names a tag (`alpine:3.19`, `*:latest`) is
+        // matched whole, so the shorthand adds reach without taking any precision away.
+        //
+        // STATED AS KERN'S RULE, not as Docker's: this was not put to a daemon, and the reference
+        // filter's exact behaviour there is not something this repository has measured.
+        "reference" => {
+            let tagged = v.rsplit_once(':').is_some_and(|(_, t)| !t.contains('/'));
+            glob_match(v, reference) || (!tagged && glob_match(&format!("{v}:*"), reference))
+        }
+        _ => false, // keys are validated at parse time; fail closed anyway
+    })
+}
+
+/// `*` matches any run of characters, everything else is literal. Iterative, so a pattern of many
+/// stars cannot recurse: the cursor only ever moves forward through the subject, and each star
+/// records the position to resume from if the literal after it fails to match here.
+fn glob_match(pattern: &str, subject: &str) -> bool {
+    let (p, s) = (pattern.as_bytes(), subject.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut resume) = (None, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            resume = si;
+            pi += 1;
+        } else if let Some(st) = star {
+            // Backtrack: the star swallows one more character and the literal is tried again.
+            pi = st + 1;
+            resume += 1;
+            si = resume;
+        } else {
+            return false;
+        }
+    }
+    // Trailing stars match the empty remainder.
+    p[pi..].iter().all(|c| *c == b'*')
+}
+
+pub fn images(json: bool, filters: &[(String, String)]) -> Result<(), Error> {
+    // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
+    // by construction - the property a script comparing the two would otherwise take on trust.
+    let all = image_entries();
+    let cache_empty = all.is_empty();
+    // FILTERED AGAINST THE WHOLE LISTING, because `before=`/`since=` name another image and have to
+    // find it: filtering a list with a predicate that reads the same list means the pivot is
+    // resolved from the UNFILTERED set, which is the only way `before=X` can work when `X` itself
+    // does not match the other filters.
+    // Resolved ONCE, before the filter loop, from the UNFILTERED listing - the pivot of a
+    // `before=`/`since=` is another image, and it need not itself match the other filters.
+    let pivot = filters
+        .iter()
+        .find(|(k, _)| k == "before" || k == "since")
+        .and_then(|(_, v)| {
+            let want = kern_oci::normalize_ref(v);
+            all.iter().find(|r| r.name == *v || r.name == want)
+        });
+    let rows: Vec<_> = all
+        .iter()
+        .filter(|e| image_matches(e, filters, pivot))
+        .map(|e| ImageEntry {
+            name: e.name.clone(),
+            size: e.size,
+            pulled: e.pulled,
+            dangling: e.dangling,
+        })
+        .collect();
 
     if json {
         let out = kern_common::json_array(&rows, |e| {
@@ -22,7 +141,15 @@ pub fn images(json: bool) -> Result<(), Error> {
         });
         println!("{out}");
     } else if rows.is_empty() {
-        println!("no images cached yet - pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
+        // AN EMPTY CACHE AND AN EMPTY FILTER RESULT ARE DIFFERENT NEWS. "nothing is cached, pull
+        // one" is wrong and misleading in front of a cache holding three hundred images that simply
+        // do not match `dangling=true` - it sends the reader to pull something they already have.
+        if cache_empty {
+            println!("no images cached yet - pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
+        } else {
+            let what: Vec<String> = filters.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("no cached image matches {}", what.join(" "));
+        }
     } else {
         let p = crate::ui::Palette::detect();
         println!(
@@ -529,6 +656,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         // Same reason as the fields above: a filesystem snapshot cannot recover OCI metadata, so a
         // commit carries none. `docker commit` without `--change` behaves identically.
         stop_signal: None,
+        labels: Vec::new(),
         healthcheck: None,
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
@@ -537,4 +665,72 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
     println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");
     Ok(())
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::glob_match;
+
+    /// TOTALITY AND TERMINATION: no pattern makes the matcher loop or panic, and backtracking is
+    /// bounded.
+    ///
+    /// A glob with backtracking is where a matcher becomes a denial of service: the naive recursive
+    /// form on `a*a*a*a*a*b` against a string of `a`s is exponential, and the reference this filter
+    /// takes comes off a command line. This one is ITERATIVE and its cursor only moves forward - a
+    /// star records where to resume and the resume point advances by one each time, so the work is
+    /// bounded by pattern length times subject length and nothing can revisit a position twice.
+    ///
+    /// Exhaustive over the alphabet that decides its control flow, at every length where a star can
+    /// interact with a literal, in both directions (pattern and subject drawn from the same space).
+    #[test]
+    fn glob_terminates_on_every_short_pattern_and_subject() {
+        let alphabet = *b"*ab";
+        let words = |len: usize| -> Vec<String> {
+            let mut out = Vec::new();
+            for i in 0..alphabet.len().pow(len as u32) {
+                let mut x = i;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(alphabet[x % alphabet.len()] as char);
+                    x /= alphabet.len();
+                }
+                out.push(s);
+            }
+            out
+        };
+        for plen in 0..=4 {
+            for p in words(plen) {
+                for slen in 0..=4 {
+                    for s in words(slen) {
+                        // The property is that it RETURNS. A wrong answer is caught by the table
+                        // below; a hang or a panic is caught here and by nothing else.
+                        let _ = glob_match(&p, &s);
+                    }
+                }
+            }
+        }
+        // THE PATHOLOGICAL SHAPE, the one a naive matcher dies on, against a long subject.
+        let subject = "a".repeat(2000);
+        assert!(!glob_match("a*a*a*a*a*a*a*a*b", &subject));
+        assert!(glob_match(&"*".repeat(500), &subject));
+
+        // And the answers themselves, so termination is not being bought with wrongness.
+        for (pat, subj, want) in [
+            ("*", "anything", true),
+            ("**", "anything", true),
+            ("", "", true),
+            ("", "x", false),
+            ("a*", "abc", true),
+            ("*c", "abc", true),
+            ("a*c", "abc", true),
+            ("a*c", "abd", false),
+            ("alpine:3.19", "alpine:3.19", true),
+            ("alpine", "alpine:3.19", false),
+            ("*:3.19", "alpine:3.19", true),
+            ("a*b*c", "axxbyyc", true),
+            ("a*b*c", "axxbyy", false),
+        ] {
+            assert_eq!(glob_match(pat, subj), want, "{pat:?} vs {subj:?}");
+        }
+    }
 }

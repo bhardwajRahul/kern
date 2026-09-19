@@ -1492,3 +1492,123 @@ fn a_compose_refusal_does_not_advise_the_other_file_format() {
          the reader is writing:\n{dup}"
     );
 }
+
+/// `kern build --check` REPORTS AND BUILDS NOTHING, and its exit code is the answer.
+///
+/// The verb exists so a project can ask "will my Dockerfile build here, and is there a line kern
+/// will quietly not act on" WITHOUT paying for a base image and half a build to find out. Three
+/// properties make it useful and each is asserted: it touches nothing, it names the lines kern does
+/// not act on, and it exits non-zero on a file that would not build - so it can gate somebody else's
+/// pipeline.
+///
+/// Run against the BINARY rather than the function, because the exit code is half the contract and a
+/// unit test cannot see one.
+#[test]
+fn build_check_reports_without_building_and_its_status_is_the_answer() {
+    let dir = std::env::temp_dir().join(format!("kern-bc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let write = |name: &str, body: &str| {
+        std::fs::write(dir.join(name), body).expect("write Dockerfile");
+    };
+    let check = |file: &str| {
+        kern()
+            .args(["build", "--check", "-f"])
+            .arg(dir.join(file))
+            .arg(&dir)
+            .output()
+            .expect("run kern build --check")
+    };
+
+    // A FILE THAT BUILDS: exit 0, every acted-on line reported, and the one kern drops named as
+    // dropped rather than passed over in silence.
+    write(
+        "Dockerfile",
+        "FROM alpine:3.19\nVOLUME /data\nEXPOSE 8080\nRUN true\n",
+    );
+    let out = check("Dockerfile");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a buildable file must exit 0: {text}");
+    assert!(
+        text.contains("EXPOSE"),
+        "an honoured line is listed: {text}"
+    );
+    assert!(
+        text.contains("dropped") && text.contains("VOLUME"),
+        "the line kern does not act on must be NAMED: {text}"
+    );
+
+    // NOTHING WAS BUILT. The verb's whole point is that it costs nothing, so the image it would
+    // have produced must not exist and no build record may have been written for it.
+    let images = kern().arg("images").output().expect("run kern images");
+    assert!(
+        !String::from_utf8_lossy(&images.stdout).contains("kern-bc-"),
+        "--check must not leave an image behind"
+    );
+
+    // A FILE THAT WOULD NOT BUILD: non-zero, with the refusal carried through rather than a generic
+    // failure - the reason is the useful part, and it is what a pipeline prints.
+    write("Dockerfile.onbuild", "FROM alpine:3.19\nONBUILD RUN true\n");
+    let out = check("Dockerfile.onbuild");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "ONBUILD must fail the check");
+    assert!(text.contains("ONBUILD"), "and name it: {text}");
+
+    // THE CASE THIS VERB WAS ASKED FOR: a credential a kern build cannot deliver. Refused loudly
+    // here, before a base image is pulled, instead of at the `RUN` that would have run unauthenticated.
+    write(
+        "Dockerfile.secret",
+        "FROM alpine:3.19\nRUN --mount=type=secret,id=n,target=/r npm ci\n",
+    );
+    let out = check("Dockerfile.secret");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "a build secret must fail the check");
+    assert!(
+        text.contains("secret"),
+        "and say which flag it cannot honour: {text}"
+    );
+
+    // A COPY THAT ESCAPES THE CONTEXT IS NOT "BUILDS HERE", and the first version of this verb said
+    // it was. The gate's whole value is that a green means green: a file whose first COPY the build
+    // then refuses is the one answer a check must never give.
+    write(
+        "Dockerfile.escape",
+        "FROM alpine:3.19\nCOPY ../../etc/passwd /stolen\n",
+    );
+    let out = check("Dockerfile.escape");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a context escape must fail the check"
+    );
+    assert!(
+        text.contains("escapes the build context"),
+        "and name the rule it broke: {text}"
+    );
+    // Same for a source that simply is not there, which the build refuses for its own reason.
+    write("Dockerfile.missing", "FROM alpine:3.19\nCOPY nope.txt /x\n");
+    assert!(
+        !check("Dockerfile.missing").status.success(),
+        "a COPY of a file the context does not hold must fail the check"
+    );
+
+    // WHAT IT MUST NOT REFUSE: a glob, which names no file until the directory is read, and a
+    // `COPY --from`, which resolves against a filesystem that does not exist until that stage has
+    // been built. Both are left to the build - the direction that never refuses something that works.
+    write("Dockerfile.glob", "FROM alpine:3.19\nCOPY *.txt /x/\n");
+    assert!(
+        check("Dockerfile.glob").status.success(),
+        "a glob must be left to the build, not guessed at"
+    );
+    write(
+        "Dockerfile.stage",
+        "FROM alpine:3.19 AS b\nRUN true\nFROM alpine:3.19\nCOPY --from=b /anywhere /x\n",
+    );
+    assert!(
+        check("Dockerfile.stage").status.success(),
+        "a COPY --from names a filesystem that does not exist yet"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

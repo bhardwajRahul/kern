@@ -70,11 +70,12 @@ const VERBS: &[&str] = &[
     "up",
     "down",
     "uninstall",
+    "port",
 ];
 
 /// Verbs whose first argument is a running box's name (so completion can offer `kern ps` names).
 const NAME_VERBS: &[&str] = &[
-    "exec", "attach", "logs", "inspect", "pause", "unpause", "stop", "kill",
+    "exec", "attach", "logs", "inspect", "pause", "unpause", "stop", "kill", "port",
 ];
 
 pub fn completions(shell: &str) -> Result<(), Error> {

@@ -628,6 +628,17 @@ fn legacy_volume_notes(owned: &[String], project: &str) -> Vec<String> {
 /// Drop, not a cleanup call per error path: those `?`s are the reason the leak existed.
 struct EmptyPodGuard<'a> {
     pod: &'a str,
+    /// How many boxes THIS invocation started, recorded by the bring-up as it finishes.
+    ///
+    /// IT IS HERE BECAUSE THE MESSAGE WITHOUT IT WAS FALSE HALF THE TIME. The guard's condition is
+    /// "does the pod hold anything NOW", and the sentence it printed was "no service started" - two
+    /// different statements, which agree only when the bring-up never started anything. MEASURED on a
+    /// stack of two services that print a line and exit: the output read `compose up: 2 box(es)
+    /// started.` and then `removed pod 'x' again: no service started, so it held nothing`, two
+    /// sentences contradicting each other four lines apart. A count makes the two cases sayable, and
+    /// they are genuinely different news: nothing came up (look at the errors above) versus
+    /// everything that came up has already finished (look at the logs).
+    started: std::cell::Cell<usize>,
 }
 
 impl Drop for EmptyPodGuard<'_> {
@@ -641,10 +652,16 @@ impl Drop for EmptyPodGuard<'_> {
         if removed {
             // The creation was announced on stderr, so the removal is announced too: a pod that
             // appears in the output and then silently vanishes is the same half-told story.
-            eprintln!(
-                "kern: note: removed pod '{}' again: no service started, so it held nothing",
-                self.pod
-            );
+            let pod = self.pod;
+            match self.started.get() {
+                0 => eprintln!(
+                    "kern: note: removed pod '{pod}' again: no service started, so it held nothing"
+                ),
+                n => eprintln!(
+                    "kern: note: removed pod '{pod}' again: all {n} service(s) it held have already \
+                     exited (`kern ps -a` lists them with their status)"
+                ),
+            }
         }
     }
 }
@@ -695,6 +712,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         project,
         env_file,
         profiles,
+        recreate,
+        renew_anon_volumes,
+        log_timestamps,
+        log_window,
+        no_log_prefix,
     } = o;
     // `--profile` is DEFINED by Docker as equivalent to `COMPOSE_PROFILES`, so it is applied by
     // exporting that variable once here, at the CLI boundary, before any parsing. One assignment in a
@@ -1557,6 +1579,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             file,
             tail,
             follow,
+            log_timestamps,
+            log_window,
+            no_log_prefix,
             all,
             services,
             own_namespaces: no_pod || want_bridge,
@@ -1690,7 +1715,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 };
                 match registry::find(n) {
                     None => true, // not running: launch it
-                    Some(inst) => match reconcile_decision(&inst, &definition_hash(b)) {
+                    Some(inst) => match reconcile_decision(&inst, &definition_hash(b), recreate) {
                         Reconcile::UpToDate => {
                             kept += 1;
                             false
@@ -1708,9 +1733,44 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 .iter()
                 .map(|n| n.strip_prefix(&format!("{pod}-")).unwrap_or(n))
                 .collect();
-            println!("→ definition changed, recreating: {}", short.join(", "));
+            // SAY WHICH REASON, because the two are not the same news. "The file changed" invites a
+            // reader to go and look at what changed; under `--force-recreate` nothing changed and
+            // sending them to diff the file would be sending them nowhere.
+            match recreate {
+                RecreatePolicy::Always => {
+                    println!("→ --force-recreate, recreating: {}", short.join(", "))
+                }
+                _ => println!("→ definition changed, recreating: {}", short.join(", ")),
+            }
             // Stopped BEFORE the launch loop so the name is free when it is recreated.
             let _ = stop(&stale, false);
+        }
+        // `-V/--renew-anon-volumes`: AFTER the stop and BEFORE the launch loop, which is the only
+        // window where the volume is neither held by the old box nor yet needed by the new one. A
+        // volume still mounted by a running box cannot be removed from under it, and one removed
+        // after the launch would come back empty under a service already reading it.
+        //
+        // SCOPED TO THE SERVICES THIS `up` IS ABOUT TO START, which after the stop above is exactly
+        // what `levels` still holds. Docker's `-V` renews the volumes of the containers it
+        // recreates, not of the ones it leaves running, and the difference is not cosmetic: the
+        // wider reading deletes storage out from under a service nobody asked to touch.
+        if renew_anon_volumes {
+            let launching: std::collections::HashSet<&str> =
+                levels.iter().flatten().map(String::as_str).collect();
+            let scope = format!("{pod}_");
+            let renew: std::collections::HashSet<String> = boxes
+                .iter()
+                .filter(|b| launching.contains(b.name.as_str()))
+                .flat_map(|b| b.volumes.iter())
+                .filter_map(|v| v.split_once(':').map(|(src, _)| src))
+                .filter_map(|src| src.strip_prefix(&scope))
+                .filter(|bare| bare.starts_with("anon-"))
+                .map(str::to_string)
+                .collect();
+            let n = remove_project_volumes_matching(&boxes, &pod, |bare| renew.contains(bare))?;
+            if n > 0 {
+                println!("→ --renew-anon-volumes: {n} anonymous volume(s) discarded");
+            }
         }
         if kept > 0 && levels.iter().all(|l| l.is_empty()) {
             println!("compose up: {kept} service(s) already up to date");
@@ -2085,7 +2145,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // that used to be ignored.
         let stack_is_internal = kern_compose::stack_is_internal_only(&boxes);
         crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range, bridge_cidr)?;
-        _pod_guard = Some(EmptyPodGuard { pod: &pod });
+        _pod_guard = Some(EmptyPodGuard {
+            pod: &pod,
+            started: std::cell::Cell::new(0),
+        });
         // Feedback-first, and the counterpart of the rule just above: the pod's user namespace has ONE
         // map, the holder's, so a member that asked for the narrow one does not get it when a peer needs
         // the range. That is structural, not a bug to fix, but silently handing a service a WIDER map
@@ -2545,7 +2608,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // is performed in the release loop, in dependency order, which is where
                             // "start only after the dependency is healthy" actually means something.
                             if !gate_active {
-                                wait_for_conditions(b, pod, up_token, wait_timeout)?;
+                                wait_for_conditions(b, pod, up_token, wait_timeout, no_deps)?;
                             }
                             let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             let dep = if b.depends_on.is_empty() {
@@ -3079,7 +3142,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // reads EOF and refuses to exec. The stack does not come up half-released.
                 // Every NAT was attached above, before this loop, and the ordering argument that
                 // used to live here is made there instead.
-                wait_for_conditions(b, &pod, &up_token, wait_timeout)?;
+                wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps)?;
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
                         "service '{}': the box was prepared but could not be released (it is no \
@@ -3118,6 +3181,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             dead.len(),
             dead.join(", ")
         )));
+    }
+    // Told to the guard BEFORE the line is printed, so the two numbers come from one place: if the
+    // whole stack has exited by the time the guard runs, its message says how many services this
+    // invocation started rather than claiming none did.
+    if let Some(g) = _pod_guard.as_ref() {
+        g.started.set(total);
     }
     println!("compose up: {total} box(es) started. track with `kern ps`.");
     if use_pod {
