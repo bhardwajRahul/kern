@@ -71,6 +71,20 @@ done
 # where a skip must block the stamp. It earned its place in one run: it caught three real compose
 # files that the tree had started refusing, which the 1097 Rust tests did not and could not see.
 step "compose-corpus" python3 "scripts/compose-corpus-gate.py"
+# THE DOCKER COMMAND SHAPES A REAL PROJECT'S SCRIPTS RUN, against a stack this gate brings up. It is
+# the last of the slow gates and the only one that starts boxes, which is exactly why it is here:
+# every other check in this file reads the tree, and the three defects this battery was written from
+# were invisible to all of them. `docker exec -i <c> psql < file.sql` hung forever, `docker build -t
+# a -t b .` kept one tag, and a `command:` carrying an escaped quote ran a fragment of its script -
+# each one a green tree and a broken habit.
+#
+# SKIPS WITHOUT A BINARY rather than failing: a `cargo test` run on a machine that has not built one
+# should not report a red gate for a missing artefact. Built binary first, then the debug one.
+if [ -x target/release/kern ] || [ -x target/debug/kern ]; then
+    step "deployment-cli" python3 "scripts/deployment-cli-battery.py"
+else
+    printf '  %-34s %s\n' "deployment-cli" "SKIP  no binary: cargo build --release"
+fi
 echo "prose"
 # The character is BUILT, never typed: this file is scanned by the same gate it runs, so a literal
 # one here fails the build. It did, on the commit that added this script, because the check reads

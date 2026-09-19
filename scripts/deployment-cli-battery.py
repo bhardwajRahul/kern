@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Every command shape a real deployment's scripts run, against kern, on a real stack.
+
+WHY THIS EXISTS. The compose-compat rate measures what kern does with a FILE: parse it, warn about
+it, bring it up. A deployment is not only its compose file - it is the fifty-odd command lines its
+scripts, its `package.json` and its CI wrap around that file, and none of those are in any corpus.
+The three defects that started this battery were all there and none of them was visible to
+`compose config`:
+
+  * `exec -i <c> psql < file.sql` hung forever, because `-i` allocated a pseudo-terminal,
+  * `build -t a -t b .` kept only `b`, silently, so the `push a` after it had nothing,
+  * a `command:` carrying `\\"` was truncated at the escape, so a service ran a fragment of its script.
+
+The shapes below were inventoried by hand from one deployment's scripts, `package.json` and CI: a
+database, a REST layer, a workflow engine and their one-shot migrations. What is reproduced here is
+the SHAPE of each command, never the deployment - its names are placeholders. Each shape is run for
+real against a stack this script brings up, and its EXIT CODE and OUTPUT are checked, not merely
+that kern accepted the flags.
+
+WHAT A FAILURE MEANS. A red line here is a command shape that a deployment's scripts contain and
+kern no longer serves. That is a regression whether or not any test in the Rust suite changed,
+because what broke is the shape of a command rather than the behaviour of a function.
+
+WHERE IT RUNS. Locally, from `scripts/gate.sh`, and deliberately NOT in CI: it starts real boxes,
+mounts volumes and pulls an image, and the hosted runner's cgroup delegation differs from a
+developer machine's - a red line there would say more about the runner than about the tree. It skips
+itself with a reason when no binary has been built.
+
+Usage:
+    scripts/deployment-cli-battery.py [--kern PATH] [-v]
+
+`--kern` defaults to ./target/release/kern, then ./target/debug/kern, then `kern` on PATH. Exits
+non-zero if any case fails.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+COMPOSE = """\
+services:
+  db:
+    image: alpine:3.19
+    container_name: battery-db
+    command: >
+      sh -c "
+        for i in 1 2 3; do
+          if [ -f /shared/token ]; then break; fi
+          echo \\"waiting for the token, attempt $$i...\\"
+          sleep 1
+        done
+        echo DB-READY
+        sleep 300
+      "
+    ports:
+      - "15999:5432"
+    volumes:
+      - shared_cfg:/shared
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 1s
+      retries: 3
+  setup:
+    image: alpine:3.19
+    container_name: battery-setup
+    command: sh -c "echo SETUP-DONE; exit 0"
+    volumes:
+      - shared_cfg:/shared
+  api:
+    image: alpine:3.19
+    container_name: battery-api
+    # RUNS AS A NON-ROOT UID ON PURPOSE. Rootless, uid 999 inside the box is a SUBUID on the host,
+    # so what it writes into `owned_data` is a directory this user cannot unlink into - which is
+    # what `down -v` has to be able to remove and, for a while, could not. Every database image
+    # does this; the battery does it without pulling one.
+    user: "999:999"
+    command: sh -c "echo owned > /owned/f 2>/dev/null || true; sleep 300"
+    volumes:
+      - owned_data:/owned
+      - shared_cfg:/shared
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+
+volumes:
+  shared_cfg:
+  owned_data:
+"""
+
+
+class Battery:
+    def __init__(self, kern, workdir, verbose):
+        self.kern = kern
+        self.workdir = workdir
+        self.verbose = verbose
+        self.passed = 0
+        self.failed = []
+
+    def run(self, args, stdin=None, timeout=120):
+        """One kern invocation. Returns (rc, stdout, stderr); a timeout is rc 124, as `timeout(1)`."""
+        try:
+            p = subprocess.run(
+                [self.kern] + args,
+                cwd=self.workdir,
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout}s"
+
+    def check(self, label, script_line, args, *, stdin=None, want_rc=0, want_out=None,
+              want_not=None, timeout=120):
+        """Run one case and record it. `script_line` is the line the deployment's script contains,
+        kept verbatim: the point of a green line is that the script needed no edit."""
+        rc, out, err = self.run(args, stdin=stdin, timeout=timeout)
+        problems = []
+        if want_rc is not None and rc != want_rc:
+            problems.append(f"exit {rc}, wanted {want_rc}")
+        if want_out is not None and want_out not in out + err:
+            problems.append(f"output does not contain {want_out!r}")
+        if want_not is not None and want_not in out + err:
+            problems.append(f"output contains {want_not!r} and must not")
+        if problems:
+            self.failed.append((label, script_line, "; ".join(problems), (out + err)[:400]))
+            print(f"  FAIL  {label}")
+            for p in problems:
+                print(f"          {p}")
+        else:
+            self.passed += 1
+            print(f"  ok    {label}")
+        if self.verbose and (out or err):
+            for line in (out + err).splitlines()[:6]:
+                print(f"          | {line}")
+        return rc, out, err
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kern", default=None)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args()
+
+    kern = a.kern
+    if kern is None:
+        for c in ("target/release/kern", "target/debug/kern"):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                kern = os.path.abspath(c)
+                break
+        else:
+            kern = shutil.which("kern")
+    if not kern:
+        print("no kern binary: build one or pass --kern PATH", file=sys.stderr)
+        return 2
+    print(f"binary: {kern}")
+    print(subprocess.run([kern, "--version"], capture_output=True, text=True).stdout.strip())
+
+    work = tempfile.mkdtemp(prefix="kern-inventory-")
+    compose_path = os.path.join(work, "docker-compose.yml")
+    with open(compose_path, "w") as f:
+        f.write(COMPOSE)
+    # A build context, for the `-t a -t b` case the CI runs.
+    with open(os.path.join(work, "Dockerfile"), "w") as f:
+        f.write("FROM alpine:3.19\nRUN true\n")
+    with open(os.path.join(work, "seed.sql"), "w") as f:
+        f.write("line one\nline two\nline three\n")
+
+    b = Battery(kern, work, a.verbose)
+    try:
+        # ---- compose lifecycle: what start.sh / rebuild.sh / npm scripts run ----
+        print("\ncompose lifecycle")
+        b.check("compose config", "docker compose config",
+                ["compose", "docker-compose.yml", "config"], want_out="3 service")
+        b.check("compose up -d", "docker compose up -d",
+                ["compose", "docker-compose.yml", "up", "-d"], want_out="started", timeout=240)
+        time.sleep(3)
+        b.check("compose ps", "docker compose ps", ["compose", "docker-compose.yml", "ps"])
+        b.check("compose ps --format", 'docker compose ps --format "{{.Name}} {{.Status}}"',
+                ["compose", "docker-compose.yml", "ps", "--format", "{{.Names}} {{.Status}}"],
+                want_out="battery-db")
+        b.check("compose up -d (idempotent)", "docker compose up -d",
+                ["compose", "docker-compose.yml", "up", "-d"], want_out="up to date")
+        b.check("compose up --force-recreate", "docker compose up -d --build --force-recreate --no-deps api",
+                ["compose", "docker-compose.yml", "up", "-d", "--build", "--force-recreate",
+                 "--no-deps", "api"], want_out="recreating", timeout=240)
+        b.check("compose logs", "docker compose logs", ["compose", "docker-compose.yml", "logs"])
+        b.check("compose logs <svc>", "docker compose logs db",
+                ["compose", "docker-compose.yml", "logs", "db"])
+        b.check("compose exec -T", "docker compose exec -T db pg_isready",
+                ["compose", "docker-compose.yml", "exec", "-T", "db", "true"])
+        b.check("compose restart <svc>", "docker compose restart db",
+                ["compose", "docker-compose.yml", "restart", "db"], timeout=240)
+        time.sleep(2)
+
+        # ---- engine verbs against a container_name, the form ~70 scripts use ----
+        print("\nengine verbs on container_name")
+        b.check("exec -i with redirect", "docker exec -i <db-container> psql ... < file.sql",
+                ["exec", "-i", "battery-db", "cat"],
+                stdin=open(os.path.join(work, "seed.sql")).read(),
+                want_out="line three", timeout=30)
+        b.check("exec -i output is byte-exact", "docker exec -i ... < file.sql",
+                ["exec", "-i", "battery-db", "cat"],
+                stdin="alpha\nbeta\n", want_out="alpha\nbeta\n", want_not="\r", timeout=30)
+        b.check("exec <box> <cmd>", 'docker exec <db-container> psql -tAc "..."',
+                ["exec", "battery-db", "echo", "hello"], want_out="hello")
+        b.check("logs <box>", "docker logs <api-container>", ["logs", "battery-db"])
+        b.check("inspect -f State.Status", "docker inspect -f '{{.State.Status}}' <one-shot-container>",
+                ["inspect", "-f", "{{.State.Status}}", "battery-setup"], want_out="exited")
+        b.check("inspect -f State.ExitCode", "docker inspect -f '{{.State.ExitCode}}' <c>",
+                ["inspect", "-f", "{{.State.ExitCode}}", "battery-setup"], want_out="0")
+        b.check("inspect --json has status", "docker inspect <c> | jq .State.Status",
+                ["inspect", "battery-db", "--json"], want_out='"status":"running"')
+        b.check("port <box> <port>", "docker port <api-container> 3000",
+                ["port", "battery-db", "5432"], want_out="15999")
+        b.check("info", "docker info", ["info"])
+        b.check("ps --filter health", "docker ps --filter health=healthy",
+                ["ps", "--filter", "health=healthy", "--format", "{{.Names}}"])
+
+        # ---- the CI's image pipeline ----
+        print("\nimage pipeline (CI)")
+        b.check("build -t A -t B .", "docker build -t $ECR:$VERSION -t $ECR:latest .",
+                ["build", "-t", "battery/app:1.0", "-t", "battery/app:latest", "."],
+                want_out="battery/app:latest", timeout=300)
+        b.check("both tags exist", "docker images", ["images", "--filter", "reference=battery/app*"],
+                want_out="battery/app:1.0")
+        b.check("tag", "docker tag a b", ["tag", "battery/app:1.0", "battery/app:2.0"])
+        b.check("save to a file", "docker save img > images/name.tar",
+                ["save", "battery/app:1.0", "-o", os.path.join(work, "app.tar")])
+        b.check("load from a file", "docker load < images/name.tar",
+                ["load", "-i", os.path.join(work, "app.tar")], timeout=300)
+        b.check("rmi", "docker rmi img",
+                ["rmi", "battery/app:1.0", "battery/app:2.0", "battery/app:latest"])
+
+        # ---- the contracts a script BRANCHES on, not just the ones it runs ----
+        #
+        # Each of these four was wrong when it was first written, and three of them were wrong in a
+        # way no exit code showed: the command succeeded and answered a different question.
+        print("\ncontracts")
+        b.check("compose wait returns the status", "docker compose wait tests  # $? is the suite's",
+                ["compose", "docker-compose.yml", "wait", "setup"], want_rc=0, timeout=240)
+        b.check("compose push skips what it did not build",
+                "docker compose push  # only services with a build section",
+                ["compose", "docker-compose.yml", "push"],
+                want_out="declares no `build:`", want_rc=0)
+        b.check("ps --last is newest CREATED", "docker ps -n 2",
+                ["ps", "--last", "2", "--format", "{{.Names}}"])
+        b.check("images --filter without a tag", "docker images --filter reference=alpine",
+                ["images", "--filter", "reference=alpine"], want_out="alpine:3.19")
+
+        # ---- the four `build:` SHAPES a real file declares, and the chain wrapped around them ----
+        #
+        # Not the project's code, which this script does not have: its SHAPES. A compose file's
+        # `build:` comes in forms that resolve paths differently, and each one is a way for a build
+        # to find nothing and say nothing: `context:` with `args:`, the bare short form, and a
+        # context at the REPO ROOT with the Dockerfile in a subdirectory (where every COPY resolves
+        # from the root, not from beside the Dockerfile).
+        #
+        # Then the chain those builds sit in, which is one real rebuild script end to end: a one-off
+        # box joined to the running stack's network mints a token, an `exec` writes it into the
+        # shared volume, and the consumer is force-recreated with `--no-deps` to pick it up. Every
+        # step of it was a defect at some point in this release.
+        print("\nbuild shapes and the rebuild chain")
+        os.makedirs(os.path.join(work, "sub"), exist_ok=True)
+        with open(os.path.join(work, "root-file.txt"), "w") as f:
+            f.write("from the repo root\n")
+        with open(os.path.join(work, "sub", "Dockerfile"), "w") as f:
+            f.write(
+                "FROM alpine:3.19\nARG MARKER\n"
+                "COPY root-file.txt /root-file.txt\n"
+                "RUN echo \"marker=$MARKER\" > /marker.txt\n"
+            )
+        b.check("build --check reports without building", "docker build (no dry run exists)",
+                ["build", "--check", "-f", "sub/Dockerfile", "."],
+                want_out="builds here")
+        b.check("build.args reaches the build", "docker compose build --build-arg",
+                ["build", "-t", "battery/shape:1", "-f", "sub/Dockerfile",
+                 "--build-arg", "MARKER=arrivato", "."],
+                want_out="battery/shape:1", timeout=300)
+        b.check("context=root, dockerfile in a subdir", "build: {context: ., dockerfile: sub/D}",
+                ["box", "shapechk", "--image", "battery/shape:1", "--",
+                 "sh", "-c", "cat /root-file.txt /marker.txt"],
+                want_out="from the repo root", timeout=300)
+        b.check("and the arg is in the image", "docker build --build-arg",
+                ["box", "shapechk2", "--image", "battery/shape:1", "--", "cat", "/marker.txt"],
+                want_out="marker=arrivato", timeout=300)
+
+        # THE CHAIN. `--network <stack>` is how a one-off talks to a running stack; it was
+        # `--network <host|none>` and nothing else until this release.
+        pod = ""
+        rc, out, _ = b.run(["pod", "ls"])
+        for line in out.splitlines():
+            if line.split()[:1] and line.split()[0].startswith(os.path.basename(work)[:8]):
+                pod = line.split()[0]
+        if not pod:
+            rc, out, _ = b.run(["ps", "--format", "{{.Pod}}"])
+            pod = next((l.strip() for l in out.splitlines() if l.strip()), "")
+        b.check("one-off joins the stack's network", "docker run --rm --network <stack> …",
+                ["box", "tokgen", "--image", "alpine:3.19", "--network", pod, "--",
+                 "sh", "-c", "echo tok-battery"], want_out="tok-battery", timeout=300)
+        # `db` mounts the shared volume rw and is still running, which is the shape the real chain
+        # has: the token is written THROUGH a live service, because the volume belongs to the stack
+        # and not to the host.
+        b.check("exec writes into the shared volume", "docker exec <c> sh -c 'echo T > /shared/t'",
+                ["exec", "battery-db", "sh", "-c", "echo tok-battery > /shared/token"])
+        b.check("and the consumer reads it back", "docker exec <c> cat /shared/token",
+                ["exec", "battery-api", "cat", "/shared/token"], want_out="tok-battery")
+        # `--force-recreate --no-deps <svc>` on a stack whose one-shot dependency already completed:
+        # the line that used to burn 120 seconds and then fail about a service that HAD completed.
+        b.check("force-recreate --no-deps after the injection",
+                "docker compose up -d --build --force-recreate --no-deps api",
+                ["compose", "docker-compose.yml", "up", "-d", "--build", "--force-recreate",
+                 "--no-deps", "api"], want_out="recreating", timeout=300)
+
+        # ---- teardown ----
+        print("\nteardown")
+        b.check("compose stop", "docker compose stop", ["compose", "docker-compose.yml", "stop"],
+                timeout=240)
+        b.check("compose rm", "docker compose rm", ["compose", "docker-compose.yml", "rm"])
+        # `down -v` MUST REPORT REMOVING BOTH NAMED VOLUMES, including the one a non-root service
+        # wrote to. It used to fail on that one with EACCES and abandon the rest of the loop, so a
+        # `reset.sh` reported a reset that had removed nothing and the next `up` reused the old data.
+        b.check("compose down -v removes a subuid volume", "docker compose down -v",
+                ["compose", "docker-compose.yml", "down", "-v"],
+                want_out="2 named volume(s) removed", timeout=240)
+        b.check("compose down (twice)", "docker compose down",
+                ["compose", "docker-compose.yml", "down"], timeout=240)
+    finally:
+        subprocess.run([kern, "compose", compose_path, "down", "-v"],
+                       capture_output=True, timeout=240)
+        for ref in ("battery/app:1.0", "battery/app:2.0", "battery/app:latest"):
+            subprocess.run([kern, "rmi", ref], capture_output=True, timeout=60)
+        shutil.rmtree(work, ignore_errors=True)
+
+    total = b.passed + len(b.failed)
+    print(f"\n{b.passed}/{total} of a deployment's command shapes work on kern")
+    if b.failed:
+        print("\nFAILED:")
+        for label, form, why, out in b.failed:
+            print(f"  {label}")
+            print(f"    the script contains: {form}")
+            print(f"    {why}")
+            if out.strip():
+                print(f"    output: {out.strip()[:200]}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
