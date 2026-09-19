@@ -9700,7 +9700,7 @@ services:
     fn container_name_is_captured_and_empty_falls_back() {
         // Docker's `container_name:` is captured (compose() then names the box this exactly, so
         // `docker exec <name>` ports 1:1); an empty value falls back to the default project name.
-        let y = "services:\n  db:\n    image: alpine\n    container_name: usbim-postgres\n  bare:\n    image: alpine\n    container_name: \"\"\n";
+        let y = "services:\n  db:\n    image: alpine\n    container_name: app-postgres\n  bare:\n    image: alpine\n    container_name: \"\"\n";
         let boxes = parse(y).unwrap();
         assert_eq!(
             boxes
@@ -9709,7 +9709,7 @@ services:
                 .unwrap()
                 .container_name
                 .as_deref(),
-            Some("usbim-postgres")
+            Some("app-postgres")
         );
         assert!(
             boxes
@@ -9961,7 +9961,7 @@ services:
         // The map form `networks: {net: {aliases: [db]}}` yields the aliases; the list form has none.
         // (kern ignores the network itself - shared-netns pod - but honours the alias names so a peer
         // can reach the service by alias too.)
-        let y = "services:\n  postgres:\n    image: x\n    networks:\n      usbim:\n        aliases:\n          - db\n          - primary\n  rest:\n    image: y\n    networks:\n      - usbim\n";
+        let y = "services:\n  postgres:\n    image: x\n    networks:\n      backend:\n        aliases:\n          - db\n          - primary\n  rest:\n    image: y\n    networks:\n      - backend\n";
         let b = parse(y).unwrap();
         assert_eq!(
             b.iter().find(|x| x.name == "postgres").unwrap().net_aliases,
