@@ -18,13 +18,19 @@ FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
 fail=0
 
+# INTEGER ARITHMETIC, NOT `%f`, and the reason is not pedantry. The first version handed printf a
+# string like `1234e-3` for a `%5.1f`, which dash renders `1.2s` and bash under an Italian locale
+# renders `1,2s`: a gate whose output changes with the operator's language. The decimal is built from
+# whole milliseconds here, so every shell and every locale print the same characters.
+elapsed() { printf '%d.%01d' "$(( $1 / 1000 ))" "$(( ($1 % 1000) / 100 ))"; }
+
 step() {
     name=$1; shift
     t0=$(date +%s%N)
     if "$@" >/tmp/prepush.log 2>&1; then
-        printf '  \033[32mok\033[0m   %-38s %5.1fs\n' "$name" "$(( ($(date +%s%N)-t0)/1000000 ))e-3"
+        printf '  \033[32mok\033[0m   %-38s %5ss\n' "$name" "$(elapsed "$(( ($(date +%s%N)-t0)/1000000 ))")"
     else
-        printf '  \033[31mFAIL\033[0m %-38s %5.1fs\n' "$name" "$(( ($(date +%s%N)-t0)/1000000 ))e-3"
+        printf '  \033[31mFAIL\033[0m %-38s %5ss\n' "$name" "$(elapsed "$(( ($(date +%s%N)-t0)/1000000 ))")"
         sed 's/^/       /' /tmp/prepush.log | tail -25
         fail=1
     fi

@@ -272,6 +272,7 @@ fn a_per_verb_help_carries_no_line_from_another_verb() {
 /// restricted". Both halves are asserted here: present on the GPU grant, absent on the other one.
 #[test]
 fn the_vram_caveat_prints_on_a_gpu_grant_and_not_on_another_device() {
+    const CAVEAT: &str = "NOT a boundary against malicious code";
     let dir = std::env::temp_dir().join(format!("kern-gpuplan-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmpdir");
     let cfg = dir.join("kern.toml");
@@ -290,7 +291,6 @@ fn the_vram_caveat_prints_on_a_gpu_grant_and_not_on_another_device() {
             .expect("run kern");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
-    const CAVEAT: &str = "NOT a boundary against malicious code";
     let gpu = plan("vgpio:gpu");
     let other = plan("vgpio:other");
     let _ = std::fs::remove_dir_all(&dir);

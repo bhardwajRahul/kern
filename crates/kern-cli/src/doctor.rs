@@ -1563,10 +1563,7 @@ mod tests {
         let start = src[..at]
             .rfind("R::Warn(")
             .expect("a denial row must be an R::Warn");
-        let end = src[at..]
-            .find("\n        }")
-            .map(|o| at + o)
-            .unwrap_or(src.len());
+        let end = src[at..].find("\n        }").map_or(src.len(), |o| at + o);
         assert!(
             src[start..end].contains("memory_probe_sites_phrase()"),
             "the row saying {d:?} states a cap does not bind without naming the cgroup it probed"
@@ -1777,11 +1774,6 @@ mod tests {
     /// the half that prose regressions live in.
     #[test]
     fn no_verdict_in_this_file_is_a_paragraph() {
-        let src = include_str!("doctor.rs");
-        let src = &src[..src
-            .find("#[cfg(test)]")
-            .expect("the test module must exist")];
-
         /// Reads a Rust string literal starting at `bytes[i] == b'"'`, joining `\` continuations.
         fn literal(b: &[u8], mut i: usize) -> String {
             let mut out = String::new();
@@ -1808,6 +1800,11 @@ mod tests {
             }
             out
         }
+
+        let src = include_str!("doctor.rs");
+        let src = &src[..src
+            .find("#[cfg(test)]")
+            .expect("the test module must exist")];
 
         let b = src.as_bytes();
         let mut checked = 0usize;
