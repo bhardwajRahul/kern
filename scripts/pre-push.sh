@@ -6,8 +6,12 @@
 # about 33 minutes of waiting - finding one defect per push, and not one of them needed a runner to
 # be found. The cost is not running checks, it is learning about a defect from CI.
 #
-#   sh scripts/pre-push.sh          fast set, ~9 s: run it as often as you like
-#   sh scripts/pre-push.sh --full   + the integration suite, ~38 s: run it before a push
+#   sh scripts/pre-push.sh          fast set + both bindings, ~45 s: run it as often as you like
+#   sh scripts/pre-push.sh --full   + the integration suite, ~75 s: run it before a push
+#
+# The fast set grew from ~9 s to ~45 s when the binding suites were added, and that is a trade made
+# with a number: they were absent, a binding change went green here and red on CI in two jobs, and
+# one CI round costs ~9 minutes of waiting. 36 seconds against 9 minutes.
 #
 # BARE EXIT CODES, never a pipe: a gate whose status is swallowed by `| tee` reports success it did
 # not earn.
@@ -73,6 +77,29 @@ done
 # IT READS WHAT GIT TRACKS, so `git add` your new files before trusting a green from it. An
 # untracked file is invisible to these gates and to CI alike, right up to the commit that adds
 # it. Verified both ways: an em-dash in a staged `.sh` and in a tracked `.rs` each turn this red.
+
+# THE BINDINGS, AND IN THE CONDITION CI HAS, because this file promised "everything CI will say" and
+# said nothing at all about them. MEASURED: a change to the Python and Node bindings went green here
+# and RED on CI in both `python binding (3.9)` and `(3.12)`, on a test that constructed a `Sandbox`
+# directly - the constructor verifies a kern binary, and a runner has none while this machine has one
+# on `$PATH`. So the gap was not only "the suite was not run", it was "it would have passed anyway
+# here": a check that runs in the wrong condition does not check anything.
+#
+# `env -u KERN_BIN PATH=/usr/bin:/bin` is that condition, spelled once. It makes the integration tests
+# SKIP, exactly as they do on CI, and leaves the several hundred unit tests that caught this. The full
+# suites with a real kern are still worth running by hand; what belongs in a pre-push gate is the
+# shape CI will actually see.
+bindings_python() {
+    [ -d bindings/python/tests ] || return 0
+    ( cd bindings/python && env -u KERN_BIN PATH=/usr/bin:/bin python3 -m pytest -q ) || return 1
+}
+bindings_node() {
+    [ -f bindings/node/test/sandbox.test.js ] || return 0
+    command -v node >/dev/null || return 0
+    ( cd bindings/node && env -u KERN_BIN node --test test/sandbox.test.js ) || return 1
+}
+step "python binding, CI shape" bindings_python
+step "node binding"            bindings_node
 
 if [ "$FULL" -eq 1 ]; then
     step "integration suite" cargo test -q -p getkern

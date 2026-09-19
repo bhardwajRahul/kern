@@ -3870,7 +3870,9 @@ def test_the_uid_range_is_skipped_exactly_when_cap_drop_all_makes_it_useless():
         (("NET_RAW",), False),  # narrower: SETUID survives, so the range still means something
         (("NET_RAW", "ALL"), True),  # ALL anywhere in the list is enough
     ):
-        sbx = Sandbox(cap_drop=cap_drop)
+        # `_cfg`, NOT `Sandbox`: the constructor verifies a kern binary, and a CI runner has none.
+        # This failed exactly there while passing here, because this machine has kern on PATH.
+        sbx = _cfg(cap_drop=cap_drop)
         argv = sbx._base_argv("n", network=False, timeout_s=10, dry=True)
         assert ("--no-uid-range" in argv) is want, (
             f"cap_drop={cap_drop!r}: expected --no-uid-range {want}, got {not want}"
