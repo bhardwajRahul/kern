@@ -545,7 +545,7 @@ mod what_may_not_reach_a_terminal {
             assert!(is_terminal_unsafe(c), "{c:?} must never reach a terminal");
         }
         for c in ['a', ' ', '/', ':', '-', 'e', '.', '3', 'e', 'a', 'o', 'u'] {
-            assert!(is_terminal_unsafe(c) == false, "{c:?} is ordinary text");
+            assert!(!is_terminal_unsafe(c), "{c:?} is ordinary text");
         }
     }
 }

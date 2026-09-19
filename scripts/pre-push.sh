@@ -44,7 +44,14 @@ step "unit tests"              cargo test -q --workspace --lib --bins
 # passes here and fails there. This runs the unit tests in THAT shape. STILL JUST THE BINARY: the
 # shape being reproduced is a cgroup one, and the crates above do not touch a cgroup.
 step "unit tests, CI host shape" sh scripts/as-ci-host.sh cargo test -q -p getkern --bin kern
-step "clippy -D warnings"      cargo clippy --release --workspace --all-targets
+# THE LABEL SAID `-D warnings` AND THE COMMAND DID NOT SET IT. Measured: a `bool_assert_comparison`
+# in a new test printed as a WARNING here and this script exited 0 and said "green: this is what CI
+# will say"; run #863 then failed clippy on both x86 and aarch64, because the CI job exports
+# `RUSTFLAGS: -D warnings` and this did not. `gate.sh` says why in its own header - a
+# clippy that passes is not evidence - and this file, whose entire promise is to say what CI will
+# say, was the one place the flag was missing. The flags now match CI exactly, `--all-features` and
+# the debug profile included: a different profile is a different cache and can be a different lint.
+step "clippy -D warnings"      env RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
 for g in no-ai-slop stale-numbers docker-vocabulary md-links flat-continuation \
          test-env-lock progress-is-tty-gated injection-declared registry-classified \
          tracked-paths-sane; do
