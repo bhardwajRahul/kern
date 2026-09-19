@@ -493,6 +493,22 @@ function kernStateDirs() {
  * wrong way round, and it is the scenario a prompt-injected agent is steered into ("read ~/.aws"). These
  * match by NAME because they live under a per-user home. No escape hatch, same as `/etc`: a job that
  * needs one credential should be given that one file in the workspace. */
+//
+// THE LIST WAS SHORT OF THE PROMISE ABOVE IT, and the asymmetry is what gave it away: AWS refused,
+// Azure refused, GCP accepted. MEASURED against the published SDK with each directory CREATED first,
+// because a refusal that is really "source does not exist" is a skip wearing a pass - that is how
+// `~/.config/gcloud` read as covered on a host that has no gcloud.
+//
+// `~/.config/<tool>` NEEDS THE PARENT, which is why there is a second set below: `gcloud` and `gh`
+// are not dotfiles, and refusing a bare `gh` component anywhere would refuse `~/projects/gh/src` - a
+// guard that fires on ordinary work gets switched off, and then it guards nothing.
+//
+// DELIBERATELY NOT ADDED: `.cargo`, `.m2`, `.gem`. Each holds ONE credential file next to a package
+// cache people legitimately mount, so refusing the directory would break a real use and push callers
+// off the guard. The residual gap is named rather than papered over.
+//
+// KEPT IDENTICAL TO THE PYTHON BINDING on purpose: two spellings of one rule drift, and a caller who
+// moved between the two SDKs would meet a different boundary in each.
 const REFUSED_MOUNT_COMPONENTS = new Set([
   ".ssh",
   ".aws",
@@ -505,6 +521,20 @@ const REFUSED_MOUNT_COMPONENTS = new Set([
   ".git-credentials",
   ".pypirc",
   ".npmrc",
+  ".oci",
+  ".terraform.d",
+  ".databrickscfg",
+  ".boto",
+  ".s3cfg",
+  ".rclone.conf",
+]);
+
+// `parent/child` pairs, refused when they appear CONSECUTIVELY in the source.
+const REFUSED_MOUNT_PAIRS = new Set([
+  ".config/gcloud",
+  ".config/gh",
+  ".config/doctl",
+  ".config/rclone",
 ]);
 
 /** A PROGRAMMER/config error, THROWN: bad argument, illegal mount, `kern` not installed, or the box
@@ -908,13 +938,23 @@ function validateMount(source, target) {
           "docker socket is refused",
       );
   }
-  for (const part of real.split(path.sep))
-    if (REFUSED_MOUNT_COMPONENTS.has(part))
-      throw new MountRefused(
-        `refusing to mount ${JSON.stringify(real)}: ${JSON.stringify(part)} holds credentials, and code ` +
-          "in the box would read them. If the job needs one secret, write THAT FILE into the workspace " +
-          "(sbx.writeFile) or mount a directory that holds only it",
-      );
+  const parts = real.split(path.sep);
+  let hit = parts.find((p) => REFUSED_MOUNT_COMPONENTS.has(p));
+  if (hit === undefined)
+    // The `parent/child` form, consecutive so `~/.config/gh` is refused and `~/gh` is not.
+    for (let i = 0; i + 1 < parts.length; i++) {
+      const pair = `${parts[i]}/${parts[i + 1]}`;
+      if (REFUSED_MOUNT_PAIRS.has(pair)) {
+        hit = pair;
+        break;
+      }
+    }
+  if (hit !== undefined)
+    throw new MountRefused(
+      `refusing to mount ${JSON.stringify(real)}: ${JSON.stringify(hit)} holds credentials, and code ` +
+        "in the box would read them. If the job needs one secret, write THAT FILE into the workspace " +
+        "(sbx.writeFile) or mount a directory that holds only it",
+    );
   return [real, target];
 }
 

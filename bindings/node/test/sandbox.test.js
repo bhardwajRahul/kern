@@ -2449,3 +2449,45 @@ test("index.d.ts declares exactly the fields an ExecutionResult exposes", async 
   assert.deepStrictEqual(missing, [], `fields on the object that the .d.ts does not declare: ${missing}`);
   assert.deepStrictEqual(extra, [], `fields the .d.ts declares that the object does not have: ${extra}`);
 });
+
+test("the credential list covers the third cloud and does not fire on a lookalike", async () => {
+  // AWS refused, Azure refused, GCP accepted: the asymmetry that exposed the gap. MEASURED against
+  // the published SDK with each directory CREATED first, because a refusal that is really "source
+  // does not exist" is a skip wearing a pass - that is how `~/.config/gcloud` read as covered on a
+  // host with no gcloud.
+  //
+  // THE SECOND HALF IS THE CONTROL. `gcloud` and `gh` are not dotfiles, so they are matched only
+  // under `.config`; a bare component match would refuse `~/projects/gh/src`, and a guard that
+  // fires on ordinary work is a guard someone turns off.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "kt-cred2-"));
+  try {
+    for (const rel of [".oci", ".terraform.d", ".config/gcloud", ".config/gh", ".config/doctl", ".config/rclone"]) {
+      const d = path.join(root, rel);
+      fs.mkdirSync(path.join(d, "inner"), { recursive: true });
+      for (const src of [d, path.join(d, "inner")]) {
+        assert.throws(() => new Sandbox({ mounts: { [src]: "/x" } }), (e) => {
+          assert.ok(e instanceof MountRefused, `${src}: ${e.constructor.name}`);
+          assert.match(e.message, /holds credentials/);
+          return true;
+        }, `${src} must be refused`);
+      }
+    }
+    for (const fname of [".databrickscfg", ".boto", ".s3cfg", ".rclone.conf"]) {
+      const f = path.join(root, fname);
+      fs.writeFileSync(f, "secret");
+      assert.throws(() => new Sandbox({ mounts: { [f]: "/x" } }), MountRefused, `${f} must be refused`);
+    }
+    // NOT credentials, and must stay mountable.
+    for (const rel of ["projects/gh", "src/gcloud-client", "work/doctl-notes", ".config/myapp"]) {
+      const d = path.join(root, rel);
+      fs.mkdirSync(d, { recursive: true });
+      assert.doesNotThrow(() => new Sandbox({ mounts: { [d]: "/x" } }), `${d} must stay mountable`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});

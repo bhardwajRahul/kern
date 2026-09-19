@@ -177,7 +177,9 @@ Every relaxing option says so in its name or docs:
   line, so a credential in `env` does not leak into `ps`.
 - **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
   `$HOME`, the docker socket), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
-  `.kube`, `.docker`, `.azure`, `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`),
+  `.kube`, `.docker`, `.azure`, `.oci`, `.terraform.d`, `.password-store`, `.netrc`, `.git-credentials`,
+  `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and under `.config`:
+  `gcloud`, `gh`, `doctl`, `rclone`),
   **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that
   holds every named volume: the sandbox's control plane), and escaping targets.
 - **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes, open the final component

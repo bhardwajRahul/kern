@@ -3781,3 +3781,66 @@ def test_a_prewarmed_session_leaves_no_scratch_behind():
         f"a prewarmed session left {live() - before} scratch directories in {scratch}; "
         "they accumulate in a tmpfs for as long as an agent runs"
     )
+
+
+def test_the_credential_list_covers_the_third_cloud_and_does_not_fire_on_a_lookalike(tmp_path):
+    """AWS refused, Azure refused, GCP accepted: the asymmetry that exposed the gap.
+
+    MEASURED against the published 0.2.27, with each directory CREATED first - and that step is the
+    point. The first sweep reported `~/.config/gcloud` as covered when the real answer was "source
+    does not exist" on a host with no gcloud, which is a skip wearing a pass. Ten candidates were
+    accepted once they existed, including a GitHub CLI token directory.
+
+    THE SECOND HALF IS THE CONTROL. `gcloud` and `gh` are not dotfiles, so they are matched only
+    under `.config`; a bare component match would refuse `~/projects/gh/src`, and a guard that fires
+    on ordinary work is a guard someone turns off. Both halves are asserted here, because only the
+    pair says the rule is the right shape.
+    """
+    for rel in (
+        ".oci",
+        ".terraform.d",
+        ".config/gcloud",
+        ".config/gh",
+        ".config/doctl",
+        ".config/rclone",
+    ):
+        d = tmp_path / rel
+        d.mkdir(parents=True)
+        (d / "inner").mkdir()
+        with pytest.raises(MountRefused) as e:
+            kern._validate_mount(str(d), "/x")
+        assert "holds credentials" in str(e.value)
+        with pytest.raises(MountRefused):  # and anything below it
+            kern._validate_mount(str(d / "inner"), "/x")
+    for fname in (".databrickscfg", ".boto", ".s3cfg", ".rclone.conf"):
+        f = tmp_path / fname
+        f.write_text("secret")
+        with pytest.raises(MountRefused):
+            kern._validate_mount(str(f), "/x")
+
+    # NOT a credential directory, and must stay mountable.
+    for rel in ("projects/gh", "src/gcloud-client", "work/doctl-notes", ".config/myapp"):
+        d = tmp_path / rel
+        d.mkdir(parents=True)
+        real, target = kern._validate_mount(str(d), "/x")
+        assert target == "/x" and real.endswith(rel.split("/")[-1])
+
+
+def test_the_two_bindings_refuse_the_same_credential_names():
+    """One rule, two spellings, and they drift.
+
+    A caller who moves between the SDKs would otherwise meet a different boundary in each, and the
+    one that is behind is the one that matters. Read out of the Node source rather than executed, so
+    this runs without a node on PATH.
+    """
+    js = (Path(__file__).resolve().parents[2] / "node" / "index.js").read_text(encoding="utf-8")
+
+    def js_set(name):
+        body = re.search(rf"const {name} = new Set\(\[(.*?)\]\);", js, re.S)
+        assert body, f"{name} is no longer a literal Set in the Node binding"
+        return set(re.findall(r'"([^"]+)"', body.group(1)))
+
+    assert js_set("REFUSED_MOUNT_COMPONENTS") == kern._REFUSED_MOUNT_COMPONENTS
+    assert js_set("REFUSED_MOUNT_PAIRS") == {
+        f"{a}/{b}" for a, b in kern._REFUSED_MOUNT_PAIRS
+    }

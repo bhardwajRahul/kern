@@ -503,6 +503,22 @@ _REFUSED_MOUNT_SOURCES = {
 # NO ESCAPE HATCH, the same as `/etc`: what a job legitimately needs is ONE credential, and the way to
 # give it one is to write that file into the workspace (or mount a directory holding only it), which is
 # also the only shape an independent test can check.
+#
+# THE LIST WAS SHORT OF THE PROMISE ABOVE IT, and the asymmetry is what gave it away: AWS refused,
+# Azure refused, GCP accepted. MEASURED against the published 0.2.27 with each directory CREATED
+# first, because a refusal that is really "source does not exist" is a skip wearing a pass - that is
+# how `~/.config/gcloud` read as covered on a host that has no gcloud. Ten candidates were accepted;
+# the ones that are nothing but credentials are added here.
+#
+# `~/.config/<tool>` NEEDS THE PARENT, which is why there is a second set. `gcloud` and `gh` are not
+# dotfiles, and refusing a bare `gh` component anywhere would refuse `~/projects/gh/src` - a guard
+# that fires on ordinary work gets switched off, and then it guards nothing.
+#
+# DELIBERATELY NOT ADDED: `.cargo`, `.m2`, `.gem`. Each holds ONE credential file next to a package
+# cache people legitimately mount (`~/.cargo/registry` for an offline build), so refusing the
+# directory would break a real use and push callers off the guard entirely. Naming the residual gap
+# beats a refusal nobody keeps: mounting `~/.cargo` still exposes `credentials.toml`, and closing
+# that needs a different mechanism than a path component.
 _REFUSED_MOUNT_COMPONENTS = {
     ".ssh",
     ".aws",
@@ -515,6 +531,21 @@ _REFUSED_MOUNT_COMPONENTS = {
     ".git-credentials",
     ".pypirc",
     ".npmrc",
+    ".oci",
+    ".terraform.d",
+    ".databrickscfg",
+    ".boto",
+    ".s3cfg",
+    ".rclone.conf",
+}
+
+# `(parent, child)` pairs, refused when they appear CONSECUTIVELY in the source. For tools whose
+# credentials live under `~/.config/<tool>` with a name too generic to match on its own.
+_REFUSED_MOUNT_PAIRS = {
+    (".config", "gcloud"),
+    (".config", "gh"),
+    (".config", "doctl"),
+    (".config", "rclone"),
 }
 
 
@@ -1374,13 +1405,24 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
                 f"started gives the code inside the sandbox's control plane, which is the same reason "
                 f"the docker socket is refused"
             )
-    for part in real.split(os.sep):
-        if part in _REFUSED_MOUNT_COMPONENTS:
-            raise MountRefused(
-                f"refusing to mount {real!r}: {part!r} holds credentials, and code in the box would "
-                f"read them. If the job needs one secret, write THAT FILE into the workspace "
-                f"(sbx.write_file) or mount a directory that holds only it"
-            )
+    parts = real.split(os.sep)
+    hit = next((p for p in parts if p in _REFUSED_MOUNT_COMPONENTS), None)
+    if hit is None:
+        # The `<parent>/<child>` form, consecutive so `~/.config/gh` is refused and `~/gh` is not.
+        hit = next(
+            (
+                f"{a}/{b}"
+                for a, b in zip(parts, parts[1:])
+                if (a, b) in _REFUSED_MOUNT_PAIRS
+            ),
+            None,
+        )
+    if hit is not None:
+        raise MountRefused(
+            f"refusing to mount {real!r}: {hit!r} holds credentials, and code in the box would "
+            f"read them. If the job needs one secret, write THAT FILE into the workspace "
+            f"(sbx.write_file) or mount a directory that holds only it"
+        )
     return real, target
 
 def _validate_mount(source: str, target: str) -> tuple[str, str]:

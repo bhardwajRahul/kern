@@ -343,6 +343,21 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**The SDK mount guard refused AWS and Azure and accepted Google Cloud.** The list of credential
+directories a `mounts=` source may not contain covered eleven names and missed the third major cloud,
+plus the GitHub CLI's token directory. Measured on the published 0.2.27 with each directory created
+first, which is the step that matters: the first sweep read `~/.config/gcloud` as covered when the
+real answer was "source does not exist" on a host that has no gcloud, and a refusal that is really a
+missing path is a skip wearing a pass. Ten candidates were accepted once they existed. Added: `.oci`,
+`.terraform.d`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and, matched only under
+`.config`, `gcloud`, `gh`, `doctl` and `rclone` - only under `.config`, because a bare `gh` component
+would refuse `~/projects/gh/src`, and a guard that fires on ordinary work is one somebody turns off.
+Deliberately NOT added, and said out loud rather than left implied: `.cargo`, `.m2` and `.gem` each
+hold one credential file beside a package cache people legitimately mount, so refusing the directory
+would break a real use; mounting `~/.cargo` still exposes `credentials.toml`. Both bindings carry the
+same list and a test now fails if they drift. This is a guard rail against an agent being steered
+into asking for the mount, not a sandbox boundary: the caller still has to ask.
+
 **`kern network ls` and `kern pod ls` printed a name off disk without stripping terminal escapes.**
 Both walk a state directory and render every entry verbatim, so what they show is what is on disk and
 not what `create` accepted: the creation-time name check does not cover them, and the REFUSAL for the
