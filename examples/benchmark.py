@@ -43,6 +43,31 @@ def have(name):
     return shutil.which(name) is not None
 
 
+def is_really(name):
+    """Is the thing called `name` on PATH actually that runtime, or kern answering to its name?
+
+    ASK THE BINARY, DO NOT TRUST THE FILENAME. kern ships an optional drop-in: `~/.local/bin/docker`
+    may be a symlink to kern, and then this script measures kern against itself and prints the number
+    under the COMPETITOR's name. MEASURED on this machine before the check existed: the table read
+    `docker run --rm  4.2 ms`, which is not Docker being fast - podman, doing the same work through a
+    daemon, reads 285 ms in the same run. BENCHMARKS.md has warned about this since 2026-09-14; the
+    warning protects whoever reads that file, and this protects whoever RUNS this one.
+
+    `--version` is the question every one of these answers, and kern answers it with `kern`.
+    """
+    real = os.path.realpath(shutil.which(name) or "")
+    if os.path.basename(real) == "kern":
+        return False, f"{name} is kern under another name ({real})"
+    try:
+        out = subprocess.run([name, "--version"], capture_output=True, text=True,
+                             timeout=10).stdout.lower()
+    except Exception:
+        return True, ""            # cannot ask: do not invent a reason to skip a real runtime
+    if "kern" in out.split() or out.startswith("kern "):
+        return False, f"{name} reports itself as kern ({out.strip()[:40]})"
+    return True, ""
+
+
 def get_rootfs(kern, workdir):
     """An Alpine rootfs for kern/bwrap/crun/runc. Pull it once with kern if needed."""
     dest = os.path.join(workdir, "alpine-rootfs")
@@ -184,12 +209,19 @@ def main():
                                          else "no OCI runtime to build a bundle"))
 
     if have("podman"):
-        rows.append(("podman run --rm", lambda i: [
-            "podman", "run", "--rm", "--network", "none", "alpine", "/bin/true"], None))
+        ok, why = is_really("podman")
+        if ok:
+            rows.append(("podman run --rm", lambda i: [
+                "podman", "run", "--rm", "--network", "none", "alpine", "/bin/true"], None))
+        else:
+            skipped.append(f"podman - NOT MEASURED: {why}")
     else:
         skipped.append("podman - not installed")
 
-    if have("docker"):
+    docker_ok, docker_why = is_really("docker") if have("docker") else (True, "")
+    if have("docker") and not docker_ok:
+        skipped.append(f"docker - NOT MEASURED: {docker_why}")
+    elif have("docker"):
         if sh(["docker", "info"]):
             sh(["docker", "pull", "alpine"])
             rows.append(("docker run --rm", lambda i: [
