@@ -310,9 +310,11 @@ caller that only catches exceptions will walk straight past it.
 
 ```python
 with kern.Sandbox(memory_mb=128, require_limits=True) as sbx:
-    r = sbx.run_code(code)
+    r = sbx.run_code("print('ran')")
     if r.fault and r.fault.type == "startup_failed":
-        ...   # this host cannot enforce the cap; nothing ran
+        print("this host cannot enforce the cap; nothing ran")
+    else:
+        print(r.stdout, r.success)
 ```
 
 ## API
@@ -369,6 +371,12 @@ shape rather than one box per call, with its own page:
 [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
 
 ## Performance
+
+**One knob gets slower as a session grows, and it is on by default.** `track_files=True` walks the
+workspace before AND after every call to fill `result.files` with the per-call diff, which is
+O(number of files in the workspace). A one-shot call never notices; a long agent session that
+accumulates thousands of files pays it on every `run_code`. Pass `track_files=False` when you do not
+read the diff and the cost becomes O(1), with `result.files` always empty.
 
 **It is two numbers rather than one.** The box is the cheap part, and an interpreter starting inside
 it costs more than the box does, so a bare box and a `run_code` are different rows below and neither
