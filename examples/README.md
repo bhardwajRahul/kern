@@ -203,7 +203,6 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 |---|---|
 | [familiar-commands.sh](basics/familiar-commands.sh) | Coming from Docker / AWS / GCP? The same verbs and building blocks, mapped to kern |
 | [run-vs-box.sh](basics/run-vs-box.sh) | The two verbs side by side, because the names collide with Docker's and the collision is backwards: the one spelled `run` is the one that does **not** isolate. Prints uid, hostname, pid 1 and whether `$HOME` is reachable, bare / under `kern run` / under `kern box`, so the difference stops being an argument about names |
-| [docker-shim.sh](security/docker-shim.sh) | Symlink `docker` to kern and keep typing what you already type: kern reads its own `argv[0]`, translates the command line and runs it rootless and daemonless. No socket, no configuration |
 | [benchmark.py](benchmark.py) | Reproduce the whole **Performance** table, kern vs bubblewrap / crun / runc / podman / docker (auto-detects what's installed) |
 | [compare-vs-docker.sh](resources/compare-vs-docker.sh) | Same isolated `/bin/true`, kern vs `docker run`, timed, and kern needs no daemon |
 | [compare-vs-bwrap.sh](resources/compare-vs-bwrap.sh) | Same speed class as bubblewrap, but kern adds OCI images, overlay, and lifecycle |

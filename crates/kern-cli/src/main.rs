@@ -258,7 +258,6 @@ mod relayhold;
 mod runstats;
 mod sandbox;
 mod secret;
-mod shim;
 mod systemd;
 mod toml_surgery;
 mod tui;
@@ -320,43 +319,23 @@ fn main() -> ExitCode {
     // that is an extreme edge for a containerised command, and never panicking is the harder guarantee.)
     let mut raw = std::env::args_os();
     let arg0 = raw.next().unwrap_or_default();
-    let mut args: Vec<String> = raw.map(|a| a.to_string_lossy().into_owned()).collect();
+    let args: Vec<String> = raw.map(|a| a.to_string_lossy().into_owned()).collect();
     let invoked = std::path::Path::new(&arg0)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    if (invoked == "docker" || invoked == "docker-compose") && !shim::argv_already_translated() {
-        if invoked == "docker-compose" {
-            args.insert(0, "compose".to_string());
-        }
-        // A FACT THE SHIM CAN ANSWER ITSELF, before translation: `docker version --format …`,
-        // `docker info --format …` and `docker compose version` ask what kern IS, not what it should
-        // do. See `shim::direct_reply` for why the first of those is the one that mattered.
-        if let Some(answer) = shim::direct_reply(&args) {
-            return match answer {
-                Ok(text) => {
-                    println!("{text}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {}", ui::scrub_message(&e.to_string()));
-                    ExitCode::FAILURE
-                }
-            };
-        }
-        match shim::translate(&args) {
-            Ok(translated) => args = translated,
-            Err(e) => {
-                eprintln!("error: {}", ui::scrub_message(&e.to_string()));
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    // Record what kern DECIDED to run. The scope re-exec replays this, not `env::args()`: through a
-    // symlink named `docker` the raw argv would arrive at the second pass untranslated, with an
-    // `argv[0]` that `current_exe()` has already resolved back to `kern`. See `shim::EFFECTIVE`.
-    shim::set_effective(&args);
-
+    // KERN IS NOT DOCKER, AND DOES NOT ANSWER TO ITS NAME. Until 2026-09-19 a symlink called
+    // `docker` made this binary rewrite a `docker …` argv into kern's own and run it. That was
+    // removed, name and all: the compatibility kern offers is with the FORMAT and the FLAGS -
+    // `kern box` already takes `-p`, `-e`, `-v`, `-it`, `-m`, `--cpus`, and `kern compose` reads a
+    // `docker-compose.yml` unchanged - not with the other tool's identity. Being invoked as
+    // `docker` added nothing a caller could not get by typing `kern`, and it cost what borrowed
+    // names always cost: a benchmark on this machine measured kern and published the row under
+    // Docker's name at 4.2 ms, next to a real podman at 285 ms, because `docker --version`
+    // answered for kern.
+    //
+    // `invoked` is still read, for the one thing argv[0] legitimately decides below.
+    let _ = invoked;
     // Map the result to an exit code in exactly ONE place (the lib/command layer returns
     // `Result`, never calls `process::exit` itself).
     match cli::run(&args) {

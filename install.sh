@@ -154,7 +154,3 @@ if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null |
   printf "      ${bindir}/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/kern\n"
   printf "${DIM}    then \`${bindir}/kern doctor\` should say ready. Full explanation: \`kern doctor\`.${ZZ}\n\n"
 fi
-# Optional Docker drop-in: invoked as `docker` / `docker-compose`, kern rewrites the argv (no daemon,
-# no docker.sock). NOT created automatically - a `docker` symlink would SHADOW a real Docker install.
-# Opt in deliberately (typically on a box with no Docker):
-printf "${DIM}    docker drop-in (optional, shadows any real Docker): ln -s \"${bindir}/kern\" \"${bindir}/docker\"${ZZ}\n"

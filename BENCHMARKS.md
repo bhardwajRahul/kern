@@ -4,12 +4,15 @@ One isolated `/bin/true`, x86_64 desktop, kernel 7.0.0, static musl binary, 200 
 Reproduce with `python3 examples/benchmark.py`; your numbers will differ with CPU, kernel and
 filesystem.
 
-**Check what `docker` is on your machine before you compare against it.** kern ships an optional
-drop-in: `~/.local/bin/docker` can be a symlink to `kern`, and then a benchmark that shells out to
-`docker` measures kern against itself and reports it as the competitor. MEASURED here on 2026-09-14:
-`docker run --rm alpine true` read 4.2 ms, which is not Docker being fast, it is kern answering to
-Docker's name. `readlink -f $(command -v docker)` settles it in one line, and the real one is usually
-`/usr/bin/docker` with a daemon that has to be running.
+**Check what `docker` is on your machine before you compare against it.** kern used to ship an
+optional drop-in that made `~/.local/bin/docker` a symlink to `kern`, and a benchmark that shells out
+to `docker` then measured kern against itself and reported it as the competitor. MEASURED here on
+2026-09-14: `docker run --rm alpine true` read 4.2 ms, which was not Docker being fast, it was kern
+answering to Docker's name, next to a real podman at 285 ms in the same run. **That drop-in was
+removed on 2026-09-19** - kern does not answer to another tool's name - but a symlink somebody
+already made does not disappear with it, and `docker` can be other things too. `readlink -f $(command
+-v docker)` settles it in one line, `docker --version` settles it in another, and `examples/benchmark.py`
+now asks both before it measures anything.
 
 | runtime | cold start | 200 in parallel |
 |---|---:|---:|

@@ -356,7 +356,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) | the published container-runtime escapes, each reproduced against this tree, and the class kern does not defend against |
 | [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
 | [BENCHMARKS.md](BENCHMARKS.md) · [EDGE.md](EDGE.md) | measurements, and running on a Pi, Jetson or UNO Q |
-| [examples/](examples/) · [blog/](blog/) | 95 runnable scripts in eight folders, and longer write-ups |
+| [examples/](examples/) · [blog/](blog/) | 94 runnable scripts in eight folders, and longer write-ups |
 | [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |
 
 ## Status

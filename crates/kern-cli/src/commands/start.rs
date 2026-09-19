@@ -2186,9 +2186,10 @@ pub fn run(
     // The confinement COMMITMENT, and why a second channel here is not the second transport it looks
     // like.
     //
-    // `--landlock-rw` reaches the post-re-exec pass as argv, which is verbatim today
-    // (`shim::effective_args` returns `env::args()`) and stays correct only as long as nothing ever
-    // rewrites, normalises or reorders it. That is an invariant of the code, not of the type: the day
+    // `--landlock-rw` reaches the post-re-exec pass as argv, which is verbatim today (`env::args()`,
+    // replayed unchanged - it used to pass through a recorded post-translation copy while kern still
+    // answered to `docker`) and stays correct only as long as nothing ever rewrites, normalises or
+    // reorders it. That is an invariant of the code, not of the type: the day
     // it breaks, an argv that LOST the flag is indistinguishable from one that never carried it, and
     // the difference between those two is a confined workload and an unconfined one. No test can
     // separate them after the fact, because a clean run and a lost-flag run look identical downstream.
@@ -3466,7 +3467,7 @@ fn install_persistent_box(
     // docker syntax into a unit whose `ExecStart` names the resolved `kern` binary, so it would fail
     // at every boot, on a machine nobody is watching.
     let mut exec = vec![systemd_quote(&self_exe.to_string_lossy())];
-    let mut it = crate::shim::effective_args().into_iter().peekable();
+    let mut it = std::env::args().skip(1).peekable();
     let mut past_sep = false;
     while let Some(a) = it.next() {
         // Strip kern's own `-d`/`--restart` only among the flags BEFORE the `--` command separator.
@@ -3828,11 +3829,11 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
-    // The DECIDED argv, not the typed one: a `docker …` invocation has already been translated into
-    // kern's dialect here, and replaying the original would hand the second pass docker syntax that
-    // kern's own parser rejects. `current_exe()` above resolves a symlink, so the shim cannot
-    // re-identify itself on the far side and cannot translate again.
-    let args: Vec<String> = crate::shim::effective_args();
+    // The argv this process received, replayed verbatim. It used to come from a recorded
+    // post-translation copy, because a `docker …` invocation arrived in another tool's dialect and
+    // replaying the typed form would hand the second pass syntax kern's own parser rejects. kern no
+    // longer answers to that name, so what was typed and what runs are the same thing again.
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
     // The scope's memory cap tracks `--memory` (so the outer scope never caps a box below what it
     // asked for); `--cpus` maps to a CPUQuota, `--cpuset-cpus` to AllowedCPUs. Swap tracks
@@ -3919,13 +3920,7 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         .arg("--")
         .arg(self_exe)
         .args(&args)
-        .env("KERN_SCOPE", "1")
-        // `args` is already kern's dialect (see `shim::effective_args`), so the child must NOT
-        // translate again. It would otherwise re-enter the shim whenever the binary it re-execs is
-        // itself named `docker` (a COPY rather than a symlink) and reject `box …` as "no kern
-        // equivalent". Not folded into KERN_SCOPE: a user can set that one by hand to opt out of the
-        // scope path, and it would then be claiming something about the argv that isn't true.
-        .env(crate::shim::DIALECT_ENV, "1");
+        .env("KERN_SCOPE", "1");
     // Minimise the check-then-use window before the IRREVERSIBLE exec. The manager was probed earlier
     // in this function, but `current_exe`, `trusted_helper` and the arg building since then are a
     // gap in which the user manager could exit (a session teardown). Re-probe HERE, adjacent to the

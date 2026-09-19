@@ -7,6 +7,16 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern no longer answers to `docker`.** A symlink named `docker` or `docker-compose` used to make
+this binary rewrite a Docker command line into kern's own and run it. That is gone, with the 1330
+lines behind it. The compatibility kern offers is with the FORMAT and the FLAGS, which is untouched:
+`kern box` still takes `-p`, `-e`, `-v`, `-it`, `-m` and `--cpus`, and `kern compose` still reads a
+`docker-compose.yml` unchanged, which is what Sentry's 57 services and Supabase's 13 run on. What
+went is borrowing the other tool's name, which added nothing a caller could not get by typing `kern`
+and cost what borrowed names cost: a benchmark on this machine measured kern, published the row as
+`docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
+runs kern, with kern's grammar and kern's errors.
+
 **This release changes two flags that already existed, so it is a MINOR and not a patch.** The
 stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on
 a minor bump, and only after a deprecation entry one release earlier. There was no such entry and
