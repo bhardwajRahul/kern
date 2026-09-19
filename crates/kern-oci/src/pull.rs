@@ -1087,7 +1087,9 @@ fn download_blobs_oneconn(
 /// error text must not inject a terminal escape), and two spellings of one rule is how one of them
 /// silently stops matching the other.
 fn without_control_chars(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| !kern_common::is_terminal_unsafe(*c))
+        .collect()
 }
 
 /// The registry's OWN diagnosis, lifted out of an auth/token error body and SCRUBBED.
@@ -1103,12 +1105,32 @@ fn without_control_chars(s: &str) -> String {
 /// breaking a single-line error. An empty or whitespace-only value is `None`: a registry that says
 /// nothing must not produce an error that says nothing either.
 fn registry_diagnosis(body: &str) -> Option<String> {
+    // A CAP, BECAUSE LENGTH IS ITSELF A WAY TO HIDE SOMETHING. Scrubbing decides WHICH characters
+    // reach the terminal and says nothing about HOW MANY. MEASURED on 2026-09-19: a hostile token
+    // endpoint on loopback put 1 MB of its own text on the terminal through `kern pull`, and curl's
+    // `--max-filesize` allows eight. No cursor is moved and no colour is set; the scrollback simply
+    // carries away whatever the reader was meant to see, which is the same end by a duller means.
+    // A registry's own diagnosis is a sentence - Hub says `incorrect username or password`, GHCR
+    // says `DENIED` - so the cap is far above any real one and the overflow is ANNOUNCED rather
+    // than silently dropped, or a truncated message would read as the registry's whole answer.
+    const MAX: usize = 200;
     first_str(body, "message")
         .or_else(|| first_str(body, "details"))
         .or_else(|| first_str(body, "error_description"))
         .or_else(|| first_str(body, "error"))
         .map(|m| without_control_chars(&m))
         .filter(|m| !m.trim().is_empty())
+        .map(|m| {
+            if m.chars().count() <= MAX {
+                m
+            } else {
+                let head: String = m.chars().take(MAX).collect();
+                format!(
+                    "{head}… (the registry sent {} characters; truncated)",
+                    m.chars().count()
+                )
+            }
+        })
 }
 
 /// Escape a value for curl's `-K` config double-quoted string: backslash-escape `\` and `"`, and
@@ -3307,6 +3329,58 @@ mod token_error_tests {
             "content is kept, only controls go: {clean:?}"
         );
         assert!(!clean.contains('\n') && !clean.contains('\t'));
+    }
+
+    /// A REGISTRY REORDERING THE LINE WITHOUT A SINGLE CONTROL CHARACTER.
+    ///
+    /// The scrub tested `char::is_control()`, which is the `Cc` category, and the bidirectional
+    /// overrides are `Cf`. MEASURED against a hostile registry on loopback: U+202E, U+200B, U+200E
+    /// and U+200F all reached the terminal through `kern pull` while ESC and carriage return were
+    /// correctly removed - a filter aimed at escape sequences, defeated by something that is not
+    /// one. U+202E draws what follows it right-to-left, so `denied` can be made to READ as
+    /// something else with nothing a control-character test can see.
+    ///
+    /// The positive control is in the same assertion: ESC must still go, or a test that only
+    /// proves the new characters are gone would pass over a filter that had stopped doing its
+    /// original job.
+    #[test]
+    fn a_registry_cannot_reorder_or_pad_what_it_makes_kern_print() {
+        use super::registry_diagnosis;
+        let body = "{\"message\":\"\u{202E}deined\u{200B}\u{200E}\u{200F} \u{1b}[32m ok\"}";
+        let lifted = registry_diagnosis(body).expect("a message must be found");
+        for c in ['\u{202E}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{1b}'] {
+            assert!(
+                !lifted.contains(c),
+                "{c:?} reached the terminal: {lifted:?}"
+            );
+        }
+        assert!(lifted.contains("deined"), "the words survive: {lifted:?}");
+    }
+
+    /// LENGTH IS A WAY TO HIDE SOMETHING TOO, and scrubbing says nothing about it.
+    ///
+    /// MEASURED: a hostile token endpoint put 1 MB on the terminal through `kern pull`, and curl's
+    /// `--max-filesize` allows eight. Nothing is repainted; the scrollback carries away what the
+    /// reader was meant to see. The overflow is ANNOUNCED, because a silently truncated message
+    /// reads as the registry's whole answer, which is a second way to mislead with the same text.
+    #[test]
+    fn a_registry_diagnosis_cannot_flood_the_terminal() {
+        use super::registry_diagnosis;
+        let long = "A".repeat(1_000_000);
+        let lifted = registry_diagnosis(&format!("{{\"message\":\"{long}\"}}"))
+            .expect("a message must be found");
+        assert!(
+            lifted.chars().count() < 300,
+            "1 MB reached the terminal: {} chars",
+            lifted.chars().count()
+        );
+        assert!(
+            lifted.contains("1000000 characters"),
+            "the truncation must name what was cut: {lifted:?}"
+        );
+        // A message at the cap is NOT announced, or every ordinary diagnosis would carry a warning.
+        let short = registry_diagnosis("{\"message\":\"incorrect username or password\"}").unwrap();
+        assert_eq!(short, "incorrect username or password");
     }
 }
 

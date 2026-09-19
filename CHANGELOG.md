@@ -24,6 +24,25 @@ before fixing it would leave the broken one in the field on purpose. The two:
 Everything else here is additive: new verbs, new flags, and fields added to `--json` documents that
 consumers already have to ignore when unknown.
 
+**A registry could reorder the line kern printed, without using a single control character.** The
+three filters that scrub remote text before it reaches a terminal all tested `char::is_control()`,
+which is the `Cc` category: C0, DEL and C1. The bidirectional overrides are `Cf`. Measured against a
+hostile registry on loopback: `kern pull` carried U+202E, U+200B, U+200E and U+200F from the token
+endpoint's `message` straight to the terminal, while correctly dropping ESC and carriage return. A
+filter written against escape sequences, defeated by something that is not one. U+202E moves no
+cursor; it reverses the order the characters after it are drawn in, which is enough to make a
+refusal read as something else. One predicate now decides the rule for all three, and it names what
+it removes rather than dropping a whole Unicode category.
+
+The same body also had no length: 1 MB of a registry's own text reached the terminal, and curl's cap
+allows eight. A diagnosis is a sentence, so it is capped at 200 characters with the overflow
+announced, because a silently truncated message reads as the registry's whole answer.
+
+`sh pentest/pentest-hostile-registry.sh` is the reproducer and is now part of `run-all.sh`. It found
+this where a unit test could not: a test asserting "a registry message cannot inject terminal
+escapes" had passed for as long as it existed, because it listed the characters somebody had thought
+of. The suite is verified in both directions, red against the previous binary.
+
 **A trailing backslash in a `command:` deleted a character, and sometimes an argument.** `command:
 myapp C:\dir\` ran `myapp` with `C:dir` - the final backslash was read as an escape with nothing to
 escape and dropped, and a `command:` that ENDED in a lone backslash lost that word entirely. POSIX

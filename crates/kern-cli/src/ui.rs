@@ -358,7 +358,9 @@ pub fn box_banner(s: &BoxStatus, p: &Palette, gl: &Glyphs, width: usize) -> Stri
 /// the cursor, title, or clipboard). The box *name* is already charset-validated by `BoxName`;
 /// `source` and `cmd` are not. Mirrors the `search`/`images` table hardening.
 pub(crate) fn scrub(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| !kern_common::is_terminal_unsafe(*c))
+        .collect()
 }
 
 /// The same guard for a whole MESSAGE rather than for one field, which is a different job.
@@ -388,7 +390,7 @@ pub(crate) fn scrub_message(s: &str) -> String {
     const CONT: &str = "       ";
     let cleaned: String = s
         .chars()
-        .filter(|c| *c == '\n' || !c.is_control())
+        .filter(|c| *c == '\n' || !kern_common::is_terminal_unsafe(*c))
         .collect();
     let mut out = String::with_capacity(cleaned.len());
     for (i, line) in cleaned.split('\n').enumerate() {

@@ -217,6 +217,41 @@ pub fn pad_visible(text: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(pad), text)
 }
 
+/// Whether `c` must never reach a terminal inside a string kern did not write.
+///
+/// THREE FILTERS HAD THE SAME JOB AND THE SAME GAP. `kern-oci`'s `without_control_chars`, and
+/// `scrub`/`scrub_message` in the CLI, each tested `char::is_control()` and each therefore drew the
+/// line at the same wrong place. `is_control()` is the `Cc` category: C0, DEL and C1. That stops the
+/// attack they were written for, which is measured and still stopped: a registry answering a failed
+/// login with `denied\e[2K\e[1A\e[32m logged in` repaints the line above it, and ESC and carriage
+/// return are `Cc`.
+///
+/// IT DOES NOT STOP THE `Cf` CATEGORY, which is where the bidirectional overrides live. MEASURED on
+/// 2026-09-19 against a hostile registry on loopback: a token-endpoint body carrying U+202E reached
+/// the terminal intact through `kern pull`, as did U+200B, U+200E and U+200F. U+202E does not move a
+/// cursor; it changes the ORDER the characters after it are drawn in, so a refusal can be made to
+/// read as something else without a single control character. That is the CVE-2021-42574 class, and
+/// it defeats a filter aimed at escape sequences precisely because it is not one.
+///
+/// WHAT IS DROPPED, and why the list is explicit rather than "every `Cf`". The embedding, override
+/// and isolate controls (U+202A-U+202E, U+2066-U+2069), the implicit marks (U+200E, U+200F, U+061C),
+/// the zero-width characters that hide a difference between two strings (U+200B-U+200D), and the
+/// byte-order mark (U+FEFF). `Cf` also holds characters that legitimately shape text in languages
+/// kern's users write, so the rule names what it removes instead of removing a whole category.
+///
+/// A NEWLINE IS STILL A CONTROL CHARACTER HERE. Whether to keep one is the caller's decision, not
+/// this predicate's: a table cell must not carry it and a multi-line error message must, which is
+/// exactly the distinction `scrub` and `scrub_message` already draw.
+pub fn is_terminal_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+}
+
 /// Render `items` as a JSON array, `render` producing each element.
 ///
 /// Eight emitters had written the same loop by hand: open a `[`, `enumerate`, push a `,` when the
@@ -484,6 +519,37 @@ mod an_exported_but_empty_flag_is_not_set {
 }
 
 /// Every spelling of a size that is accepted must mean the same number.
+#[cfg(test)]
+mod what_may_not_reach_a_terminal {
+    use super::is_terminal_unsafe;
+
+    /// THE `Cc` LINE WAS THE WRONG LINE, and three filters had drawn it.
+    ///
+    /// Measured on 2026-09-19 against a hostile registry on loopback: `kern pull` printed U+202E,
+    /// U+200B, U+200E and U+200F straight from the remote body while correctly dropping ESC and
+    /// carriage return. `char::is_control()` is `Cc`; the bidirectional overrides are `Cf`, so a
+    /// filter written against escape sequences never saw them. U+202E does not move a cursor - it
+    /// reverses the drawing order of what follows, which is enough to make a refusal read as
+    /// something else.
+    ///
+    /// BOTH DIRECTIONS, because a predicate that answered true for everything would pass a test
+    /// that only listed what must go. Ordinary text, including the non-ASCII text kern's own
+    /// messages carry, must survive untouched.
+    #[test]
+    fn the_bidi_and_invisible_characters_go_and_ordinary_text_stays() {
+        for c in [
+            '\u{1b}', '\r', '\n', '\t', '\u{0}', '\u{7f}', '\u{9b}', // the Cc line, unchanged
+            '\u{202E}', '\u{202D}', '\u{202A}', '\u{2066}', '\u{2069}', // overrides, isolates
+            '\u{200B}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{FEFF}', // invisible marks
+        ] {
+            assert!(is_terminal_unsafe(c), "{c:?} must never reach a terminal");
+        }
+        for c in ['a', ' ', '/', ':', '-', 'e', '.', '3', 'e', 'a', 'o', 'u'] {
+            assert!(is_terminal_unsafe(c) == false, "{c:?} is ordinary text");
+        }
+    }
+}
+
 #[cfg(test)]
 mod size_spellings {
     use super::parse_binary_size as p;
