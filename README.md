@@ -56,8 +56,9 @@ kern compose up -d
 - **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
   agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
   fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
-  caps the kernel enforces, capabilities dropped, seccomp deny-by-default, timeout applied from the
-  outside.
+  caps the kernel enforces where your host delegates them (`kern doctor` says whether yours does, and
+  `--require-limits` refuses to start rather than give you an uncapped box), capabilities dropped,
+  seccomp deny-by-default, timeout applied from the outside.
   <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, missing command:
   each returned next to stdout and the exit code. Branch on it and keep going.
   <br>**One binary, no daemon.** Wire it from Python, Node, LangChain, or any MCP client

@@ -12,9 +12,9 @@ kernel-enforced sandbox out of one static binary, with no daemon, no VM and no c
 tool-call, a model's generated snippet, a CI step: code that runs before anyone reads it gets its own
 box, and the box is thrown away after.
 
-Network off, memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp
-allowlist, and a wall-clock deadline the binding applies from **outside** the box, so code that hangs
-cannot outlive it. Dependency-free: it shells out to the `kern` binary and does not re-implement
+Network off, memory and PID caps the kernel enforces **where your host delegates them**,
+capabilities dropped, a deny-by-default seccomp allowlist, and a wall-clock deadline the binding
+applies from **outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell in a container often does not. `kern doctor` says which you have, and `requireLimits: true` refuses to build a Sandbox rather than hand you an uncapped box. Dependency-free: it shells out to the `kern` binary and does not re-implement
 isolation in JavaScript.
 
 **Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall or a missing
@@ -254,10 +254,15 @@ or Redis connection under `egressAllow` cannot resolve its host. For a database,
 `prewarm: N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,
 and refills in the background while your agent thinks. Measured on `python:3.12-slim`:
 
-| | first call | p50 within the burst |
+| `runCode` | first call | p50 within the burst |
 |---|---:|---:|
 | default | 30.9 ms | 14.2 ms |
 | `prewarm: 4` | 0.9 ms | **0.8 ms** |
+
+**The number is `runCode`, not `run()`.** A prewarmed box holds a BOOTED INTERPRETER, so what the
+pool removes is the interpreter's cost and not the box's. `run(["true"])` starts a fresh box either
+way and reads the same either way: measured, 4.74 ms with the pool against 4.67 ms without it. Time
+the wrong call and prewarming looks like a no-op.
 
 **The pool covers a burst, not a rate**, and it refills in the background: past N the cost returns to
 the default, and a call made immediately after construction pays the default until the boxes exist.
@@ -323,7 +328,8 @@ hostile or belongs to someone else. It costs what a machine costs: measured here
 0.43.0 on the same laptop, half a second per command in a live sandbox and about three seconds to
 create one, against 2 ms and 4 ms for kern, with `uname -r` inside reading its own kernel there and
 the host's here. kern is for the OTHER job, the one an agent loop does a thousand times: a cell per
-call, network off, memory and pids the kernel enforces, a deadline applied from outside the box.
+call, network off, memory and pids the kernel enforces where the host delegates them, a
+deadline applied from outside the box.
 Pick by which job you have, not by the ratio.
 
 **What the box does NOT hide from the code inside it.** The caps are real and the kernel enforces
