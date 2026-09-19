@@ -1799,3 +1799,92 @@ fn a_long_name_widens_the_column_instead_of_shifting_the_row() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// No list verb lets a name off disk carry a terminal escape to stdout.
+///
+/// ENUMERATED, NOT WALKED. `network ls` was found printing `ev^[[2Jil^[]0;PWNED^G` with the ESC and
+/// BEL bytes intact, and fixing only that one would have left `pod ls`, which had exactly the same
+/// hole and was found by running every list verb against the same planted name instead of inspecting
+/// the one already known broken. Both listings walk a state directory and yield every entry
+/// verbatim, so what they return is what is ON DISK, not what `create` accepted - the creation-time
+/// `valid_resource_name` check does not cover them, and two functions away the REFUSAL for the same
+/// name already scrubbed it.
+///
+/// NOT REACHABLE FROM A BOX TODAY, and this test does not pretend otherwise: planting the directory
+/// needs write access to kern's runtime dir, and `-v` refuses to mount that into a box by name. This
+/// is the layer under that refusal, and it is cheap to hold.
+///
+/// THE FIXTURE IS ASSERTED LIVE. A sweep where no verb lists anything passes while testing nothing,
+/// so at least one verb must be shown to have actually reached the planted name and neutralised it.
+#[test]
+fn no_list_verb_carries_a_terminal_escape_off_disk() {
+    let tmp = std::env::temp_dir().join(format!("kern-it-esc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (run, data, conf) = (tmp.join("run"), tmp.join("data"), tmp.join("conf"));
+    for d in [&run, &data, &conf] {
+        std::fs::create_dir_all(d).expect("temp dir");
+    }
+    // ESC + a CSI erase-screen, ESC + an OSC title set ending in BEL: the two shapes that repaint or
+    // retitle a terminal. `PWNED` is the marker that says the name was actually reached.
+    let evil = "ev\u{1b}[2Jil\u{1b}]0;PWNED\u{7}";
+    for d in [
+        "networks",
+        "volumes",
+        "pods",
+        "secrets",
+        "instances",
+        "builds",
+        "images",
+    ] {
+        let _ = std::fs::create_dir_all(run.join("kern").join(d).join(evil));
+        let _ = std::fs::create_dir_all(run.join("kern").join(d).join(format!("plain-{d}")));
+    }
+    let _ = std::fs::create_dir_all(data.join("kern/volumes").join(evil));
+
+    let verbs: [&[&str]; 9] = [
+        &["network", "ls"],
+        &["volume", "ls"],
+        &["pod", "ls"],
+        &["secret", "ls"],
+        &["images"],
+        &["ps", "-a"],
+        &["stats"],
+        &["history", "-n", "10"],
+        &["top"],
+    ];
+    let mut reached = Vec::new();
+    for args in verbs {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &run)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &conf)
+            .args(args)
+            .output()
+            .expect("run kern");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Colour is off (not a TTY), so ANY escape here came from the planted name.
+        let bad: Vec<char> = text
+            .chars()
+            .filter(|c| *c == '\u{1b}' || *c == '\u{7}')
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "`kern {}` carried {} raw terminal control char(s) off disk: {text:?}",
+            args.join(" "),
+            bad.len()
+        );
+        if text.contains("PWNED") {
+            reached.push(args.join(" "));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        !reached.is_empty(),
+        "no verb listed the planted name, so this swept nothing; the fixture stopped being live"
+    );
+    eprintln!("reached and neutralised by: {reached:?}");
+}

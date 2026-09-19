@@ -941,9 +941,13 @@ fn list() -> Result<(), Error> {
         z = p.z
     );
     for v in vols {
-        // No quota = UNLIMITED → `∞` (not a bare `-`, which reads as unset/error). `∞` is 1 glyph but
-        // 3 bytes; `kern_common::pad_visible` right-pads to 10 COLUMNS (not `{:>10}`, which counts bytes
-        // and would misalign). Same helper as the `kern top` Storage tab, so the two can't drift.
+        // No quota = UNLIMITED → `∞` (not a bare `-`, which reads as unset/error). `∞` is 1 char and
+        // 3 bytes, and `kern_common::pad_visible` right-pads it to 10. Kept because it is the same
+        // helper the `kern top` Storage tab uses, so the two cannot drift - NOT because `{:>10}`
+        // would misalign, which is what the note here used to claim. MEASURED: Rust's width counts
+        // CHARS, so `{:<10}` on a 4-char 8-byte string emits 6 spaces, exactly as `pad_visible` does.
+        // The two agree on everything but a glyph that is wider than one column, which neither
+        // handles and no value in this cell is.
         let quota = v.quota.map_or_else(|| "∞".to_string(), human_bytes);
         // Same fact as `usable` in the JSON.
         let flag = if kern_common::valid_resource_name(&v.raw) {

@@ -777,19 +777,41 @@ pub fn print_list(json: bool) -> Result<(), Error> {
         println!("naming `external: true` needs before it will run.");
         return Ok(());
     }
-    // MEASURED: the fixed 24 shifted MEMBERS for the whole table on any longer name, and a network a
-    // compose file declares `external:` is named by its author, not by kern.
-    let nw = crate::ui::name_col_width(names.iter().map(String::as_str), 24);
+    // SCRUBBED BEFORE IT IS MEASURED, let alone printed, and this was the ONLY table in the CLI that
+    // did neither. `list()` returns every directory name under the networks root verbatim - no
+    // `valid_resource_name` filter - so what it yields is not what `network create` accepted, it is
+    // whatever is on disk. MEASURED: a planted directory printed `ev^[[2Jil^[]0;PWNED^G` with the ESC
+    // and BEL bytes intact, and the terminal obeyed them. Two functions up, the REFUSAL for that same
+    // name already scrubs it, so the file disagreed with itself; `--json` was already correct
+    // (`\u001b`, `\u0007`), which left this one line.
+    //
+    // NOT REACHABLE FROM A BOX TODAY, and the fix is not sold as if it were: planting the directory
+    // needs write access to kern's runtime dir, and `-v` refuses to mount that into a box by name.
+    // This is the layer under that refusal.
+    //
+    // NOT FILTERED OUT, deliberately. Hiding a directory that exists would leave the operator with a
+    // network kern acts on and never lists; neutralised and shown beats silently dropped.
+    //
+    // Scrubbing FIRST also keeps the column honest: measuring the raw name would reserve width for
+    // characters that never print. The member cells are the same class, read from the same tree.
+    let shown: Vec<String> = names.iter().map(|n| crate::ui::scrub(n)).collect();
+    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24);
     println!("{:<nw$} {:>7}  BOXES", "NAME", "MEMBERS");
-    for n in &names {
-        let live = members(n);
+    for (n, label) in names.iter().zip(&shown) {
+        let live = members(n); // the RAW name is the path; only the display is scrubbed
         let who: Vec<String> = live
             .iter()
-            .map(|m| format!("{} ({})", m.service, m.project))
+            .map(|m| {
+                format!(
+                    "{} ({})",
+                    crate::ui::scrub(&m.service),
+                    crate::ui::scrub(&m.project)
+                )
+            })
             .collect();
         println!(
             "{:<nw$} {:>7}  {}",
-            n,
+            label,
             live.len(),
             if who.is_empty() {
                 "-".to_string()

@@ -1848,16 +1848,29 @@ pub fn list() -> Result<(), Error> {
         return Ok(());
     }
     let p = crate::ui::Palette::detect();
+    // SCRUBBED BEFORE IT IS MEASURED, for the reason `network ls` states at length and for the same
+    // cause: `rows()` walks the pods root and yields every directory name verbatim, so what it
+    // returns is what is on disk and not what `pod create` accepted. FOUND BY ENUMERATING the list
+    // verbs against a planted hostile name rather than by inspecting the one that was already known
+    // broken: this table printed `ev^[[2Jil^[]0;PWNED^G` with the ESC and BEL intact.
+    //
+    // The width is measured for the same reason the other five are: a compose project pod is
+    // `<project>-<hash8>`, which passes 24 as soon as the project name does.
+    let shown: Vec<String> = rows.iter().map(|(n, _, _)| crate::ui::scrub(n)).collect();
+    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24);
     println!(
-        "{d}{:<24} {:>7}  STATUS{z}",
+        "{d}{:<nw$} {:>7}  STATUS{z}",
         "POD",
         "BOXES",
         d = p.d,
         z = p.z
     );
-    for (name, members, alive) in &rows {
+    for ((_, members, alive), label) in rows.iter().zip(&shown) {
         let status = if *alive { "up" } else { "dead" };
-        println!("{}{}{:<24}{} {:>7}  {status}", p.b, p.c, name, p.z, members);
+        println!(
+            "{}{}{:<nw$}{} {:>7}  {status}",
+            p.b, p.c, label, p.z, members
+        );
     }
     Ok(())
 }

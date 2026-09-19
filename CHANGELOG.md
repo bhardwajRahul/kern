@@ -343,6 +343,17 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**`kern network ls` and `kern pod ls` printed a name off disk without stripping terminal escapes.**
+Both walk a state directory and render every entry verbatim, so what they show is what is on disk and
+not what `create` accepted: the creation-time name check does not cover them, and the REFUSAL for the
+same name two functions away already scrubbed it. Measured with a planted directory, both printed the
+ESC and BEL bytes intact and the terminal obeyed them. Not reachable from inside a box - planting the
+directory needs write access to kern's runtime dir, and `-v` refuses to mount that into a box by name
+- so this is the layer under that refusal rather than a hole in it. `--json` was already correct on
+both. The entry is still LISTED, neutralised, because hiding a directory kern acts on would be worse
+than showing it safely. Found by running every list verb against the same planted name instead of
+inspecting the one already known broken, which is what turned one table into two.
+
 **Four tables had a fixed NAME width, and `kern history` printed two different boxes as one line.**
 `kern ps` was widened to fit its longest name some releases ago; `stats`, `history`, `volume ls` and
 `network ls` were not, each with its own number. The three that do not truncate (`stats` 16,
