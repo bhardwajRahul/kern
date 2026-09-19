@@ -14,8 +14,15 @@ box, and the box is thrown away after.
 
 Network off, memory and PID caps the kernel enforces **where your host delegates them**,
 capabilities dropped, a deny-by-default seccomp allowlist, and a wall-clock deadline the binding
-applies from **outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell in a container often does not. `kern doctor` says which you have, and `requireLimits: true` refuses to build a Sandbox rather than hand you an uncapped box. Dependency-free: it shells out to the `kern` binary and does not re-implement
-isolation in JavaScript.
+applies from **outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your
+HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell
+in a container often does not. `kern doctor` says which you have, and `requireLimits: true` makes an
+unenforceable cap FATAL: the box refuses to start rather than run uncapped. It arrives the way every
+other refusal does, as `fault.type === "startup_failed"` on the result, NOT as an exception from the
+constructor, so a caller that only catches exceptions will walk past it.
+
+Dependency-free: it shells out to the `kern` binary and does not re-implement isolation in
+JavaScript.
 
 **Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall or a missing
 interpreter each arrive as a typed `fault` on the result, beside stdout and the exit code, so the

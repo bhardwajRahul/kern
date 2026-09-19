@@ -32,7 +32,14 @@ print(r.stdout, r.success)
 
 Network off, memory and PID caps the kernel enforces **where your host delegates them**,
 capabilities dropped, a deny-by-default seccomp allowlist, and a wall-clock deadline applied from
-**outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell in a container often does not. `kern doctor` says which you have, and `require_limits=True` refuses to build a Sandbox rather than hand you an uncapped box. Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
+**outside** the box, so code that hangs cannot outlive it. Whether the caps bind is a property of your
+HOST, not of kern: they need a delegated cgroup, which a desktop session has and a bare root shell
+in a container often does not. `kern doctor` says which you have, and `require_limits=True` makes an
+unenforceable cap FATAL: the box refuses to start rather than run uncapped. It arrives the way every
+other refusal does, as `fault.type == "startup_failed"` on the result, NOT as an exception from the
+constructor, so a caller that only catches exceptions will walk past it.
+
+Node and TypeScript get the same binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox)
 (the MCP server below is this package's).
 
 ## Your loop reads a field, not a stack trace
@@ -301,6 +308,12 @@ and why `/tmp` is one of them, the bytecode route `deps_readonly` closes, the si
 describes the host, and the three things a server image asks for.
 
 ## API
+
+**A `Sandbox` is a context manager, and `Sandbox(...)` alone is not entered.** The methods below are
+written `Sandbox(...).method(...)` for brevity, and calling one that way raises
+`use the Sandbox as a context manager: with Sandbox() as s: ...`. Read every `Sandbox(...)` here as
+the `s` of `with Sandbox(...) as s:`. Only `kern.run_code` and the other module-level helpers stand
+alone, because each opens and closes one for you.
 
 - `kern.run_code(code, **kwargs)`, one-shot: a throwaway `Sandbox` under the hood.
 - `Sandbox(...).run_code(code, language="python"|"bash"|"sh"|"node")` on the session workspace. The
